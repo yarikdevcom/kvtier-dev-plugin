@@ -115,15 +115,25 @@ TO BE FULLY INSTALLED. Why the boot default had to change:
   `core.py:260`. So `register()`'s immediate `install(manager_class())` is
   ALWAYS refused at boot (`cls is None`), and that refusal path returns before
   any disarm - the state used to stay at its initial value, `armed: True`.
-* Nothing on the scheduler or store path calls `ensure_installed`: its only call
-  sites are the two engine verbs (`engine_side.py:99`, `engine_side.py:131`) and
+* Nothing on the scheduler or store path called `ensure_installed`: its only call
+  sites were the two engine verbs (`engine_side.py:99`, `engine_side.py:131`) and
   the `/tier` verb itself (`backport.py:953`).
 
-Booted armed, that combination means the FIRST request reaches the UNPATCHED
-store selector and dies on the assert - a fail-open whose only defence was an
+Booted armed, that combination meant the FIRST request reached the UNPATCHED
+store selector and died on the assert - a fail-open whose only defence was an
 operator remembering to curl a verb first. `BOOT_ARMED = False` removes the
 reliance on remembering: a tier boot is inert until someone arms it, and the arm
 is gated on the proof (see the all-or-nothing contract below).
+
+That fixes "inert", not "patched", so the second half closed the other gap: the
+install is no longer left to verbs. `install_connector_hook()` (fitted by
+`register()`) wraps `KVConnectorFactory.create_connector`, and when that returns
+a tier connector carrying a `scheduler_manager` it runs the whole install against
+the class the connector just imported, with the LIVE `kv_cache_config`. That is
+the first moment the manager class exists and it is still inside
+`Scheduler.__init__`, long before the first request - so an engine that boots
+with the tier configured is patched by the boot itself, and geometry-checked by
+the boot too (a class-only install cannot see a config; this one can).
 
 The arm gate therefore seeks proof rather than trusting its caller:
 `set_armed(True)` runs `_arm_proof()` (an install onto the class, when a class is
@@ -131,39 +141,48 @@ resolvable) before deciding, and `tier_for_engine` calls `ensure_installed`
 (the live manager's class, WITH its `KVCacheConfig`, so the geometry guard
 actually checks) before every op. A cold-boot arm sequence is:
 
-  POST /tier {"op":"status"}  -> installs against the live manager; armed:false
+  (boot) connector creation -> wrappers fitted + the fix installed, tier disarmed
+  POST /tier {"op":"status"}  -> confirms it against the live manager; armed:false
   POST /tier {"op":"arm"}     -> refuses unless installed AND the guard passed
   (a refusal names its kind: "geometry" | "no_manager" | "incomplete_install")
 
-WHAT A DISARMED TIER DOES *NOT* GATE (read this before trusting the flag)
--------------------------------------------------------------------------
+WHAT THE KILL SWITCH GATES (and what it still cannot reach)
+-----------------------------------------------------------
 The kill switch is a set of wrappers this module fits; `armed` is only ever read
-INSIDE them. Two consequences, both honest and both reported in
-`disarm_limits()`:
+INSIDE them. Four manager methods, which together are the ONLY two routes to the
+method that contains the assert (`_select_eager_blocks_to_store`, and inside it
+`resolve_block_hashes` at `manager.py:842`):
 
-1. Before the first verb contact NO wrappers exist yet (the boot case above), so
-   `armed: false` at boot is an INTENT that nothing enforces until some verb -
-   `/tier`, `/snapshot` or `/policy/reload`, all of which call
-   `ensure_installed` - fits them. This is why the runbook's first step is a
-   status/snapshot call and not "trust the default".
-2. The three gated methods are the connector's per-step entry points. The
-   connector's finish path reaches the same selector by a route the switch does
-   NOT cover: `request_finished_all_groups` -> `_queue_finished_eager_store`
-   (`manager.py:1166`) -> `_select_eager_blocks_to_store` (`manager.py:1177`).
-   While the fix IS fully installed that method is the patched one and the route
-   is safe; while it is NOT, a disarmed tier can still reach the assert when a
-   request finishes. That is a second reason the fix is never optional and a
-   disarmed tier is never a substitute for the patch.
+1. ROUTE 1, per step: `get_num_new_matched_tokens`, `build_connector_meta`
+   (`manager.py:488`) -> `prepare_store_specs` (`:552`) -> selector at `:745`.
+2. ROUTE 2, per finished request: `_queue_finished_eager_store` (`:1169`), the
+   only other caller of the selector (`:1177`), reached from
+   `request_finished_all_groups` (`:1161`). It is gated too, and it had to be:
+   the scheduler calls `update_state_after_alloc` for EVERY scheduled request
+   (`scheduler.py:1228`) and that registers `_reqs_to_store` before its
+   `num_external_tokens == 0` early return - so a disarmed tier reached the
+   selector on every finished request, gated elsewhere or not. The gate is on the
+   INNER method because the outer one returns the `(bool, dict|None)` that drives
+   delayed freeing, while this one returns `None` either way.
+
+There is no third caller: `_select_eager_blocks_to_store` has exactly two call
+sites in the fork (`:745`, `:1177`) and `resolve_block_hashes` is called once
+inside the manager (`:842`). Two honest limits remain, both in `disarm_limits()`:
+the worker process is never patched (it builds no `scheduler_manager` and runs
+none of these methods), and a tier connector nested inside another connector
+(e.g. `MultiConnector`) is not the object `create_connector` returns, so its hook
+reports `other_connector` instead of installing.
 
 THE KILL SWITCH (runtime, no restart)
 -------------------------------------
-`set_armed(False)` makes the tier a strict no-op through three manager
-methods, mirroring the connector's own `scheduler_manager is None` code path
-(`simple_cpu_offload_connector.py:250,262,296`):
+`set_armed(False)` makes the tier a strict no-op through four manager methods,
+the first three mirroring the connector's own `scheduler_manager is None` code
+path (`simple_cpu_offload_connector.py:250,262,296`):
 
   get_num_new_matched_tokens -> (0, False)        (no prefix match)
   build_connector_meta       -> SimpleCPUOffloadMetadata()  (empty store+load)
   has_pending_stores         -> False
+  _queue_finished_eager_store-> None              (queue nothing on finish)
 
 An empty metadata is what makes the WORKER a no-op: `worker.start_load_kv`
 copies only `metadata.load_cpu_blocks` and `worker.wait_for_save` only
@@ -187,9 +206,14 @@ live-traffic crash this backport is supposed to make impossible.
   own marker). One refusal makes `installed: false`. The per-method verdicts
   stay visible so the operator still sees WHICH one was refused.
 * A not-fully-installed install force-DISARMS the tier (`set_armed(False)`) and
-  records `disarm_reason: "incomplete_install"`. The kill-switch wrappers install
-  independently of the fingerprints, so a disarmed connector is a strict no-op
-  and never reaches the crashing selector even unpatched.
+  records `disarm_reason: "incomplete_install"`. The kill-switch wrappers are
+  fitted FIRST, before the guard and before any upstream body is compiled, and
+  they need no fingerprint - so a refused backport, a geometry veto or an
+  install that raised midway all leave the SAME state: wrappers present +
+  disarmed, which now gates BOTH routes to the selector. A refused backport must
+  never leave the tier armed-and-unpatched, and never says "armed": it logs
+  `backport NOT installed`, arms nothing, and `arm_block.kind` reads
+  `incomplete_install`.
 * `set_armed(True)` is REFUSED - state unchanged, never raising - while the
   geometry guard has vetoed the live config (`kind: "geometry"`), no
   `SimpleCPUOffloadScheduler` exists in this process to install onto or arm at
@@ -232,8 +256,11 @@ METHODS = ("__init__", "_estimate_lazy_target_blocks",
 REPLACED = ("_estimate_lazy_target_blocks", "update_state_after_alloc",
             "_select_eager_blocks_to_store")
 # Kill-switch wrappers (independent of the backport; gated on the arm flag).
+# The first three are the connector's per-step entry points; the fourth is the
+# FINISH path, the only other caller of the crashing selector, and the reason a
+# disarmed tier is a gate rather than merely an intent. See "THE KILL SWITCH".
 SWITCH_METHODS = ("get_num_new_matched_tokens", "build_connector_meta",
-                  "has_pending_stores")
+                  "has_pending_stores", "_queue_finished_eager_store")
 
 # THE TIER IS DISARMED AT BOOT. See "THE BOOT DEFAULT IS DISARMED" above: the
 # install cannot land at plugin-load time (the manager class does not exist
@@ -265,6 +292,18 @@ _state = {
     "geometry": None,                    # last guard result
     "fallbacks": 0,
     "last_error": None,
+    # The connector-creation hook: the moment the manager class EXISTS, which is
+    # the only reason a boot can be patched before its first request.
+    "hook_fitted": False,
+    "hook_reason": None,
+    "hook_fits": 0,
+    "hook_calls": 0,
+    "hook_tier_connectors": 0,
+    "hook_no_manager": 0,
+    "hook_other_connector": 0,
+    "hook_installs": 0,
+    "hook_errors": 0,
+    "hook_last": None,
 }
 
 
@@ -278,6 +317,10 @@ def reset_state_for_tests() -> None:
         "last_arm_refusal": None,
         "method_verdicts": {}, "switch_verdicts": {}, "geometry": None,
         "fallbacks": 0, "last_error": None,
+        "hook_fitted": False, "hook_reason": None, "hook_fits": 0,
+        "hook_calls": 0, "hook_tier_connectors": 0, "hook_no_manager": 0,
+        "hook_other_connector": 0, "hook_installs": 0, "hook_errors": 0,
+        "hook_last": None,
     })
 
 
@@ -569,10 +612,41 @@ def _make_pending_wrapper(original):
     return has_pending_stores
 
 
+def _make_finished_store_wrapper(original):
+    """Gate ROUTE 2 into the crashing selector: the connector's FINISH path.
+
+    `request_finished_all_groups` (manager.py:1161) calls this and then returns
+    `request_finished(...)`'s real `(bool, dict|None)`; THIS method returns
+    `None` and is a pure queueing side effect (`_pending_finished_stores.append`
+    + pool touches), so declining it is free and it is the correct place to
+    gate. Gating the OUTER method instead would lie to the scheduler about
+    delayed freeing, which is what it drives.
+
+    Disarmed, nothing is queued, so the step that follows
+    (`build_connector_meta`, which drains `_pending_finished_stores`) has
+    nothing to store either. `None` is also exactly what the fork returns when
+    it queues nothing (`state is None or gpu_pool is None`), so a decline is
+    indistinguishable from "nothing to do" - which it is.
+    """
+    def _queue_finished_eager_store(self, request, block_ids):
+        if not _state["armed"]:
+            return None
+        return original(self, request, block_ids)
+
+    setattr(_queue_finished_eager_store, SWITCH_ATTR, SWITCH_TAG)
+    setattr(_queue_finished_eager_store, ORIGINAL_ATTR, original)
+    _queue_finished_eager_store.__doc__ = (
+        "kvtier-dev-plugin kill switch: queue nothing while the tier is "
+        "disarmed, so the finish path never reaches "
+        "_select_eager_blocks_to_store; else the engine's own queueing.")
+    return _queue_finished_eager_store
+
+
 _SWITCH_FACTORIES = {
     "get_num_new_matched_tokens": _make_matched_wrapper,
     "build_connector_meta": _make_meta_wrapper,
     "has_pending_stores": _make_pending_wrapper,
+    "_queue_finished_eager_store": _make_finished_store_wrapper,
 }
 
 
@@ -610,11 +684,19 @@ def _install_switch(cls, name) -> dict:
 # --- installation -----------------------------------------------------------
 
 def install(cls, kv_cache_config=None) -> dict:
-    """Backport PR #56810 onto `cls`, then fit the kill-switch wrappers.
+    """Fit the kill-switch wrappers, then backport PR #56810 onto `cls`.
 
     Never raises. Idempotent and marker-guarded like store_hook. A stale
     fingerprint is a per-method refusal, so one moved function cannot make the
     others silently wrong: the verdict for each is reported independently.
+
+    THE ORDER IS THE POINT: the wrappers go on FIRST, before the geometry guard
+    and before a single upstream body is compiled. The backport can be refused
+    (a fingerprint drift) or can raise midway, and in BOTH cases the process must
+    be left in "wrappers present + disarmed" - which, with the finish path gated
+    as well as the per-step trio, means NEITHER route to the crashing selector is
+    open. Fitting the wrappers last would leave a geometry-vetoed or
+    half-installed class with the finish route still wide open.
     """
     report = {"installed": False, "class": None, "reason": None,
               "methods": {}, "switch": {}, "geometry": None}
@@ -625,9 +707,20 @@ def install(cls, kv_cache_config=None) -> dict:
             # disarm and never did; what makes it safe is that the state it
             # refuses INTO is now `armed: False`, so an uninstalled tier is also
             # an idle one. `arm_block.kind` reports "no_manager" in this state.
+            # There is nothing to fit wrappers ONTO here - which is exactly the
+            # hole the connector-creation hook closes.
             return _refuse(report, f"no {TARGET_CLASS} is imported in this "
                                    f"process ({TARGET_MODULE} absent)")
         report["class"] = getattr(cls, "__name__", type(cls).__name__)
+
+        # FIRST: the kill switch. It needs no fingerprint (it only adds a gated
+        # early-return around the engine's own function) and it is what makes a
+        # refused, vetoed or half-installed tier a strict no-op on BOTH routes
+        # into the selector.
+        for name in SWITCH_METHODS:
+            verdict = _install_switch(cls, name)
+            report["switch"][name] = verdict
+            _state["switch_verdicts"][name] = verdict
 
         guard = geometry_guard(
             kv_cache_config if kv_cache_config is not None
@@ -646,7 +739,9 @@ def install(cls, kv_cache_config=None) -> dict:
             # The patch would skip a group whose KV is needed on resume: turn
             # the tier OFF rather than leave it armed to drop cacheable KV. The
             # methods are not attempted at all here, so nothing is refused per
-            # method - the whole install is refused on geometry.
+            # method - the whole install is refused on geometry. The kill-switch
+            # wrappers are already fitted above, so this class is a no-op with
+            # both selector routes gated rather than an unwrapped crash.
             _state["fully_installed"] = False
             _state["refused_methods"] = []
             report["refused_methods"] = []
@@ -659,11 +754,6 @@ def install(cls, kv_cache_config=None) -> dict:
             verdict = _install_one(cls, name)
             report["methods"][name] = verdict
             _state["method_verdicts"][name] = verdict
-
-        for name in SWITCH_METHODS:
-            verdict = _install_switch(cls, name)
-            report["switch"][name] = verdict
-            _state["switch_verdicts"][name] = verdict
 
         # ALL-OR-NOTHING: `installed` means EVERY method in METHODS is patched
         # (a fingerprint that matched, or a re-install verified over our own
@@ -830,6 +920,12 @@ def ensure_installed(engine) -> dict:
     our markers, `already_installed` keeps that work off the serving loop.
     """
     try:
+        if not _state["hook_fitted"]:
+            # The connector-creation hook is what makes a boot patch itself. If
+            # this process imported the factory only AFTER plugin load, fit it
+            # here: once fitted it is a marker check, and re-fitting re-binds the
+            # fork's own function, so this can never nest a second hook.
+            install_connector_hook()
         manager = manager_of(engine)
     except Exception as exc:  # noqa: BLE001 - a manager we cannot reach is data
         _state["fallbacks"] += 1
@@ -877,6 +973,262 @@ def manager_of(engine):
     scheduler = getattr(engine, "scheduler", None)
     connector = getattr(scheduler, "connector", None)
     return getattr(connector, "scheduler_manager", None)
+
+
+# --- the connector-creation hook: when the patch ACTUALLY lands --------------
+#
+# WHY A HOOK AT ALL. `register()` cannot install: it runs at `core.py:217` and
+# the manager class is first imported while the Scheduler is being built at
+# `core.py:260`, so the boot install attempt is ALWAYS refused on `cls is None`
+# and the only later chances were HTTP verbs. That made "patched before the
+# first request" a claim about operator habit, not about the boot order.
+#
+# WHY THIS HOOK IS THE RIGHT MOMENT. The connector module
+# (`.../v1/simple_cpu_offload_connector.py:21`) imports the manager at module
+# scope, and `KVConnectorFactory.create_connector` is the only thing that
+# imports THAT module - in both of its two callers (`scheduler.py:164` for the
+# scheduler role, `kv_transfer_state.py:90` for the worker role). So the instant
+# `create_connector` returns is the first instant the manager class exists, and
+# it is still inside `EngineCore.__init__`/`Scheduler.__init__`: before the first
+# step, before the first `bind_gpu_block_pool`, long before any request. The
+# scheduler-role call also hands us a manager with a LIVE `kv_cache_config`, so
+# the geometry guard gets a real check at boot instead of `checked: False`.
+#
+# WHY IT CANNOT BE TOO EARLY OR TOO LATE. `load_general_plugins()` (core.py:217)
+# precedes every `create_connector` call in the tree (`scheduler.py:164` is
+# reached from core.py:260; the worker's pair is `worker_base.py:288` then
+# `kv_transfer_state.py:90`), so the hook is fitted before the class it wraps can
+# be called. Verified against the fork: importing `vllm.v1.engine.core` - which
+# is what makes `register()` able to attach verbs at all - already puts the
+# factory module in `sys.modules`, while the scheduler and offload-manager
+# modules are NOT there yet.
+
+CONNECTOR_FACTORY_MODULE = "vllm.distributed.kv_transfer.kv_connector.factory"
+CONNECTOR_FACTORY_CLASS = "KVConnectorFactory"
+CREATE_CONNECTOR = "create_connector"
+CONNECTOR_MODULE = ("vllm.distributed.kv_transfer.kv_connector.v1."
+                    "simple_cpu_offload_connector")
+CONNECTOR_CLASS = "SimpleCPUOffloadConnector"
+
+# Its OWN marker, distinct from backport-1/switch-1/store-1/capacity-1: a hook on
+# a factory classmethod is a different kind of patch and must never be mistaken
+# for one on the manager.
+HOOK_ATTR = "__kvtier_dev_connector_hook__"
+HOOK_TAG = "kvtier-dev-plugin/connector-hook-1"
+HOOK_ORIGINAL = "__kvtier_dev_connector_hook_original__"
+
+
+def connector_factory_class():
+    """`KVConnectorFactory` if this process already imported it. Never imports."""
+    module = sys.modules.get(CONNECTOR_FACTORY_MODULE)
+    if module is None:
+        return None
+    return getattr(module, CONNECTOR_FACTORY_CLASS, None)
+
+
+def _is_tier_connector(connector) -> bool:
+    """Is this object the simple-CPU offload connector (or a subclass)?
+
+    Identity by MRO name+module, never `isinstance` on a fork class: this module
+    does not import vllm and must not start. A MultiConnector holding a tier
+    connector inside it is NOT matched, and says so as `other_connector` - the
+    gap is reported, not hidden.
+    """
+    try:
+        for klass in type(connector).__mro__:
+            if (klass.__name__ == CONNECTOR_CLASS
+                    and getattr(klass, "__module__", "") == CONNECTOR_MODULE):
+                return True
+    except Exception as exc:  # noqa: BLE001 - an unreadable object is "not ours"
+        snapshot._error(exc, "backport connector identity")
+    return False
+
+
+def _after_connector_created(connector) -> None:
+    """The install moment. Contained: the engine ALWAYS gets its connector.
+
+    Nothing here may raise into `create_connector`, and nothing here may swap the
+    object the caller asked for: a diagnostic that can break connector
+    construction is a worse outage than an unpatched tier.
+    """
+    try:
+        _state["hook_calls"] += 1
+        if not _is_tier_connector(connector):
+            # Some other connector (or a MultiConnector wrapping one). Not ours,
+            # not an error, and NOT silent: it is counted and published.
+            _state["hook_other_connector"] += 1
+            _state["hook_last"] = (f"{type(connector).__name__}: not the tier "
+                                   f"connector, nothing installed")
+            return
+        manager = getattr(connector, "scheduler_manager", None)
+        if manager is None:
+            # THE WORKER CASE. `role=WORKER` builds `worker_handler`, never a
+            # `scheduler_manager`, and the worker process runs no manager code at
+            # all - so there is nothing to patch HERE and that is the NORMAL
+            # answer, not a failure. The scheduler role gets its own call in the
+            # EngineCore process, which is where the manager actually runs.
+            _state["hook_no_manager"] += 1
+            _state["hook_last"] = ("role=WORKER: no scheduler_manager in this "
+                                   "process (no_manager), nothing to install")
+            logger.info("kvtier-dev-plugin: connector hook saw a tier connector "
+                        "with no scheduler_manager (worker role) - normal, "
+                        "nothing installed")
+            return
+        _state["hook_tier_connectors"] += 1
+        cls = type(manager)
+        report = install(cls, getattr(manager, "kv_cache_config", None))
+        wrapped = sum(1 for v in report["switch"].values() if v.get("wrapped"))
+        _state["hook_installs"] += 1
+        _state["hook_last"] = (f"{getattr(cls, '__name__', '?')}: "
+                               f"installed={report.get('installed')} "
+                               f"switch={wrapped}/{len(SWITCH_METHODS)} "
+                               f"reason={report.get('reason') or 'none'}")
+        # LOUD, because this is the state an operator must be able to read from
+        # the boot log without curling anything: patched before the first request,
+        # or refused and therefore disarmed.
+        if report.get("installed"):
+            logger.warning("kvtier-dev-plugin: PR #56810 install run at CONNECTOR "
+                           "CREATION (before the first request): %s; tier still "
+                           "DISARMED until POST %s {\"op\":\"arm\"}",
+                           _state["hook_last"], tier_route())
+        else:
+            logger.warning("kvtier-dev-plugin: connector-creation install was NOT "
+                           "completed (%s) - the tier is DISARMED with its "
+                           "kill-switch wrappers fitted, so BOTH routes to the "
+                           "divisibility assert are gated and arming is refused",
+                           _state["hook_last"])
+    except Exception as exc:  # noqa: BLE001 - a hook must never break a connector
+        _state["hook_errors"] += 1
+        _state["hook_last"] = f"hook raised {type(exc).__name__}: {exc}"[:200]
+        snapshot._error(exc, "backport connector hook")
+
+
+def _make_create_connector_hook(original):
+    """Pass every argument through untouched, install on the way out."""
+    def create_connector(cls, *args, **kwargs):
+        # The fork's own call FIRST, and its exceptions propagate verbatim (the
+        # HMA/`kv_transfer_config` ValueErrors it raises are the engine's story,
+        # not ours to swallow). Only a SUCCESSFUL construction gets inspected.
+        connector = original(cls, *args, **kwargs)
+        _after_connector_created(connector)
+        return connector
+
+    setattr(create_connector, HOOK_ATTR, HOOK_TAG)
+    setattr(create_connector, HOOK_ORIGINAL, original)
+    create_connector.__name__ = CREATE_CONNECTOR
+    create_connector.__qualname__ = f"{CONNECTOR_FACTORY_CLASS}.{CREATE_CONNECTOR}"
+    create_connector.__doc__ = (
+        "kvtier-dev-plugin: the fork's own create_connector, unchanged, then the "
+        "PR #56810 install against the manager class the connector just imported "
+        "- the first moment that class exists. Contained: a hook failure cannot "
+        "stop the connector being built.")
+    return create_connector
+
+
+def install_connector_hook() -> dict:
+    """Wrap `KVConnectorFactory.create_connector`. Idempotent, never raises.
+
+    Same ownership discipline as `_install_switch`: ours is re-fitted by
+    re-binding the fork's original (so a reload loop cannot nest hooks), a
+    foreign marker is refused, and anything that is not the class's OWN
+    `classmethod` is refused rather than guessed at - the fork calls it as
+    `KVConnectorFactory.create_connector(config=..., role=..., kv_cache_config=...)`
+    and a wrapper that got that convention wrong would break every boot that has
+    a connector, tier or not.
+    """
+    report = {"fitted": False, "class": None, "reason": None}
+    try:
+        factory = connector_factory_class()
+        if factory is None:
+            # A process that has not imported the factory yet (an arg-parsing or
+            # worker process at plugin-load time). Nothing to wrap now;
+            # `ensure_installed` re-fits from the first verb contact.
+            report["reason"] = (f"{CONNECTOR_FACTORY_MODULE} is not imported in "
+                                f"this process, nothing to wrap")
+            _note_hook_fit(report)
+            return report
+        report["class"] = getattr(factory, "__name__", type(factory).__name__)
+        raw = factory.__dict__.get(CREATE_CONNECTOR)
+        if raw is None:
+            report["reason"] = (f"{report['class']}.{CREATE_CONNECTOR} is not "
+                                "defined on this class: the fork moved it, "
+                                "refusing to re-bind it here")
+            _note_hook_fit(report)
+            return report
+        if not isinstance(raw, classmethod):
+            report["reason"] = (f"{report['class']}.{CREATE_CONNECTOR} is a "
+                                f"{type(raw).__name__}, not a classmethod: the "
+                                "calling convention changed, refusing to guess")
+            _note_hook_fit(report)
+            return report
+        inner = raw.__func__
+        owner = getattr(inner, HOOK_ATTR, None)
+        if owner is not None and owner != HOOK_TAG:
+            held = getattr(inner, "__qualname__", type(inner).__name__)
+            report["reason"] = (f"{report['class']}.{CREATE_CONNECTOR} carries "
+                                f"another plugin's connector-hook marker "
+                                f"({held!r}), refusing to overwrite it")
+            _note_hook_fit(report)
+            return report
+        # Re-fitting our own hook re-binds the FORK's function, so a reload loop
+        # is one wrapper deep forever.
+        original = getattr(inner, HOOK_ORIGINAL, None) or inner
+        setattr(factory, CREATE_CONNECTOR,
+                classmethod(_make_create_connector_hook(original)))
+        first = not _state["hook_fitted"]
+        _state["hook_fitted"] = True
+        _state["hook_fits"] += 1
+        _state["hook_reason"] = None
+        report["fitted"] = True
+        if first:
+            logger.warning("kvtier-dev-plugin: connector-creation hook fitted on "
+                           "%s.%s - the PR #56810 install now lands when the "
+                           "tier connector is built, before its first request",
+                           report["class"], CREATE_CONNECTOR)
+        return report
+    except Exception as exc:  # noqa: BLE001 - a plugin must not break a boot
+        _state["hook_errors"] += 1
+        report["reason"] = f"install_connector_hook raised: {type(exc).__name__}"[:200]
+        snapshot._error(exc, "backport connector hook fit")
+        _note_hook_fit(report)
+        return report
+
+
+def _note_hook_fit(report) -> None:
+    """One log line per distinct refusal reason (the snapshot polls this path)."""
+    reason = report.get("reason")
+    if _state["hook_reason"] == reason:
+        return
+    _state["hook_reason"] = reason
+    if reason is not None:
+        logger.info("kvtier-dev-plugin: connector-creation hook NOT fitted: %s",
+                    reason)
+
+
+def connector_hook_section() -> dict:
+    """What the hook is and did, for `status`/`snapshot`."""
+    return {
+        "fitted": bool(_state["hook_fitted"]),
+        "class": f"{CONNECTOR_FACTORY_MODULE}.{CONNECTOR_FACTORY_CLASS}",
+        "method": CREATE_CONNECTOR,
+        "reason": _state["hook_reason"],
+        "fits": int(_state["hook_fits"]),
+        "calls": int(_state["hook_calls"]),
+        "tier_connectors": int(_state["hook_tier_connectors"]),
+        "worker_role_no_manager": int(_state["hook_no_manager"]),
+        "other_connector": int(_state["hook_other_connector"]),
+        "installs_run": int(_state["hook_installs"]),
+        "errors": int(_state["hook_errors"]),
+        "last": _state["hook_last"],
+        "lands": ("when create_connector returns a SimpleCPUOffloadConnector "
+                  "built with a scheduler_manager (core.py:217 plugin load -> "
+                  "scheduler.py:164 connector creation -> core.py:260 scheduler "
+                  "-> first request)"),
+        "order": ("install() fits the kill-switch wrappers FIRST, then the "
+                  "backport, so a refused backport still leaves both routes to "
+                  "the selector gated"),
+    }
+
 
 
 # --- the kill switch --------------------------------------------------------
@@ -1021,8 +1373,9 @@ def is_armed() -> bool:
 def disarm_limits() -> dict:
     """What the kill switch canNOT cover. Honest, and shown in the snapshot.
 
-    Everything here is a consequence of the switch operating on the SCHEDULER
-    role through the manager, on the step boundary:
+    Everything here follows from the switch operating on the SCHEDULER role,
+    through the manager, at the scheduler's own call boundaries (a step for the
+    per-step trio, a finished request for the finish path):
 
     * An in-flight copy already handed to the workers at the instant of disarm
       still runs to completion and is freed normally - the scheduler does not
@@ -1040,18 +1393,29 @@ def disarm_limits() -> dict:
       None.
     * `has_pending_block_frees` is not wrapped: this connector does not override
       it, so it is already `False` unconditionally (base.py:625).
-    * The switch is IMPLEMENTED BY WRAPPERS, so it only exists once `install()`
-      has fitted them. Before the first verb contact (the boot case) `armed:
-      false` is an intent nothing yet enforces - see
-      `enforced_by_wrappers_fitted_at` below.
-    * The connector's FINISH path reaches the same store selector through a
-      method the switch does not wrap: `request_finished_all_groups` ->
-      `_queue_finished_eager_store` (`manager.py:1166`) ->
-      `_select_eager_blocks_to_store` (`manager.py:1177`). Safe while the fix is
-      fully installed (that method is then the patched one, and arming requires
-      exactly that); NOT safe while it is not, which is the other reason an
-      incomplete install must never be armed and a disarm is never a substitute
-      for the patch.
+    * The switch is IMPLEMENTED BY WRAPPERS, so it only exists once an install
+      has fitted them. `install()` fits them FIRST (before the geometry guard and
+      before the backport), and the connector-creation hook runs that install the
+      moment the tier connector is built - so on a boot that reaches
+      `create_connector` with a `scheduler_manager`, `armed: false` is a real gate
+      from before the first request. What that does NOT cover: a process where the
+      tier connector is never built by the factory (a connector nested inside a
+      `MultiConnector`, reported as `connector_hook.other_connector`), and a
+      worker process, which builds no scheduler-side manager at all and runs none
+      of these methods. `connector_hook` in the payload says which happened.
+    * The connector's FINISH path is now GATED: `request_finished_all_groups` ->
+      `_queue_finished_eager_store` (`manager.py:1166`) was the second caller of
+      `_select_eager_blocks_to_store` (`manager.py:1177`) and is wrapped like the
+      per-step trio, so disarmed it queues nothing. Note WHY it mattered: the
+      scheduler calls `update_state_after_alloc` for every scheduled request
+      (`scheduler.py:1228`, unconditionally on `self.connector`), and that method
+      registers `_reqs_to_store` BEFORE its `num_external_tokens == 0` early
+      return - so while disarmed the finish path DID reach the selector, on every
+      finished request, whether or not the tier ever stored anything.
+    * Gating the finish path is not the same as cancelling a store the engine has
+      already committed to: the queued `_pending_finished_stores` entries that
+      exist at the instant of disarm stay queued and are drained by the next
+      armed `build_connector_meta`.
     """
     return {
         "worker_process_patched": False,
@@ -1060,17 +1424,28 @@ def disarm_limits() -> dict:
         "parked_blocks_freed": False,
         "has_pending_block_frees": "not overridden by this connector (base "
                                    "returns False)",
-        "enforced_by_wrappers_fitted_at": "install()/ensure_installed() only - "
-                                          "before the first /tier, /snapshot or "
-                                          "/policy/reload contact no wrapper "
-                                          "exists, so the boot-time disarmed "
-                                          "state is an intent, not a gate",
-        "finished_request_store_path": "NOT gated: request_finished_all_groups -> "
+        "enforced_by_wrappers_fitted_at": "install(), which fits the wrappers "
+                                          "FIRST, run from the connector-creation "
+                                          "hook (backport.connector_hook) as soon "
+                                          "as the tier connector is built - and "
+                                          "from install()/ensure_installed() on "
+                                          "any verb contact. NOT fitted only where "
+                                          "the factory never builds a tier "
+                                          "connector in this process",
+        "finished_request_store_path": "GATED: request_finished_all_groups -> "
                                        "_queue_finished_eager_store "
-                                       "(manager.py:1166) reaches "
+                                       "(manager.py:1166) -> "
                                        "_select_eager_blocks_to_store "
-                                       "(manager.py:1177); harmless ONLY because "
-                                       "the fix patched that method",
+                                       "(manager.py:1177) is wrapped, so a "
+                                       "disarmed tier queues nothing and reaches "
+                                       "the selector by NEITHER route. The gate "
+                                       "sits on the inner method because the "
+                                       "outer one returns the (bool, dict|None) "
+                                       "that drives delayed freeing, while this "
+                                       "one returns None either way",
+        "queued_before_disarm": "a _pending_finished_stores entry already queued "
+                                "at the instant of disarm stays queued and is "
+                                "drained by the next armed build_connector_meta",
     }
 
 
@@ -1239,6 +1614,11 @@ def _fields(**overrides) -> dict:
         "wrapped": ["__init__"],
         "switch_methods": list(SWITCH_METHODS),
         "switch": {name: dict(v) for name, v in _state["switch_verdicts"].items()},
+        # WHERE THE PATCH LANDED: the answer to "was this engine patched before
+        # its first request, or only after somebody curled a verb?".
+        "connector_hook": connector_hook_section(),
+        "patched_before_first_request": bool(_state["hook_tier_connectors"]
+                                             and _state["hook_installs"]),
         "geometry": _state["geometry"],
         "disarm_limits": disarm_limits(),
         "fallbacks": int(_state["fallbacks"]),

@@ -865,27 +865,34 @@ async def route_tier_post(request: Request):
     THE TIER IS DISARMED AT BOOT BY DESIGN, so a fresh engine parks nothing until
     someone arms it; `arm` is refused unless the PR #56810 fix is fully installed
     and the geometry guard passes (the refusal names its kind: `geometry`,
-    `no_manager` or `incomplete_install`). The boot sequence is `status` (the
-    verb installs the fix; expect `installed: true`, `armed: false`), then `arm`
-    (expect `armed: true`), and only then traffic.
+    `no_manager` or `incomplete_install`). Being disarmed is not the same as being
+    unpatched: the connector-creation hook (`backport.install_connector_hook`,
+    fitted by `register()`) runs the install when the tier connector is built -
+    the first moment the manager class exists, inside `Scheduler.__init__` and
+    long before the first request - so the boot sequence is `status` (CONFIRMS it:
+    expect `installed: true`, `armed: false`, `patched_before_first_request: true`),
+    then `arm` (expect `armed: true`), and only then traffic. The verbs are the
+    backstop, not the mechanism.
 
     `disarm` makes the connector a STRICT no-op through the manager methods the
     plugin wraps: it reports no prefix hit, hands the workers empty store/load
-    lists, and claims no pending work, so the engine serves from GPU KV alone.
-    No restart, no reboot of a 4-minute boot. `arm` puts the scheduling back.
+    lists, claims no pending work, and queues nothing on the finish path - which
+    is why a disarm now gates BOTH callers of the selector that holds the upstream
+    assert (`manager.py:745` and `manager.py:1177`). No restart, no reboot of a
+    4-minute boot. `arm` puts the scheduling back.
 
     What it cannot undo is reported honestly in the payload under
     `tier.disarm_limits`: an in-flight copy already handed to the workers
     finishes, blocks already parked in host RAM stay parked (re-arm makes them
     reachable again), and the worker PROCESS is never contacted - its no-op is
-    delivered as empty metadata. Two more limits, both in that same block:
-    the switch exists only once an install has fitted the wrappers (so the
-    boot-time disarmed state is an intent until the first verb contacts the
-    engine), and the connector's FINISH path reaches the store selector through a
-    method the switch does not gate - survivable only because arming requires the
-    patched selector. Nothing here touches the backport itself: if
-    `tier.patched` is false, a hybrid geometry will still crash the store path
-    whenever the tier is allowed to schedule.
+    delivered as empty metadata. The two entries about the switch's own machinery
+    now read in its favour: `install()` fits the wrappers FIRST (so a refused or
+    half-done install still leaves "wrappers + disarmed"), and the connector's
+    FINISH path is `GATED` like the per-step trio. `connector_hook` says whether
+    this process ever saw a tier connector at all, which is the only way the
+    wrappers can be missing. Nothing here touches the backport itself: if
+    `tier.patched` is false the tier is harmless ONLY while it is disarmed, and
+    arming such an engine is what `set_armed` refuses.
     """
     await _guard_dev_state_route(request)
     args = await body_arguments(request, config.ROUTE_TIER)

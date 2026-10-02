@@ -38,7 +38,7 @@ so these routes answer between requests.
 | File | Role |
 |------|------|
 | `kvtier_dev_plugin/config.py` | the env vars, the route prefix, the utility method names, and the policy-path validator |
-| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the six engine methods, wires the logger and the worker-writer retry |
+| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the seven engine methods, fits the connector-creation hook, wires the logger and the worker-writer retry |
 | `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary, and the `guard`/`trace`/`worker_diag` sections of the snapshot. Stdlib only |
 | `kvtier_dev_plugin/kvconfig.py` | `kvconfig`: the KV-cache geometry and the divisibility verdict the tier's first store depends on |
 | `kvtier_dev_plugin/kvinspect.py` | `inspect`: one block, or one request, per group, with every id list capped |
@@ -49,7 +49,7 @@ so these routes answer between requests.
 | `kvtier_dev_plugin/policy_holder.py` | late-bound holder for the policy module; trial-load + swap, rollback on failure |
 | `kvtier_dev_plugin/policy.py` | **the file you edit.** `decide(view)` observes, `decide_store(ctx)` vetoes |
 | `kvtier_dev_plugin/store_hook.py` | the runtime patch on the tier's store-decision path: idempotent, non-clobbering, fail-open |
-| `kvtier_dev_plugin/backport.py` | the runtime backport of upstream PR #56810 (hybrid-geometry fix) plus the tier's runtime kill switch. Stdlib only |
+| `kvtier_dev_plugin/backport.py` | the runtime backport of upstream PR #56810 (hybrid-geometry fix), the tier's runtime kill switch, and the `create_connector` hook that makes both land before the first request. Stdlib only |
 | `kvtier_dev_plugin/pr56810_sources.py` | the patched function bodies, byte-exact, with the SHA-256 of the source each one replaces. Generated |
 | `kvtier_dev_plugin/endpoint.py` | `vllm.endpoint_plugins` entry: the router, the guards, the argument specs, the 504 |
 | `tests/` | CPU-only pytest; runs without vllm and without an engine (`fakes_debug.py` holds the shared fake engine structures) |
@@ -757,23 +757,42 @@ auto-disarmed rather than left running (`auto_disarmed: true`).
 > **The tier does nothing at boot; arming is a deliberate act that requires the
 > fix to be fully installed.**
 
-The install cannot land when the plugin loads: `load_general_plugins()` runs at
+The install cannot land when the plugin *loads*: `load_general_plugins()` runs at
 `core.py:217`, but the Scheduler - and with it the connector and the offload
-manager - is not constructed until `core.py:260`. So `register()`'s install
-attempt is *always* refused at boot (`cls is None`), and that refusal path
-never disarmed: with the old `armed: True` boot default, an engine booted with
-tier env was an **unpatched** tier facing the first request, and the only thing
-between that and a crash was somebody remembering to curl a verb first. "Somebody
-remembers" is not a safety property, so the boot default is `BOOT_ARMED = False`
-and arming is a gated act:
+manager - is not constructed until `core.py:260`, so `register()`'s install
+attempt is *always* refused at boot (`cls is None`). And that refusal never
+disarmed: with the old `armed: True` boot default, an engine booted with tier env
+was an **unpatched** tier facing the first request, and the only thing between
+that and a crash was somebody remembering to curl a verb first. "Somebody
+remembers" is not a safety property, so two things had to change:
+
+* **`BOOT_ARMED = False`.** A tier boot is inert, and arming is a gated act.
+* **The install no longer waits for a verb.** `register()` fits a hook on
+  `KVConnectorFactory.create_connector` (`factory.py:43`). When that returns a
+  `SimpleCPUOffloadConnector` carrying a `scheduler_manager`, the hook runs the
+  whole install against the class the connector module just imported
+  (`simple_cpu_offload_connector.py:21`) - the first instant that class exists,
+  still inside `Scheduler.__init__` (`scheduler.py:164`, reached from
+  `core.py:260`), long before the first request - and it passes the manager's
+  LIVE `kv_cache_config`, so the geometry guard gets a real check at boot rather
+  than `checked: false`. The order inside `install()` is **wrappers FIRST, then
+  the backport**, so a refused or exploded patch still leaves "wrappers fitted +
+  disarmed", which gates *both* routes to the selector (see *The kill switch*).
+  `pr56810.connector_hook` says what happened (`fitted`, `tier_connectors`,
+  `worker_role_no_manager`, `installs_run`, `errors`, `last`), and
+  `pr56810.patched_before_first_request` is the one-word answer.
 
 ```bash
-# 1. boot the engine (tier env set). Expect this line in /tmp/vllm-serve.log:
-#    "kvtier-dev-plugin: KV tier INERT at boot (armed=False; ...)"
+# 1. boot the engine (tier env set). Expect BOTH lines in /tmp/vllm-serve.log:
+#    "kvtier-dev-plugin: connector-creation hook fitted on KVConnectorFactory..."
+#    "kvtier-dev-plugin: PR #56810 install run at CONNECTOR CREATION (before the
+#     first request): ...; tier still DISARMED until POST /plugins/kvtier/tier"
+#    plus "KV tier INERT at boot (armed=False; ...)" - inert and patched are the
+#    same boot seen from two sides.
 
-# 2. talk to it. ANY verb installs the fix against the LIVE manager, and this
-#    one also reads the config the geometry guard needs. Expect:
-#    installed: true, armed: false, arm_block: null
+# 2. read it back. This no longer PATCHES anything (the boot did), it CONFIRMS it:
+#    expect installed: true, armed: false, arm_block: null,
+#    patched_before_first_request: true
 ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
   | python3 -c 'import sys,json;t=sys.stdin;p=json.load(sys.stdin);print({k:p[k] for k in ("armed","next_step")}, p["install"])'
 
@@ -784,11 +803,14 @@ ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
 # 4. only now send traffic.
 ```
 
-Step 2 is what makes step 3 able to succeed, and it is a *verb*: patching lands
-on first verb contact (`/tier`, `/snapshot`, `/policy/reload`), because nothing
-on the scheduler or store path calls `ensure_installed`. Nothing retries the
-install on the hot path, deliberately - the disarmed state is what makes an
-unpatched one harmless.
+Step 2 is now a *confirmation*, not the mechanism: the boot already landed the
+patch at connector creation. The verbs remain the backstop - `ensure_installed`
+re-fits the hook and re-runs the install on `/tier`, `/snapshot` and
+`/policy/reload`, which is what covers a process whose connector factory was
+imported only after the plugin loaded, or a manager class that appeared later. A
+boot where `installed: false` survives step 2 is not "nobody has curled yet": it
+means the hook never saw a tier connector or the install was refused, and
+`refused_methods` / `connector_hook.last` names which.
 
 An `arm` is refused, never forced, and the refusal kind tells you which gate you
 hit (`arm_block.kind`, `state.kind`, `disarm_reason`):
@@ -813,35 +835,56 @@ curl -s -X POST localhost:8000/plugins/kvtier/tier -H "authorization: Bearer $TO
      -d '{"op": "disarm"}'          # or "arm", or "status"
 ```
 
-Disarmed, the connector is a strict no-op: `get_num_new_matched_tokens` ->
-`(0, False)`, `build_connector_meta` -> an empty `SimpleCPUOffloadMetadata`,
-`has_pending_stores` -> `False`. The worker lives in another process the HTTP
-call never reaches, so its no-op is delivered as DATA (empty store/load lists,
-which `worker.py:266,289` copy) rather than as a second patch. A tier that can
-only be turned off by a 4-minute reboot is not safe to have on.
+Disarmed, the connector is a strict no-op through **four** manager methods:
+`get_num_new_matched_tokens` -> `(0, False)`, `build_connector_meta` -> an empty
+`SimpleCPUOffloadMetadata`, `has_pending_stores` -> `False`, and
+`_queue_finished_eager_store` -> `None` (queue nothing). The worker lives in
+another process the HTTP call never reaches, so its no-op is delivered as DATA
+(empty store/load lists, which `worker.py:266,289` copy) rather than as a second
+patch. A tier that can only be turned off by a 4-minute reboot is not safe to
+have on.
+
+**Those four are the whole surface.** `_select_eager_blocks_to_store` - the method
+that contains the assert - has exactly two callers in the fork, and both are now
+behind a gate:
+
+| route | chain | gate |
+|---|---|---|
+| 1, per step | `build_connector_meta` (`manager.py:488`) -> `prepare_store_specs` (`:552`) -> selector (`:745`) | the `build_connector_meta` wrapper |
+| 2, per finished request | `request_finished_all_groups` (`:1161`) -> `_queue_finished_eager_store` (`:1169`) -> selector (`:1177`) | the `_queue_finished_eager_store` wrapper |
+
+Route 2 had to be gated, and the reason is worth knowing before you trust a
+disarm: the scheduler calls `update_state_after_alloc` for **every** scheduled
+request (`scheduler.py:1228`, unconditional on `self.connector`), and the fork
+registers `_reqs_to_store` *before* that method's `num_external_tokens == 0` early
+return. So while the tier was disarmed and unpatched, every finished request still
+reached the selector and crashed. The gate sits on the INNER method because
+`request_finished_all_groups` returns the `(bool, dict|None)` that drives delayed
+freeing and must never lie, while `_queue_finished_eager_store` returns `None`
+whether or not it queued anything.
 
 `snapshot.pr56810.disarm_limits` states what it cannot undo: an in-flight copy
 already handed to workers finishes, blocks already parked in host RAM stay
 parked (re-arming makes them reachable again), and the worker process is never
-contacted. Two more limits are in that same block, and both are about this
-module's own machinery:
+contacted. The limits about this module's own machinery:
 
 * `enforced_by_wrappers_fitted_at` - the kill switch IS a set of wrappers, so it
-  exists only after an install has fitted them. Before the first verb contact,
-  `armed: false` is an intent, not a gate. That is why the boot sequence above
-  starts with a verb and not with "trust the default".
-* `finished_request_store_path` - the connector's finish path
-  (`request_finished_all_groups` -> `_queue_finished_eager_store`,
-  `manager.py:1166`) calls the store selector at `manager.py:1177` through a
-  method the switch does **not** wrap. It is safe because arming requires the fix
-  to be fully installed - i.e. because that selector is the patched one. It is
-  the second reason an incomplete install is never armable and a disarm is never
-  a substitute for the patch.
+  exists only where an install has fitted them. `install()` fits them FIRST, and
+  the connector-creation hook runs that install when the tier connector is built,
+  so on a normal tier boot `armed: false` is a gate from before the first request.
+  What it does NOT cover: a tier connector the factory never builds as its own
+  return value (one nested inside a `MultiConnector`, reported as
+  `connector_hook.other_connector`) and a worker process, which builds no
+  `scheduler_manager` and runs none of these methods.
+* `finished_request_store_path` - now `GATED`, per the table above.
+* `queued_before_disarm` - a `_pending_finished_stores` entry already queued at
+  the instant of disarm stays queued and is drained by the next armed
+  `build_connector_meta`.
 
-`patched: false` and `armed: false` are different states - the former means a
-hybrid geometry will still crash the store path *whenever the tier is allowed to
-schedule*, which is why the boot default is disarmed and why arming is gated on
-the fix.
+`patched: false` and `armed: false` are different states. With the gate covering
+both routes, `patched: false, armed: false` is a HARMLESS engine (it stores
+nothing, by either route); `patched: false, armed: true` is the state that must
+never exist, and `set_armed` is what makes it impossible.
 
 ### Coexisting with the plugin's other two patches
 
@@ -853,32 +896,43 @@ rather than silent:
 |---|---|---|---|
 | `cpu_capacity.py` | the connector BASE class | `get_handshake_metadata` (worker side), `set_xfer_handshake_metadata_pp_aware` (scheduler side); separately marks a block POOL (`POOL_MARKER`) and a manager INSTANCE (`MANAGER_MARKER`) | `kvtier-dev-plugin/capacity-1` |
 | `store_hook.py` | `SimpleCPUOffloadScheduler` | `_classify_store_candidate` | `kvtier-dev-plugin/store-1` |
-| `backport.py` | `SimpleCPUOffloadScheduler` | `__init__`, `_estimate_lazy_target_blocks`, `update_state_after_alloc`, `_select_eager_blocks_to_store`; plus the kill-switch wrappers `get_num_new_matched_tokens`, `build_connector_meta`, `has_pending_stores` | `kvtier-dev-plugin/backport-1` and `.../switch-1` |
+| `backport.py` | `SimpleCPUOffloadScheduler` | `__init__`, `_estimate_lazy_target_blocks`, `update_state_after_alloc`, `_select_eager_blocks_to_store`; plus the kill-switch wrappers `get_num_new_matched_tokens`, `build_connector_meta`, `has_pending_stores`, `_queue_finished_eager_store` | `kvtier-dev-plugin/backport-1` and `.../switch-1` |
+| `backport.py` (again) | `KVConnectorFactory` | `create_connector` - one wrapper, on the factory, so the install above lands when the connector is built | `kvtier-dev-plugin/connector-hook-1` |
 
 **There is no overlap to resolve, and that is a property worth keeping.** The
-three tag constants are deliberately distinct strings, and every member name is
+tag constants are deliberately distinct strings, and every member name is
 owned by exactly one module. Each installer refuses to clobber a member carrying
 a DIFFERENT tag (naming the owner in the refusal), so if a future change ever
 picks a name another module already holds, the result is a logged refusal and a
 `skipped:` entry - never a silently unwrapped patch. Do not merge the tags.
 
-Two notes a future editor needs:
+Notes a future editor needs:
 
-* `backport` uses TWO tags on purpose: `backport-1` for the fingerprint-guarded
-  bug fix and `switch-1` for the kill-switch wrappers, which have no fingerprint
-  (they only add a gated early-return around the engine's own function and can
-  never mispatch a moved body). Keeping them apart is what lets `status` say
-  "fix refused, switch live" - the state you want during a fingerprint drift.
+* `backport` uses THREE tags on purpose: `backport-1` for the fingerprint-guarded
+  bug fix, `switch-1` for the kill-switch wrappers (no fingerprint - they only add
+  a gated early-return around the engine's own function and can never mispatch a
+  moved body), and `connector-hook-1` for the factory wrapper. Keeping them apart
+  is what lets `status` say "fix refused, switch live" - the state you want during
+  a fingerprint drift - and lets a foreign hook on the factory be refused by name.
 * `store_hook`'s veto and `backport`'s selector compose by dispatch, not by
   order: the replaced `_select_eager_blocks_to_store` calls
   `self._classify_store_candidate(...)`, which resolves through the instance at
   call time, so it reaches store_hook's wrapper whichever of the two landed
   first. Do not "optimise" that into a direct call.
+* `guard_mode` composes with the kill-switch wrappers instead of refusing them
+  (its `SIBLING_PACKAGE` rule), and it only ever unwinds a method whose OUTSIDE
+  still carries its own marker: fit order either way, an arm/disarm cycle cannot
+  remove the kill switch - both orders are pinned by tests
+  (`test_the_finish_wrapper_survives_guard_mode_wrapping_on_top`,
+  `test_the_switch_fitted_after_guard_mode_composes_and_still_declines`).
 * Install ORDER in `register()` is `cpu_capacity.install()` ->
-  `store_hook.install()` -> `backport.install()`, and the verbs call the three
-  `ensure_installed`/`adopt_if_missed` helpers in the same sequence. It is not
-  load-bearing today (no shared members); it is what keeps the log readable and
-  the capacity handshake settled before anything schedules a store.
+  `backport.install_connector_hook()` -> `store_hook.install()` ->
+  `backport.install()`, and the verbs call the three
+  `ensure_installed`/`adopt_if_missed` helpers in the same sequence. The hook is
+  fitted early and unconditionally because it wraps the FACTORY, which is already
+  imported wherever `EngineCore` is; the `backport.install()` inside `install()`
+  itself fits the kill-switch wrappers before touching a single method body. That
+  inner order IS load-bearing: a refused patch must never leave a route open.
 
 Three different "offs", which are easy to confuse: `store_hook`'s policy veto is
 a per-block SKIP inside a live tier; `guard_mode` turns an exception into a
@@ -907,9 +961,10 @@ H="x-kvtier-dev-token: $TOK"
 > fix to be fully installed.**
 
 ```bash
-# 1. any verb installs the fix against the live manager and reads the geometry.
-#    ( /snapshot does it too, token-free from loopback - this curl IS the patch.
-#      Expect installed:true, armed:false, arm_block:null )
+# 1. read it back. The BOOT installs the fix (the connector-creation hook runs it
+#    when the tier connector is built, with the live KVCacheConfig); this curl only
+#    CONFIRMS it - and it is still the read that proves the claim. Expect
+#    installed:true, armed:false, arm_block:null, patched_before_first_request:true
 ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["install"]["installed"],d["armed"],d["operator_note"])'
 
@@ -922,29 +977,45 @@ ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
 # 3. only now let traffic in.
 ```
 
-Step 1 is mandatory, not ceremonial. Patching lands on **first verb contact** -
-nothing on the scheduler or store path retries the install, by design - so an
-engine that has never been spoken to has never been patched. Arming is what makes
-that matter, because an `arm` without the fix is refused.
+Step 1 is a confirmation, not the patch: `install_connector_hook()` runs the
+install inside `Scheduler.__init__` (`core.py:217` plugin load -> `core.py:260`
+Scheduler -> `scheduler.py:164` `create_connector` -> first request), so an engine
+that has never been spoken to is still a patched engine. If step 1 answers
+`installed:false`, that is a finding, not a to-do: either the hook never saw a
+tier connector in this process (`pr56810.connector_hook`: `fitted`,
+`tier_connectors`, `other_connector`, `last`) or a method was refused
+(`refused_methods`, a fingerprint drift).
 
-The limit, stated where you will read it: while the tier is disarmed the three
-per-step connector entry points are gated, but `armed: false` is only enforced by
-wrappers an install has fitted, and the connector's finish path
-(`request_finished_all_groups` -> `_queue_finished_eager_store`, `manager.py:1166`)
-reaches the store selector at `manager.py:1177` ungated. So a disarmed tier is
-NOT a shield against the assert on an engine that was never patched - it is the
-reason an unpatched engine never *stores* anything once it has been spoken to.
-The shield is the install; the boot order above is what makes you prove it.
+What a disarmed tier now shields, stated where you will read it: BOTH callers of
+`_select_eager_blocks_to_store` are gated - the three per-step entry points AND
+the connector's finish path (`request_finished_all_groups` ->
+`_queue_finished_eager_store`, `manager.py:1166` -> `manager.py:1177`), which used
+to reach the selector ungated on every finished request. A disarmed tier is
+therefore a real gate, not an intent - provided the wrappers exist, and the hook
+is what makes them exist at boot rather than at first contact. The two cases the
+wrappers genuinely cannot reach are the worker process (no `scheduler_manager` at
+all, and it runs none of these methods) and a tier connector that is not the
+object `create_connector` returns (a `MultiConnector` child, reported as
+`other_connector`).
 
 ### Engine crashed / crashes on the FIRST request
 
-With the tier disarmed at boot, the first-request crash means the store path was
-reached while the fix was **not fully installed**: traffic went in before any
-verb had patched the engine, or the tier was armed against an engine whose
-install is incomplete (an `arm` refuses that, so check the log for
-`REFUSED to arm`). It is NOT what a correctly inert tier looks like - see the
-next section for that. Confirm it in one line (the tier state lives in the
-engine, so read the snapshot; the read also patches the engine for next time):
+On this geometry the first-request crash is the *unpatched* selector being reached
+by one of its two callers. Since both callers are gated and the boot installs the
+patch at connector creation, a crash here means one of exactly three things:
+
+1. the plugin was not mounted at all (no `kvtier-dev-plugin:` line in the log -
+   check *Verify it is really mounted*), so nothing gated or patched anything;
+2. the tier connector was never built by the factory (a nested connector, or a
+   tier wired up some other way), so the hook had nothing to install onto -
+   `pr56810.connector_hook.last` says what it saw;
+3. the tier is ARMED while `installed: false`, which is impossible by
+   construction (`set_armed` refuses it, naming `incomplete_install`) - if you
+   ever see it, that is the bug to report, not a thing to work around.
+
+It is NOT what a correctly inert tier looks like - see the next section for that.
+Confirm it in one line (the tier state lives in the engine; the read also re-fits
+the hook and re-runs the install, so it is the repair as well as the diagnosis):
 
 ```bash
 # installed=false or refused_methods non-empty => the fix is incomplete.
@@ -961,9 +1032,10 @@ backport's own install/arm verdicts:
 ```bash
 # the assert the incomplete fix lets through:
 ssh llm "grep -a 'not divisible by tokens_per_hash' /tmp/vllm-serve.log | tail -3"
-# did the backport install? was the tier force-disarmed or arm refused? did it
-# boot inert (the expected line on every boot with the plugin enabled)?
-ssh llm "grep -aE 'PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)|KV tier INERT at boot' /tmp/vllm-serve.log | tail -10"
+# did the hook get fitted, did the install run at connector creation, was it
+# refused? was the tier force-disarmed or an arm refused? did it boot inert (the
+# expected line on every boot with the plugin enabled)?
+ssh llm "grep -aE 'connector-creation hook (fitted|NOT fitted)|install run at CONNECTOR CREATION|connector-creation install was NOT completed|PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)|KV tier INERT at boot' /tmp/vllm-serve.log | tail -12"
 ```
 
 If guard mode was armed there is also a structured capture of the fault (guard
@@ -984,10 +1056,14 @@ installed, a crash on that first request). So:
 
 - `armed: false`, `boot_default_armed: false`, engine healthy -> **normal**. Read
   `pr56810.operator_note`; if you want the tier, POST `{"op":"arm"}`.
-- `installed: false` -> you have not spoken to this engine yet (nothing installs
-  the fix on the scheduler path), or a method was refused. The first
-  `/tier?op=status` or `/snapshot` call usually flips it to `true`; if it does
-  not, `refused_methods` names what drifted.
+- `installed: false` -> the connector-creation install did not complete in this
+  process. Read `pr56810.connector_hook` FIRST: `fitted: false` means the factory
+  was not importable when the plugin loaded (the next verb re-fits it),
+  `other_connector` means the factory returned something that is not the tier
+  connector (a `MultiConnector` child), `worker_role_no_manager` is the normal
+  worker-process answer. If the hook DID run and the install still failed,
+  `refused_methods` names the fingerprint drift, and the tier is disarmed with
+  both selector routes gated - park nothing, do not arm, fix the source.
 - `armed: true` with `installed: false` -> impossible by construction; if you
   ever see it, that is the bug to report.
 
@@ -1013,9 +1089,10 @@ ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
 
 Disarmed, the connector reports `(0, False)` for prefix hits, hands the workers
 an **empty** `SimpleCPUOffloadMetadata` (so `worker.py:266,289` copy nothing),
-and claims no pending stores - the engine serves from GPU KV alone. **`disarm`
-is never refused** (it is the safe direction). What it does NOT cover, verbatim
-from `disarm_limits()` in the payload:
+claims no pending stores, and queues nothing on the finish path - the engine
+serves from GPU KV alone. **`disarm` is never refused** (it is the safe
+direction). What it does NOT cover, verbatim from `disarm_limits()` in the
+payload:
 
 - the **worker process is never contacted** (it is a separate process; its no-op
   arrives as empty metadata, `worker_process_patched: false`);
@@ -1082,9 +1159,15 @@ Where to look in `pr56810`:
   which refusal caused it: `"geometry"` vs `"incomplete_install"`.
 - `arm_block` - if present (`{kind, reason}`), arming is currently refused and
   this says why; `null` means arming is allowed.
-- `disarm_limits` - what the kill switch cannot undo, including the two limits
-  that are about the switch itself: it exists only once an install fitted the
-  wrappers, and the connector's finish path is not gated by it.
+- `disarm_limits` - what the kill switch cannot undo. Both entries about the
+  switch itself now read in its favour: the wrappers are fitted FIRST by the
+  install the connector-creation hook runs, and the finish path is `GATED`, so
+  both callers of the store selector are covered.
+- `connector_hook` - how the patch actually landed: `fitted`, `calls`,
+  `tier_connectors`, `worker_role_no_manager`, `other_connector`, `installs_run`,
+  `errors`, `last` (a one-line verdict for the most recent connector built).
+- `patched_before_first_request` - true once the hook has run an install in this
+  process; the one-word answer to "was this engine patched before traffic?".
 
 ## Access model
 
@@ -1207,10 +1290,12 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
   `InvalidStateError` (`core_client.py:847-865`).
 * No writes, no `reset_cache`, no mutation of the tier. The side effects are,
   exhaustively: swapping the policy module reference; the store-policy and capacity
-  wrappers; the PR #56810 replacements plus the three kill-switch wrappers on the
-  offload scheduler (installed by the first verb, and INERT until someone arms -
-  `BOOT_ARMED = False`); a trace ring and its two scheduler wrappers while ARMED
-  (removed on disarm); the guard wrappers while armed or traced (restored by
+  wrappers; the PR #56810 replacements plus the four kill-switch wrappers on the
+  offload scheduler and the one wrapper on `KVConnectorFactory.create_connector`
+  (the hook is what installs them, at connector creation, and the tier stays INERT
+  until someone arms - `BOOT_ARMED = False`); a trace ring and its two scheduler
+  wrappers while ARMED (removed on disarm); the guard wrappers while armed or traced
+  (restored by
   identity on disarm); and the worker's diagnostics file when
   `VLLM_E2_TIER_DIAG` names a directory. Every one of those is opt-in, and the two
   that change engine behaviour (`guard`, tracing) say so in every payload.
@@ -1256,7 +1341,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-727 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+742 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1271,14 +1356,15 @@ reload verb, holder-based reload actually changing behaviour (same-size/same-mti
 edit), rollback with the traceback as data, containment (a raising policy and a
 raising engine both come back as data, `BaseException` propagates), the 504/502/503
 answers, that every installed engine method takes exactly one optional argument and
-answers under both dispatch shapes, and that the mount point is exactly the eight
+answers under both dispatch shapes, and that the mount point is exactly the nine
 `/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
 one from loopback with no token, two from a source-bound non-loopback client socket
 on this host's own LAN address (skipped on a box with no such address).
 
-The backport and the kill switch (`tests/test_backport.py`) drive the fork's own
+The backport and the kill switch (`tests/test_backport.py`, 65 of them) drive the
+fork's own
 method text (fingerprints match, so the real install path runs) against the
 production geometry, with a poison-pill `resolve_block_hashes` that reproduces
 the assert - so "the patch works" and "the unpatched selector crashes" are
@@ -1291,9 +1377,27 @@ caller skips `ensure_installed`; each refusal kind is refused, named, and
 explained in the verb payload; a class-level install cannot forget a geometry
 veto a live config already gave; a disarmed tier produces no store/load work as
 observed **through the wrappers** (the fork's own no-op shapes, with the engine's
-methods never called); and the two limits of the switch - it exists only once an
-install fitted it, and the finish path is not gated - are pinned so nobody can
-quietly rely on a disarmed tier as a shield.
+methods never called).
+
+The invariant itself is proven rather than asserted, and paired with a control so
+it cannot be vacuous: with the backport REFUSED (the store selector left
+unpatched, the worst install there is) and the tier disarmed, a spy on
+`_select_eager_blocks_to_store` records **no call at all** from
+`request_finished_all_groups` or `build_connector_meta`; the mirror with the fix
+installed and the tier armed sees both routes reach it (and skip the ring); and
+the control - the same class with NO wrappers fitted - raises the production
+assertion on both routes. The install ORDER is pinned by an install that explodes
+halfway through the patch (all four wrappers are already on the class, the tier is
+disarmed, both routes stay gated) and by a geometry veto, which now patches
+nothing and therefore MUST get the gate. And the boot itself is tested without a
+single HTTP verb: `register()` fits the factory hook, a fork-shaped
+`create_connector(config=..., role=..., kv_cache_config=...)` returns the very
+connector it built, and by then `installed` and every wrapper marker are true -
+including a LIVE geometry check, which a class-only install can never do. The
+worker role is a `no_manager` answer, not an error; a hook that raises is counted
+and the engine still gets its connector; the fork's own `create_connector`
+exceptions propagate untouched; a foreign hook marker is refused; and guard mode
+composes with the new wrapper in BOTH fit orders, handing it back by identity.
 
 The debugger verbs add six files:
 

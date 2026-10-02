@@ -11,7 +11,9 @@ inside `EngineCore.__init__` (vllm/v1/engine/core.py:214-217), from
     is skipped with a warning instead of clobbered;
   * total: nothing it does can raise into the process that loaded it.
 
-What it installs: SIX methods on the `EngineCore` class. `EngineCoreProc`
+What it installs: SEVEN methods on the `EngineCore` class, plus one wrapper on
+`KVConnectorFactory.create_connector` (the connector-creation hook that lands the
+PR #56810 install when the tier connector is built). `EngineCoreProc`
 (and `DPEngineCoreProc`, the actor classes) inherit them, and the UTILITY
 dispatch looks them up with `getattr(self, method_name)`
 (vllm/v1/engine/core.py:1669-1671), so a class-level method is exactly what
@@ -216,12 +218,22 @@ def _make_tier_method():
         tier live, and it is refused - naming `geometry`, `no_manager` or
         `incomplete_install` - unless the fix is fully installed.
 
+        Being unable to land AT PLUGIN LOAD is no longer the same as being unable
+        to land before the first request: `backport.install_connector_hook()`
+        wraps `KVConnectorFactory.create_connector` and runs the install when the
+        tier connector is built, which is the first moment the manager class
+        exists and is still inside the Scheduler's own constructor. So a tier boot
+        patches and geometry-checks itself; the verbs are the backstop, not the
+        mechanism.
+
         `disarm` makes the connector a strict no-op through the manager methods
         `backport` wraps: no prefix hit is reported, the metadata it hands the
-        workers is empty, and no pending work is claimed. It is the reason the
-        tier can be turned on at all - a knob that needs a 4-minute reboot is not
-        a kill switch. The upstream divisibility fix (PR #56810) is installed on
-        the way through every op, so a hybrid geometry never reaches the assert.
+        workers is empty, no pending work is claimed, and the finish path queues
+        nothing - which is why a disarm now gates BOTH routes into the selector
+        that contains the upstream assert. It is the reason the tier can be turned
+        on at all - a knob that needs a 4-minute reboot is not a kill switch. The
+        upstream divisibility fix (PR #56810) is installed on the way through every
+        op, so a hybrid geometry never reaches the assert.
         """
         return backport.tier_for_engine(self, args)
 
@@ -300,6 +312,18 @@ def register() -> None:
         cpu_capacity.set_worker_report_hook(worker_diag.ensure_installed)
         capacity = cpu_capacity.install()
         worker_files = worker_diag.install()
+        # THE CONNECTOR-CREATION HOOK, and it comes before anything that could
+        # refuse: this is what turns "patched before the first request" from an
+        # operator habit into a property of the boot order. `create_connector` is
+        # the only thing that imports the connector module, which imports the
+        # offload manager at module scope - so the instant it returns is the first
+        # instant `SimpleCPUOffloadScheduler` exists, still inside `Scheduler.__init__`
+        # (core.py:260 -> scheduler.py:164) and long before any request. Fitted in
+        # EVERY process like the capacity wrappers: in a worker the hook fires and
+        # finds no `scheduler_manager`, which is the normal `no_manager` answer,
+        # not an error, and a failure inside the hook can never stop a connector
+        # being built. Contained by its own try/except; never raises.
+        connector_hook = backport.install_connector_hook()
         cls = _engine_core_class()
         if cls is None:
             logger.info("kvtier-dev-plugin: vllm.v1.engine.core is not imported "
@@ -316,18 +340,20 @@ def register() -> None:
         # already imported, this is what lands it immediately.
         hook = store_hook.install(store_hook.manager_class(), get_holder)
         # The PR #56810 backport, same posture as the store hook: usually a
-        # no-op here because the connector has not imported the manager yet
-        # (then `ensure_installed` from a verb lands it), and an immediate patch
-        # when the module is already in sys.modules. It is installed because
-        # without it a hybrid geometry - our five block_size=3200 groups plus the
-        # block_size=8 QSA ring - dies on
+        # no-op here because the connector has not imported the manager yet, and
+        # an immediate patch when the module is already in sys.modules. It is
+        # installed because without it a hybrid geometry - our five
+        # block_size=3200 groups plus the block_size=8 QSA ring - dies on
         # `assert block_size % hash_block_size == 0` inside the store path, and
         # that costs a live-traffic reboot rather than degrading the tier.
         #
-        # This refusal at boot is EXPECTED and is no longer a fail-open: the
-        # tier's state is `armed: False` from `BOOT_ARMED`, so an engine that has
-        # not been patched is also an engine that schedules no tier work. The
-        # patch lands on the first verb contact, and arming is what makes it
+        # This refusal at boot is EXPECTED and is no longer a fail-open twice
+        # over: the tier's state is `armed: False` from `BOOT_ARMED`, so an engine
+        # that has not been patched schedules no tier work, and the hook above
+        # lands the install anyway the moment the tier connector is built - before
+        # the first request, without anybody curling a verb. The verbs remain the
+        # backstop for a process where the factory is imported after plugin load
+        # (`ensure_installed` re-fits the hook), and arming is what makes any of it
         # matter (`backport.set_armed` refuses to arm an unpatched tier).
         tier_fix = backport.install(backport.manager_class())
         # Unlike the store hook, the capacity wrappers MUST land here: the
@@ -341,6 +367,7 @@ def register() -> None:
               config.canonical_policy_path())
         level("kvtier-dev-plugin: store-policy hook %s", hook)
         level("kvtier-dev-plugin: PR #56810 backport %s", tier_fix)
+        level("kvtier-dev-plugin: connector-creation hook %s", connector_hook)
         level("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
         level("kvtier-dev-plugin: worker diagnostics writer %s", worker_files)
         # Guard mode is OFF at boot by construction (it has no env var at all),
@@ -354,9 +381,10 @@ def register() -> None:
         # an arm can prove the fix is in place (see backport.BOOT_ARMED).
         level("kvtier-dev-plugin: KV tier INERT at boot (armed=False; the "
               "backport install above is refused until the connector imports "
-              "the manager). It parks nothing until POST %s {\"op\":\"arm\"}, "
-              "and that arm is refused until the PR #56810 fix is fully "
-              "installed", config.ROUTE_PREFIX + config.ROUTE_TIER)
+              "the manager, and the connector-creation hook lands it then - "
+              "before the first request). It parks nothing until POST %s "
+              "{\"op\":\"arm\"}, and that arm is refused until the PR #56810 fix "
+              "is fully installed", config.ROUTE_PREFIX + config.ROUTE_TIER)
     except Exception:  # noqa: BLE001 - a diagnostic plugin must not break a boot
         logger.exception("kvtier-dev-plugin: engine-side install failed; "
                          "continuing without it")
