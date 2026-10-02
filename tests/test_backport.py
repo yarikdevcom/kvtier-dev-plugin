@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import inspect
 import linecache
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import fixtures_pr56810 as FX
 import pytest
@@ -37,17 +39,19 @@ PCIDS = tuple(range(CACHEABLE_GROUPS))
 
 @pytest.fixture(autouse=True)
 def reset_backport_state():
-    """`backport._state` is process-wide, like every other piece of plugin state."""
+    """`backport._state` is process-wide, like every other piece of plugin state.
+
+    It resets through the MODULE's own `reset_state_for_tests()` rather than a
+    hand-copied field list: a hand-copied list silently stops covering new
+    fields, and a leaked `fully_installed`/`armed` is exactly the kind of leak
+    that makes an arm-refusal test pass for the wrong reason. The boot default
+    comes from `backport.BOOT_ARMED`, so a test that wants an ARMED tier has to
+    arm it - which is the production story.
+    """
     saved = dict(backport._state)
     saved_verdicts = dict(backport._state["method_verdicts"])
     saved_switch = dict(backport._state["switch_verdicts"])
-    backport._state.update({
-        "installs": 0, "reinstalls": 0, "skips": 0, "skip_reason": None,
-        "class": None, "armed": True, "disarm_calls": 0, "arm_calls": 0,
-        "fallbacks": 0, "last_error": None, "geometry": None,
-    })
-    backport._state["method_verdicts"] = {}
-    backport._state["switch_verdicts"] = {}
+    backport.reset_state_for_tests()
     yield
     backport._state.clear()
     backport._state.update(saved)
@@ -416,6 +420,7 @@ def teardown_module():
 def test_disarmed_reports_no_prefix_hit():
     cls, _meta, calls = _install_with_metadata()
     self = object()
+    backport.set_armed(True)      # armed by an explicit act, never at boot
 
     assert cls.__dict__["get_num_new_matched_tokens"](self, None, 0) == (4096, True)
     assert calls["matched"] == 1
@@ -432,6 +437,7 @@ def test_disarmed_reports_no_prefix_hit():
 def test_disarmed_builds_an_empty_metadata_so_the_worker_does_nothing():
     cls, EmptyMetadata, calls = _install_with_metadata()
     self = object()
+    backport.set_armed(True)
 
     assert cls.__dict__["build_connector_meta"](self, None) == "ENGINE METADATA"
     backport.set_armed(False)
@@ -448,6 +454,7 @@ def test_disarmed_builds_an_empty_metadata_so_the_worker_does_nothing():
 def test_disarmed_claims_no_pending_work():
     cls, _meta, calls = _install_with_metadata()
     self = object()
+    backport.set_armed(True)
 
     assert cls.__dict__["has_pending_stores"](self) is True
     backport.set_armed(False)
@@ -473,7 +480,10 @@ def test_switch_wrappers_do_not_nest_across_reloads():
 
 def test_kill_switch_reports_its_own_state():
     _install_with_metadata()
-    assert backport.is_armed() is True
+    # Installing does not arm: a freshly installed tier is still the boot default
+    # until someone asks for it to be live.
+    assert backport.is_armed() is backport.BOOT_ARMED is False
+    assert backport.set_armed(True)["changed"] is True
     assert backport.set_armed(False)["changed"] is True
     assert backport.set_armed(False)["changed"] is False, "a no-op must not count"
     assert backport.is_armed() is False
@@ -646,11 +656,16 @@ def _state_disarm_reason():
 
 
 def test_disarm_is_never_refused_even_when_incomplete():
-    """Disarm is the safe direction: it always applies, even before any install."""
+    """Disarm is the safe direction: it always applies, even before any install.
+
+    With `BOOT_ARMED = False` this is also the boot state itself: refusing to
+    install must not leave anything armed behind, so the tier is already inert
+    here and a disarm is a refused-free no-op.
+    """
     backport.install(None)                     # nothing installed at all
-    assert backport.is_armed() is True         # boot default, before a connector
+    assert backport.is_armed() is False        # the boot default, no connector
     res = backport.set_armed(False)
-    assert res["refused"] is False and res["changed"] is True
+    assert res["refused"] is False and res["changed"] is False
     assert backport.is_armed() is False
 
 
@@ -703,8 +718,14 @@ def test_tier_verb_disarms_through_the_engine_and_reports_it():
     engine, _cls, calls = _engine_with_live_manager()
     status = backport.tier_for_engine(engine, {"op": "status"})
     assert status["status_code"] == 200
-    assert status["tier"]["armed"] is True
+    # The cold-boot truth: installed by the verb, STILL disarmed, because arming
+    # is a separate deliberate act (see the runbook's boot sequence).
+    assert status["tier"]["armed"] is False
+    assert status["armed"] is False
     assert status["tier"]["patched"] is True
+
+    armed = backport.tier_for_engine(engine, {"op": "arm"})
+    assert armed["applied"] is True and armed["tier"]["armed"] is True
 
     out = backport.tier_for_engine(engine, {"op": "disarm"})
     assert out["applied"] is True and out["status_code"] == 200
@@ -724,12 +745,17 @@ def test_tier_verb_needs_no_arguments_and_defaults_to_status():
 def test_tier_verb_refuses_an_unknown_op_without_changing_anything():
     """A typo must not flip the tier on the way to doing something else."""
     engine, _cls, _calls = _engine_with_live_manager()
+    backport.set_armed(True)
     assert backport.is_armed() is True
     out = backport.tier_for_engine(engine, {"op": "dissarm"})
     assert out["status_code"] == 400
     assert out["applied"] is False
     assert "Nothing was changed" in out["reason"]
     assert backport.is_armed() is True, "a refused op must not disarm the tier"
+
+    backport.set_armed(False)
+    backport.tier_for_engine(engine, {"op": "dissarm"})
+    assert backport.is_armed() is False, "a refused op must not arm the tier either"
 
 
 def test_tier_verb_installs_the_backport_on_the_way_through():
@@ -784,6 +810,7 @@ def test_ensure_installed_disarms_when_a_later_config_fails_the_guard():
     cls, _calls = _fresh_class_with_switch()
     engine = _FakeEngine(_live_manager(cls))
     assert backport.ensure_installed(engine)["installed"] is True
+    backport.set_armed(True)      # the scenario is a tier that IS live
     assert backport.is_armed() is True
 
     # Same class, but now the live config omits a group that IS cacheable.
@@ -817,6 +844,242 @@ def test_tier_verb_never_raises(monkeypatch):
     assert out["status_code"] == 500
     assert "manager exploded" in out["reason"]
     assert backport.snapshot._state["errors"] > 0
+
+
+# --- 3d. THE BOOT DEFAULT: the tier is inert until someone arms it ----------
+#
+# `BOOT_ARMED = False` exists because the install CANNOT land at plugin-load
+# time: `load_general_plugins()` runs at `core.py:217` while the Scheduler - and
+# with it the connector and the offload manager - arrives at `core.py:260`. A
+# tier that booted armed was a tier that booted UNPATCHED and faced the first
+# request with the upstream assert still in its store path.
+
+def _registered_manager_class(monkeypatch, cls):
+    """Make `manager_class()` resolve, as it does once the connector has
+    imported the manager - which is exactly the moment `register()` missed."""
+    module = types.ModuleType(backport.TARGET_MODULE)
+    module.SimpleCPUOffloadScheduler = cls
+    monkeypatch.setitem(sys.modules, backport.TARGET_MODULE, module)
+    return cls
+
+
+def test_a_freshly_imported_module_is_disarmed():
+    """The boot default, measured in a process that only IMPORTS the plugin.
+
+    The fixtures reset state, so they can only prove what a reset produces - and
+    "the tier does nothing at boot" is a claim about the first instant of a real
+    process, before any test helper has touched it.
+    """
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "from kvtier_dev_plugin import backport; "
+         "print(backport.BOOT_ARMED, backport.is_armed(), "
+         "backport.section()['armed'])"],
+        capture_output=True, text=True, timeout=120,
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "False", "False"], out.stdout
+
+
+def test_the_boot_refusal_leaves_the_tier_disarmed_and_explains_itself():
+    """`register()`'s install attempt, which the boot order always refuses.
+
+    The refusal path has never disarmed, and no longer needs to: what it refuses
+    INTO is now the disarmed default, so "not installed" and "idle" are the same
+    state at boot instead of a crash waiting for a request.
+    """
+    report = backport.install(None)
+    assert report["installed"] is False
+    assert backport.is_armed() is False
+
+    section = backport.section()
+    assert section["boot_default_armed"] is False
+    assert section["boot_is_inert"] is True
+    assert section["armed"] is False and section["installed"] is False
+    # Nothing to install onto and nothing attempted => its OWN kind.
+    assert section["arm_block"]["kind"] == "no_manager"
+    assert "boot" in section["operator_note"].lower()
+    for kind in backport.ARM_BLOCK_KINDS:
+        assert kind in section["arm_requires"]
+
+
+def test_arm_from_a_cold_boot_installs_then_succeeds(monkeypatch):
+    """The runbook sequence - status, then arm - from a class never installed on.
+
+    `installing is not arming`: the status call lands the fix and leaves the tier
+    disarmed; only the arm flips it, and only because it can prove the fix is
+    fully in place against the live manager's config.
+    """
+    cls, calls = _fresh_class_with_switch()
+    _registered_manager_class(monkeypatch, cls)
+    backport.install(None)                       # the boot-time refusal
+    engine = _FakeEngine(_live_manager(cls))
+
+    status = backport.tier_for_engine(engine, {"op": "status"})
+    assert status["install"]["installed"] is True, status["install"]
+    assert status["armed"] is False, "installing is not arming"
+    assert status["tier"]["arm_block"] is None
+    assert "arm" in status["next_step"]
+
+    arm = backport.tier_for_engine(engine, {"op": "arm"})
+    assert arm["applied"] is True and arm["armed"] is True
+    assert arm["state"]["kind"] is None
+    assert calls == {"matched": 0, "meta": 0, "pending": 0}, \
+        "arming must not itself schedule any store or load"
+
+
+def test_set_armed_seeks_its_own_proof(monkeypatch):
+    """Arming without a verb first still cannot arm an unpatched tier.
+
+    `set_armed(True)` runs `_arm_proof()` (an install onto the class, the only
+    thing an arm can prove without a live manager), so no caller - a future verb,
+    a direct import - can skip the proof by forgetting to call `ensure_installed`.
+    """
+    cls, _calls = _fresh_class_with_switch()
+    _registered_manager_class(monkeypatch, cls)
+    assert backport._state["fully_installed"] is False
+
+    res = backport.set_armed(True)
+    assert res["refused"] is False and res["armed"] is True
+    assert backport.section()["installed"] is True
+
+
+def test_arm_is_refused_from_a_cold_boot_when_the_fix_cannot_install(monkeypatch):
+    """No fingerprint match => no arm, named, through the verb."""
+    cls, _calls = _fresh_class_with_switch()
+    _registered_manager_class(monkeypatch, cls)
+    monkeypatch.setattr(backport, "fingerprint_of", lambda fn: None)
+    engine = _FakeEngine(_live_manager(cls))
+
+    status = backport.tier_for_engine(engine, {"op": "status"})
+    assert status["install"]["installed"] is False
+    assert "_select_eager_blocks_to_store" in status["install"]["refused_methods"]
+
+    arm = backport.tier_for_engine(engine, {"op": "arm"})
+    assert arm["applied"] is False and arm["armed"] is False
+    assert arm["state"]["kind"] == "incomplete_install"
+    assert "_select_eager_blocks_to_store" in arm["reason"]
+    assert "refused" in arm["next_step"]
+
+
+def test_arm_is_refused_on_a_geometry_veto_and_names_the_group():
+    """A config the patch must not run for is refused with the geometry kind."""
+    cls, _calls = _fresh_class_with_switch()
+    groups = [_Group(HASH_BLOCK_SIZE, True, f"layer_{g}")
+              for g in range(CACHEABLE_GROUPS)]
+    groups.append(_Group(HASH_BLOCK_SIZE, True, "group_five_is_cacheable"))
+    engine = _FakeEngine(_live_manager(cls, config=_Config(groups, PCIDS)))
+
+    status = backport.tier_for_engine(engine, {"op": "status"})
+    assert status["install"]["installed"] is False
+    assert status["install"]["disarm_reason"] == "geometry"
+
+    arm = backport.tier_for_engine(engine, {"op": "arm"})
+    assert arm["applied"] is False
+    assert arm["state"]["kind"] == "geometry"
+    assert "prefix_cacheable" in arm["reason"]
+    assert "prefix-cacheable" in arm["next_step"]
+
+
+def test_a_class_install_cannot_forget_a_geometry_veto():
+    """The arm-proof shape must not erase a veto a live config already gave.
+
+    `install(cls)` with no config gets `checked: False` from the guard, which
+    proves nothing. Overwriting the recorded veto with it would let `_arm_proof`
+    arm a config the guard explicitly rejected - the fail-open the guard exists
+    to close, re-opened through the arm gate.
+    """
+    cls, _calls = _fresh_class_with_switch()
+    groups = [_Group(HASH_BLOCK_SIZE, True, f"layer_{g}")
+              for g in range(CACHEABLE_GROUPS)]
+    groups.append(_Group(HASH_BLOCK_SIZE, True, "group_five_is_cacheable"))
+    bad = _Config(groups, PCIDS)
+    assert backport.install(cls, kv_cache_config=bad)["installed"] is False
+    assert backport.section()["arm_block"]["kind"] == "geometry"
+
+    backport.install(cls)                        # kv_cache_config=None
+    assert backport.section()["arm_block"]["kind"] == "geometry", \
+        "a check with no config must not overwrite a veto with a verdict"
+    assert backport.set_armed(True)["kind"] == "geometry"
+
+
+def test_a_disarmed_tier_does_no_store_or_load_work_without_anyone_disarming():
+    """The boot default, proven through the WRAPPERS, not through the flag.
+
+    Nothing here calls `set_armed`: these are the return shapes a disarmed
+    connector hands the scheduler (the fork's own "found nothing", an empty
+    metadata, no pending work) with the engine's own methods never reached - the
+    loud stand-ins count every call, so a wrapper that fell through is visible.
+    """
+    cls, EmptyMetadata, calls = _install_with_metadata()
+    self = object()
+
+    assert cls.__dict__["get_num_new_matched_tokens"](self, None, 0) == (0, False)
+    meta = cls.__dict__["build_connector_meta"](self, None)
+    assert isinstance(meta, EmptyMetadata)
+    assert [list(getattr(meta, name)) for name in
+            ("store_gpu_blocks", "store_cpu_blocks",
+             "load_gpu_blocks", "load_cpu_blocks")] == [[], [], [], []]
+    assert cls.__dict__["has_pending_stores"](self) is False
+    assert calls == {"matched": 0, "meta": 0, "pending": 0}
+    # The one route to the crashing selector that the switch does NOT gate is the
+    # finish path, and it is safe here for exactly one reason: the fix is live.
+    selector = cls.__dict__["_select_eager_blocks_to_store"]
+    assert getattr(selector, backport.OWNER_ATTR, None) == backport.OWNER_TAG
+
+
+def test_the_disarm_does_not_gate_the_finished_request_store_path():
+    """The honest limit, pinned so nobody can forget it.
+
+    `request_finished_all_groups` -> `_queue_finished_eager_store`
+    (`manager.py:1166`) -> `_select_eager_blocks_to_store` (`manager.py:1177`)
+    bypasses the kill switch. That is survivable ONLY because a fully installed
+    fix replaced the selector - which is why an incomplete install is never
+    armable and why `disarm` is not a substitute for the patch. If someone ever
+    adds that method to the switch, this test is the one to change (and the
+    docstring of `disarm_limits`).
+    """
+    assert "_queue_finished_eager_store" not in backport.SWITCH_METHODS
+    limits = backport.disarm_limits()
+    assert "manager.py:1177" in limits["finished_request_store_path"]
+    assert "first /tier" in limits["enforced_by_wrappers_fitted_at"]
+
+
+def test_the_payload_says_why_an_idle_tier_is_expected():
+    """Inert-at-boot is a design decision; the JSON has to explain it.
+
+    Otherwise the first thing an operator concludes from `armed: false` on a
+    tier-env boot is that the tier is broken - the exact confusion this design
+    buys with its safety.
+    """
+    _install_with_metadata()
+    installed_note = backport.section()["operator_note"]
+    assert "boot default" in installed_note and "arm" in installed_note
+
+    backport.set_armed(True)
+    assert backport.section()["operator_note"].startswith("ARMED")
+
+    backport.reset_state_for_tests()
+    drifted = _switch_standin_methods(
+        _drifted_fork_class("_select_eager_blocks_to_store"))
+    backport.install(drifted)
+    note = backport.section()["operator_note"]
+    assert "NOT fully installed" in note
+    assert "expected" in note
+
+
+def test_the_tier_verb_reports_its_refusal_kind_and_next_step():
+    """`applied: false` alone is not an explanation; the payload carries one."""
+    cls = _switch_standin_methods(_drifted_fork_class("update_state_after_alloc"))
+    engine = _FakeEngine(_live_manager(cls))
+    arm = backport.tier_for_engine(engine, {"op": "arm"})
+    assert arm["applied"] is False
+    assert arm["armed"] is False
+    assert arm["boot_default_armed"] is False
+    assert arm["state"]["kind"] == "incomplete_install"
+    assert "update_state_after_alloc" in arm["reason"]
+    assert "arm" in arm["next_step"]
+    assert "DISARMED" in arm["operator_note"]
 
 
 def test_the_route_validates_op_before_the_engine_sees_it():

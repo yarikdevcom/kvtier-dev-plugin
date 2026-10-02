@@ -208,12 +208,20 @@ def _make_tier_method():
     def kvtier_dev_tier(self, args=None):  # noqa: ARG001 - bound method
         """Arm or disarm the KV tier at runtime, without restarting the engine.
 
+        THE TIER IS DISARMED AT BOOT (`backport.BOOT_ARMED = False`), and that is
+        the safety property, not an inconvenience: the plugin's install cannot
+        land at plugin-load time (the manager class does not exist until
+        `core.py:260`), so a boot-armed tier would be a boot-UNPATCHED tier
+        facing the first request. `arm` is therefore the only thing that makes a
+        tier live, and it is refused - naming `geometry`, `no_manager` or
+        `incomplete_install` - unless the fix is fully installed.
+
         `disarm` makes the connector a strict no-op through the manager methods
         `backport` wraps: no prefix hit is reported, the metadata it hands the
         workers is empty, and no pending work is claimed. It is the reason the
         tier can be turned on at all - a knob that needs a 4-minute reboot is not
         a kill switch. The upstream divisibility fix (PR #56810) is installed on
-        the way through, so a hybrid geometry never reaches the assert.
+        the way through every op, so a hybrid geometry never reaches the assert.
         """
         return backport.tier_for_engine(self, args)
 
@@ -315,6 +323,12 @@ def register() -> None:
         # block_size=8 QSA ring - dies on
         # `assert block_size % hash_block_size == 0` inside the store path, and
         # that costs a live-traffic reboot rather than degrading the tier.
+        #
+        # This refusal at boot is EXPECTED and is no longer a fail-open: the
+        # tier's state is `armed: False` from `BOOT_ARMED`, so an engine that has
+        # not been patched is also an engine that schedules no tier work. The
+        # patch lands on the first verb contact, and arming is what makes it
+        # matter (`backport.set_armed` refuses to arm an unpatched tier).
         tier_fix = backport.install(backport.manager_class())
         # Unlike the store hook, the capacity wrappers MUST land here: the
         # EngineCore collects the handshake and calls the connector's consumer a
@@ -335,6 +349,14 @@ def register() -> None:
         level("kvtier-dev-plugin: guard mode OFF (development-only facility; "
               "arm it with POST %s/guard, and disarm it before any production "
               "boot)", config.ROUTE_PREFIX)
+        # Same reasoning for the tier: "was this engine parking KV?" must be
+        # answerable from the boot log. The tier is inert until armed, and only
+        # an arm can prove the fix is in place (see backport.BOOT_ARMED).
+        level("kvtier-dev-plugin: KV tier INERT at boot (armed=False; the "
+              "backport install above is refused until the connector imports "
+              "the manager). It parks nothing until POST %s {\"op\":\"arm\"}, "
+              "and that arm is refused until the PR #56810 fix is fully "
+              "installed", config.ROUTE_PREFIX + config.ROUTE_TIER)
     except Exception:  # noqa: BLE001 - a diagnostic plugin must not break a boot
         logger.exception("kvtier-dev-plugin: engine-side install failed; "
                          "continuing without it")

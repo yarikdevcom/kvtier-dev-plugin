@@ -105,6 +105,56 @@ prefix_cacheable_group_ids`. `geometry_guard()` recomputes the set of groups
 the patch would skip from a live `KVCacheConfig` and, if any of them reports
 `prefix_cacheable=True`, REFUSES to install and names the group.
 
+THE BOOT DEFAULT IS DISARMED (`BOOT_ARMED = False`)
+--------------------------------------------------
+THE TIER DOES NOTHING AT BOOT; ARMING IS A DELIBERATE ACT THAT REQUIRES THE FIX
+TO BE FULLY INSTALLED. Why the boot default had to change:
+
+* `vllm` calls `load_general_plugins()` at `core.py:217`, but the Scheduler - and
+  with it the connector and the offload manager - is not constructed until
+  `core.py:260`. So `register()`'s immediate `install(manager_class())` is
+  ALWAYS refused at boot (`cls is None`), and that refusal path returns before
+  any disarm - the state used to stay at its initial value, `armed: True`.
+* Nothing on the scheduler or store path calls `ensure_installed`: its only call
+  sites are the two engine verbs (`engine_side.py:99`, `engine_side.py:131`) and
+  the `/tier` verb itself (`backport.py:953`).
+
+Booted armed, that combination means the FIRST request reaches the UNPATCHED
+store selector and dies on the assert - a fail-open whose only defence was an
+operator remembering to curl a verb first. `BOOT_ARMED = False` removes the
+reliance on remembering: a tier boot is inert until someone arms it, and the arm
+is gated on the proof (see the all-or-nothing contract below).
+
+The arm gate therefore seeks proof rather than trusting its caller:
+`set_armed(True)` runs `_arm_proof()` (an install onto the class, when a class is
+resolvable) before deciding, and `tier_for_engine` calls `ensure_installed`
+(the live manager's class, WITH its `KVCacheConfig`, so the geometry guard
+actually checks) before every op. A cold-boot arm sequence is:
+
+  POST /tier {"op":"status"}  -> installs against the live manager; armed:false
+  POST /tier {"op":"arm"}     -> refuses unless installed AND the guard passed
+  (a refusal names its kind: "geometry" | "no_manager" | "incomplete_install")
+
+WHAT A DISARMED TIER DOES *NOT* GATE (read this before trusting the flag)
+-------------------------------------------------------------------------
+The kill switch is a set of wrappers this module fits; `armed` is only ever read
+INSIDE them. Two consequences, both honest and both reported in
+`disarm_limits()`:
+
+1. Before the first verb contact NO wrappers exist yet (the boot case above), so
+   `armed: false` at boot is an INTENT that nothing enforces until some verb -
+   `/tier`, `/snapshot` or `/policy/reload`, all of which call
+   `ensure_installed` - fits them. This is why the runbook's first step is a
+   status/snapshot call and not "trust the default".
+2. The three gated methods are the connector's per-step entry points. The
+   connector's finish path reaches the same selector by a route the switch does
+   NOT cover: `request_finished_all_groups` -> `_queue_finished_eager_store`
+   (`manager.py:1166`) -> `_select_eager_blocks_to_store` (`manager.py:1177`).
+   While the fix IS fully installed that method is the patched one and the route
+   is safe; while it is NOT, a disarmed tier can still reach the assert when a
+   request finishes. That is a second reason the fix is never optional and a
+   disarmed tier is never a substitute for the patch.
+
 THE KILL SWITCH (runtime, no restart)
 -------------------------------------
 `set_armed(False)` makes the tier a strict no-op through three manager
@@ -140,13 +190,15 @@ live-traffic crash this backport is supposed to make impossible.
   records `disarm_reason: "incomplete_install"`. The kill-switch wrappers install
   independently of the fingerprints, so a disarmed connector is a strict no-op
   and never reaches the crashing selector even unpatched.
-* `set_armed(True)` is REFUSED - state unchanged, never raising - while either
-  the geometry guard has vetoed the live config (`"geometry"`) or the fix is not
-  fully installed (`"incomplete_install"`). The refusal names the refused
-  methods and is published in `status`/`snapshot` (`installed`,
-  `refused_methods`, `auto_disarmed`, `disarm_reason`, `arm_block`) and in the
-  `/tier` verb response, so a dashboard operator reads "not armed, because X"
-  rather than a silent no-op. Disarm is never refused: it is the safe direction.
+* `set_armed(True)` is REFUSED - state unchanged, never raising - while the
+  geometry guard has vetoed the live config (`kind: "geometry"`), no
+  `SimpleCPUOffloadScheduler` exists in this process to install onto or arm at
+  all (`kind: "no_manager"`), or the fix is not fully installed
+  (`kind: "incomplete_install"`). The refusal names the refused methods and is
+  published in `status`/`snapshot` (`installed`, `refused_methods`,
+  `auto_disarmed`, `disarm_reason`, `arm_block`) and in the `/tier` verb
+  response, so a dashboard operator reads "not armed, because X" rather than a
+  silent no-op. Disarm is never refused: it is the safe direction.
 """
 
 from __future__ import annotations
@@ -157,7 +209,7 @@ import logging
 import sys
 import textwrap
 
-from . import pr56810_sources, snapshot
+from . import config, pr56810_sources, snapshot
 
 logger = logging.getLogger("kvtier_dev_plugin.backport")
 
@@ -183,13 +235,22 @@ REPLACED = ("_estimate_lazy_target_blocks", "update_state_after_alloc",
 SWITCH_METHODS = ("get_num_new_matched_tokens", "build_connector_meta",
                   "has_pending_stores")
 
+# THE TIER IS DISARMED AT BOOT. See "THE BOOT DEFAULT IS DISARMED" above: the
+# install cannot land at plugin-load time (the manager class does not exist
+# yet), so a boot-armed tier is a boot-unpatched tier facing live traffic.
+# The only way this becomes True at boot is someone editing this file.
+BOOT_ARMED = False
+
+# The refusal kinds an arm can get, so `arm_block.kind` has a closed vocabulary.
+ARM_BLOCK_KINDS = ("geometry", "no_manager", "incomplete_install")
+
 _state = {
     "installs": 0,
     "reinstalls": 0,
     "skips": 0,
     "skip_reason": None,
     "class": None,
-    "armed": True,                       # tier is live until someone disarms it
+    "armed": BOOT_ARMED,                 # inert at boot; arming is deliberate
     "disarm_calls": 0,
     "arm_calls": 0,
     "fully_installed": False,            # every method in METHODS patched/verified
@@ -211,7 +272,7 @@ def reset_state_for_tests() -> None:
     """Process-wide counters, like `snapshot._state` and `store_hook._state`."""
     _state.update({
         "installs": 0, "reinstalls": 0, "skips": 0, "skip_reason": None,
-        "class": None, "armed": True, "disarm_calls": 0, "arm_calls": 0,
+        "class": None, "armed": BOOT_ARMED, "disarm_calls": 0, "arm_calls": 0,
         "fully_installed": False, "refused_methods": [], "auto_disarmed": False,
         "disarm_reason": None, "disarm_detail": None, "arm_refusals": 0,
         "last_arm_refusal": None,
@@ -559,6 +620,11 @@ def install(cls, kv_cache_config=None) -> dict:
               "methods": {}, "switch": {}, "geometry": None}
     try:
         if cls is None:
+            # THE BOOT CASE (`register()` runs at core.py:217, the Scheduler - and
+            # so this class - arrives at core.py:260). Refusing here does NOT
+            # disarm and never did; what makes it safe is that the state it
+            # refuses INTO is now `armed: False`, so an uninstalled tier is also
+            # an idle one. `arm_block.kind` reports "no_manager" in this state.
             return _refuse(report, f"no {TARGET_CLASS} is imported in this "
                                    f"process ({TARGET_MODULE} absent)")
         report["class"] = getattr(cls, "__name__", type(cls).__name__)
@@ -566,6 +632,14 @@ def install(cls, kv_cache_config=None) -> dict:
         guard = geometry_guard(
             kv_cache_config if kv_cache_config is not None
             else _config_of(cls))
+        if (not guard.get("checked") and _state["geometry"]
+                and _state["geometry"].get("checked")
+                and not _state["geometry"].get("ok")):
+            # A check with NO config proves nothing, so it must not overwrite a
+            # veto we were already given from a live one: forgetting it here
+            # would re-open exactly the fail-open the guard exists to close
+            # (patching - and then arming - a config that must not be patched).
+            guard = dict(_state["geometry"])
         report["geometry"] = guard
         _state["geometry"] = guard
         if kv_cache_config is not None and not guard.get("ok"):
@@ -825,16 +899,21 @@ def _force_disarm(kind: str, detail) -> None:
 def _arm_block_reason() -> dict | None:
     """Why arming the tier is unsafe right now, or None if arming is allowed.
 
-    Two independent gates, checked in this order:
+    Three independent gates, checked in this order, each with its own `kind` so
+    an operator never has to guess which one they hit:
 
     * the GEOMETRY guard, when it has actually checked a live config and said no
       -- the patch would skip a prefix-cacheable group (silent output loss).
+    * NO MANAGER in this process -- there is no class to install onto and no
+      connector to arm, so an "arm" would be a flag nobody reads. Reporting it
+      as `incomplete_install` would blame a fix that was never refused.
     * an INCOMPLETE install -- not every method in METHODS is patched, so the
       store path would still reach the upstream assert.
 
     A geometry guard that never checked (a class-install before any config
-    exists) is NOT a block: booting patches the class first, and refusing to arm
-    there would strand a healthy engine.
+    exists) is NOT a block: the verbs patch the class first, and refusing to arm
+    there would strand a healthy engine. A veto that WAS given is never
+    forgotten - see the guard-preservation note in `install()`.
     """
     geometry = _state["geometry"]
     if geometry and geometry.get("checked") and not geometry.get("ok"):
@@ -843,7 +922,16 @@ def _arm_block_reason() -> dict | None:
                           "would let the patch skip a prefix-cacheable group: "
                           f"{geometry.get('reason')}"}
     if not _state["fully_installed"]:
-        refused = list(_state["refused_methods"])
+        refused = list(_state['refused_methods'])
+        attempted = bool(refused) or bool(_state["method_verdicts"])
+        if not attempted and manager_class() is None:
+            return {"kind": "no_manager",
+                    "reason": f"no {TARGET_CLASS} exists in this process "
+                              f"({TARGET_MODULE} is not imported) and nothing has "
+                              "been installed yet: there is no tier connector to "
+                              "arm. Either this engine booted without the tier, "
+                              "or the engine is not built yet. Arming here would "
+                              "set a flag nothing reads."}
         names = ", ".join(refused) if refused else "(none attempted)"
         return {"kind": "incomplete_install",
                 "reason": f"the PR #56810 fix is not fully installed; refused "
@@ -852,19 +940,54 @@ def _arm_block_reason() -> dict | None:
     return None
 
 
+def _arm_proof() -> None:
+    """Seek the proof an arm requires, instead of trusting the caller to have
+    obtained it. Contained; never raises.
+
+    `tier_for_engine` already calls `ensure_installed(engine)` for EVERY op, so
+    the operator path has always had its proof (against the LIVE manager, with
+    its config) before this runs. This is the backstop for any caller that arms
+    without one - a future verb, a direct import, a test - and it can only
+    install onto the CLASS, which is why the live-config geometry check still
+    belongs to `ensure_installed`.
+
+    Skipped when the guard has already vetoed: install onto a class without a
+    config cannot un-veto a config, and trying would only churn the state.
+    """
+    if _state["fully_installed"]:
+        return
+    geometry = _state["geometry"]
+    if geometry and geometry.get("checked") and not geometry.get("ok"):
+        return
+    cls = manager_class()
+    if cls is None:
+        return
+    try:
+        install(cls)
+    except Exception as exc:  # noqa: BLE001 - a proof we cannot get is a refusal
+        _state["fallbacks"] += 1
+        snapshot._error(exc, "backport arm proof")
+
+
 def set_armed(armed: bool) -> dict:
     """Arm/disarm the tier at runtime. Contained; never raises.
 
     DISARM is unconditional -- it is the safe direction and must always work.
-    ARM is GATED: it is refused (state unchanged, nothing raised) while the
-    geometry guard has vetoed the live config or the fix is not fully installed,
-    because the invariant is that the tier is never armed unless the divisibility
-    fix is provably, fully in place. A refused arm says WHY and names the refused
-    methods, and shows up in `status`/`snapshot` and the `/tier` verb so an
-    operator reads "not armed, because X" instead of a silent no-op.
+    ARM is GATED: it first seeks its own proof (`_arm_proof`) and is then refused
+    (state unchanged, nothing raised) while the geometry guard has vetoed the
+    live config, no manager exists in this process, or the fix is not fully
+    installed, because the invariant is that the tier is never armed unless the
+    divisibility fix is provably, fully in place. A refused arm says WHY, names
+    its `kind` and the refused methods, and shows up in `status`/`snapshot` and
+    the `/tier` verb so an operator reads "not armed, because X" instead of a
+    silent no-op.
+
+    The boot default is DISARMED (`BOOT_ARMED`), so this is the only thing that
+    makes a tier live - nothing else calls it with True at startup.
     """
     armed = bool(armed)
     if armed:
+        _arm_proof()
         block = _arm_block_reason()
         if block is not None:
             _state["arm_refusals"] += 1
@@ -917,6 +1040,18 @@ def disarm_limits() -> dict:
       None.
     * `has_pending_block_frees` is not wrapped: this connector does not override
       it, so it is already `False` unconditionally (base.py:625).
+    * The switch is IMPLEMENTED BY WRAPPERS, so it only exists once `install()`
+      has fitted them. Before the first verb contact (the boot case) `armed:
+      false` is an intent nothing yet enforces - see
+      `enforced_by_wrappers_fitted_at` below.
+    * The connector's FINISH path reaches the same store selector through a
+      method the switch does not wrap: `request_finished_all_groups` ->
+      `_queue_finished_eager_store` (`manager.py:1166`) ->
+      `_select_eager_blocks_to_store` (`manager.py:1177`). Safe while the fix is
+      fully installed (that method is then the patched one, and arming requires
+      exactly that); NOT safe while it is not, which is the other reason an
+      incomplete install must never be armed and a disarm is never a substitute
+      for the patch.
     """
     return {
         "worker_process_patched": False,
@@ -925,12 +1060,74 @@ def disarm_limits() -> dict:
         "parked_blocks_freed": False,
         "has_pending_block_frees": "not overridden by this connector (base "
                                    "returns False)",
+        "enforced_by_wrappers_fitted_at": "install()/ensure_installed() only - "
+                                          "before the first /tier, /snapshot or "
+                                          "/policy/reload contact no wrapper "
+                                          "exists, so the boot-time disarmed "
+                                          "state is an intent, not a gate",
+        "finished_request_store_path": "NOT gated: request_finished_all_groups -> "
+                                       "_queue_finished_eager_store "
+                                       "(manager.py:1166) reaches "
+                                       "_select_eager_blocks_to_store "
+                                       "(manager.py:1177); harmless ONLY because "
+                                       "the fix patched that method",
     }
 
 
 # --- the engine-side verb ---------------------------------------------------
 
 TIER_OPS = ("status", "arm", "disarm")
+
+
+def tier_route() -> str:
+    """The route an operator posts to arm the tier, for notes and next-steps."""
+    return config.ROUTE_PREFIX + config.ROUTE_TIER
+
+
+def _operator_note(armed: bool, installed: bool) -> str:
+    """The one-line answer to "the engine booted with tier env set - why is it
+    parking nothing?".
+
+    Inert-at-boot is deliberate, and the confusion it causes is the price of not
+    crashing on the first request; the JSON pays that price here, so an operator
+    reading `pr56810` or a `/tier` payload never has to know the design to read
+    the state correctly.
+    """
+    route = tier_route()
+    if armed:
+        return ("ARMED: the tier parks and restores KV. Nothing arms the tier at "
+                "boot (BOOT_ARMED is False), so this state is the result of an "
+                f"explicit POST {route} {{\"op\":\"arm\"}}.")
+    if installed:
+        return ("DISARMED - the boot default, not a fault. A tier boot parks "
+                f"nothing until someone POSTs {route} {{\"op\":\"arm\"}}; "
+                "installed=true, so that arm is allowed right now.")
+    return ("DISARMED and NOT fully installed, so arming is refused until every "
+            "required method is patched (see refused_methods / arm_block). "
+            "Parking nothing after a boot with tier env set is the expected "
+            "inert state, not a bug.")
+
+
+def _next_step(refusal: dict | None) -> str:
+    """What to DO about the current state, keyed on the refusal kind."""
+    kind = (refusal or {}).get("kind")
+    if kind == "geometry":
+        return ("do NOT arm this config: the patch would skip a prefix-cacheable "
+                "group and lose its KV on resume. Boot without the tier, or fix "
+                "the geometry.")
+    if kind == "no_manager":
+        return ("nothing to arm in this process: the tier connector is not "
+                "configured (or the engine is not built yet). Boot it with "
+                "KV_OFFLOAD_SIZE / VLLM_USE_SIMPLE_KV_OFFLOAD, then POST "
+                + tier_route() + ' {"op":"status"}.')
+    if kind == "incomplete_install":
+        return ("fix the install first - the refused methods are named in "
+                "install.refused_methods (a fingerprint mismatch means the fork "
+                "moved that function); then POST " + tier_route()
+                + ' {"op":"arm"} again.')
+    return ("arming is allowed now: POST " + tier_route() + ' {"op":"arm"}, '
+            "confirm armed:true, then send traffic.")
+
 
 
 def tier_for_engine(engine, args=None) -> dict:
@@ -974,6 +1171,15 @@ def tier_for_engine(engine, args=None) -> dict:
                           "auto_disarmed": bool(_state["auto_disarmed"]),
                           "disarm_reason": _state["disarm_reason"]}
         out["tier"] = section(manager_of(engine))
+        # Top level, next to `applied`, because this is the payload an operator
+        # actually reads after `POST /tier`: "is it armed, is the fix in, and is
+        # the answer supposed to be no?".
+        out["armed"] = bool(_state["armed"])
+        out["boot_default_armed"] = bool(BOOT_ARMED)
+        out["operator_note"] = out["tier"]["operator_note"]
+        refusal = out.get("state") if isinstance(out.get("state"), dict) else None
+        out["next_step"] = (_next_step(refusal) if refusal and refusal.get("refused")
+                            else _next_step(_arm_block_reason()))
         out["status_code"] = 200
         return out
     except Exception as exc:  # noqa: BLE001 - never into the scheduler loop
@@ -1001,6 +1207,17 @@ def _fields(**overrides) -> dict:
         "skips": int(_state["skips"]),
         "skip_reason": _state["skip_reason"],
         "armed": bool(_state["armed"]),
+        # THE BOOT POSTURE, stated in the payload. `armed: false` immediately
+        # after a boot with tier env set is BY DESIGN (`BOOT_ARMED`), and
+        # `operator_note` says so in the same object - otherwise the first thing
+        # an operator concludes is that the tier is broken.
+        "boot_default_armed": bool(BOOT_ARMED),
+        "boot_is_inert": not BOOT_ARMED,
+        "arm_requires": ("the PR #56810 fix fully installed AND the geometry "
+                         "guard passing (refusal kinds: "
+                         + ", ".join(ARM_BLOCK_KINDS) + ")"),
+        "operator_note": _operator_note(bool(_state["armed"]),
+                                        bool(_state["fully_installed"])),
         # All-or-nothing install state: `installed` is true ONLY when every
         # method in METHODS is patched; `refused_methods` names the ones that
         # are not, so a partial install is visible, not just a failed one.

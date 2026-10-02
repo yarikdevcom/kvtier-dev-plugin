@@ -19,7 +19,7 @@ GET  /plugins/kvtier/block?…   -- utility -> kvtier_dev_inspect       (one blo
 GET  /plugins/kvtier/request?… -- utility -> kvtier_dev_inspect       (one request, per group)
 POST /plugins/kvtier/trace     -- utility -> kvtier_dev_trace         (arm/disarm/read the ring)
 POST /plugins/kvtier/guard     -- utility -> kvtier_dev_guard         (DEV ONLY: catch + decline)
-GET|POST /plugins/kvtier/tier  -- utility -> kvtier_dev_tier          (kill switch + PR #56810 status)
+GET|POST /plugins/kvtier/tier  -- utility -> kvtier_dev_tier          (kill switch, off at boot; #56810)
 POST /plugins/kvtier/policy/reload -- util-> kvtier_dev_reload_policy (re-reads policy.py)
 
 Worker process (per rank)        no utility channel exists, so a worker reports by file:
@@ -89,6 +89,13 @@ Nothing activates yet - see the switches below.
 There is deliberately **no env var for guard mode**. It can mask real bugs, so it
 is off at every boot and reachable only through `POST /plugins/kvtier/guard` with
 the token - see *Guard mode*.
+
+There is equally **no env var that arms the KV tier**. The tier is disarmed at
+boot (`backport.BOOT_ARMED = False`) because the plugin's install cannot land
+before the manager class exists, and arming is gated on that install being
+complete - so an env var that armed at boot would be an env var that arms an
+unpatched engine. Arm it with `POST /plugins/kvtier/tier {"op":"arm"}`; see
+*Booting the tier*.
 
 `VLLM_PLUGINS` parses as a comma-separated list; `VLLM_PLUGINS=""` is `[""]`
 and matches nothing (it is not "unset").
@@ -686,7 +693,8 @@ the manager that is actually running.
 ## Making the tier bootable at all: the PR #56810 backport (`backport.py`)
 
 The tier cannot be enabled on our model without this fix, so it is installed on
-the way through every verb, not behind a switch.
+the way through every verb - while **the tier itself is behind a switch that is
+OFF at boot** (see *Booting the tier* below).
 
 Upstream issue #56396 / PR #56810 (merged 2026-09-20, NOT in the `v0.30.0` tag
 this fork is on). `SimpleCPUOffloadScheduler` assumed every KV cache group's
@@ -744,6 +752,60 @@ of those groups reports `prefix_cacheable=True`, naming the group. If the patch
 is already live on a class and a LATER config fails the guard, the tier is
 auto-disarmed rather than left running (`auto_disarmed: true`).
 
+### Booting the tier: inert until someone arms it (the invariant)
+
+> **The tier does nothing at boot; arming is a deliberate act that requires the
+> fix to be fully installed.**
+
+The install cannot land when the plugin loads: `load_general_plugins()` runs at
+`core.py:217`, but the Scheduler - and with it the connector and the offload
+manager - is not constructed until `core.py:260`. So `register()`'s install
+attempt is *always* refused at boot (`cls is None`), and that refusal path
+never disarmed: with the old `armed: True` boot default, an engine booted with
+tier env was an **unpatched** tier facing the first request, and the only thing
+between that and a crash was somebody remembering to curl a verb first. "Somebody
+remembers" is not a safety property, so the boot default is `BOOT_ARMED = False`
+and arming is a gated act:
+
+```bash
+# 1. boot the engine (tier env set). Expect this line in /tmp/vllm-serve.log:
+#    "kvtier-dev-plugin: KV tier INERT at boot (armed=False; ...)"
+
+# 2. talk to it. ANY verb installs the fix against the LIVE manager, and this
+#    one also reads the config the geometry guard needs. Expect:
+#    installed: true, armed: false, arm_block: null
+ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+  | python3 -c 'import sys,json;t=sys.stdin;p=json.load(sys.stdin);print({k:p[k] for k in ("armed","next_step")}, p["install"])'
+
+# 3. arm it. Expect applied: true, armed: true.
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
+  -d '{\"op\":\"arm\"}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["applied"],d["armed"],d.get("reason"))'
+
+# 4. only now send traffic.
+```
+
+Step 2 is what makes step 3 able to succeed, and it is a *verb*: patching lands
+on first verb contact (`/tier`, `/snapshot`, `/policy/reload`), because nothing
+on the scheduler or store path calls `ensure_installed`. Nothing retries the
+install on the hot path, deliberately - the disarmed state is what makes an
+unpatched one harmless.
+
+An `arm` is refused, never forced, and the refusal kind tells you which gate you
+hit (`arm_block.kind`, `state.kind`, `disarm_reason`):
+
+| kind | meaning | what to do |
+|---|---|---|
+| `incomplete_install` | a required method was refused (a fingerprint drift: the fork moved that function); names the method(s) | fix/re-record the source, then arm again |
+| `geometry` | the guard vetoed this config: the patch would skip a group that is still `prefix_cacheable=True` | do **not** arm; boot without the tier or fix the geometry |
+| `no_manager` | no `SimpleCPUOffloadScheduler` exists in this process - the tier connector is not configured, or the engine is not built yet | there is nothing to arm here; check the tier env of the engine you reached |
+
+And because `armed: false` on a tier-env boot is now *correct*, every payload
+says so where an operator will read it: `pr56810.boot_default_armed`,
+`pr56810.boot_is_inert`, `pr56810.arm_requires`, and `pr56810.operator_note` - a
+sentence that answers "the engine booted with the tier on, why is it parking
+nothing?". The `/tier` verb repeats `armed`, `boot_default_armed`,
+`operator_note` and a `next_step` at the top level, next to `applied`.
+
 ### The kill switch (runtime, no restart)
 
 ```
@@ -761,8 +823,25 @@ only be turned off by a 4-minute reboot is not safe to have on.
 `snapshot.pr56810.disarm_limits` states what it cannot undo: an in-flight copy
 already handed to workers finishes, blocks already parked in host RAM stay
 parked (re-arming makes them reachable again), and the worker process is never
-contacted. `patched: false` and `armed: false` are different states - the
-former means a hybrid geometry will still crash the store path.
+contacted. Two more limits are in that same block, and both are about this
+module's own machinery:
+
+* `enforced_by_wrappers_fitted_at` - the kill switch IS a set of wrappers, so it
+  exists only after an install has fitted them. Before the first verb contact,
+  `armed: false` is an intent, not a gate. That is why the boot sequence above
+  starts with a verb and not with "trust the default".
+* `finished_request_store_path` - the connector's finish path
+  (`request_finished_all_groups` -> `_queue_finished_eager_store`,
+  `manager.py:1166`) calls the store selector at `manager.py:1177` through a
+  method the switch does **not** wrap. It is safe because arming requires the fix
+  to be fully installed - i.e. because that selector is the patched one. It is
+  the second reason an incomplete install is never armable and a disarm is never
+  a substitute for the patch.
+
+`patched: false` and `armed: false` are different states - the former means a
+hybrid geometry will still crash the store path *whenever the tier is allowed to
+schedule*, which is why the boot default is disarmed and why arming is gated on
+the fix.
 
 ### Coexisting with the plugin's other two patches
 
@@ -822,17 +901,57 @@ TOK=$(cat ~/.local/share/kvtier-dev-token)
 H="x-kvtier-dev-token: $TOK"
 ```
 
+### Every boot with the tier env set: the order traffic goes in
+
+> **The tier does nothing at boot; arming is a deliberate act that requires the
+> fix to be fully installed.**
+
+```bash
+# 1. any verb installs the fix against the live manager and reads the geometry.
+#    ( /snapshot does it too, token-free from loopback - this curl IS the patch.
+#      Expect installed:true, armed:false, arm_block:null )
+ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["install"]["installed"],d["armed"],d["operator_note"])'
+
+# 2. arm. Expect applied:true, armed:true. A refusal says its kind:
+#    incomplete_install | geometry | no_manager  (see the table in the backport
+#    section) and leaves the tier disarmed.
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
+  -d '{\"op\":\"arm\"}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["applied"],d["armed"],d.get("reason"),d["next_step"])'
+
+# 3. only now let traffic in.
+```
+
+Step 1 is mandatory, not ceremonial. Patching lands on **first verb contact** -
+nothing on the scheduler or store path retries the install, by design - so an
+engine that has never been spoken to has never been patched. Arming is what makes
+that matter, because an `arm` without the fix is refused.
+
+The limit, stated where you will read it: while the tier is disarmed the three
+per-step connector entry points are gated, but `armed: false` is only enforced by
+wrappers an install has fitted, and the connector's finish path
+(`request_finished_all_groups` -> `_queue_finished_eager_store`, `manager.py:1166`)
+reaches the store selector at `manager.py:1177` ungated. So a disarmed tier is
+NOT a shield against the assert on an engine that was never patched - it is the
+reason an unpatched engine never *stores* anything once it has been spoken to.
+The shield is the install; the boot order above is what makes you prove it.
+
 ### Engine crashed / crashes on the FIRST request
 
-The first-request crash is the divisibility assert firing because the fix is
-**not fully installed**. Confirm it in one line (the tier state lives in the
-engine, so read the snapshot):
+With the tier disarmed at boot, the first-request crash means the store path was
+reached while the fix was **not fully installed**: traffic went in before any
+verb had patched the engine, or the tier was armed against an engine whose
+install is incomplete (an `arm` refuses that, so check the log for
+`REFUSED to arm`). It is NOT what a correctly inert tier looks like - see the
+next section for that. Confirm it in one line (the tier state lives in the
+engine, so read the snapshot; the read also patches the engine for next time):
 
 ```bash
 # installed=false or refused_methods non-empty => the fix is incomplete.
-# armed=false there is the injector protecting you, not a bug.
+# armed=false there is the injector protecting you, not a bug; armed=TRUE with
+# installed=false must be impossible and is the thing to chase.
 ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
-  | python3 -c 'import sys,json;p=json.load(sys.stdin)["pr56810"];print({k:p[k] for k in ("installed","armed","refused_methods","auto_disarmed","disarm_reason")})'
+  | python3 -c 'import sys,json;p=json.load(sys.stdin)["pr56810"];print({k:p[k] for k in ("installed","armed","refused_methods","auto_disarmed","disarm_reason","boot_default_armed")})'
 ```
 
 Read the last fault. The engine log is `/tmp/vllm-serve.log` (the journal copy
@@ -842,8 +961,9 @@ backport's own install/arm verdicts:
 ```bash
 # the assert the incomplete fix lets through:
 ssh llm "grep -a 'not divisible by tokens_per_hash' /tmp/vllm-serve.log | tail -3"
-# did the backport install? was the tier force-disarmed or arm refused?
-ssh llm "grep -aE 'PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)' /tmp/vllm-serve.log | tail -10"
+# did the backport install? was the tier force-disarmed or arm refused? did it
+# boot inert (the expected line on every boot with the plugin enabled)?
+ssh llm "grep -aE 'PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)|KV tier INERT at boot' /tmp/vllm-serve.log | tail -10"
 ```
 
 If guard mode was armed there is also a structured capture of the fault (guard
@@ -854,7 +974,34 @@ ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
   -d '{\"op\":\"captures\",\"limit\":2}'"   # capture.decline, ...geometry.groups_failing_divisibility
 ```
 
+### Tier env is set but nothing is parked / `armed: false` after a boot
+
+**This is the expected inert behaviour, not a bug.** Since `BOOT_ARMED = False`
+an engine that booted with `KV_OFFLOAD_SIZE` / `VLLM_USE_SIMPLE_KV_OFFLOAD` set
+parks and loads NOTHING until someone arms it - the opposite of the old posture,
+where a tier boot was live on the first request (and, with the fix not yet
+installed, a crash on that first request). So:
+
+- `armed: false`, `boot_default_armed: false`, engine healthy -> **normal**. Read
+  `pr56810.operator_note`; if you want the tier, POST `{"op":"arm"}`.
+- `installed: false` -> you have not spoken to this engine yet (nothing installs
+  the fix on the scheduler path), or a method was refused. The first
+  `/tier?op=status` or `/snapshot` call usually flips it to `true`; if it does
+  not, `refused_methods` names what drifted.
+- `armed: true` with `installed: false` -> impossible by construction; if you
+  ever see it, that is the bug to report.
+
+Confirm which one you are looking at:
+
+```bash
+ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("armed","boot_default_armed","operator_note","next_step")}, indent=1)); print(d["install"])'
+```
+
 ### Runtime kill: make the tier a strict no-op, NO restart (one curl)
+
+Also the state the engine starts in: `disarm` is how you get back to the boot
+posture without a reboot.
 
 ```bash
 ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
@@ -920,6 +1067,13 @@ Where to look in `pr56810`:
 
 - `installed` - the **all-or-nothing** verdict: `true` only if every required
   method is patched. `armed` must be `false` whenever this is `false`.
+- `boot_default_armed` / `boot_is_inert` - the tier is disarmed at boot on
+  purpose, so `armed: false` right after a boot with tier env set is the design,
+  not a fault. `operator_note` says which of the two you are looking at, and the
+  `/tier` payload adds `next_step`.
+- `arm_requires` / `arm_block.kind` - arming needs the fix fully installed AND
+  the geometry guard passing; a refusal kind is `geometry`, `no_manager` (no
+  manager in this process - nothing to arm) or `incomplete_install`.
 - `refused_methods` - the method(s) that were refused; each is also
   `methods.<name>.patched: false` with the reason in `methods.<name>.reason`.
 - `geometry` - the geometry guard verdict (`geometry.ok`, and
@@ -928,6 +1082,9 @@ Where to look in `pr56810`:
   which refusal caused it: `"geometry"` vs `"incomplete_install"`.
 - `arm_block` - if present (`{kind, reason}`), arming is currently refused and
   this says why; `null` means arming is allowed.
+- `disarm_limits` - what the kill switch cannot undo, including the two limits
+  that are about the switch itself: it exists only once an install fitted the
+  wrappers, and the connector's finish path is not gated by it.
 
 ## Access model
 
@@ -1050,11 +1207,13 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
   `InvalidStateError` (`core_client.py:847-865`).
 * No writes, no `reset_cache`, no mutation of the tier. The side effects are,
   exhaustively: swapping the policy module reference; the store-policy and capacity
-  wrappers; a trace ring and its two scheduler wrappers while ARMED (removed on
-  disarm); the guard wrappers while armed or traced (restored by identity on
-  disarm); and the worker's diagnostics file when `VLLM_E2_TIER_DIAG` names a
-  directory. Every one of those is opt-in, and the two that change engine behaviour
-  (`guard`, tracing) say so in every payload.
+  wrappers; the PR #56810 replacements plus the three kill-switch wrappers on the
+  offload scheduler (installed by the first verb, and INERT until someone arms -
+  `BOOT_ARMED = False`); a trace ring and its two scheduler wrappers while ARMED
+  (removed on disarm); the guard wrappers while armed or traced (restored by
+  identity on disarm); and the worker's diagnostics file when
+  `VLLM_E2_TIER_DIAG` names a directory. Every one of those is opt-in, and the two
+  that change engine behaviour (`guard`, tracing) say so in every payload.
 * The worker's *compute* path is never referenced
   (`simple_kv_offload/worker.py:293-294` records on the live compute stream);
   `tests/test_snapshot.py` asserts the read side never names it and pulls in no
@@ -1097,7 +1256,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-709 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+727 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1118,6 +1277,23 @@ cannot go unlisted, with the openapi surface checked against it too). Three of t
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
 one from loopback with no token, two from a source-bound non-loopback client socket
 on this host's own LAN address (skipped on a box with no such address).
+
+The backport and the kill switch (`tests/test_backport.py`) drive the fork's own
+method text (fingerprints match, so the real install path runs) against the
+production geometry, with a poison-pill `resolve_block_hashes` that reproduces
+the assert - so "the patch works" and "the unpatched selector crashes" are
+behavioural claims. The boot posture has its own section: a **fresh subprocess
+that only imports the plugin is disarmed** (the fixtures reset state, so they
+cannot prove the first instant of a real process); the boot-time install refusal
+leaves the tier inert and reports `arm_block.kind: "no_manager"`; the cold-boot
+`status` -> `arm` sequence installs then arms; arming seeks its own proof when a
+caller skips `ensure_installed`; each refusal kind is refused, named, and
+explained in the verb payload; a class-level install cannot forget a geometry
+veto a live config already gave; a disarmed tier produces no store/load work as
+observed **through the wrappers** (the fork's own no-op shapes, with the engine's
+methods never called); and the two limits of the switch - it exists only once an
+install fitted it, and the finish path is not gated - are pinned so nobody can
+quietly rely on a disarmed tier as a shield.
 
 The debugger verbs add six files:
 
@@ -1176,7 +1352,7 @@ PYTHONPATH=/home/user/Source/experiment/vllm-testenv:\
 /home/user/Source/experiment/kvtier-dev-plugin \
 /home/user/Source/experiment/vllm-testenv/.venv/bin/python -m pytest \
     --noconftest -q /home/user/Source/experiment/scratch/test_cpu_capacity_clamp_live.py
-# -> 9 passed
+# -> 10 passed
 ```
 
 It builds a real `SimpleCPUOffloadConnector` (both roles) and a real

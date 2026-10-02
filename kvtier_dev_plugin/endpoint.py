@@ -605,20 +605,27 @@ def status_payload(dev_state: dict | None = None) -> dict:
             "note": "the KV tier's runtime kill switch and the status of the "
                     "upstream PR #56810 backport (excluding non-prefix-cacheable "
                     "KV groups from store/load, which a hybrid geometry needs or "
-                    "the store path asserts). Disarmed, the connector reports no "
-                    "prefix hit, hands the workers empty store/load lists and "
-                    "claims no pending work, so the engine serves from GPU KV "
-                    "alone - no engine restart. `pr56810.installed: false` means "
-                    "the divisibility fix is NOT fully live (see "
-                    "`pr56810.refused_methods`) and a hybrid geometry will still "
-                    "crash the store path. The tier can NEVER be armed unless the "
-                    "fix is fully installed and the geometry guard passes: an "
-                    "`arm` is refused, not applied, otherwise, and "
-                    "`pr56810.arm_block`/`disarm_reason` say why (distinguishing "
-                   "`geometry` from `incomplete_install`). Read them from the "
-                    "engine in `snapshot` or the engine's `"
-                    + config.ROUTE_PREFIX + config.ROUTE_TIER
-                    + "` route.",
+                    "the store path asserts). THE TIER IS DISARMED AT BOOT "
+                    "(pr56810.boot_default_armed: false): an engine booted with "
+                    "tier env parks nothing until someone POSTs "
+                    "{\"op\":\"arm\"}, and that is the expected inert state, not "
+                    "a fault - read pr56810.operator_note. Disarmed, the "
+                    "connector reports no prefix hit, hands the workers empty "
+                    "store/load lists and claims no pending work, so the engine "
+                    "serves from GPU KV alone - no engine restart. "
+                    "`pr56810.installed: false` means the divisibility fix is NOT "
+                    "fully live (see `pr56810.refused_methods`) and a hybrid "
+                    "geometry will still crash the store path. The tier can NEVER "
+                    "be armed unless the fix is fully installed and the geometry "
+                    "guard passes: an `arm` is refused, not applied, otherwise, "
+                    "and `pr56810.arm_block`/`disarm_reason` say why "
+                    "(distinguishing `geometry`, `no_manager` - nothing to arm in "
+                    "this process - and `incomplete_install`). Boot sequence: "
+                    "`GET /tier?op=status` (the verb installs the fix; expect "
+                    "installed:true, armed:false) -> `POST /tier "
+                    "{\"op\":\"arm\"}` (expect armed:true) -> only then traffic. "
+                    "Read the state from the engine in `snapshot` or the engine's "
+                    "`" + config.ROUTE_PREFIX + config.ROUTE_TIER + "` route.",
             "ops": ["status", "arm", "disarm"],
         },
         "development_facilities": {
@@ -841,7 +848,9 @@ async def route_guard_post(request: Request):
 @router.get(config.ROUTE_TIER)
 async def route_tier(request: Request):
     """KV-tier state: is the PR #56810 fix live, and is the tier armed? Token
-    required, because the same door disarms the connector."""
+    required, because the same door arms AND disarms the connector. With no `op`
+    this is `op=status`: it installs the fix against the live manager and reports
+    `armed: false` - arming is a separate, deliberate act (see the runbook)."""
     await _guard_dev_state_route(request)
     args = dict(query_arguments(request, config.ROUTE_TIER))
     args.setdefault("op", "status")
@@ -853,6 +862,13 @@ async def route_tier(request: Request):
 async def route_tier_post(request: Request):
     """`{op: status|arm|disarm}` - the tier's runtime kill switch.
 
+    THE TIER IS DISARMED AT BOOT BY DESIGN, so a fresh engine parks nothing until
+    someone arms it; `arm` is refused unless the PR #56810 fix is fully installed
+    and the geometry guard passes (the refusal names its kind: `geometry`,
+    `no_manager` or `incomplete_install`). The boot sequence is `status` (the
+    verb installs the fix; expect `installed: true`, `armed: false`), then `arm`
+    (expect `armed: true`), and only then traffic.
+
     `disarm` makes the connector a STRICT no-op through the manager methods the
     plugin wraps: it reports no prefix hit, hands the workers empty store/load
     lists, and claims no pending work, so the engine serves from GPU KV alone.
@@ -862,9 +878,14 @@ async def route_tier_post(request: Request):
     `tier.disarm_limits`: an in-flight copy already handed to the workers
     finishes, blocks already parked in host RAM stay parked (re-arm makes them
     reachable again), and the worker PROCESS is never contacted - its no-op is
-    delivered as empty metadata. Nothing here touches the backport itself: if
+    delivered as empty metadata. Two more limits, both in that same block:
+    the switch exists only once an install has fitted the wrappers (so the
+    boot-time disarmed state is an intent until the first verb contacts the
+    engine), and the connector's FINISH path reaches the store selector through a
+    method the switch does not gate - survivable only because arming requires the
+    patched selector. Nothing here touches the backport itself: if
     `tier.patched` is false, a hybrid geometry will still crash the store path
-    and disarming does not prevent that.
+    whenever the tier is allowed to schedule.
     """
     await _guard_dev_state_route(request)
     args = await body_arguments(request, config.ROUTE_TIER)
