@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvtier-dev-plugin"
+version = "0.1.0"
+description = "Development plugin for a live vLLM host-RAM KV-cache tier: loopback-or-allowlist scheduler-side diagnostics (token-gated off-box) and hot reload of a local policy module."
+readme = "README.md"
+requires-python = ">=3.10"
+# Deliberately empty. `fastapi`/`starlette` arrive with vllm, and pinning them
+# here would let a `pip install -e .` churn the serving venv's package set.
+# This plugin must be installable into a running vllm venv without changing any
+# other installed version - check with `pip check` and `pip list --outdated`
+# staying quiet after the install.
+dependencies = []
+
+[project.optional-dependencies]
+# Only for running tests/ on a machine without vllm installed.
+dev = ["pytest", "fastapi", "httpx"]
+
+[project.entry-points."vllm.general_plugins"]
+# Loaded in every process (EngineCore, workers, arg parsing) under "load all
+# unless VLLM_PLUGINS narrows it" posture. Gated on VLLM_E2_TIER_DEV, idempotent.
+kvtier_dev = "kvtier_dev_plugin.engine_side:register"
+
+[project.entry-points."vllm.endpoint_plugins"]
+# Loaded in the API server process only, and only when VLLM_PLUGINS explicitly
+# names it (vllm/plugins/__init__.py:load_endpoint_plugins).
+kvtier_dev = "kvtier_dev_plugin.endpoint:KVTierDevEndpointPlugin"
+
+[tool.setuptools]
+packages = ["kvtier_dev_plugin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [".venv", ".venv-install"]
+
+[tool.ruff.lint]
+# The fork's own posture (pyproject.toml [tool.ruff.lint]) plus the two rules
+# that matter most for code that must never raise into a scheduler.
+select = ["E", "F", "W", "I", "B", "SIM", "ARG", "RET", "RSE", "BLE", "S"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert; that is the point of them.
+"tests/*" = ["S101", "S104", "S105", "S107", "S108", "ARG", "B008", "RET504",
+             "SIM117"]
