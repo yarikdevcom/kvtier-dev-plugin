@@ -50,3 +50,13 @@ ignore = []
 # Tests assert; that is the point of them.
 "tests/*" = ["S101", "S104", "S105", "S107", "S108", "ARG", "B008", "RET504",
              "SIM117"]
+
+# Generated, machine-verified: each carries the fork's method text as ONE string
+# literal that must stay byte-exact (its SHA-256 IS the fingerprint the plugin
+# compares against), so the line length is not editable. S102 likewise: these
+# files exec the fork's own captured text to rebuild a class for tests.
+"tests/fixtures_pr56810.py" = ["E501", "S102"]
+"kvtier_dev_plugin/pr56810_sources.py" = ["E501"]
+# A build-time verifier whose assertions ARE its product: it refuses to write a
+# fixture that drifted from the fork.
+"tools/*" = ["S101", "S102"]

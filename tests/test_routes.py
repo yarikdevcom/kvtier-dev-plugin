@@ -27,7 +27,7 @@ import time
 
 import pytest
 
-from kvtier_dev_plugin import config
+from kvtier_dev_plugin import config, endpoint
 from kvtier_dev_plugin.endpoint import TOKEN_HEADER, KVTierDevEndpointPlugin
 
 fastapi = pytest.importorskip("fastapi")
@@ -39,6 +39,24 @@ from fastapi.testclient import TestClient  # noqa: E402
 STATUS = config.ROUTE_PREFIX + "/status"
 SNAPSHOT = config.ROUTE_PREFIX + "/snapshot"
 RELOAD = config.ROUTE_PREFIX + "/policy/reload"
+KVCONFIG = config.ROUTE_PREFIX + config.ROUTE_KVCONFIG
+BLOCK = config.ROUTE_PREFIX + config.ROUTE_BLOCK
+REQUEST = config.ROUTE_PREFIX + config.ROUTE_REQUEST
+TRACE = config.ROUTE_PREFIX + config.ROUTE_TRACE
+GUARD = config.ROUTE_PREFIX + config.ROUTE_GUARD
+TIER = config.ROUTE_PREFIX + config.ROUTE_TIER
+
+# (path, http method) for EVERY route this plugin serves. The guard tests are
+# parametrized over it, so a new route is automatically tested for the peer rule,
+# the inert rule and the token rule - and `test_PLUGIN_ROUTES_is_the_whole_surface`
+# fails if this list and the router ever disagree.
+PLUGIN_ROUTES = [(STATUS, "get")] + [
+    (config.ROUTE_PREFIX + route, verb)
+    for route in (config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG, config.ROUTE_BLOCK,
+                  config.ROUTE_REQUEST, config.ROUTE_TRACE, config.ROUTE_GUARD,
+                  config.ROUTE_TIER)
+    for verb in ("get", "post")
+] + [(RELOAD, "post")]
 
 
 class FakeEngineCoreClient:
@@ -192,15 +210,18 @@ def real_client(base_url, source=None):
 
 def test_routes_live_under_the_plugin_prefix_and_nowhere_else():
     app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
-    served = served_paths(app)
+    # served_paths() is per ROUTE (path + method), so a path registered for GET
+    # and POST appears twice; the mount points are what this test is about.
+    served = sorted(set(served_paths(app)))
     assert [path for path in served
             if path.startswith(config.ROUTE_PREFIX)] == sorted(
-        [STATUS, SNAPSHOT, RELOAD])
+        [config.ROUTE_PREFIX + route for route in config.ROUTES])
     # A plugin route must not shadow /v1: --api-key's coverage of /v1 is the
     # only reason that prefix is interesting to an attacker (security.md:349).
     assert [path for path in served if path.startswith("/v1")] == []
     # Nothing else was added either: only FastAPI's own documentation routes.
-    assert sorted(set(served) - {STATUS, SNAPSHOT, RELOAD}) == [
+    assert sorted(set(served) - {config.ROUTE_PREFIX + route
+                                 for route in config.ROUTES}) == [
         "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"]
     assert KVTierDevEndpointPlugin.name == config.PLUGIN_NAME
     assert KVTierDevEndpointPlugin.required_tasks is None
@@ -208,9 +229,58 @@ def test_routes_live_under_the_plugin_prefix_and_nowhere_else():
 
 def test_the_openapi_surface_matches_the_router():
     """The cheap operator proof (`curl .../openapi.json`) must show exactly the
-    three routes - that is what README.md tells you to check on the box."""
+    routes this plugin claims - that is what README.md tells you to check on the
+    box, and the claim comes from config.ROUTES so the two cannot drift."""
     app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
-    assert sorted(app.openapi()["paths"]) == sorted([STATUS, SNAPSHOT, RELOAD])
+    assert sorted(app.openapi()["paths"]) == sorted(
+        [config.ROUTE_PREFIX + route for route in config.ROUTES])
+
+
+def test_PLUGIN_ROUTES_is_the_whole_surface_and_cannot_rot():
+    """The guard tests are parametrized over PLUGIN_ROUTES, so that list must be
+    the router's surface exactly - a route added to the router and forgotten in
+    the list would be an UNTESTED route, which is the failure this pins."""
+    app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
+    registered = {(path, method)                       # openapi uses lower case
+                  for path, item in app.openapi()["paths"].items()
+                  for method in item}
+    assert set(PLUGIN_ROUTES) == registered
+    # And every one of them is under the prefix, never under /v1.
+    assert all(path.startswith(config.ROUTE_PREFIX) for path, _ in PLUGIN_ROUTES)
+
+
+def test_every_route_is_registered_for_the_methods_its_doc_promise_needs():
+    """GET where a browser should reach it, POST where a body is required."""
+    app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
+    methods = {}
+    for path, item in app.openapi()["paths"].items():
+        methods[path] = sorted(item)
+    prefix = config.ROUTE_PREFIX
+    assert methods[f"{prefix}{config.ROUTE_STATUS}"] == ["get"]
+    assert methods[f"{prefix}{config.ROUTE_RELOAD}"] == ["post"]
+    for route in (config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG,
+                  config.ROUTE_BLOCK, config.ROUTE_REQUEST):
+        assert methods[f"{prefix}{route}"] == ["get", "post"], route
+    for route in config.DEV_STATE_ROUTES:
+        assert methods[f"{prefix}{route}"] == ["get", "post"], route
+
+
+def test_the_guard_and_trace_verbs_advertise_themselves_as_development_facilities():
+    """The OpenAPI text is the endpoint's own description, and it is the place an
+    operator reads before arming something. Guard mode must be labelled there."""
+    app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
+    paths = app.openapi()["paths"]
+    guard = paths[f"{config.ROUTE_PREFIX}{config.ROUTE_GUARD}"]["post"]
+    assert "DEVELOPMENT ONLY" in guard["description"]
+    assert "BaseException" in guard["description"]
+    trace = paths[f"{config.ROUTE_PREFIX}{config.ROUTE_TRACE}"]["post"]
+    assert "arm" in trace["description"]
+    # The arity contract - one body, one dict argument, uniform engine arity -
+    # is documented where an operator reads it: the module docstring, which is
+    # also the file's own security notes.
+    doc = endpoint.__doc__ or ""
+    assert "ONE positional argument" in doc
+    assert "GUARD MODE IS A DEVELOPMENT FACILITY" in doc
 
 
 # --- loopback ---------------------------------------------------------------
@@ -288,12 +358,12 @@ def test_allowlisted_peer_may_read_with_the_token(enabled, monkeypatch):
     assert engine.calls == [(config.METHOD_SNAPSHOT, ())]
 
 
-@pytest.mark.parametrize("path,method", [(STATUS, "get"), (SNAPSHOT, "get"),
-                                         (RELOAD, "post")])
+@pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
 def test_allowlisted_peer_without_a_token_is_403_everywhere(
         enabled, monkeypatch, method, path):
-    """The new rule: off-box reads carry the token too. Nothing is served, and
-    the engine is never touched."""
+    """The rule for off-box traffic: the token is required, reads included, and
+    the routes that can change dev state require it even from loopback (which
+    this peer is not). Nothing is served and the engine is never touched."""
     monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
     engine = FakeEngineCoreClient()
@@ -513,8 +583,7 @@ def test_inert_still_answers_503_to_an_allowlisted_token_holder(
     assert config.ENV_ENABLE in response.json()["detail"]
 
 
-@pytest.mark.parametrize("path,method", [(STATUS, "get"), (SNAPSHOT, "get"),
-                                         (RELOAD, "post")])
+@pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
 def test_a_disallowed_peer_learns_nothing_even_when_inert(
         monkeypatch, method, path):
     """The peer check runs BEFORE the 503, so an inert plugin is not a way to
@@ -598,8 +667,7 @@ def test_real_socket_forwarded_for_does_not_help_a_real_remote_peer(
 
 # --- inert by default -------------------------------------------------------
 
-@pytest.mark.parametrize("path,method", [(STATUS, "get"), (SNAPSHOT, "get"),
-                                         (RELOAD, "post")])
+@pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
 def test_inert_answers_503_even_on_loopback(method, path, monkeypatch):
     monkeypatch.setenv(config.ENV_TOKEN, "tk")     # token does not unlock it
     response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))

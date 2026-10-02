@@ -32,6 +32,24 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
 
 There is deliberately NO env var that selects the policy file. The reloadable
 policy is `kvtier_dev_plugin/policy.py` next to this file, and nothing else.
+
+THE WORKER DIAGNOSTICS FAMILY (all optional; see `worker_diag.py`'s docstring for
+the file contract the proxy host's reader expects):
+
+  VLLM_E2_TIER_DIAG              where one JSON file per rank is written, on the
+                                 ENGINE's host. UNSET = nothing is wrapped and no
+                                 file is ever created, which is the default.
+  VLLM_E2_TIER_DIAG_EPOCH        the boot id shared by every writer. Set it once
+                                 per boot if you want the reader's cross-rank
+                                 verdicts; unset, each process stamps its own id
+                                 and says `writer.epoch_scope: "process"`.
+  VLLM_E2_TIER_DIAG_INTERVAL     write cadence in steps (default 50, clamped).
+  VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS
+                                 the rate floor under it (default 1.0 s), so a
+                                 changing signature cannot make this a per-step
+                                 writer.
+  VLLM_E2_TIER_DIAG_RANK         pin the rank id (`PP<n>_TP<m>`) instead of
+                                 deriving it from the process's distributed state.
 """
 
 from __future__ import annotations
@@ -46,6 +64,30 @@ ENV_TOKEN = "VLLM_E2_TIER_DEV_TOKEN"  # noqa: S105 - a variable NAME, not a secr
 ENV_TIMEOUT = "VLLM_E2_TIER_DEV_TIMEOUT"
 ENV_ALLOW = "VLLM_E2_TIER_DEV_ALLOW"  # empty/unset = loopback only
 
+# --- the worker-side diagnostics writer (`worker_diag.py`) ------------------
+# The directory one JSON file per rank is written into, on the ENGINE's host. The
+# proxy host has a reader for the same layout (`llm-api/kv_tier_diagnostics.py`);
+# the operator ships the files over, or points both sides at a shared path.
+# UNSET = the writer installs nothing and creates no files anywhere, which is the
+# default even when every other part of the plugin is live.
+ENV_DIAG_DIR = "VLLM_E2_TIER_DIAG"
+# The boot id shared by every writer. The reader compares epochs across writers
+# and declares an equality conclusion `meaningless` when they disagree, and a
+# worker process CANNOT learn the EngineCore's boot id (the handshake flows one
+# way: worker -> EngineCore). Set this once per boot in the launcher's
+# environment so all ranks agree; unset, each process stamps its own id and the
+# file says `writer.epoch_scope = "process"`.
+ENV_DIAG_EPOCH = "VLLM_E2_TIER_DIAG_EPOCH"
+# Write cadence: at most once every N steps or on a change of facts, and never
+# more than once per MIN seconds. See `worker_diag`'s BUDGET section.
+ENV_DIAG_INTERVAL = "VLLM_E2_TIER_DIAG_INTERVAL"
+ENV_DIAG_MIN_INTERVAL = "VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS"
+# Pin the rank id (`PP<n>_TP<m>`) instead of deriving it from the process's
+# distributed state. Optional; a value in the wrong shape is refused loudly
+# rather than written, because the reader classifies a file whose `rank` does not
+# match its file name as mislabeled.
+ENV_DIAG_RANK = "VLLM_E2_TIER_DIAG_RANK"
+
 logger = logging.getLogger("kvtier_dev_plugin.config")
 
 # Engine-side method names. `EngineCore` dispatches a UTILITY message with
@@ -54,10 +96,42 @@ logger = logging.getLogger("kvtier_dev_plugin.config")
 # name collision protection we have; `grep -rn kvtier vllm/` finds nothing.
 METHOD_SNAPSHOT = "kvtier_dev_snapshot"
 METHOD_RELOAD_POLICY = "kvtier_dev_reload_policy"
+METHOD_KVCONFIG = "kvtier_dev_kvconfig"
+METHOD_INSPECT = "kvtier_dev_inspect"
+METHOD_TRACE = "kvtier_dev_trace"
+METHOD_GUARD = "kvtier_dev_guard"
+METHOD_TIER = "kvtier_dev_tier"
+
+# Every engine method this plugin owns, in attach order. `attach_methods` walks
+# this, so a new verb cannot be attached in one place and forgotten elsewhere.
+METHODS = (METHOD_SNAPSHOT, METHOD_RELOAD_POLICY, METHOD_KVCONFIG, METHOD_INSPECT,
+           METHOD_TRACE, METHOD_GUARD, METHOD_TIER)
 
 # All HTTP surface lives here, never under /v1 (see docs/usage/security.md:349:
 # `--api-key` only protects the /v1, /v2, /inference, /cohere prefixes).
 ROUTE_PREFIX = "/plugins/kvtier"
+
+# Route names, for status and the tests. The verbs that CAN change dev state
+# (`/guard`, `/trace`) require the token in every shape, loopback included.
+ROUTE_STATUS = "/status"
+ROUTE_SNAPSHOT = "/snapshot"
+ROUTE_RELOAD = "/policy/reload"
+ROUTE_KVCONFIG = "/kvconfig"
+ROUTE_BLOCK = "/block"
+ROUTE_REQUEST = "/request"
+ROUTE_TRACE = "/trace"
+ROUTE_GUARD = "/guard"
+ROUTE_TIER = "/tier"
+
+# The same routes as one tuple, in the order a reader wants them, so `status`
+# and the tests enumerate the surface from ONE place. Suffixes: the router
+# carries ROUTE_PREFIX itself.
+ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUEST,
+          ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_RELOAD)
+
+# The routes that can change engine dev state. Token in every shape, loopback
+# included - see endpoint.require_dev_state_token.
+DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER)
 
 # Name used for logs, for `VLLM_PLUGINS` allowlisting and as the entry-point
 # name in both groups. One name allowlists both halves at once.
@@ -66,6 +140,15 @@ PLUGIN_NAME = "kvtier_dev"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MIN_TIMEOUT_SECONDS = 0.05
 MAX_TIMEOUT_SECONDS = 60.0
+
+DEFAULT_DIAG_INTERVAL_STEPS = 50
+MIN_DIAG_INTERVAL_STEPS = 1
+MAX_DIAG_INTERVAL_STEPS = 100_000
+DEFAULT_DIAG_MIN_INTERVAL_SECONDS = 1.0
+MIN_DIAG_MIN_INTERVAL_SECONDS = 0.0
+MAX_DIAG_MIN_INTERVAL_SECONDS = 3600.0
+MAX_DIAG_EPOCH_CHARS = 32
+MAX_DIAG_RANK_CHARS = 32
 
 _PKG_DIR = Path(__file__).resolve().parent
 _FALSY = frozenset({"", "0", "false", "off", "no"})
@@ -150,6 +233,81 @@ def timeout_seconds() -> float:
 def package_dir() -> Path:
     """The directory this plugin was imported from (resolved, symlinks gone)."""
     return _PKG_DIR
+
+
+def diagnostics_dir() -> Path | None:
+    """Where the per-rank worker files go. None = the writer must not run.
+
+    Read per write, not at import, so turning it on is an env change in the
+    engine's environment (which means a restart) and turning it off takes effect
+    on the next write without one.
+    """
+    raw = os.environ.get(ENV_DIAG_DIR, "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    return Path(raw)
+
+
+def diagnostics_epoch() -> tuple[str, str]:
+    """(epoch, scope). `scope` is "env" or "process", and it ships in the file.
+
+    A per-process epoch is honest but incomparable: the reader would (correctly)
+    refuse to compare facts across ranks. An operator who wants the cross-rank
+    verdicts sets VLLM_E2_TIER_DIAG_EPOCH once per boot, and every writer uses it
+    verbatim (bounded, whitespace-stripped, control characters refused).
+    """
+    raw = os.environ.get(ENV_DIAG_EPOCH, "").strip()
+    if raw and len(raw) <= MAX_DIAG_EPOCH_CHARS and not any(
+            ord(char) < 32 for char in raw):
+        return raw, "env"
+    return snapshot_epoch(), "process"
+
+
+def snapshot_epoch() -> str:
+    """The plugin's per-process epoch. Imported lazily: `snapshot` is the read
+    side and this module must stay importable on its own."""
+    from . import snapshot  # noqa: PLC0415 - config is imported by snapshot
+    return snapshot.epoch()
+
+
+def worker_write_interval_steps() -> int:
+    """The step cadence, clamped. Garbage falls back to the default."""
+    raw = os.environ.get(ENV_DIAG_INTERVAL, "").strip()
+    if not raw:
+        return DEFAULT_DIAG_INTERVAL_STEPS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DIAG_INTERVAL_STEPS
+    return max(MIN_DIAG_INTERVAL_STEPS, min(MAX_DIAG_INTERVAL_STEPS, value))
+
+
+def worker_min_interval_seconds() -> float:
+    """The rate floor, clamped - the same policy as the interval above.
+
+    Out of range is CLAMPED (a negative floor means "no floor", which is a legal
+    choice; an absurd one becomes the cap), while unparseable falls back to the
+    default. A typo must not silently remove a budget.
+    """
+    raw = os.environ.get(ENV_DIAG_MIN_INTERVAL, "").strip()
+    if not raw:
+        return DEFAULT_DIAG_MIN_INTERVAL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_DIAG_MIN_INTERVAL_SECONDS
+    if value != value:                      # NaN: not comparable, so not usable
+        return DEFAULT_DIAG_MIN_INTERVAL_SECONDS
+    return max(MIN_DIAG_MIN_INTERVAL_SECONDS,
+               min(MAX_DIAG_MIN_INTERVAL_SECONDS, value))
+
+
+def diagnostics_rank() -> str | None:
+    """An operator-pinned rank id, or None. Shape is validated by the writer."""
+    raw = os.environ.get(ENV_DIAG_RANK, "").strip()
+    if not raw or len(raw) > MAX_DIAG_RANK_CHARS:
+        return None
+    return raw
 
 
 def canonical_policy_path() -> Path:

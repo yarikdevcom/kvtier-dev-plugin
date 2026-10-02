@@ -13,6 +13,7 @@ pins that.
 
 from __future__ import annotations
 
+import inspect
 import sys
 import types
 
@@ -191,7 +192,10 @@ def test_attach_refuses_to_clobber_a_foreign_attribute():
     report = engine_side.attach_methods(Engine)
     assert Engine.kvtier_dev_snapshot == "not a function we installed"
     assert report["skipped"] == [config.METHOD_SNAPSHOT]
-    assert report["attached"] == [config.METHOD_RELOAD_POLICY]
+    # Everything else still lands: one hostile name does not cost the whole
+    # surface. Listed from config.METHODS so a new verb cannot slip past here.
+    assert report["attached"] == [name for name in config.METHODS
+                                  if name != config.METHOD_SNAPSHOT]
 
 
 def test_attach_is_idempotent_and_reports_a_replacement():
@@ -199,14 +203,43 @@ def test_attach_is_idempotent_and_reports_a_replacement():
         pass
 
     first = engine_side.attach_methods(Engine)
-    assert sorted(first["attached"]) == sorted(
-        [config.METHOD_SNAPSHOT, config.METHOD_RELOAD_POLICY])
+    assert sorted(first["attached"]) == sorted(config.METHODS)
     second = engine_side.attach_methods(Engine)
     assert second["attached"] == []
-    assert sorted(second["replaced"]) == sorted(
-        [config.METHOD_SNAPSHOT, config.METHOD_RELOAD_POLICY])
+    assert sorted(second["replaced"]) == sorted(config.METHODS)
     assert getattr(Engine.kvtier_dev_snapshot,
                    engine_side.OWNER_ATTR) == engine_side.OWNER_TAG
+
+
+def test_every_installed_method_takes_exactly_one_optional_argument():
+    """The arity contract the HTTP layer depends on, for EVERY verb.
+
+    `_convert_msgspec_args` asserts `len(args) <= len(parameters)`
+    (vllm/v1/engine/core.py:1731-1744), so a verb that accepted only `self` would
+    turn a JSON body into an AssertionError inside the engine loop. Uniform
+    `(self, args=None)` is also what lets one HTTP body map onto one engine call
+    for every verb, and what keeps a NO-argument call (what every GET sends)
+    working exactly as it always did.
+    """
+    class Engine:
+        pass
+
+    engine_side.attach_methods(Engine)
+    engine = Engine()
+    engine.scheduler = None
+    for name in config.METHODS:
+        function = getattr(Engine, name)
+        own = list(inspect.signature(function).parameters)
+        assert own == ["self", "args"], (name, own)
+        for parameter in inspect.signature(function).parameters.values():
+            if parameter.name != "self":
+                assert parameter.default is not inspect.Parameter.empty, name
+                assert parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        # Both dispatch shapes the fork can produce must be answerable.
+        answer = getattr(engine, name)()
+        assert isinstance(answer, dict), name
+        answer = getattr(engine, name)({})
+        assert isinstance(answer, dict), name
 
 
 def test_installed_methods_are_bound_engine_methods_with_no_arguments():

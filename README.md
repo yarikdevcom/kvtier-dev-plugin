@@ -1,9 +1,11 @@
-# kvtier-dev-plugin
+# kvtier_dev_plugin
 
 A development window onto a **live** vLLM engine's host-RAM KV-cache tier
 (`SimpleCPUOffloadConnector`): read scheduler-side offload state over HTTP while
-the engine serves traffic, and hot-reload your own policy module without
-restarting the engine.
+the engine serves traffic, ask about one block or one request, trace the steps
+around a decision, hot-reload your own policy module without restarting the
+engine, and - in development only - keep the engine up while a tier bug is still
+in it.
 
 Out-of-tree. No file in the vLLM tree is edited, nothing is written to the GPU
 box, and the engine-side code path never imports `torch`.
@@ -12,7 +14,16 @@ box, and the engine-side code path never imports `torch`.
 HTTP (loopback + allowlist)                 EngineCore loop thread (the one that runs step_fn)
 GET  /plugins/kvtier/status        local  -> no engine call, answers while the engine is wedged
 GET  /plugins/kvtier/snapshot  -- utility -> kvtier_dev_snapshot      (pure reads, contained)
+GET  /plugins/kvtier/kvconfig  -- utility -> kvtier_dev_kvconfig      (geometry + divisibility)
+GET  /plugins/kvtier/block?…   -- utility -> kvtier_dev_inspect       (one block, one group)
+GET  /plugins/kvtier/request?… -- utility -> kvtier_dev_inspect       (one request, per group)
+POST /plugins/kvtier/trace     -- utility -> kvtier_dev_trace         (arm/disarm/read the ring)
+POST /plugins/kvtier/guard     -- utility -> kvtier_dev_guard         (DEV ONLY: catch + decline)
+GET|POST /plugins/kvtier/tier  -- utility -> kvtier_dev_tier          (kill switch + PR #56810 status)
 POST /plugins/kvtier/policy/reload -- util-> kvtier_dev_reload_policy (re-reads policy.py)
+
+Worker process (per rank)        no utility channel exists, so a worker reports by file:
+VLLM_E2_TIER_DIAG=…              -> rank-PP<n>_TP<m>.json, read by the proxy host
 ```
 
 One hop per request: `engine_client.engine_core.call_utility_async(name)`
@@ -27,13 +38,21 @@ so these routes answer between requests.
 | File | Role |
 |------|------|
 | `kvtier_dev_plugin/config.py` | the env vars, the route prefix, the utility method names, and the policy-path validator |
-| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the two engine methods |
-| `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary. Stdlib only |
+| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the six engine methods, wires the logger and the worker-writer retry |
+| `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary, and the `guard`/`trace`/`worker_diag` sections of the snapshot. Stdlib only |
+| `kvtier_dev_plugin/kvconfig.py` | `kvconfig`: the KV-cache geometry and the divisibility verdict the tier's first store depends on |
+| `kvtier_dev_plugin/kvinspect.py` | `inspect`: one block, or one request, per group, with every id list capped |
+| `kvtier_dev_plugin/trace_ring.py` | the bounded event ring and the `trace` verb (arming installs the observers, disarming removes them) |
+| `kvtier_dev_plugin/step_trace.py` | the two scheduler-step observers the ring reads from. Pure observers, no catching |
+| `kvtier_dev_plugin/guard_mode.py` | **development only**: the tier exception capture-and-decline, its captures, and the `guard` verb |
+| `kvtier_dev_plugin/worker_diag.py` | the worker-side per-rank JSON writer (files are how a worker reports; it has no utility channel) |
 | `kvtier_dev_plugin/policy_holder.py` | late-bound holder for the policy module; trial-load + swap, rollback on failure |
 | `kvtier_dev_plugin/policy.py` | **the file you edit.** `decide(view)` observes, `decide_store(ctx)` vetoes |
 | `kvtier_dev_plugin/store_hook.py` | the runtime patch on the tier's store-decision path: idempotent, non-clobbering, fail-open |
-| `kvtier_dev_plugin/endpoint.py` | `vllm.endpoint_plugins` entry: the router, the guards, the 504 |
-| `tests/` | CPU-only pytest; runs without vllm and without an engine |
+| `kvtier_dev_plugin/backport.py` | the runtime backport of upstream PR #56810 (hybrid-geometry fix) plus the tier's runtime kill switch. Stdlib only |
+| `kvtier_dev_plugin/pr56810_sources.py` | the patched function bodies, byte-exact, with the SHA-256 of the source each one replaces. Generated |
+| `kvtier_dev_plugin/endpoint.py` | `vllm.endpoint_plugins` entry: the router, the guards, the argument specs, the 504 |
+| `tests/` | CPU-only pytest; runs without vllm and without an engine (`fakes_debug.py` holds the shared fake engine structures) |
 
 ## Install
 
@@ -58,9 +77,18 @@ Nothing activates yet - see the switches below.
 |---------|---------|
 | `VLLM_PLUGINS` | vLLM's own allowlist. **Endpoint plugins never load unless named here.** One name (`kvtier_dev`) covers both halves. |
 | `VLLM_E2_TIER_DEV` | this plugin's switch. Unset/`0`/`false`/`off`/`no` = inert: no engine methods attached, HTTP answers 503. |
-| `VLLM_E2_TIER_DEV_TOKEN` | required for the only mutating verb, **and for every read from a non-loopback peer**. Unset = reload refused (403) and no non-loopback read is served. Loopback reads do not need it. |
+| `VLLM_E2_TIER_DEV_TOKEN` | required for the mutating verbs (`policy/reload`, and every shape of `trace` and `guard`), **and for every read from a non-loopback peer**. Unset = those requests refused (403) and no non-loopback read is served. Loopback reads do not need it - except `trace`/`guard`, which are token-gated as a whole because they can change engine dev state. |
 | `VLLM_E2_TIER_DEV_ALLOW` | extra peers beyond loopback: a comma-separated list of addresses or CIDRs. **Unset/empty = loopback only** (the pre-allowlist behaviour). A malformed entry is logged and skipped - never fatal, never an opening. See *Access model*. |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | seconds the HTTP layer waits for the engine before answering 504. Default `5.0`, clamped to `[0.05, 60]`. |
+| `VLLM_E2_TIER_DIAG` | the worker diagnostics directory (capability 5). **Unset = the worker writer is completely inert: no directory created, no file written, nothing wrapped in the worker.** Set it to a path both the worker ranks and the proxy host's reader can see. |
+| `VLLM_E2_TIER_DIAG_INTERVAL` | how often a rank rewrites its file, in engine steps. Default `50`, clamped to `[1, 100000]`. A step that *changed* something writes immediately (subject to the floor below). |
+| `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
+| `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
+| `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
+
+There is deliberately **no env var for guard mode**. It can mask real bugs, so it
+is off at every boot and reachable only through `POST /plugins/kvtier/guard` with
+the token - see *Guard mode*.
 
 `VLLM_PLUGINS` parses as a comma-separated list; `VLLM_PLUGINS=""` is `[""]`
 and matches nothing (it is not "unset").
@@ -84,6 +112,9 @@ Environment=VLLM_PLUGINS=kvtier_dev
 Environment=VLLM_E2_TIER_DEV=1
 Environment=VLLM_E2_TIER_DEV_TOKEN=put-a-real-token-here
 Environment=VLLM_E2_TIER_DEV_TIMEOUT=5
+# Worker diagnostics: leave this out and the worker writer never runs at all.
+Environment=VLLM_E2_TIER_DIAG=/tmp/kv-tier-diagnostics
+Environment=VLLM_E2_TIER_DIAG_INTERVAL=50
 # Only if you need to reach it from other machines (see *Access model*):
 Environment=VLLM_E2_TIER_DEV_ALLOW=192.168.2.64,192.168.2.120
 ```
@@ -121,7 +152,9 @@ from kvtier_dev_plugin.endpoint import KVTierDevEndpointPlugin
 app = FastAPI(); p = KVTierDevEndpointPlugin(); p.attach_router(app)
 print(sorted(r.path for r in app.routes if 'kvtier' in getattr(r, 'path', '')))
 "
-# ['/plugins/kvtier/policy/reload', '/plugins/kvtier/snapshot', '/plugins/kvtier/status']
+# ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+#  '/plugins/kvtier/policy/reload', '/plugins/kvtier/request',
+#  '/plugins/kvtier/snapshot', '/plugins/kvtier/status', '/plugins/kvtier/trace']
 ```
 
 Against the **running** server, the equivalent that does not depend on the
@@ -131,7 +164,9 @@ FastAPI route-tree shape (newer FastAPI nests included routers behind an
 ```bash
 curl -s http://127.0.0.1:8000/openapi.json | python3 -c \
   'import json,sys; print(sorted(p for p in json.load(sys.stdin)["paths"] if "kvtier" in p))'
-# ['/plugins/kvtier/policy/reload', '/plugins/kvtier/snapshot', '/plugins/kvtier/status']
+# ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+#  '/plugins/kvtier/policy/reload', '/plugins/kvtier/request',
+#  '/plugins/kvtier/snapshot', '/plugins/kvtier/status', '/plugins/kvtier/trace']
 ```
 
 and confirm nothing under `/v1` came from us: `GET /v1/models` must behave
@@ -142,16 +177,51 @@ nests them behind an `_IncludedRouter`, so prefer the openapi check there.)
 
 ## Using it
 
+The whole surface, all under `/plugins/kvtier`:
+
+| Route | Methods | Token | What it does |
+|-------|---------|-------|--------------|
+| `/status` | GET | off-box only | local facts; makes **no** engine call, so it answers while the engine is wedged |
+| `/snapshot` | GET, POST | off-box only | the scheduler-side tier view (pools, counters, policy, `store_hook`, `guard`, `trace`) |
+| `/kvconfig` | GET, POST | off-box only | the KV-cache geometry: per-group block sizes, spec classes, prefix-cacheability, and every group's divisibility verdict |
+| `/block` | GET, POST | off-box only | one GPU block by id (and group), plus the tier's CPU slot of the same id |
+| `/request` | GET, POST | off-box only | one request by id: its blocks per group and what the tier could park |
+| `/trace` | GET, POST | **always** | the bounded event ring: read it, or arm / disarm / clear it |
+| `/guard` | GET, POST | **always** | guard mode: state, captured faults, arm, disarm |
+| `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
+
+**Arguments.** GET takes them as query parameters, POST as a JSON object body, and
+both are validated against the SAME per-route table (`endpoint.ARG_SPECS`), so a
+bound cannot be evaded by changing the method. An unrecognised key is a `400` that
+never reaches the engine - including a stray `?cachebuster=1` on `/snapshot`. A
+validated body is forwarded to the engine as ONE dict argument
+(`call_utility_async(method, args)` -> `getattr(self, name)(*args)`,
+`vllm/v1/engine/core.py:1669-1671`); a call with no arguments still sends none, so
+nothing that worked before arguments changed. Which engine method a request reaches
+is fixed by the route and can never come from the body.
+
 ```bash
 TOK='put-a-real-token-here'
 B=http://127.0.0.1:8000/plugins/kvtier
 
 curl -s $B/snapshot | python3 -m json.tool | head -60
+curl -s $B/kvconfig | python3 -m json.tool
+curl -s "$B/block?block_id=412&group=5" | python3 -m json.tool
+curl -s "$B/request?request_id=cmpl-a" | python3 -m json.tool
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"request_id":"cmpl-a","ids_cap":200}' \
+     $B/request | python3 -m json.tool
+
+# the ring: arm it, work, read it, disarm it (nothing is wrapped while disarmed)
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"arm","depth":256}' $B/trace
+curl -s -H "x-kvtier-dev-token: $TOK" "$B/trace?limit=40" | python3 -m json.tool
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"disarm"}' $B/trace
+
+# the one mutating verb of the old surface
 curl -s -X POST -H "x-kvtier-dev-token: $TOK" $B/policy/reload | python3 -m json.tool
 ```
 
-From an allowlisted machine the same three calls work with the token on all of
-them (`status` and `snapshot` need it off-box, loopback does not):
+From an allowlisted machine the same calls work with the token on all of them
+(`status` and `snapshot` need it off-box, loopback does not):
 
 ```bash
 # on the engine's own machine, nothing to configure:
@@ -165,14 +235,25 @@ curl -s -H "x-kvtier-dev-token: $TOK" $B/snapshot | python3 -m json.tool
 
 `status` is the place to check what you actually opened: `allow_networks` is the
 parsed list (an entry that failed to parse is simply absent from it), and
-`loopback_only` answers "is this still closed to the LAN?".
+`loopback_only` answers "is this still closed to the LAN?". It also answers
+"is this engine in a development mode?": `guard_mode` and `trace_armed` at the top
+level, the same facts again in `dev_state` with their `source`, `epoch` and
+`age_seconds`, and `worker_diagnostics` with the directory the worker writer was
+told to use. Because `/status` never calls the engine, `guard_mode` is `null` until
+this API process has seen an engine answer that says otherwise - it is never a
+guessed `false`.
 
 `snapshot` returns the CPU pool totals/free, GPU pool totals/free,
 `pending_stores`, the ten in-flight/queue lengths, the load/store event counters,
 the eight `BoundaryStoreStats` decline reasons, scheduler lengths, the plugin's
 per-boot `epoch` (proof that two snapshots came from the same boot), the policy's
-own verdict plus `decide_us` and `build_us`, and the `store_hook` patch report
-(below) that says whether the runtime veto is actually live.
+own verdict plus `decide_us` and `build_us`, the `store_hook` patch report (below)
+that says whether the runtime veto is actually live, the `cpu_capacity` clamp
+report, and the development sections - `guard_mode` (a top-level copy of the answer,
+because a guarded engine must never be mistaken for a production one), `guard` (its
+bounded previews), `trace` (the ring's counters and the step observer's), and
+`worker_diag` (what this process knows about the per-rank file writer, with
+`worker_scope` saying that the truth lives in the files).
 
 The edit loop:
 
@@ -190,6 +271,212 @@ costs one `compile()` of a small file (tens of microseconds, reported as
 
 `decide()` is the *observing* hook and runs once per snapshot. The steering hook,
 `decide_store(ctx)`, runs once per candidate block - see the next section.
+
+## Reading the geometry before the first store (`kvconfig.py`)
+
+One line of the fork decides whether the tier can store at all:
+
+```python
+assert block_size % hash_block_size == 0     # vllm/v1/core/kv_cache_utils.py:2888
+```
+
+and the tier reaches it through
+`resolve_block_hashes(request.block_hashes, hash_block_size, group_block_size)`
+(`vllm/v1/simple_kv_offload/manager.py`) on the **first store for that group** -
+long after boot, far from the cause. `GET /plugins/kvtier/kvconfig` answers it as
+data, per group, before anything is stored:
+
+* `geometry.num_blocks`, `num_groups`, `kv_cache_layout`, and one entry per group:
+  `block_size`, `spec_class`, `page_size_bytes`, `prefix_cacheable`,
+  `is_circular_buffer`, `layer_count`/`layer_names` (capped, with
+  `layer_names_dropped`), the group's `role`/`host_resident`/`enable_kv_transfer`,
+  and the spec's own attributes (`spec`), reported only when the object carries
+  them - so a Mamba group does not grow a wall of nulls and the ring group reports
+  what makes it a ring.
+* `geometry.groups[i].divisibility`: `divisible`, `remainder`, `scale_factor`,
+  `would_fail`, plus the `rule` text. An operand that is missing or not an int
+  gives `None` and a `reason`, never a misleading `true`: **"unknown" and "safe"
+  must not look the same.**
+* `geometry.divisibility_summary`: `groups_failing`, `groups_unknown`,
+  `all_divisible`, `any_fail` - the yes/no an operator actually wants.
+* `geometry.transfer_group_ids` / `prefix_cacheable_group_ids` /
+  `scratch_group_ids`: the classification the tier needs (group index 4/5 in the
+  live layout is the QSA raw-key ring - `CircularBufferSpec`, one block per
+  request, `prefix_cacheable=False`, and recognised by CLASS NAME through the MRO
+  because `isinstance` would need the import this plugin must not do).
+* `tier_crosscheck`: the SAME geometry from the tier manager's side
+  (`group_block_sizes`, `hash_block_size`, `fa_block_size`, `fa_gidx`), the
+  per-group `agree` verdict, `disagreements`, and each group's divisibility
+  recomputed against the TIER's operands. A spec whose `block_size` disagrees with
+  the manager that allocates for it is reported as `manager_block_size_mismatch`
+  - that one is a corruption, not a crash.
+* `scheduler.managers`: `coordinator.single_type_managers` keyed by each manager's
+  own `kv_cache_group_id` (with its position), because the tier's `group_block_sizes`
+  and this list are positional and a silent misalignment would make every number
+  above a lie.
+
+It takes no arguments, reads only, and is bounded (`MAX_GROUPS = 64`, 32 layer
+names per group); what it dropped is always counted rather than hidden.
+
+## Asking about one block or one request (`kvinspect.py`)
+
+A snapshot gives counters. These two questions are about one object:
+
+```bash
+curl -s "$B/block?block_id=412&group=5"      # ref_cnt, in_free_queue, prev/next free
+                                             # ids, the decoded block hash
+                                             # (hex + the group packed in its last
+                                             # 4 bytes, kv_cache_utils.py:86-92),
+                                             # in_cached_map via the same O(1)
+                                             # lookup the tier uses (manager.py:940),
+                                             # the group's geometry, and the tier's
+                                             # CPU slot of the same id
+curl -s "$B/request?request_id=cmpl-a"       # the request's counters, then per group:
+                                             # block_ids (capped), divisibility,
+                                             # hash_scale_factor, coverable_blocks
+                                             # and the tier's own readiness terms
+```
+
+`ids_cap` bounds every id list (default 64, max 1024) and each list says how many
+it dropped. A block id outside the pool, a group index that does not exist, a
+request that has already finished: each answers with a `reason` that names the
+range or the ids that DO exist.
+
+`coverable_blocks` and `tier_view.ready_blocks` are the fork's arithmetic, not an
+invention (`manager.py:820-831`):
+
+```
+confirmed = num_computed_tokens - num_output_placeholders
+alignment = hash_block_size if enable_partial_hash_hits else block_size
+aligned   = confirmed // alignment * alignment
+ready     = min(len(group_gpu_block_ids), aligned // group_block_size)
+```
+
+plus one extra cap the fork's scheduler cannot see from inside: the number of
+block hashes it can actually view at that group's size (`block_hashes //
+(block_size // hash_block_size)`). The answer names `binding_term`, i.e. which of
+those limits bound it - and a group whose division fails reports
+`coverable_blocks: 0`, because the fork would assert before storing anything.
+
+## The trace ring (`trace_ring.py` + `step_trace.py`)
+
+An opt-in ring of scheduler/tier events, for the ten seconds around a decision you
+cannot reproduce.
+
+* **Disarmed it costs nothing**, and not because a branch is cheap: nothing is
+  wrapped at all. `record()` returns on one test and there is no ring to write
+  into; arming is what installs the observers, disarming removes them.
+* **Armed, it is preallocated and fixed.** `arm(depth)` builds `depth` slots once
+  (`512` default, clamped to `[16, 4096]`) and each record is a seven-field tuple
+  `(seq, mono_ns, kind, group, n1, n2, text)` written at a cursor. No append, no
+  growth, no lock, and `overwritten` counts what the wrap ate.
+* **Reads are bounded.** `read(limit, after_seq)` walks backwards from the cursor
+  (cost O(returned), never O(depth)), newest last, `limit` capped at 512. An
+  incremental poller that fell behind gets `gap_records` instead of an illusion of
+  contiguous history; `clear()` empties the ring but never the sequence, so a
+  reader's cursor stays valid across a clear.
+* **What lands in it:** `sched:step` (step number, scheduled tokens,
+  running/waiting/requests) and `sched:output` from the two wrapped scheduler
+  methods; `step:build_meta`, `step:store_specs`, `tier:load_offer`,
+  `tier:load_accepted`, `tier:finish`, `tier:completion_report` and `tier:reset`
+  from the tier's entry points; and `exception` for any guard capture. Each record
+  is one dict of the seven slot fields plus its `age_ms`.
+* The observers are pure: they call the fork's method first and return its value
+  untouched, they catch nothing on the serving path, and a record that cannot be
+  built is counted as a fallback. Installing and arming are separate decisions - an
+  installed observer records nothing while the ring is disarmed.
+
+`/trace` and `/guard` require the token in every shape, loopback included: a route
+that can change engine dev state is token-gated as a whole, not per field.
+
+## Guard mode: develop against a live engine without an outage (`guard_mode.py`)
+
+> **DEVELOPMENT ONLY. Disarm it before any production boot.** Armed, a tier
+> exception becomes a record plus a safe decline, which is exactly how you keep a
+> live engine up while debugging - and also how a real bug gets masked: a declined
+> store is silent, and a decline can leave tier state half-advanced. It has **no
+> env var** (it is off at every boot), it is armed only by a tokened `POST
+> /plugins/kvtier/guard`, and its state is echoed as `guard_mode` by `status` and
+> by every verb payload.
+
+```bash
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"armed":true}'  $B/guard
+curl -s -H      "x-kvtier-dev-token: $TOK"        "$B/guard" | python3 -m json.tool
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"captures","limit":2}' $B/guard
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"armed":false}' $B/guard   # restore
+```
+
+Armed, the tier's entry points return the fork's own "nothing happened" value
+instead of faulting - never an invented one:
+
+| Method | Declined with | Source |
+|--------|---------------|--------|
+| `get_num_new_matched_tokens` | `(0, False)` | `manager.py:320` returns the same shape when it finds nothing |
+| `update_state_after_alloc` | `None` | the method's normal fall-through |
+| `build_connector_meta` | a fresh empty `SimpleCPUOffloadMetadata` (resolved from the original's own `__globals__`; if the fork renamed it there is **no** decline and the exception continues) | `metadata.py:16-38` |
+| `prepare_store_specs` | `([], [], [], None)`, fresh lists per call | nothing to park this step |
+| `request_finished`, `request_finished_all_groups` | `(False, None)` | `manager.py:1152` returns exactly this anyway |
+| `take_events` | `()` | no events |
+| `reset` | `False` ("the cache was not reset") | `base.py:748-760` documents `bool` |
+| `update_connector_output` | **no decline: capture and re-raise** | a fake value here would corrupt state the scheduler trusts |
+
+What a capture holds: the method, the exception type and a clipped message, a
+bounded traceback, the arguments as data (a `Request` as its id and counters, a
+`KVCacheBlocks` as per-group id heads), and the tier's own `manager_context` -
+including `geometry.groups_failing_divisibility`, i.e. the arithmetic of the fork's
+assert at the instant it failed. Captures live in a `deque(maxlen=8)` (overflow
+counted, full text only via the `captures` op); the per-poll `snapshot` carries
+bounded previews instead.
+
+Two properties are absolute: `except Exception`, **never** `except BaseException`
+(a `KeyboardInterrupt`, `SystemExit` or `asyncio.CancelledError` inside a tier call
+is the engine's signal and always continues), and disarming restores the fork's own
+functions by identity. If the trace ring is armed, disarming guard mode leaves the
+wrappers in place - tracing still needs them, and traces capture-and-re-raise.
+
+A wrapper installed by **this package's own** other module (today: the PR #56810
+backport, which wraps `get_num_new_matched_tokens` and `build_connector_meta` too)
+is composed with rather than refused: the guard goes on top of it, the install
+report names those methods under `nested`, and uninstalling hands the sibling's
+wrapper back exactly. Refusing it would have left the two most fault-prone entry
+points unguarded while `arm` still reported "exceptions are captured and declined" -
+a payload worse than a refusal, because it is confidently wrong. Anything owned by
+anyone else is still refused outright, marker or no marker.
+
+## Worker-side diagnostics (`worker_diag.py`)
+
+A worker has no request path: `general_plugins` loads in the worker process, a
+worker never imports `vllm.v1.engine.core`, and the UTILITY channel is
+EngineCore-only. So a worker reports through a **file**: one per rank, into
+`VLLM_E2_TIER_DIAG`, named `rank-PP<n>_TP<m>.json` for the proxy host's reader
+(`kv_tier_diagnostics.py`) to pick up.
+
+* **Inert by default.** With `VLLM_E2_TIER_DIAG` unset nothing is created, nothing
+  is wrapped, and `install()` says the env var is unset. `engine_side.register()`
+  normally runs before the connector imports its worker module, so it registers
+  `worker_diag.ensure_installed` with the capacity handshake, which fires once this
+  rank really has an offload handler.
+* **Budgeted.** A write happens when either the step cadence
+  (`VLLM_E2_TIER_DIAG_INTERVAL`, default 50) or a change in the handler's signature
+  says so - and never more often than `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS`
+  (default 1 s). The first step always writes: "no file" must not be
+  indistinguishable from "the tier is not running on this rank".
+* **Atomic.** A temp file in the same directory, then `os.replace`; a document over
+  32 KiB is trimmed (prose first, then the optional group list) and if it still does
+  not fit the write is refused and counted. Nothing is ever truncated in place.
+* **The fork's return values are untouched.** `bind_connector_metadata` counts the
+  blocks this rank was handed; `get_finished` writes after the fork's own work, and
+  both wrappers are contained, so a full disk cannot fail a step.
+* **The schema is the reader's contract**: `version` 1, a per-boot `epoch`, `ts`,
+  `role: "worker"`, `rank` matching the file name (the reader calls a mismatch
+  `malformed`), `arena.bytes_total`/`bytes_used`/`num_blocks` (plus
+  `block_bytes_by_group` = `len(layer_names) * page_size_bytes` per group),
+  `counters`, and `writer` prose that states where each number came from.
+  `arena.bytes_used` is a **proven floor** (blocks in flight x bytes per block), not
+  the pool's occupancy, and says so; `counters.dropped_cpu_full` and
+  `counters.boundary_stored` are deliberately absent because they are scheduler-side
+  (`BoundaryStoreStats`) - the reader notes an absent counter and adds zero, which
+  keeps the aggregate honest instead of inventing a reading.
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
@@ -396,6 +683,129 @@ field to page on), `cpu_blocks_withheld`, `pool_free_after`,
 `entries_without_capacity`, `original_call_error`, and `live_cpu_pool` read off
 the manager that is actually running.
 
+## Making the tier bootable at all: the PR #56810 backport (`backport.py`)
+
+The tier cannot be enabled on our model without this fix, so it is installed on
+the way through every verb, not behind a switch.
+
+Upstream issue #56396 / PR #56810 (merged 2026-09-20, NOT in the `v0.30.0` tag
+this fork is on). `SimpleCPUOffloadScheduler` assumed every KV cache group's
+block size is a multiple of the hash block size. Core only validates that over
+the PREFIX-CACHEABLE groups (`kv_cache_utils.py:768-781`), so a hybrid model
+dies in the store path:
+
+```
+manager.py:842 _select_eager_blocks_to_store -> resolve_block_hashes(hashes, 3200, 8)
+kv_cache_utils.py:2888:  assert block_size % hash_block_size == 0
+```
+
+Our model is five `block_size=3200` groups plus the QSA raw-key ring, a
+`CircularBufferSpec` of block size **8**. The ring's size is computed
+(`qsa_cache.py:900-901`: `compress_ratio * cdiv(compress_ratio +
+num_speculative_tokens, compress_ratio)` = `4 * cdiv(8, 4) = 8`), so it is not a
+knob we can turn. It reaches the assert because the loop's only filter was
+`has_positionally_stable_blocks`, which `CircularBufferManager` inherits as True
+(unlike `MambaManager`).
+
+**`--prefix-match-unit 4` or `8` is a dead end, and must not be re-proposed.**
+It would make the sizes divisible by lowering `hash_block_size`, but (1) a
+ring block is positionally UNSTABLE - a circular buffer reuses slots - so
+hashing it in 8-token units creates prefix-cache entries that can hit against
+stale ring content; the group is `prefix_cacheable=False` because its content
+must never be matched, and the assert is telling us something true; and (2) it
+multiplies prefix hashing by ~400x (every 8 tokens instead of every 3200, per
+group, per step) for entries that can never be hit.
+
+Four methods change, all inside `SimpleCPUOffloadScheduler`: record
+`prefix_cacheable_group_ids`; iterate `prefix_cacheable_groups` when estimating
+the lazy target; give a non-cacheable group `cpu_hit_blocks.append([])`; and
+`continue` past a non-cacheable group in the store selector, placed BEFORE the
+`len(gpu_block_ids) >= num_free` break so a scratch group can never consume CPU
+blocks or emit `BlockStored`.
+
+### Two guards, because a wrong patch here corrupts output silently
+
+**Source fingerprints.** For each method the plugin stores the SHA-256 of
+`inspect.getsource()` at fork HEAD `10b8e07`. At install time a mismatch means
+the function moved: that method is REFUSED (reported per-method as
+`patched: false` with the reason), never patched "close enough". Three methods
+are replaced by a byte-identical copy of upstream's body exec'd in the
+ORIGINAL function's `__globals__` (a wrapper cannot inject a `continue` into a
+loop it cannot see); `__init__` is WRAPPED because its change is purely
+additive and provably identical to setting the attribute after the original
+returns.
+
+**The geometry guard.** `manager.py:456-458` silently skips any group with no
+parked blocks, so a *blanket* "skip whatever trips the assert" policy is an
+output-corruption machine: drop a genuinely cacheable group and its KV is
+simply missing on resume, with no error. `geometry_guard()` recomputes the set
+the patch would skip from the live `KVCacheConfig` and REFUSES to install if any
+of those groups reports `prefix_cacheable=True`, naming the group. If the patch
+is already live on a class and a LATER config fails the guard, the tier is
+auto-disarmed rather than left running (`auto_disarmed: true`).
+
+### The kill switch (runtime, no restart)
+
+```
+curl -s -X POST localhost:8000/plugins/kvtier/tier -H "authorization: Bearer $TOK" \
+     -d '{"op": "disarm"}'          # or "arm", or "status"
+```
+
+Disarmed, the connector is a strict no-op: `get_num_new_matched_tokens` ->
+`(0, False)`, `build_connector_meta` -> an empty `SimpleCPUOffloadMetadata`,
+`has_pending_stores` -> `False`. The worker lives in another process the HTTP
+call never reaches, so its no-op is delivered as DATA (empty store/load lists,
+which `worker.py:266,289` copy) rather than as a second patch. A tier that can
+only be turned off by a 4-minute reboot is not safe to have on.
+
+`snapshot.pr56810.disarm_limits` states what it cannot undo: an in-flight copy
+already handed to workers finishes, blocks already parked in host RAM stay
+parked (re-arming makes them reachable again), and the worker process is never
+contacted. `patched: false` and `armed: false` are different states - the
+former means a hybrid geometry will still crash the store path.
+
+### Coexisting with the plugin's other two patches
+
+Three modules patch engine classes at runtime. They never touch the same
+attribute, and each carries its own marker tag, so an overlap is detectable
+rather than silent:
+
+| Module | Class it patches | Members it owns | Marker tag |
+|---|---|---|---|
+| `cpu_capacity.py` | the connector BASE class | `get_handshake_metadata` (worker side), `set_xfer_handshake_metadata_pp_aware` (scheduler side); separately marks a block POOL (`POOL_MARKER`) and a manager INSTANCE (`MANAGER_MARKER`) | `kvtier-dev-plugin/capacity-1` |
+| `store_hook.py` | `SimpleCPUOffloadScheduler` | `_classify_store_candidate` | `kvtier-dev-plugin/store-1` |
+| `backport.py` | `SimpleCPUOffloadScheduler` | `__init__`, `_estimate_lazy_target_blocks`, `update_state_after_alloc`, `_select_eager_blocks_to_store`; plus the kill-switch wrappers `get_num_new_matched_tokens`, `build_connector_meta`, `has_pending_stores` | `kvtier-dev-plugin/backport-1` and `.../switch-1` |
+
+**There is no overlap to resolve, and that is a property worth keeping.** The
+three tag constants are deliberately distinct strings, and every member name is
+owned by exactly one module. Each installer refuses to clobber a member carrying
+a DIFFERENT tag (naming the owner in the refusal), so if a future change ever
+picks a name another module already holds, the result is a logged refusal and a
+`skipped:` entry - never a silently unwrapped patch. Do not merge the tags.
+
+Two notes a future editor needs:
+
+* `backport` uses TWO tags on purpose: `backport-1` for the fingerprint-guarded
+  bug fix and `switch-1` for the kill-switch wrappers, which have no fingerprint
+  (they only add a gated early-return around the engine's own function and can
+  never mispatch a moved body). Keeping them apart is what lets `status` say
+  "fix refused, switch live" - the state you want during a fingerprint drift.
+* `store_hook`'s veto and `backport`'s selector compose by dispatch, not by
+  order: the replaced `_select_eager_blocks_to_store` calls
+  `self._classify_store_candidate(...)`, which resolves through the instance at
+  call time, so it reaches store_hook's wrapper whichever of the two landed
+  first. Do not "optimise" that into a direct call.
+* Install ORDER in `register()` is `cpu_capacity.install()` ->
+  `store_hook.install()` -> `backport.install()`, and the verbs call the three
+  `ensure_installed`/`adopt_if_missed` helpers in the same sequence. It is not
+  load-bearing today (no shared members); it is what keeps the log readable and
+  the capacity handshake settled before anything schedules a store.
+
+Three different "offs", which are easy to confuse: `store_hook`'s policy veto is
+a per-block SKIP inside a live tier; `guard_mode` turns an exception into a
+decline (development only, masks bugs); the kill switch stops the connector
+scheduling ANY store or load. Only the last one is a kill switch.
+
 ## Access model
 
 Read `docs/usage/security.md:349` first: `--api-key` only covers `/v1`, `/v2`,
@@ -502,24 +912,34 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
 
 * Inert: with `VLLM_E2_TIER_DEV` unset, `register()` returns before importing
   anything and every route answers 503 (after the peer check, so a peer that is
-  not loopback and not allowlisted learns nothing).
+  not loopback and not allowlisted learns nothing). With `VLLM_E2_TIER_DIAG`
+  unset the worker writer never wraps, never creates a directory and never writes.
 * Contained: every engine-side body is wrapped in `try/except Exception` in this
   fork's idiom (`vllm/v1/core/sched/e2_alloc_log.py:143,151,201`, capped
   `_error()` at `:92`): failures are counted, the first 20 are logged, the log
-  writer has its own `except Exception`. `BaseException` is never swallowed.
+  writer has its own `except Exception`. `BaseException` is never swallowed -
+  which is also why guard mode declines `Exception`s and lets a `KeyboardInterrupt`,
+  `SystemExit` or `CancelledError` through to the engine.
 * No engine-side timeout exists (`future.result()` at `core_client.py:971`), so
   the HTTP layer bounds the call with `asyncio.wait_for` and answers **504**.
   Cancelling that await is safe: when the engine eventually answers,
   `_process_utility_output` pops the future and swallows the resulting
   `InvalidStateError` (`core_client.py:847-865`).
-* No writes, no `reset_cache`, no mutation of the tier. The only side effect in
-  the whole plugin is swapping the policy module reference.
+* No writes, no `reset_cache`, no mutation of the tier. The side effects are,
+  exhaustively: swapping the policy module reference; the store-policy and capacity
+  wrappers; a trace ring and its two scheduler wrappers while ARMED (removed on
+  disarm); the guard wrappers while armed or traced (restored by identity on
+  disarm); and the worker's diagnostics file when `VLLM_E2_TIER_DIAG` names a
+  directory. Every one of those is opt-in, and the two that change engine behaviour
+  (`guard`, tracing) say so in every payload.
 * The worker's *compute* path is never referenced
   (`simple_kv_offload/worker.py:293-294` records on the live compute stream);
   `tests/test_snapshot.py` asserts the read side never names it and pulls in no
-  heavy import. What the plugin does read on the worker side is one plain int,
-  `worker_handler.num_cpu_blocks`, exactly once, inside the init-time handshake
-  (`cpu_capacity.py`) - never on a per-step path.
+  heavy import, and the import check now walks **every** file in the package so a
+  new verb module cannot smuggle in `torch`. What the worker side is asked for is
+  one plain int inside the init-time handshake (`cpu_capacity.py`) and, when the
+  diagnostics directory is configured, the plain fields `worker_diag.build_document`
+  reads. Neither touches a CUDA API or a stream.
 
 ## Uninstall / rollback
 
@@ -554,22 +974,39 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-328 tests, no engine and no vllm required. They cover: loopback accept/reject
-(including a spoofed `X-Forwarded-For` from a real remote peer), the allowlist
-(bare address, CIDR, IPv6, the `::ffff:` unwrap, unset = loopback-only, malformed
-entries that neither raise nor admit, cache invalidation when the env shrinks),
-the token on off-box reads *and* its continued absence for loopback reads, the
-guard order (peer -> enabled -> token), the `status` payload's new
-`allow_networks` / `loopback_only` / `non_loopback_peers_require_token` fields,
-the token check and its fail-closed case, path rejection for the reload verb,
-holder-based reload actually changing behaviour (same-size/same-mtime edit),
-rollback with the traceback as data, containment (a raising policy and a raising
-engine both come back as data, `BaseException` propagates), the 504/502/503
-answers, and that the mount point is exactly the three `/plugins/kvtier/*`
-paths. Three of them (`test_real_socket_*`) drive a real uvicorn listener over a
-real TCP connection - one from loopback with no token, two from a source-bound
-non-loopback client socket on this host's own LAN address (skipped on a box with
-no such address).
+709 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+count in this README is a snapshot - trust `pytest --collect-only`). They cover:
+loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
+peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
+loopback-only, malformed entries that neither raise nor admit, cache invalidation
+when the env shrinks), the token on off-box reads *and* its continued absence for
+loopback reads, the token requirement on `trace`/`guard` in **every** shape, the
+guard order (peer -> enabled -> token), the `status` payload's `allow_networks` /
+`loopback_only` / `non_loopback_peers_require_token` fields and its `guard_mode` /
+`dev_state` / `worker_diagnostics` fields (including `guard_mode` being `null` -
+not `false` - until an engine has actually said something), path rejection for the
+reload verb, holder-based reload actually changing behaviour (same-size/same-mtime
+edit), rollback with the traceback as data, containment (a raising policy and a
+raising engine both come back as data, `BaseException` propagates), the 504/502/503
+answers, that every installed engine method takes exactly one optional argument and
+answers under both dispatch shapes, and that the mount point is exactly the eight
+`/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
+cannot go unlisted, with the openapi surface checked against it too). Three of them
+(`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
+one from loopback with no token, two from a source-bound non-loopback client socket
+on this host's own LAN address (skipped on a box with no such address).
+
+The debugger verbs add six files:
+
+| File | Tests | What it pins down |
+|------|-------|-------------------|
+| `tests/test_kvconfig.py` | 40 | the divisibility table against the fork's assert (`kv_cache_utils.py:2888`), a Mamba group's different `hash_block_size`, the QSA ring recognised by class name, `prefix_cacheable` never inferred from `host_rotation`, the geometry-vs-manager disagreement, every cap honouring `dropped` counts, a missing operand reported as `unknown` and never as safe |
+| `tests/test_kvinspect.py` | 41 | block/request inspection against a production-shaped fake: the packed block-hash decode, `in_cached_map` via the tier's own dict, `coverable_blocks` and `binding_term` recomputed by hand, the `ids_cap`/drop reporting, every "does not exist" answer naming what does |
+| `tests/test_trace_ring.py` | 36 | the ring's fixed capacity and wrap accounting, `read` never walking O(depth), the `gap_records` a slow poller gets, `clear` not resetting `seq`, arming installing and disarming removing the observers, a disarmed ring costing no allocation and no wrap, the step observer returning the fork's value untouched |
+| `tests/test_guard_mode.py` | 46 | every declined method returning the fork's documented no-op shape (and the one method that must re-raise), `BaseException` never swallowed, the metadata rebuild falling back to a re-raise if the fork renames its class, captures bounded with the full text only via the `captures` op, `guard_mode: true` in every payload, disarm restoring the originals by identity, tracing keeping the wrappers alive after a disarm |
+| `tests/test_worker_diag.py` | 43 | the file schema against the reader's contract (`version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters`), the rank name matching the file name, an unknown rank meaning no file at all, the cadence and the time floor, "a change writes now", the empty pool still writing zeros, atomic replace and the no-truncate rule, the size cap trimming prose before data, a full disk failing a step never, `bytes_used` as a proven floor |
+| `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
+| `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
 
 The store-policy hook (`tests/test_store_hook.py`, 55 of them) runs against a
 stub built by `exec`ing a source string into a real module object, so the
@@ -629,10 +1066,33 @@ copy of either method. The fork's own tier suite is unaffected: `84 passed`
 
 ## Known limits
 
+* **Guard mode is a development facility.** Armed, it turns a tier exception into a
+  record plus a decline, so a real bug can hide behind a decline that looks like
+  normal "nothing to do" - and `build_connector_meta`'s substitute is an *empty*
+  metadata, which means the worker does nothing that step. It is off at every boot,
+  needs the token, echoes `guard_mode: true` everywhere, and must be disarmed before
+  a production boot. The same reasoning covers tracing: the ring is bounded and the
+  observers are pure, but they are wrappers on the scheduler loop.
+* `/status` mirrors `guard_mode` and `trace_armed`; it does not know them. They come
+  from the last engine answer this API process saw and are `null` before the first
+  one, so a `/status` right after an API restart says *unknown*, not *off* - and
+  `status.dev_state.note` says exactly that, naming the boot default as a default
+  rather than presenting it as an observation.
+* Worker diagnostics are **self-reported per rank**. The numbers come from the
+  worker's own plain fields (`num_cpu_blocks`, the `SimpleCPUBlockPool` totals,
+  `cpu_to_gpu`/`gpu_to_cpu` lengths): the arena is never walked and no CUDA API is
+  called, so `arena.bytes_used` is a proven floor from blocks in flight rather than
+  the pool's occupancy, and `dropped_cpu_full`/`boundary_stored` are absent because
+  they are scheduler-side counters. A file proves a worker *reached* a state; it is
+  not a measurement of the arena.
+* The worker writer resolves the connector class through the capacity handshake, so a
+  rank that never reaches `register_kv_connector` (no KV connector role, or a
+  connector overriding both handshake methods) simply never writes a file - reported
+  as `install: {class: null, skip_reason: ...}`, never as a silent gap.
 * `snapshot` reads the **scheduler process** view (one EngineCore per TP2xPP2
-  layout). Per-rank arenas arrive only as the handshake number each worker
-  reports (`cpu_capacity.per_rank`); nothing else on the worker side is read,
-  and no per-step worker path is touched.
+  layout). Per-rank arenas arrive only as the handshake number each worker reports
+  (`cpu_capacity.per_rank`) and, when `VLLM_E2_TIER_DIAG` is set, as that rank's own
+  file; no per-step worker path is touched.
 * The clamp wraps the connector **base** class, so a connector that overrides a
   handshake method shadows that half of it: `MultiConnector` overrides both
   (`multi_connector.py:482`, `:503`) and `NixlConnector` the consumer

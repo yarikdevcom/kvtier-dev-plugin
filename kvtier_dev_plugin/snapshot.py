@@ -329,6 +329,68 @@ def cpu_capacity_section(engine) -> dict:
         return cpu_capacity.empty_section(f"{type(exc).__name__}: {exc}")
 
 
+def backport_section(engine) -> dict:
+    """The PR #56810 backport: is the ring-group fix live, and is the tier armed?
+
+    Two questions in one section because they are read together. (1) Is the
+    upstream divisibility fix actually installed - all four methods, or did a
+    fingerprint refuse one? (2) Is the tier armed, i.e. is the connector allowed
+    to schedule any store or load at all? `armed` is the kill-switch state and it
+    belongs in the SAME section as the patch it governs: "patched and disarmed"
+    and "not patched" look similar in a payload and mean very different things
+    (one serves from GPU KV alone, the other crashes on a hybrid geometry).
+
+    Function-level import because `backport` imports THIS module.
+    """
+    from . import backport  # noqa: PLC0415 - cycle, see store_hook_section
+    manager = None
+    try:
+        manager = backport.manager_of(engine)
+    except Exception as exc:  # noqa: BLE001 - a manager we cannot reach is data
+        _error(exc, "backport manager")
+    try:
+        return backport.section(manager)
+    except Exception as exc:  # noqa: BLE001 - the shape must survive regardless
+        _error(exc, "backport section")
+        return backport.empty_section(f"{type(exc).__name__}: {exc}")
+
+
+def dev_state_sections() -> dict:
+    """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer.
+
+    These are the three pieces of the plugin that CHANGE what the engine does, so
+    every snapshot publishes them. Guard mode in particular must be impossible to
+    miss: `snapshot_for_engine` also copies it to the top level as `guard_mode`,
+    because a guarded dev engine mistaken for a production one is the single
+    worst way this plugin could hurt.
+
+    Function-level imports again: `guard_mode` records into `trace_ring` and
+    `kvconfig` reads `guard_mode`, so a module-level import here would be a cycle.
+    """
+    from . import guard_mode, step_trace, trace_ring, worker_diag  # noqa: PLC0415
+    out: dict = {}
+    try:
+        out["guard"] = guard_mode.section()
+        out["guard_mode"] = guard_mode.is_armed()
+    except Exception as exc:  # noqa: BLE001 - a missing section is data, not a 500
+        _error(exc, "guard section")
+        out["guard"] = {"guard_mode": None, "error": f"{type(exc).__name__}"[:200]}
+        out["guard_mode"] = None
+    try:
+        counters = trace_ring.counters()
+        counters["step_observers"] = step_trace.counters()
+        out["trace"] = counters
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "trace section")
+        out["trace"] = {"error": f"{type(exc).__name__}"[:200]}
+    try:
+        out["worker_diag"] = worker_diag.section()
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "worker diag section")
+        out["worker_diag"] = {"error": f"{type(exc).__name__}"[:200]}
+    return out
+
+
 def snapshot_for_engine(engine, holder) -> dict:
     """THE engine-side handler body. Never raises an Exception; reads only."""
     _state["calls"] += 1
@@ -338,18 +400,33 @@ def snapshot_for_engine(engine, holder) -> dict:
         view["policy"] = policy_section(view, holder)
         view["store_hook"] = store_hook_section(engine)
         view["cpu_capacity"] = cpu_capacity_section(engine)
+        view["pr56810"] = backport_section(engine)
+        view.update(dev_state_sections())
+        # `dev_state_sections()` already put `guard_mode` at the top level: the
+        # field a reader must never have to dig for. `guard` is the detail.
         view["build_us"] = int((time.perf_counter() - started) * 1e6)
         view["self"] = error_counters()
         return json_safe(view)
     except Exception as exc:  # noqa: BLE001 - never into the scheduler
         _error(exc, "snapshot")
-        # Hand-built from formatted strings only: this path cannot raise.
+        # Hand-built from formatted strings only: this path cannot raise. The
+        # guard question is still the first thing a reader wants, even here.
         return {"version": PROTOCOL_VERSION,
                 "epoch": str(epoch()),
                 "error": f"{type(exc).__name__}: {exc}"[:300],
+                "guard_mode": _guard_mode_quietly(),
                 "counters": {"calls": int(_state["calls"]),
                              "errors": int(_state["errors"]),
                              "logged": int(_state["logged"])}}
+
+
+def _guard_mode_quietly():
+    """guard_mode.is_armed() that cannot fail inside the containment path."""
+    try:
+        from . import guard_mode  # noqa: PLC0415 - cycle, see dev_state_sections
+        return guard_mode.is_armed()
+    except Exception:  # noqa: BLE001, S112 - the last resort stays silent
+        return None
 
 
 def reload_policy_on_engine(holder) -> dict:

@@ -263,6 +263,33 @@ def _rank_capacity(connector) -> int | None:
     return _non_negative_int(getattr(handler, "num_cpu_blocks", None))
 
 
+# An optional zero/one-argument hook, called once per rank right after that rank
+# reported its capacity. WHY IT IS HERE: it is the first moment in a WORKER
+# process at which the offload connector - and therefore its worker handler and
+# the module that class lives in - is guaranteed to exist, which is exactly what
+# `worker_diag.install()` needs and what `engine_side.register()` (which runs
+# earlier) cannot know. It stays a generic callback so this module keeps knowing
+# nothing about who listens; `engine_side` wires `worker_diag` to it.
+_worker_report_hook = None
+
+
+def set_worker_report_hook(hook) -> None:
+    """Install (or clear with None) the after-a-rank-reports hook. Contained."""
+    global _worker_report_hook
+    _worker_report_hook = hook
+
+
+def _call_worker_report_hook(connector) -> None:
+    hook = _worker_report_hook
+    if hook is None:
+        return
+    try:
+        hook(connector)
+    except Exception as exc:  # noqa: BLE001 - a listener never breaks a handshake
+        _state["worker_fallbacks"] += 1
+        snapshot._error(exc, "worker report hook")
+
+
 def _carrier(payload, capacity: int):
     """Attach the capacity to whatever the connector returned. Never mutates it.
 
@@ -302,6 +329,7 @@ def _make_worker_wrapper(original):
                 # say nothing at all and let the fork's payload through untouched.
                 return payload
             _state["worker_reports"] += 1
+            _call_worker_report_hook(self)
             return _carrier(payload, capacity)
         except Exception as exc:  # noqa: BLE001 - but see the re-raise below
             # Count it, then re-raise: without this plugin the original's own

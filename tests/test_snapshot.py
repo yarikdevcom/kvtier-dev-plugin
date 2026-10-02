@@ -144,15 +144,15 @@ class HostileLogger(QuietLogger):
 HEAVY = {"torch", "vllm", "cuda", "numpy", "triton", "numba", "cupy", "psutil"}
 
 
-@pytest.mark.parametrize("module_file", [
-    "snapshot.py", "policy.py", "policy_holder.py", "config.py",
-    "engine_side.py", "endpoint.py", "store_hook.py", "cpu_capacity.py",
-])
+@pytest.mark.parametrize("module_file", sorted(p.name for p in PKG.glob("*.py")))
 def test_no_heavy_imports_in_the_read_side(module_file):
     """Requirement: the engine-side path never pulls torch/CUDA/vllm in.
 
-    Checked by AST over every import in the file, so it cannot be satisfied by
-    an import that only runs conditionally.
+    Checked by AST over every import in the file, so it cannot be satisfied by an
+    import that only runs conditionally. The file list is the PACKAGE DIRECTORY,
+    not a hand-written list: a new verb module is covered by this the moment it
+    exists, which is the only way a forgotten `import torch` in a module added
+    next month gets caught.
     """
     tree = ast.parse((PKG / module_file).read_text(encoding="utf-8"))
     pulled = set()
