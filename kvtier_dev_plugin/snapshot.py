@@ -307,6 +307,28 @@ def store_hook_section(engine) -> dict:
                 "reason": f"report failed: {type(exc).__name__}"[:200]}
 
 
+def cpu_capacity_section(engine) -> dict:
+    """Whether the CPU block-id ceiling is clamped to what every rank can hold.
+
+    The one section of the view that reports a SAFETY property rather than a
+    measurement: `installed` / `reason` (and why not), the per-rank arena sizes
+    the handshake carried, the chosen cap, whether the clamp was applied, whether
+    the tier is in fail-safe zero mode, and how many allocations the cap has
+    refused. Function-level import because `cpu_capacity` imports THIS module.
+    """
+    from . import cpu_capacity  # noqa: PLC0415 - see above
+    manager = None
+    try:
+        manager = cpu_capacity.manager_of(engine)
+    except Exception as exc:  # noqa: BLE001 - a manager we cannot reach is data
+        _error(exc, "cpu capacity manager")
+    try:
+        return cpu_capacity.section(manager)
+    except Exception as exc:  # noqa: BLE001 - the shape must survive regardless
+        _error(exc, "cpu capacity section")
+        return cpu_capacity.empty_section(f"{type(exc).__name__}: {exc}")
+
+
 def snapshot_for_engine(engine, holder) -> dict:
     """THE engine-side handler body. Never raises an Exception; reads only."""
     _state["calls"] += 1
@@ -315,6 +337,7 @@ def snapshot_for_engine(engine, holder) -> dict:
         view = build_view(engine)
         view["policy"] = policy_section(view, holder)
         view["store_hook"] = store_hook_section(engine)
+        view["cpu_capacity"] = cpu_capacity_section(engine)
         view["build_us"] = int((time.perf_counter() - started) * 1e6)
         view["self"] = error_counters()
         return json_safe(view)

@@ -322,6 +322,80 @@ nothing), `decide_store_present`, `calls`, `policy_calls`, `vetoes`,
 say where a veto is charged: `veto_member` and
 `veto_charged_to_engine_counter`.
 
+## Making the tier safe to enable: the CPU arena capacity clamp (`cpu_capacity.py`)
+
+The defect this exists to close (measured on the live TP2xPP2 layout,
+`VLLM_PP_LAYER_PARTITION=25,23` + MTP on the last stage):
+
+* the scheduler sizes its CPU block-id space from ONE aggregate view
+  (`manager.py:270-272`, `manager.py:167`), while
+* every worker sizes its OWN pinned arena from its OWN stage's bytes/block
+  (`worker.py:162`). Here that is 11,468,800 B on PP0 vs 12,902,400 B on PP1, so
+  at `--kv-offloading-size 8` the scheduler emits ids up to **187** while the
+  last rank's arena holds **166** (always ~13%), and
+* `cuda_mem_ops.py:243-249` computes `src_bases[:, None] + ids[None, :] *
+  bpb[:, None]` with **no bounds check**: an out-of-range id is a write past the
+  end of that rank's pinned host arena.
+
+Dropping an out-of-range copy in the worker is not a fix: a dropped *store* is a
+lost park, but a dropped *load* is the model attending to garbage KV, because the
+scheduler already counted those tokens as computed. So the requirement is that
+the scheduler **never emits** an out-of-range id.
+
+The mechanism is the fork's own PP-aware handshake, which runs inside
+`EngineCore.__init__` (`core.py:288-302`) after KV-cache registration and before
+any traffic: `collective_rpc("get_kv_connector_handshake_metadata")`
+(`abstract.py:214-217`, `gpu_worker.py:868-895`) collects one dict per worker,
+they are merged into `content: dict[(pp_rank, tp_rank), metadata]`, and handed to
+`kv_connector.set_xfer_handshake_metadata_pp_aware(content)`
+(`base.py:716-731`). Three wrappers, installed by the existing
+`vllm.general_plugins` entry point:
+
+| side | wrapped | what it does |
+|------|---------|--------------|
+| worker | `KVConnectorBase_V1.get_handshake_metadata` (`base.py:447-456`) | calls the original, then attaches this rank's `worker_handler.num_cpu_blocks`. A `None` payload becomes a bare carrier; a `dict` payload becomes a **copy** plus our key; anything else is wrapped under a second key and unwrapped again on the scheduler side, so a connector with a typed payload still receives the original object. |
+| scheduler | `KVConnectorBase_V1.set_xfer_handshake_metadata_pp_aware` (`base.py:716`) | calls the original **first**, with exactly the payload the fork would have received without the plugin (our in-band keys stripped, carriers contributing no entry at all - `base.py:725` raises on a `pp_rank > 0` entry this connector does not support, so an naive carrier would be a boot crash, not a clamp), then reads every reported capacity and clamps. |
+| clamp | the manager's CPU `BlockPool` | one-time surgery at handshake time. |
+
+**The clamp is surgery, not a hot-path check.** Ids `>= cap` are withdrawn from
+the CPU pool's free structure once (`FreeKVCacheBlockQueue.remove` is O(1) per
+node, and the LRU order of the ids that stay is untouched), and they are evicted
+from the prefix-cache map first so no hash entry can name a block that can no
+longer be allocated. `get_num_free_blocks()` (`block_pool.py:861`) and
+`get_new_blocks()` (`block_pool.py:664`) then agree with the cap *by
+construction*, every existing tier counter stays honest, and the per-step code
+path costs nothing. The mirrors follow: `manager.num_cpu_blocks`
+(`manager.py:167`), the pool's own `num_gpu_blocks` (`block_pool.py:173`, which
+`get_usage()` and `reset_prefix_cache()` do arithmetic on) and the manager's CPU
+`kv_cache_config.num_blocks` (`manager.py:164`, a `replace()`-derived copy -
+never the engine's own GPU config). The pool's `blocks` list keeps its full
+length on purpose, so `pool.blocks[bid]` for an id the fork already emitted
+cannot become an `IndexError`. A tiny **instance-level** wrapper (never
+class-level - the same `BlockPool` class backs the GPU pool) counts the
+allocations the fork's own guard refuses; it decides nothing.
+
+**Unknown means park nothing.** If no rank reports, a rank reports 0, a rank
+reports without a capacity, or the payload is not keyed by `(pp_rank, tp_rank)`,
+the cap is 0: the CPU pool keeps only its null block. Every tier allocation site
+tests free space *before* allocating (`manager.py:698-701` eager,
+`manager.py:586/600` lazy, `manager.py:829/834` the positional scan), so zero
+free CPU blocks is a silent no-op step, never an exception, and the engine boots
+and serves. Uncapped is never the fallback. As a backstop, the snapshot and
+reload verbs call `adopt_if_missed()`: the handshake runs in `__init__` while a
+utility handler can only run from the busy loop, so if the handshake never
+delivered a ceiling by the first snapshot, the ceiling is invented at 0 and
+reported as `adopted_by_snapshot`.
+
+The whole answer is one object in the snapshot, `cpu_capacity`: `installed` and
+`reason`, `per_rank` / `per_rank_list` (the arena sizes each rank reported,
+keyed `"pp_rank,tp_rank"` because a tuple is not a msgpack key), `chosen_cap`,
+`cap_source`, `clamp_applied`, `zero_mode` + `zero_reason`,
+`adopted_by_snapshot`, `clamp_failed_open` (we could NOT prove a ceiling - the
+field to page on), `cpu_blocks_withheld`, `pool_free_after`,
+`manager_num_cpu_blocks_before/after`, `allocations_refused_by_cap`,
+`entries_without_capacity`, `original_call_error`, and `live_cpu_pool` read off
+the manager that is actually running.
+
 ## Access model
 
 Read `docs/usage/security.md:349` first: `--api-key` only covers `/v1`, `/v2`,
@@ -440,10 +514,12 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
   `InvalidStateError` (`core_client.py:847-865`).
 * No writes, no `reset_cache`, no mutation of the tier. The only side effect in
   the whole plugin is swapping the policy module reference.
-* The worker side is never referenced
+* The worker's *compute* path is never referenced
   (`simple_kv_offload/worker.py:293-294` records on the live compute stream);
   `tests/test_snapshot.py` asserts the read side never names it and pulls in no
-  heavy import.
+  heavy import. What the plugin does read on the worker side is one plain int,
+  `worker_handler.num_cpu_blocks`, exactly once, inside the init-time handshake
+  (`cpu_capacity.py`) - never on a per-step path.
 
 ## Uninstall / rollback
 
@@ -478,7 +554,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-264 tests, no engine and no vllm required. They cover: loopback accept/reject
+328 tests, no engine and no vllm required. They cover: loopback accept/reject
 (including a spoofed `X-Forwarded-For` from a real remote peer), the allowlist
 (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset = loopback-only, malformed
 entries that neither raise nor admit, cache invalidation when the env shrinks),
@@ -512,11 +588,67 @@ snapshot's `store_hook` section (including `governs_current_mode` going false in
 lazy mode); the per-call cost; and the kill-switch procedure end to end through
 the two verbs the plugin actually exposes.
 
+The capacity clamp (`tests/test_cpu_capacity.py`, 63 of them) runs against two
+stub layers built to the fork's shapes: the connector base class `exec`'d into a
+module NAMED `cpu_capacity.BASE_MODULE` (so the ownership check sees the module
+the real methods are defined in, and a foreign `__module__` is refused), carrying
+`base.py:716-731` including its `pp_rank > 0` `ValueError`; and a
+`BlockPool`/`FreeKVCacheBlockQueue`/`KVCacheBlock` transcription with the fake
+head/tail sentinels that make "is this block in the queue?" a decidable
+question. It covers: min-across-ranks being the cap and a disagreement never
+picking the max; the cap never being raised above the scheduler's own view; a
+rank reporting nothing, reporting 0, or sending a payload without a capacity all
+selecting zero mode instead of uncapped; a bare carrier contributing a capacity
+and NO entry (the crash case); the original payload reaching the original method
+intact, including a non-dict payload handed back as the identical object; the
+original's own exception still propagating with the clamp applied first; double
+install, foreign markers, renamed and non-callable targets; the drained pool
+never yielding an id at or above the cap while `cap-1` is handed out; the GPU
+pool acquiring nothing; a failed surgery reporting `clamp_failed_open` and never
+a false `zero_mode`; and adoption.
+
+Against the real fork classes (CPU-only, outside the fork's tree) run
+`scratch/test_cpu_capacity_clamp_live.py` from the fork root:
+
+```bash
+cd /home/user/Source/experiment/vllm-dev
+PYTHONPATH=/home/user/Source/experiment/vllm-testenv:\
+/home/user/Source/experiment/kvtier-dev-plugin \
+/home/user/Source/experiment/vllm-testenv/.venv/bin/python -m pytest \
+    --noconftest -q /home/user/Source/experiment/scratch/test_cpu_capacity_clamp_live.py
+# -> 9 passed
+```
+
+It builds a real `SimpleCPUOffloadConnector` (both roles) and a real
+`SimpleCPUOffloadScheduler` with the fork's own test builders, installs the
+wrappers on the real `KVConnectorBase_V1`, and asserts the pool ends up capped,
+that no id at or above the cap can leave the real free queue, that the fork's own
+consumer did not raise, and that `SimpleCPUOffloadConnector` never grew its own
+copy of either method. The fork's own tier suite is unaffected: `84 passed`
+(`tests/v1/simple_kv_offload/{test_scheduler,test_kv_events,test_hip_mem_ops}.py`).
+
 ## Known limits
 
 * `snapshot` reads the **scheduler process** view (one EngineCore per TP2xPP2
-  layout). Per-rank worker arenas are not covered - that is the file-based
-  writer's job, and this plugin deliberately never touches the worker side.
+  layout). Per-rank arenas arrive only as the handshake number each worker
+  reports (`cpu_capacity.per_rank`); nothing else on the worker side is read,
+  and no per-step worker path is touched.
+* The clamp wraps the connector **base** class, so a connector that overrides a
+  handshake method shadows that half of it: `MultiConnector` overrides both
+  (`multi_connector.py:482`, `:503`) and `NixlConnector` the consumer
+  (`nixl/connector.py:214`). A tier nested in a `MultiConnector` still gets the
+  clamp - the forwarder at `multi_connector.py:503-507` calls each
+  sub-connector's own method, which is ours by inheritance - but its worker half
+  reports only the FIRST non-`None` sub-connector payload
+  (`multi_connector.py:482-491`), so if that is not the offload connector's
+  carrier no capacity arrives and the tier lands in fail-safe zero. Safe,
+  degraded, visible in `zero_reason`. `adopt_if_missed` cannot see a nested
+  manager at all (`scheduler_manager` is not on a `MultiConnector`), so it
+  declines rather than guessing.
+* `clamp_failed_open: true` is the state to read as "not safe": it means a
+  manager we recognised could not be clamped, so the tier keeps the aggregate
+  view's ids. Disable the tier if you see it. A `zero_mode: true` with
+  `clamp_applied: true` is the *safe* degraded state.
 * Fields are read with `getattr(..., None)`. If the fork renames one, the
   snapshot reports `null` (and names missing `BoundaryStoreStats` fields under
   `missing_fields`) rather than raising. Re-check `snapshot.py`'s header list

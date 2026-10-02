@@ -30,7 +30,7 @@ import logging
 import sys
 import threading
 
-from . import config, snapshot, store_hook
+from . import config, cpu_capacity, snapshot, store_hook
 from .policy_holder import PolicyHolder
 
 logger = logging.getLogger("kvtier_dev_plugin.engine_side")
@@ -64,13 +64,18 @@ def _make_snapshot_method():
     def kvtier_dev_snapshot(self):  # noqa: ARG001 - bound method
         """Read-only KV-tier snapshot. Runs on the EngineCore loop thread.
 
-        The only mutation on this path is `ensure_installed` adopting the
-        store-policy patch exactly once when the manager's class shows up after
-        boot (see `_make_reload_method`); afterwards it is a marker check.
-        Without it a restarted engine would run the tier unvetted until nobody
-        thought to POST a reload, which is the opposite of a kill switch.
+        The only mutations on this path are `ensure_installed` adopting the
+        store-policy patch and the capacity wrappers exactly once when the
+        manager's class shows up after boot (see `_make_reload_method`), plus
+        `cpu_capacity.adopt_if_missed`, which settles the CPU block-id ceiling
+        once if the init-time handshake never delivered one. Afterwards they are
+        marker checks. Without them a restarted engine would run the tier
+        unvetted until nobody thought to POST a reload, which is the opposite of
+        a kill switch.
         """
         store_hook.ensure_installed(self, get_holder)
+        cpu_capacity.ensure_installed()
+        cpu_capacity.adopt_if_missed(self)
         return snapshot.snapshot_for_engine(self, get_holder())
 
     kvtier_dev_snapshot.__doc__ = (
@@ -92,6 +97,8 @@ def _make_reload_method():
         changes nothing but the policy module.
         """
         store_hook.ensure_installed(self, get_holder)
+        cpu_capacity.ensure_installed()
+        cpu_capacity.adopt_if_missed(self)
         return snapshot.reload_policy_on_engine(get_holder())
 
     kvtier_dev_reload_policy.__doc__ = (
@@ -144,11 +151,18 @@ def register() -> None:
             return
         _INSTALLS["count"] += 1
         snapshot.attach_logger(logger)
+        # The handshake wrappers come FIRST, and independently of `EngineCore`
+        # being imported: `general_plugins` loads in the worker processes too,
+        # a worker never imports `vllm.v1.engine.core`, and the worker's half of
+        # this pair is the only thing that reports its arena size. A capacity no
+        # worker reported is a tier that parks nothing.
+        capacity = cpu_capacity.install()
         cls = _engine_core_class()
         if cls is None:
             logger.info("kvtier-dev-plugin: vllm.v1.engine.core is not imported "
                         "in this process, nothing to attach (install #%d)",
                         _INSTALLS["count"])
+            logger.info("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
             return
         report = attach_methods(cls)
         # Usually a no-op here: at this point in EngineCore.__init__ the
@@ -156,11 +170,17 @@ def register() -> None:
         # later, from the reload verb or the first snapshot. When the module IS
         # already imported, this is what lands it immediately.
         hook = store_hook.install(store_hook.manager_class(), get_holder)
+        # Unlike the store hook, the capacity wrappers MUST land here: the
+        # EngineCore collects the handshake and calls the connector's consumer a
+        # few lines after it loads plugins (core.py:288-302), and their targets
+        # live on the connector BASE class, which is imported everywhere by then.
+        # See cpu_capacity's module docstring.
         level = logger.info if _INSTALLS["count"] == 1 else logger.debug
         level("kvtier-dev-plugin: attached to %s %s (install #%d, policy %s)",
               cls.__name__, report, _INSTALLS["count"],
               config.canonical_policy_path())
         level("kvtier-dev-plugin: store-policy hook %s", hook)
+        level("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
     except Exception:  # noqa: BLE001 - a diagnostic plugin must not break a boot
         logger.exception("kvtier-dev-plugin: engine-side install failed; "
                          "continuing without it")

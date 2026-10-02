@@ -146,7 +146,7 @@ HEAVY = {"torch", "vllm", "cuda", "numpy", "triton", "numba", "cupy", "psutil"}
 
 @pytest.mark.parametrize("module_file", [
     "snapshot.py", "policy.py", "policy_holder.py", "config.py",
-    "engine_side.py", "endpoint.py", "store_hook.py",
+    "engine_side.py", "endpoint.py", "store_hook.py", "cpu_capacity.py",
 ])
 def test_no_heavy_imports_in_the_read_side(module_file):
     """Requirement: the engine-side path never pulls torch/CUDA/vllm in.
