@@ -806,6 +806,129 @@ a per-block SKIP inside a live tier; `guard_mode` turns an exception into a
 decline (development only, masks bugs); the kill switch stops the connector
 scheduling ANY store or load. Only the last one is a kill switch.
 
+## Operator runbook: the KV tier is misbehaving, right now
+
+Terse commands for standing at the box while something is wrong. Everything
+below runs **on the box** (`ssh llm ...`) because `/plugins/kvtier/*` is
+loopback-or-allowlist. The mutating/dev-state routes (`/tier`, `/guard`) need
+the token in every shape, loopback included (`~/.local/share/kvtier-dev-token`,
+mode 600, never in the repo). The plain reads (`/status`, `/snapshot`) are
+token-free from loopback.
+
+Set the token once per shell:
+
+```bash
+TOK=$(cat ~/.local/share/kvtier-dev-token)
+H="x-kvtier-dev-token: $TOK"
+```
+
+### Engine crashed / crashes on the FIRST request
+
+The first-request crash is the divisibility assert firing because the fix is
+**not fully installed**. Confirm it in one line (the tier state lives in the
+engine, so read the snapshot):
+
+```bash
+# installed=false or refused_methods non-empty => the fix is incomplete.
+# armed=false there is the injector protecting you, not a bug.
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
+  | python3 -c 'import sys,json;p=json.load(sys.stdin)["pr56810"];print({k:p[k] for k in ("installed","armed","refused_methods","auto_disarmed","disarm_reason")})'
+```
+
+Read the last fault. The engine log is `/tmp/vllm-serve.log` (the journal copy
+under systemd does NOT feed `logs.db`). The crash line to grep, and the
+backport's own install/arm verdicts:
+
+```bash
+# the assert the incomplete fix lets through:
+ssh llm "grep -a 'not divisible by tokens_per_hash' /tmp/vllm-serve.log | tail -3"
+# did the backport install? was the tier force-disarmed or arm refused?
+ssh llm "grep -aE 'PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)' /tmp/vllm-serve.log | tail -10"
+```
+
+If guard mode was armed there is also a structured capture of the fault (guard
+mode is OFF at every boot; there is no capture unless someone armed it):
+
+```bash
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+  -d '{\"op\":\"captures\",\"limit\":2}'"   # capture.decline, ...geometry.groups_failing_divisibility
+```
+
+### Runtime kill: make the tier a strict no-op, NO restart (one curl)
+
+```bash
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
+  -d '{\"op\":\"disarm\"}'"
+# prove it: armed=false, and the connector now reports no pending work
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
+  | python3 -c 'import sys,json;p=json.load(sys.stdin)["pr56810"];print("armed=",p["armed"])'
+```
+
+Disarmed, the connector reports `(0, False)` for prefix hits, hands the workers
+an **empty** `SimpleCPUOffloadMetadata` (so `worker.py:266,289` copy nothing),
+and claims no pending stores - the engine serves from GPU KV alone. **`disarm`
+is never refused** (it is the safe direction). What it does NOT cover, verbatim
+from `disarm_limits()` in the payload:
+
+- the **worker process is never contacted** (it is a separate process; its no-op
+  arrives as empty metadata, `worker_process_patched: false`);
+- an **in-flight copy already handed to the workers finishes**
+  (`in_flight_transfers_undone: false`);
+- blocks **already parked in host RAM stay parked** and become reachable again
+  if you re-arm (`parked_blocks_freed: false`);
+- a store already inside `prepare_store_specs` for the CURRENT step completes;
+- `has_pending_block_frees` is not wrapped - this connector does not override
+  it, so it is already `False`.
+
+There is deliberately **no `update_connector_output` entry** in `disarm_limits`:
+that method is capture-and-reraise under *guard mode* (a development facility),
+not something a disarm touches.
+
+### Permanent off (survives the next boot)
+
+The tier env for this experiment is a **systemd drop-in**, not the launcher
+(the `KV_OFFLOAD_SIZE` knob in `config/box/serve-v2.2.sh` is commented out on the
+box and stays that way). The drop-in is
+`/etc/systemd/system/vllm-engine.service.d/kv-tier.conf`, carrying
+`KV_OFFLOAD_SIZE=<GiB>` and `VLLM_USE_SIMPLE_KV_OFFLOAD=1`. To turn the tier off
+permanently, remove those two lines (or the drop-in) and restart:
+
+```bash
+ssh llm 'sudo systemctl daemon-reload'          # after editing/removing kv-tier.conf
+ssh llm '/usr/local/bin/pkexec /usr/local/bin/llm-engine-ctl restart'
+```
+
+A restart is a **~4-minute boot** (weights load after `systemctl` returns).
+The unit runs under `Restart=no` on purpose: a crash is recovered by the **proxy
+watchdog**, not systemd, so do not add `Restart=`. Until the restart the running
+engine still has the arena allocated - use the runtime disarm above to stop it
+scheduling right now.
+
+### Confirm what state the engine is actually in
+
+`GET /plugins/kvtier/status` makes **no engine call** (it answers while the
+engine is wedged) and therefore does NOT show the live armed/installed state -
+it only echoes the route note. The live truth is in `snapshot` (or
+`GET /tier?op=status`, token) under `pr56810`:
+
+```bash
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' -H "$H" \
+  | python3 -m json.tool | sed -n '/"pr56810"/,$p'
+```
+
+Where to look in `pr56810`:
+
+- `installed` - the **all-or-nothing** verdict: `true` only if every required
+  method is patched. `armed` must be `false` whenever this is `false`.
+- `refused_methods` - the method(s) that were refused; each is also
+  `methods.<name>.patched: false` with the reason in `methods.<name>.reason`.
+- `geometry` - the geometry guard verdict (`geometry.ok`, and
+  `geometry.cacheable_skipped` names any group it would wrongly skip).
+- `disarm_reason` / `auto_disarmed` - whether the injector force-disarmed, and
+  which refusal caused it: `"geometry"` vs `"incomplete_install"`.
+- `arm_block` - if present (`{kind, reason}`), arming is currently refused and
+  this says why; `null` means arming is allowed.
+
 ## Access model
 
 Read `docs/usage/security.md:349` first: `--api-key` only covers `/v1`, `/v2`,

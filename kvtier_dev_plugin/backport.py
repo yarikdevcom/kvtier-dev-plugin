@@ -122,6 +122,31 @@ in another process the HTTP call never reaches, so the no-op is delivered as
 data (empty metadata), not as a second patch. `has_pending_block_frees` is
 already always False on this connector (it does not override the base
 implementation, `base.py:625`). See `disarm_limits()` for what this cannot undo.
+
+THE ALL-OR-NOTHING INSTALL CONTRACT (never armed unless the fix is complete)
+----------------------------------------------------------------------------
+The invariant this module exists to guarantee: THE TIER IS NEVER ARMED UNLESS
+THE FIX IS PROVABLY, FULLY IN PLACE. It closes the fail-open where the store
+selector (the method that CONTAINS the crash) is refused by its fingerprint
+while the other methods install: an "any method patched" install would report
+`installed: true` and boot armed-and-incomplete, which is exactly the
+live-traffic crash this backport is supposed to make impossible.
+
+* "Fully installed" means EVERY method in `METHODS` carries `patched: true`
+  (a fresh install whose fingerprint matched, or a re-install verified over our
+  own marker). One refusal makes `installed: false`. The per-method verdicts
+  stay visible so the operator still sees WHICH one was refused.
+* A not-fully-installed install force-DISARMS the tier (`set_armed(False)`) and
+  records `disarm_reason: "incomplete_install"`. The kill-switch wrappers install
+  independently of the fingerprints, so a disarmed connector is a strict no-op
+  and never reaches the crashing selector even unpatched.
+* `set_armed(True)` is REFUSED - state unchanged, never raising - while either
+  the geometry guard has vetoed the live config (`"geometry"`) or the fix is not
+  fully installed (`"incomplete_install"`). The refusal names the refused
+  methods and is published in `status`/`snapshot` (`installed`,
+  `refused_methods`, `auto_disarmed`, `disarm_reason`, `arm_block`) and in the
+  `/tier` verb response, so a dashboard operator reads "not armed, because X"
+  rather than a silent no-op. Disarm is never refused: it is the safe direction.
 """
 
 from __future__ import annotations
@@ -167,6 +192,13 @@ _state = {
     "armed": True,                       # tier is live until someone disarms it
     "disarm_calls": 0,
     "arm_calls": 0,
+    "fully_installed": False,            # every method in METHODS patched/verified
+    "refused_methods": [],               # METHODS not patched on the last attempt
+    "auto_disarmed": False,              # last refusal force-disarmed the tier
+    "disarm_reason": None,               # "geometry" | "incomplete_install" | None
+    "disarm_detail": None,               # the text behind the disarm
+    "arm_refusals": 0,                   # set_armed(True) refused, count
+    "last_arm_refusal": None,            # last refused-arm reason
     "method_verdicts": {},               # name -> {"patched","reason","sha_ok"}
     "switch_verdicts": {},               # name -> {"wrapped","reason"}
     "geometry": None,                    # last guard result
@@ -180,6 +212,9 @@ def reset_state_for_tests() -> None:
     _state.update({
         "installs": 0, "reinstalls": 0, "skips": 0, "skip_reason": None,
         "class": None, "armed": True, "disarm_calls": 0, "arm_calls": 0,
+        "fully_installed": False, "refused_methods": [], "auto_disarmed": False,
+        "disarm_reason": None, "disarm_detail": None, "arm_refusals": 0,
+        "last_arm_refusal": None,
         "method_verdicts": {}, "switch_verdicts": {}, "geometry": None,
         "fallbacks": 0, "last_error": None,
     })
@@ -534,34 +569,70 @@ def install(cls, kv_cache_config=None) -> dict:
         report["geometry"] = guard
         _state["geometry"] = guard
         if kv_cache_config is not None and not guard.get("ok"):
+            # The patch would skip a group whose KV is needed on resume: turn
+            # the tier OFF rather than leave it armed to drop cacheable KV. The
+            # methods are not attempted at all here, so nothing is refused per
+            # method - the whole install is refused on geometry.
+            _state["fully_installed"] = False
+            _state["refused_methods"] = []
+            report["refused_methods"] = []
+            _force_disarm("geometry", guard.get("reason"))
+            report["auto_disarmed"] = True
+            report["disarm_reason"] = "geometry"
             return _refuse(report, guard.get("reason"))
 
-        any_patched = False
         for name in METHODS:
             verdict = _install_one(cls, name)
             report["methods"][name] = verdict
             _state["method_verdicts"][name] = verdict
-            any_patched = any_patched or verdict["patched"]
 
         for name in SWITCH_METHODS:
             verdict = _install_switch(cls, name)
             report["switch"][name] = verdict
             _state["switch_verdicts"][name] = verdict
 
-        if any_patched:
+        # ALL-OR-NOTHING: `installed` means EVERY method in METHODS is patched
+        # (a fingerprint that matched, or a re-install verified over our own
+        # marker). One refusal is a failed install, not a partial success - so
+        # the method that happens to contain the crash can never be the one left
+        # unpatched behind an `installed: true`. The per-method verdicts stay in
+        # the report so the operator still sees WHICH one was refused.
+        refused = [name for name in METHODS
+                   if not report["methods"][name].get("patched")]
+        report["refused_methods"] = refused
+        fully_installed = not refused
+        report["installed"] = fully_installed
+        _state["fully_installed"] = fully_installed
+        _state["refused_methods"] = refused
+
+        if fully_installed:
             if _state["installs"] == 0:
                 _state["installs"] += 1
                 logger.warning(
                     "kvtier-dev-plugin: PR #56810 backport INSTALLED on %s "
-                    "(%d/%d methods; geometry ok=%s)", report["class"],
-                    sum(v["patched"] for v in report["methods"].values()),
+                    "(all %d methods; geometry ok=%s)", report["class"],
                     len(METHODS), guard.get("ok"))
             else:
                 _state["reinstalls"] += 1
             _state["skip_reason"] = None
-        report["installed"] = bool(any_patched)
-        if report["installed"] is False:
-            report["reason"] = _first_refusal(report) or "all methods refused"
+            _state["auto_disarmed"] = False
+            _state["disarm_reason"] = None
+            _state["disarm_detail"] = None
+            report["auto_disarmed"] = False
+            report["disarm_reason"] = None
+        else:
+            # A partial install is the fail-open this contract exists to kill.
+            # Without the full fix the store path asserts, so leave the tier OFF
+            # rather than armed-and-incomplete; the kill-switch wrappers (which
+            # install independently of the fingerprints) make the disarmed
+            # connector a strict no-op, so it never reaches the crashing
+            # selector. Distinct `disarm_reason` from the geometry guard above.
+            reason = _first_refusal(report) or "all required methods refused"
+            report["reason"] = reason
+            report["auto_disarmed"] = True
+            report["disarm_reason"] = "incomplete_install"
+            _force_disarm("incomplete_install", reason)
+            return _refuse(report, reason)
         return report
     except Exception as exc:  # noqa: BLE001 - a plugin must not break a boot
         _state["fallbacks"] += 1
@@ -706,13 +777,24 @@ def ensure_installed(engine) -> dict:
             # The patch is already live on this class and the config has turned
             # out to be one it must not be live for: turn the tier OFF rather
             # than let a live patch skip a group whose KV is needed on resume.
-            set_armed(False)
+            # `disarm_reason: "geometry"` distinguishes this from an incomplete
+            # install; the methods ARE installed, so arming is blocked by the
+            # geometry gate in `_arm_block_reason`, not by `fully_installed`.
+            _force_disarm("geometry", guard.get("reason"))
             out["auto_disarmed"] = True
+            out["disarm_reason"] = "geometry"
+            out["refused_methods"] = []
             return out
+        # Markers verified on every method: the fix is fully in place on this
+        # class. Publish that so `installed` is honest on the polling path too.
+        _state["fully_installed"] = True
+        _state["refused_methods"] = []
         return {"installed": True, "class": getattr(cls, "__name__", None),
                 "reason": "already installed (markers verified, nothing to do)",
                 "methods": dict(_state["method_verdicts"]),
-                "switch": dict(_state["switch_verdicts"]), "geometry": guard}
+                "switch": dict(_state["switch_verdicts"]), "geometry": guard,
+                "refused_methods": [], "auto_disarmed": bool(_state["auto_disarmed"]),
+                "disarm_reason": _state["disarm_reason"]}
     return install(cls, config)
 
 
@@ -725,9 +807,75 @@ def manager_of(engine):
 
 # --- the kill switch --------------------------------------------------------
 
+def _force_disarm(kind: str, detail) -> None:
+    """Turn the tier OFF and remember WHY, so the snapshot names the reason.
+
+    The shared tail of every "the fix is not safe to run" path: the geometry
+    guard and an incomplete install both land here, and `kind` is what keeps the
+    two refusal reasons distinguishable in the report ("geometry" vs
+    "incomplete_install"). Disarm is the safe direction, so `set_armed(False)`
+    can never be refused and this cannot fail.
+    """
+    set_armed(False)
+    _state["auto_disarmed"] = True
+    _state["disarm_reason"] = kind
+    _state["disarm_detail"] = (str(detail) if detail else "")[:200]
+
+
+def _arm_block_reason() -> dict | None:
+    """Why arming the tier is unsafe right now, or None if arming is allowed.
+
+    Two independent gates, checked in this order:
+
+    * the GEOMETRY guard, when it has actually checked a live config and said no
+      -- the patch would skip a prefix-cacheable group (silent output loss).
+    * an INCOMPLETE install -- not every method in METHODS is patched, so the
+      store path would still reach the upstream assert.
+
+    A geometry guard that never checked (a class-install before any config
+    exists) is NOT a block: booting patches the class first, and refusing to arm
+    there would strand a healthy engine.
+    """
+    geometry = _state["geometry"]
+    if geometry and geometry.get("checked") and not geometry.get("ok"):
+        return {"kind": "geometry",
+                "reason": "the geometry guard refuses this config, so arming "
+                          "would let the patch skip a prefix-cacheable group: "
+                          f"{geometry.get('reason')}"}
+    if not _state["fully_installed"]:
+        refused = list(_state["refused_methods"])
+        names = ", ".join(refused) if refused else "(none attempted)"
+        return {"kind": "incomplete_install",
+                "reason": f"the PR #56810 fix is not fully installed; refused "
+                          f"method(s): {names}. The tier stays disarmed until "
+                          f"every required method is patched."}
+    return None
+
+
 def set_armed(armed: bool) -> dict:
-    """Arm/disarm the tier at runtime. Contained; never raises."""
+    """Arm/disarm the tier at runtime. Contained; never raises.
+
+    DISARM is unconditional -- it is the safe direction and must always work.
+    ARM is GATED: it is refused (state unchanged, nothing raised) while the
+    geometry guard has vetoed the live config or the fix is not fully installed,
+    because the invariant is that the tier is never armed unless the divisibility
+    fix is provably, fully in place. A refused arm says WHY and names the refused
+    methods, and shows up in `status`/`snapshot` and the `/tier` verb so an
+    operator reads "not armed, because X" instead of a silent no-op.
+    """
     armed = bool(armed)
+    if armed:
+        block = _arm_block_reason()
+        if block is not None:
+            _state["arm_refusals"] += 1
+            _state["last_arm_refusal"] = block["reason"][:200]
+            logger.warning("kvtier-dev-plugin: REFUSED to arm the KV tier: %s",
+                           block["reason"])
+            return {"armed": bool(_state["armed"]), "changed": False,
+                    "refused": True, "kind": block["kind"],
+                    "reason": block["reason"],
+                    "refused_methods": list(_state["refused_methods"]),
+                    "switch_installed": bool(_state["switch_verdicts"])}
     changed = armed != _state["armed"]
     _state["armed"] = armed
     if armed:
@@ -738,7 +886,8 @@ def set_armed(armed: bool) -> dict:
         logger.warning("kvtier-dev-plugin: KV tier %s",
                        "ARMED (tier live)" if armed else
                        "DISARMED (connector forced to a strict no-op)")
-    return {"armed": armed, "changed": changed,
+    return {"armed": armed, "changed": changed, "refused": False, "kind": None,
+            "reason": None, "refused_methods": [],
             "switch_installed": bool(_state["switch_verdicts"])}
 
 
@@ -809,10 +958,21 @@ def tier_for_engine(engine, args=None) -> dict:
             out["tier"] = section(manager_of(engine))
             return out
         if op != "status":
-            out["state"] = set_armed(op == "arm")
-            out["applied"] = True
-        out["install"] = {"installed": report.get("installed"),
-                          "reason": report.get("reason")}
+            state = set_armed(op == "arm")
+            out["state"] = state
+            # `applied` is False when an arm was REFUSED: the operator asked and
+            # nothing was allowed to change, which is a different answer from a
+            # no-op re-arm and must not read as success.
+            out["applied"] = not state.get("refused", False)
+            if state.get("refused"):
+                out["reason"] = state["reason"]
+        # The install verdict comes from the authoritative _state so a refused
+        # arm is explained by the same fields a snapshot shows.
+        out["install"] = {"installed": bool(_state["fully_installed"]),
+                          "reason": report.get("reason"),
+                          "refused_methods": list(_state["refused_methods"]),
+                          "auto_disarmed": bool(_state["auto_disarmed"]),
+                          "disarm_reason": _state["disarm_reason"]}
         out["tier"] = section(manager_of(engine))
         out["status_code"] = 200
         return out
@@ -827,6 +987,7 @@ def tier_for_engine(engine, args=None) -> dict:
 # --- observability ----------------------------------------------------------
 
 def _fields(**overrides) -> dict:
+    block = _arm_block_reason()
     fields = {
         "patched": bool(_state["installs"] or _state["reinstalls"]),
         "class": _state["class"],
@@ -840,6 +1001,20 @@ def _fields(**overrides) -> dict:
         "skips": int(_state["skips"]),
         "skip_reason": _state["skip_reason"],
         "armed": bool(_state["armed"]),
+        # All-or-nothing install state: `installed` is true ONLY when every
+        # method in METHODS is patched; `refused_methods` names the ones that
+        # are not, so a partial install is visible, not just a failed one.
+        "installed": bool(_state["fully_installed"]),
+        "refused_methods": list(_state["refused_methods"]),
+        "auto_disarmed": bool(_state["auto_disarmed"]),
+        "disarm_reason": _state["disarm_reason"],
+        "disarm_detail": _state["disarm_detail"],
+        "arm_refusals": int(_state["arm_refusals"]),
+        "last_arm_refusal": _state["last_arm_refusal"],
+        # Why an arm would be refused right now (None means arming is allowed).
+        # This is the "not armed, because X" an operator reads on a dashboard.
+        "arm_block": None if block is None else {"kind": block["kind"],
+                                                 "reason": block["reason"]},
         "arm_calls": int(_state["arm_calls"]),
         "disarm_calls": int(_state["disarm_calls"]),
         "methods": {name: dict(v) for name, v in _state["method_verdicts"].items()},

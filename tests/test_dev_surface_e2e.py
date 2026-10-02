@@ -42,7 +42,7 @@ from test_routes import (
     token_headers,
 )
 
-from kvtier_dev_plugin import config, engine_side, guard_mode, step_trace
+from kvtier_dev_plugin import backport, config, engine_side, guard_mode, step_trace
 
 pytest.importorskip("fastapi")
 
@@ -291,6 +291,14 @@ def test_a_real_fault_becomes_a_capture_and_a_ring_record(dev, monkeypatch):
     client = dev["client"]
     tier = dev["tier"]
     client.get(SNAPSHOT, headers=headers())      # the backport wraps first
+    # The guard-capture path runs inside get_num_new_matched_tokens, which the
+    # kill switch gates on armed=True. This fake tier's methods are not the
+    # fork's, so the backport rightly REFUSES them on fingerprint and force-
+    # disarms (the all-or-nothing contract). The scenario guard mode is meant for
+    # is a tier that IS fully patched and armed, so represent that precondition
+    # explicitly: armed only because the fix is provably fully in place.
+    backport._state["fully_installed"] = True
+    backport._state["armed"] = True
     armed = client.post(GUARD, headers=headers(), json={"armed": True}).json()
     client.post(TRACE, headers=headers(), json={"op": "arm", "depth": 64})
     # The guard composes with this package's OWN wrapper instead of refusing it:

@@ -608,10 +608,17 @@ def status_payload(dev_state: dict | None = None) -> dict:
                     "the store path asserts). Disarmed, the connector reports no "
                     "prefix hit, hands the workers empty store/load lists and "
                     "claims no pending work, so the engine serves from GPU KV "
-                    "alone - no engine restart. `tier.patched: false` means the "
-                    "divisibility fix is NOT live and a hybrid geometry will "
-                    "still crash the store path; arming the tier does not change "
-                    "that.",
+                    "alone - no engine restart. `pr56810.installed: false` means "
+                    "the divisibility fix is NOT fully live (see "
+                    "`pr56810.refused_methods`) and a hybrid geometry will still "
+                    "crash the store path. The tier can NEVER be armed unless the "
+                    "fix is fully installed and the geometry guard passes: an "
+                    "`arm` is refused, not applied, otherwise, and "
+                    "`pr56810.arm_block`/`disarm_reason` say why (distinguishing "
+                   "`geometry` from `incomplete_install`). Read them from the "
+                    "engine in `snapshot` or the engine's `"
+                    + config.ROUTE_PREFIX + config.ROUTE_TIER
+                    + "` route.",
             "ops": ["status", "arm", "disarm"],
         },
         "development_facilities": {

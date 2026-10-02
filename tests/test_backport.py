@@ -481,7 +481,14 @@ def test_kill_switch_reports_its_own_state():
 
 
 def test_switch_is_independent_of_the_backport_fingerprints(monkeypatch):
-    """A stale fingerprint must not also disarm the operator's kill switch."""
+    """A stale fingerprint must not BREAK the kill switch, but it must make the
+    tier un-armable: the disarmed connector still no-ops (the switch is live),
+    yet arming is refused because the fix is not fully in place.
+
+    This is the fail-open closed: a partial install leaves the tier force-
+    disarmed, and `set_armed(True)` refuses rather than re-arming an engine whose
+    store selector was never patched.
+    """
     ns = selector_namespace()
     cls, _ = FX.build_fork_class(ns)
     cls.get_num_new_matched_tokens = lambda self, r, n: (1, True)
@@ -490,12 +497,178 @@ def test_switch_is_independent_of_the_backport_fingerprints(monkeypatch):
     monkeypatch.setattr(backport, "fingerprint_of", lambda fn: None)
     report = backport.install(cls)
     assert report["installed"] is False, "fingerprints were poisoned"
+    # The refusal force-disarms the tier and records WHY (incomplete, not geometry).
+    assert report["auto_disarmed"] is True
+    assert report["disarm_reason"] == "incomplete_install"
+    assert backport.is_armed() is False
+    # The switch wrappers still install (they need no fingerprint): disarmed, the
+    # connector is a strict no-op even though the selector was never patched.
     assert all(v["wrapped"] for v in report["switch"].values()), report["switch"]
-    backport.set_armed(False)
     assert cls.__dict__["has_pending_stores"](object()) is False
     assert cls.__dict__["get_num_new_matched_tokens"](object(), None, 0) == (0, False)
-    backport.set_armed(True)
-    assert cls.__dict__["get_num_new_matched_tokens"](object(), None, 0) == (1, True)
+    # Arming is REFUSED (state unchanged, nothing reached the engine), naming the
+    # refused methods rather than silently flipping on a half-patched tier.
+    res = backport.set_armed(True)
+    assert res["refused"] is True and res["changed"] is False
+    assert res["kind"] == "incomplete_install"
+    assert "_select_eager_blocks_to_store" in res["reason"]
+    assert backport.is_armed() is False
+    assert cls.__dict__["get_num_new_matched_tokens"](object(), None, 0) == (0, False)
+
+
+# --- 3c. the all-or-nothing install contract --------------------------------
+
+def _drifted_fork_class(drift_name):
+    """The fork's class with exactly ONE method's source drifted off fingerprint.
+
+    The drifted method is refused; the other three (including the store selector
+    that carries the crash) install cleanly. That is the fail-open the contract
+    kills: the tier must NOT be armed when the crash method could be the refused
+    one, so a refused method anywhere makes the whole install a failure.
+    """
+    ns = selector_namespace()
+    order = ("__init__", "_estimate_lazy_target_blocks",
+             "update_state_after_alloc", "_select_eager_blocks_to_store")
+    parts = []
+    for name in order:
+        text = FX.ORIGINAL_SOURCES[name]
+        if name == drift_name:
+            text = text.replace(f"def {name}(", f"def {name}(  # fork edit\n", 1)
+        parts.append(text)
+    module = types.ModuleType("drifted_fork")
+    module.__dict__.update(ns)
+    src = "class SimpleCPUOffloadScheduler:\n" + "".join(parts)
+    fname = "<drifted_fork_class>"
+    linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+    exec(compile(src, fname, "exec"), module.__dict__, module.__dict__)  # noqa: S102
+    cls = module.SimpleCPUOffloadScheduler
+    cls.__module__ = "drifted_fork"
+    return cls
+
+
+def _switch_standin_methods(cls):
+    cls.get_num_new_matched_tokens = lambda self, r, n: (1, True)
+    cls.build_connector_meta = lambda self, so: "ENGINE METADATA"
+    cls.has_pending_stores = lambda self: True
+    return cls
+
+
+def test_partial_install_reports_incomplete_and_disarms():
+    """One drifted fingerprint => installed False AND armed False.
+
+    Drift the store selector itself (the method that contains the crash): the
+    other three install, yet the tier must come up DISARMED, not armed with the
+    crash still live.
+    """
+    cls = _switch_standin_methods(_drifted_fork_class("_select_eager_blocks_to_store"))
+    report = backport.install(cls)
+    # The three that matched are patched; the crash method is refused.
+    assert report["methods"]["update_state_after_alloc"]["patched"] is True
+    assert report["methods"]["_select_eager_blocks_to_store"]["patched"] is False
+    # ALL-OR-NOTHING: one refusal is a failed install, not a partial success.
+    assert report["installed"] is False
+    assert report["refused_methods"] == ["_select_eager_blocks_to_store"]
+    # Force-disarmed, and the reason is the incomplete install (not geometry).
+    assert report["auto_disarmed"] is True
+    assert report["disarm_reason"] == "incomplete_install"
+    assert backport.is_armed() is False
+    section = backport.section()
+    assert section["installed"] is False
+    assert section["refused_methods"] == ["_select_eager_blocks_to_store"]
+    assert section["arm_block"]["kind"] == "incomplete_install"
+
+
+def test_runtime_arm_is_refused_while_incomplete_and_names_the_method():
+    cls = _switch_standin_methods(_drifted_fork_class("update_state_after_alloc"))
+    backport.install(cls)
+    assert backport.is_armed() is False
+    res = backport.set_armed(True)             # refused: fix is not fully in place
+    assert res["refused"] is True
+    assert res["armed"] is False and res["changed"] is False
+    assert res["kind"] == "incomplete_install"
+    assert "update_state_after_alloc" in res["reason"]
+    assert backport.is_armed() is False, "a refused arm must not flip the state"
+    assert backport._state["arm_refusals"] == 1
+    # Never raises, and the disarmed switch still holds the tier as a no-op.
+    assert cls.__dict__["has_pending_stores"](object()) is False
+
+
+def test_arm_succeeds_after_a_full_install():
+    """Once every method installs, arming is allowed and reports no refusal."""
+    cls, _meta, _calls = _install_with_metadata()
+    assert backport.section()["installed"] is True
+    assert backport.section()["arm_block"] is None
+    # Start disarmed, then arm: fully installed + geometry not vetoing => allowed.
+    backport.set_armed(False)
+    res = backport.set_armed(True)
+    assert res["refused"] is False and res["armed"] is True and res["changed"] is True
+    assert backport.is_armed() is True
+
+
+def test_geometry_refusal_disarms_and_reports_its_own_reason():
+    """A geometry refusal disarms too, with a reason DISTINCT from incomplete."""
+    cls, _ = FX.build_fork_class(selector_namespace())
+    groups = [_Group(HASH_BLOCK_SIZE, True, f"layer_{g}")
+              for g in range(CACHEABLE_GROUPS)]
+    groups.append(_Group(HASH_BLOCK_SIZE, True, "group_five_is_cacheable"))
+    cfg = _Config(groups, PCIDS)
+
+    report = backport.install(cls, kv_cache_config=cfg)
+    assert report["installed"] is False
+    assert report["auto_disarmed"] is True
+    assert report["disarm_reason"] == "geometry"
+    assert backport.is_armed() is False
+    # A geometry veto blocks arming even though nothing was refused per method.
+    res = backport.set_armed(True)
+    assert res["refused"] is True and res["kind"] == "geometry"
+    assert "prefix_cacheable" in res["reason"]
+    assert backport.is_armed() is False
+
+
+def test_the_two_refusal_reasons_are_distinguishable():
+    """`disarm_reason` separates the geometry guard from an incomplete install."""
+    incomplete = _switch_standin_methods(
+        _drifted_fork_class("_select_eager_blocks_to_store"))
+    backport.install(incomplete)
+    assert _state_disarm_reason() == "incomplete_install"
+
+    backport.reset_state_for_tests()
+    cls, _ = FX.build_fork_class(selector_namespace())
+    groups = [_Group(HASH_BLOCK_SIZE, True, f"layer_{g}")
+              for g in range(CACHEABLE_GROUPS)]
+    groups.append(_Group(HASH_BLOCK_SIZE, True, "group_five_is_cacheable"))
+    backport.install(cls, kv_cache_config=_Config(groups, PCIDS))
+    assert _state_disarm_reason() == "geometry"
+
+
+def _state_disarm_reason():
+    return backport.section()["disarm_reason"]
+
+
+def test_disarm_is_never_refused_even_when_incomplete():
+    """Disarm is the safe direction: it always applies, even before any install."""
+    backport.install(None)                     # nothing installed at all
+    assert backport.is_armed() is True         # boot default, before a connector
+    res = backport.set_armed(False)
+    assert res["refused"] is False and res["changed"] is True
+    assert backport.is_armed() is False
+
+
+def test_tier_verb_reports_a_refused_arm_to_the_operator():
+    """POST /tier {op:arm} on an incomplete tier says why, and did not apply."""
+    cls = _switch_standin_methods(_drifted_fork_class("update_state_after_alloc"))
+    engine = _FakeEngine(_live_manager(cls))
+    status = backport.tier_for_engine(engine, {"op": "status"})
+    assert status["install"]["installed"] is False
+    assert "update_state_after_alloc" in status["install"]["refused_methods"]
+    assert status["tier"]["armed"] is False
+
+    arm = backport.tier_for_engine(engine, {"op": "arm"})
+    assert arm["applied"] is False, "a refused arm is not applied"
+    assert arm["status_code"] == 200           # a refusal is reported, not raised
+    assert arm["state"]["refused"] is True
+    assert "update_state_after_alloc" in arm["reason"]
+    assert arm["tier"]["armed"] is False
 
 
 # --- 3b. the tier verb (POST /plugins/kvtier/tier) --------------------------
