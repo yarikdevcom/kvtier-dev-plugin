@@ -38,8 +38,9 @@ so these routes answer between requests.
 | File | Role |
 |------|------|
 | `kvtier_dev_plugin/config.py` | the env vars, the route prefix, the utility method names, and the policy-path validator |
-| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the seven engine methods, fits the connector-creation hook, wires the logger and the worker-writer retry |
-| `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary, and the `guard`/`trace`/`worker_diag` sections of the snapshot. Stdlib only |
+| `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the eight engine methods, fits the connector-creation hook, wires the logger and the worker-writer retry |
+| `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary, and the `guard`/`trace`/`worker_diag`/`lookup_ledger` sections of the snapshot, including the `tier.cpu_hash_index` parked-KV reading. Stdlib only |
+| `kvtier_dev_plugin/lookup_ledger.py` | **development only**: the bounded ring that joins each `get_num_new_matched_tokens` offer to the `update_state_after_alloc` adopt that followed it, and the verdict that classifies the hits the scheduler did not adopt |
 | `kvtier_dev_plugin/kvconfig.py` | `kvconfig`: the KV-cache geometry and the divisibility verdict the tier's first store depends on |
 | `kvtier_dev_plugin/kvinspect.py` | `inspect`: one block, or one request, per group, with every id list capped |
 | `kvtier_dev_plugin/trace_ring.py` | the bounded event ring and the `trace` verb (arming installs the observers, disarming removes them) |
@@ -85,17 +86,22 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
 | `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
+| `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 
-There is deliberately **no env var for guard mode**. It can mask real bugs, so it
-is off at every boot and reachable only through `POST /plugins/kvtier/guard` with
-the token - see *Guard mode*.
+There is deliberately **no env var for guard mode** - no env var that turns it *on*.
+The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
+the EngineCore, and `VLLM_E2_TIER_DEV_BOOT_INERT` is the one switch that stops the
+boot doing so; there is no env var that arms guard mode on an inert boot, which can
+only be done with `POST /plugins/kvtier/guard` and the token - see *Guard mode*.
 
-There is equally **no env var that arms the KV tier**. The tier is disarmed at
-boot (`backport.BOOT_ARMED = False`) because the plugin's install cannot land
-before the manager class exists, and arming is gated on that install being
-complete - so an env var that armed at boot would be an env var that arms an
-unpatched engine. Arm it with `POST /plugins/kvtier/tier {"op":"arm"}`; see
-*Booting the tier*.
+There is equally **no env var that arms the KV tier on an inert boot**. The tier is
+disarmed at plugin *load* (`backport.BOOT_ARMED = False`) because the plugin's
+install cannot land before the manager class exists, and arming is gated on that
+install being complete - so an env var that armed at plugin load would be an env var
+that arms an unpatched engine. What the boot does instead, at CONNECTOR CREATION,
+is arm the tier itself once the install verifies; `VLLM_E2_TIER_DEV_BOOT_INERT`
+restores the fully manual posture, where `POST /plugins/kvtier/tier {"op":"arm"}` is
+the only thing that arms it. See *Booting the tier*.
 
 `VLLM_PLUGINS` parses as a comma-separated list; `VLLM_PLUGINS=""` is `[""]`
 and matches nothing (it is not "unset").
@@ -160,8 +166,9 @@ app = FastAPI(); p = KVTierDevEndpointPlugin(); p.attach_router(app)
 print(sorted(r.path for r in app.routes if 'kvtier' in getattr(r, 'path', '')))
 "
 # ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
-#  '/plugins/kvtier/policy/reload', '/plugins/kvtier/request',
-#  '/plugins/kvtier/snapshot', '/plugins/kvtier/status', '/plugins/kvtier/trace']
+#  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
+#  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
+#  '/plugins/kvtier/status', '/plugins/kvtier/trace']
 ```
 
 Against the **running** server, the equivalent that does not depend on the
@@ -172,8 +179,9 @@ FastAPI route-tree shape (newer FastAPI nests included routers behind an
 curl -s http://127.0.0.1:8000/openapi.json | python3 -c \
   'import json,sys; print(sorted(p for p in json.load(sys.stdin)["paths"] if "kvtier" in p))'
 # ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
-#  '/plugins/kvtier/policy/reload', '/plugins/kvtier/request',
-#  '/plugins/kvtier/snapshot', '/plugins/kvtier/status', '/plugins/kvtier/trace']
+#  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
+#  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
+#  '/plugins/kvtier/status', '/plugins/kvtier/trace']
 ```
 
 and confirm nothing under `/v1` came from us: `GET /v1/models` must behave
@@ -393,18 +401,145 @@ cannot reproduce.
   built is counted as a fallback. Installing and arming are separate decisions - an
   installed observer records nothing while the ring is disarmed.
 
-`/trace` and `/guard` require the token in every shape, loopback included: a route
-that can change engine dev state is token-gated as a whole, not per field.
+`/trace`, `/guard` and `/lookups` require the token in every shape, loopback
+included: a route that can change engine dev state is token-gated as a whole, not
+per field.
+
+## The lookup ledger: where a host-RAM prefix hit goes missing (`lookup_ledger.py`)
+
+The warning is unambiguous and the state behind it is not:
+
+```
+SimpleCPUOffloadScheduler: update_state_after_alloc called for req_id=chatcmpl-...
+with no external tokens but get_num_new_matched_tokens() unexpectedly recorded
+a pending CPU hit; releasing the stale pin.
+```
+
+The fork pins a CPU hit ONLY when `hit_length > 0` and then returns
+`(hit_length, True)` (`manager.py:363-374`), so "a pending hit was recorded" means
+the connector really did name a positive number of tokens - while the scheduler
+really did arrive with `num_external_tokens == 0`, and
+`vllm:external_prefix_cache_hits_total` did not move. Somewhere between "N tokens
+are in host RAM" and "the scheduler adopts them", N becomes 0. The ledger records
+the triple that says which rule did it, per request id:
+
+| field | where it comes from |
+|---|---|
+| `local` | the second argument the scheduler passed to `get_num_new_matched_tokens` - **already block-aligned** (`scheduler.py:969-980`) |
+| `hit_returned` | the first element of what the connector returned (`None` = "no verdict", and the scheduler skips the request) |
+| `adopted` | the `num_external_tokens` the scheduler later passed to `update_state_after_alloc` (`scheduler.py:1228`) |
+
+* **Armed only in development - and the recording is not a third wrapper.** It rides
+  `guard_mode._record_success()`, which already has the method name, the arguments
+  and the return value of both calls, on the armed *and* the disarmed path. `arm`
+  installs those wrappers through `guard_mode.ensure_installed()` - the code that
+  already composes over the backport's replacement, refuses a foreign owner marker
+  and is idempotent - so the ledger owns **no class attribute of its own** and cannot
+  clobber or double-stack a layer. One set of wrappers, three consumers (guard mode,
+  the trace ring, the ledger), and `guard_mode.wrapper_customers()` is the question
+  every removal asks first: a `/trace` disarm cannot blind the ledger, and neither
+  can a `/guard` disarm.
+* **Bounded, because this runs on the serving loop.** A ring of `cap` slots (`256`
+  default, clamped to `[16, 4096]`) preallocated at arm, holding plain dicts.
+  `dropped` counts what the wrap ate; `dropped_unjoined` the subset that can never be
+  joined. The join index holds one entry per live record, so it is bounded by the
+  same cap, and evicting a record takes its entry with it (a later adopt for that id
+  is then honestly an `adopt_without_lookup`, never a stamp on someone else's record).
+* **Joined by request id, never by call order.** The scheduler walks a queue, so any
+  number of other requests' calls land between an offer and its adopt; a request can
+  be skipped so no adopt ever arrives; and a `num_computed_tokens > 0` re-entry
+  adopts without ever looking up (`scheduler.py:1046-1060`). All three are normal and
+  each has its own bucket.
+* **The verdict** (`op: verdict`) classifies every readable record: `adopted_full`,
+  `adopted_partial`, `adopted_more_than_offered`, `dropped_to_zero`, `no_host_copy`,
+  `no_verdict_from_connector`, `lookup_without_adopt`, `adopt_without_lookup`,
+  `unparsable`. `dropped_to_zero` (`hit_returned > 0`, `adopted == 0`) is the case
+  being hunted; each one carries `local_mod_block`,
+  `min_partial_tail_the_rule_needs`, `implied_true_local_range` and
+  `tail_rule_can_explain`.
+
+Read that last field deliberately, because it is the honest part. The connector is
+only ever handed `local - local % block_size`, so `local_mod_block` is 0 by
+construction in every record that has a hit at all (the fork's own gate,
+`manager.py:334-346`, returns `(0, False)` for an unaligned input), and the
+scheduler's `partial_tail` is therefore **inferred, never observed**. What the data
+can do is *refute*: the rule (`scheduler.py:996-1010`) drops the offer when
+`partial_tail >= ext_tokens`, and a tail is by construction smaller than one block -
+so a dropped hit at or above `block_size` cannot come from that rule at all
+(`tail_rule_can_explain: false`), while one below it is consistent with a true local
+hit somewhere in `[local + hit, local + block_size - 1]`.
+
+```bash
+T=$VLLM_E2_TIER_DEV_TOKEN
+# arm it, let it see traffic, then ask the question
+curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+     -H 'content-type: application/json' -d '{"op":"arm"}' | jq .reason
+curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+     -H 'content-type: application/json' -d '{"op":"verdict"}' | jq '.counts, .dropped_examples'
+curl -s -H "x-kvtier-dev-token: $T" localhost:8000/plugins/kvtier/lookups | jq .entries
+curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+     -H 'content-type: application/json' -d '{"op":"disarm"}'   # removes the wrappers if alone
+```
+
+A bounded preview of the ring is in every `snapshot` under `lookup_ledger`, beside
+its `not_covered` list: nothing before the arm is recorded, a guard-DECLINED call is
+*not* recorded (that value never reached the caller - look in the guard captures), a
+record lost to the cap is absent from a verdict, and an adopted N is the scheduler's
+decision, not proof that a worker loaded N tokens.
+
+## How much parked KV is retrievable (`snapshot.py`: `tier.cpu_hash_index`)
+
+`cpu_pool.free_blocks` is not the answer, and the two numbers that look like a
+contradiction are not one:
+
+```json
+"cpu_pool":             {"total_blocks": 665, "free_blocks": 664}
+"boundary_store_stats": {"stored": 4372}
+```
+
+A parked CPU block is handed **back to the allocator** when its store finishes
+(`BlockPool.free_blocks` / `unpin_blocks` only move it in the free queue,
+`block_pool.py:705-741`, `:770-798`), and what keeps it retrievable afterwards is its
+entry in `cpu_block_pool.cached_block_hash_to_block` - the index the fork itself
+resolves hits through (`get_one_block`, `manager.py:605`, `:940`, `:1251`).
+**Allocator freeness does not mean the index is empty.** `tier.cpu_hash_index` reads
+that index:
+
+| field | what it is |
+|---|---|
+| `entries` | `len()` of the map: distinct `(hash, group)` keys. The map does not de-duplicate (`block_pool.py:47-51`), so this is *hit-able prefixes*, not blocks - `sampled_keys_with_multiple_blocks` says when a key holds more than one |
+| `tokens_upper_bound` | `entries × hash_block_size`, labelled an upper bound |
+| `per_group` | distinct entries per KV-cache group, from the 4 packed big-endian bytes of each key (`kv_cache_utils.py:74-93`); a capped scan (`MAX_HASH_INDEX_SCAN`), and `key_handle` admits when it had to read the map's private `_cache` |
+| `sampled_values_without_hash`, `sampled_null_blocks` | the empirical tripwire for a stale entry, from at most 32 values |
+
+On staleness the fork's contract is checkable rather than guessable:
+`get_new_blocks` runs `_maybe_evict_cached_block` → `_remove_cached_block_hashes` on
+every block it hands out (`block_pool.py:664-688`, `:725-745`) and `unpin_blocks`
+documents the blocks it releases as readable *until reused*, so the reading says
+`stale_entries: "not_expected_on_pool_paths"` - with
+`stale_entries_not_ruled_out` naming the one thing that would defeat it (a write into
+a CPU block that never went through `get_new_blocks`) and
+`retrievable_now_vs_retained` saying what it does *not* claim: an entry's block is an
+eviction candidate the moment its store releases it, so the count is *retrievable
+now*, not *retained*. A missing attribute, an unsized container or a `len()` that
+raises comes back as a `reason` string with no `entries` key at all - a missing
+reading is information, a fabricated one is a lie.
+
 
 ## Guard mode: develop against a live engine without an outage (`guard_mode.py`)
 
 > **DEVELOPMENT ONLY. Disarm it before any production boot.** Armed, a tier
 > exception becomes a record plus a safe decline, which is exactly how you keep a
 > live engine up while debugging - and also how a real bug gets masked: a declined
-> store is silent, and a decline can leave tier state half-advanced. It has **no
-> env var** (it is off at every boot), it is armed only by a tokened `POST
-> /plugins/kvtier/guard`, and its state is echoed as `guard_mode` by `status` and
-> by every verb payload.
+> store is silent, and a decline can leave tier state half-advanced. **The boot
+> arms it**, immediately before it arms the tier, so no store or lookup ever runs
+> unguarded; there is no env var that turns it on (`VLLM_E2_TIER_DEV_BOOT_INERT`
+> turns the boot's arming off, and on such a boot `POST /plugins/kvtier/guard` is
+> the only way to arm it), and its state is echoed as `guard_mode` by `status` and
+> by every verb payload. **Because it is armed by default, the fault ring is the
+> evidence that a boot was clean**: after every boot, read `POST /plugins/kvtier/guard
+> {"op":"captures"}` and expect it empty. A tier that is armed, up, and reporting
+> zero work usually means it is *declining* - and the captures say why.
 
 ```bash
 curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"armed":true}'  $B/guard
@@ -752,21 +887,21 @@ of those groups reports `prefix_cacheable=True`, naming the group. If the patch
 is already live on a class and a LATER config fails the guard, the tier is
 auto-disarmed rather than left running (`auto_disarmed: true`).
 
-### Booting the tier: inert until someone arms it (the invariant)
+### Booting the tier: the boot brings it up working (`VLLM_E2_TIER_DEV_BOOT_INERT`)
 
-> **The tier does nothing at boot; arming is a deliberate act that requires the
-> fix to be fully installed.**
+> **A tier-env boot ends with the tier ARMED and GUARDED, without a human in the
+> loop - and it arms nothing it cannot verify.**
 
 The install cannot land when the plugin *loads*: `load_general_plugins()` runs at
 `core.py:217`, but the Scheduler - and with it the connector and the offload
 manager - is not constructed until `core.py:260`, so `register()`'s install
-attempt is *always* refused at boot (`cls is None`). And that refusal never
-disarmed: with the old `armed: True` boot default, an engine booted with tier env
-was an **unpatched** tier facing the first request, and the only thing between
-that and a crash was somebody remembering to curl a verb first. "Somebody
-remembers" is not a safety property, so two things had to change:
+attempt is *always* refused at boot (`cls is None`). For a while the answer was
+"then the boot stays inert and a human arms it", which is safe but not a system:
+every boot needed a curl, and a forgotten curl was a tier that silently parked
+nothing. Both halves are now handled at the one moment the class exists:
 
-* **`BOOT_ARMED = False`.** A tier boot is inert, and arming is a gated act.
+* **`BOOT_ARMED = False` still holds at plugin load.** Nothing is armed before
+  there is anything to arm, so no code path can ever arm an unpatched engine.
 * **The install no longer waits for a verb.** `register()` fits a hook on
   `KVConnectorFactory.create_connector` (`factory.py:43`). When that returns a
   `SimpleCPUOffloadConnector` carrying a `scheduler_manager`, the hook runs the
@@ -781,39 +916,76 @@ remembers" is not a safety property, so two things had to change:
   `pr56810.connector_hook` says what happened (`fitted`, `tier_connectors`,
   `worker_role_no_manager`, `installs_run`, `errors`, `last`), and
   `pr56810.patched_before_first_request` is the one-word answer.
+* **Then the BOOT runs: guard, then arm.** `backport.boot_from_connector()` is the
+  whole sequence, and it is strict in one direction only - it will not arm what it
+  cannot verify:
+
+  1. **Guard mode is installed and armed.** Its wrappers are *composed* over the
+     backport's and the switch's (`nested`), never put under them, so there is no
+     window in which a store or a lookup can run unguarded.
+  2. **The tier is armed** - only if the install reported `installed: true` (the
+     all-or-nothing verdict: every required method patched, every kill-switch
+     wrapper fitted), **and** the live-object check passed on the connector's own
+     `scheduler_manager` (the method *objects* it resolves are the ones carrying
+     our markers, so an instance built before the patch was fitted cannot pass),
+     **and** the guard is a layer of every entry point the class actually has.
+  3. Anything else leaves the tier disarmed and puts the reason in
+     `pr56810.boot.refusals` - never a silent no.
+
+  Guard before arm is not a style preference: arming the tier without the guard
+  means the first real tier bug is an EngineCore death instead of a recorded
+  decline, and the arm gate therefore treats "the guard refused this method" as a
+  reason not to arm.
+* **One line says all of it.** `pr56810.boot.line`, also written to the engine log
+  at WARNING so it survives without curling anything:
+
+  `BOOT[auto] backport=YES guard=YES tier=ARMED faults=0 guard_over=... not_covered=...`
+
+  `mode` is `auto` or `inert` and says which env posture ran; `refused=` names each
+  gate that failed with its reason; `not_covered=` lists the methods the guard does
+  **not** wrap (methods the fork's class does not define, or ones it inherits from
+  outside the tier module) so the line never implies more coverage than it has;
+  `faults=` is the guard's fault count at that instant, repeated as `faults_now`
+  when you read the payload later.
 
 ```bash
-# 1. boot the engine (tier env set). Expect BOTH lines in /tmp/vllm-serve.log:
+# 1. boot the engine (tier env set, VLLM_E2_TIER_DEV_BOOT_INERT unset). Expect
+#    BOTH lines in /tmp/vllm-serve.log:
 #    "kvtier-dev-plugin: connector-creation hook fitted on KVConnectorFactory..."
-#    "kvtier-dev-plugin: PR #56810 install run at CONNECTOR CREATION (before the
-#     first request): ...; tier still DISARMED until POST /plugins/kvtier/tier"
-#    plus "KV tier INERT at boot (armed=False; ...)" - inert and patched are the
-#    same boot seen from two sides.
+#    "kvtier-dev-plugin: BOOT[auto] backport=YES guard=YES tier=ARMED faults=0 ..."
+#    and NOTHING else to do. `grep 'BOOT\[' /tmp/vllm-serve.log | tail -1` is the
+#    whole boot verdict.
 
-# 2. read it back. This no longer PATCHES anything (the boot did), it CONFIRMS it:
-#    expect installed: true, armed: false, arm_block: null,
-#    patched_before_first_request: true
+# 2. read it back. This no longer PATCHES or ARMS anything (the boot did), it
+#    CONFIRMS it: expect installed: true, armed: true, boot.mode: "auto",
+#    boot.ran: true, patched_before_first_request: true
 ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
-  | python3 -c 'import sys,json;t=sys.stdin;p=json.load(sys.stdin);print({k:p[k] for k in ("armed","next_step")}, p["install"])'
+  | python3 -c 'import sys,json;p=json.load(sys.stdin);b=p["pr56810"]["boot"];print(p["armed"],b["mode"],b["backport"],b["guard"],b["tier"],b["faults_at_boot"])'
 
-# 3. arm it. Expect applied: true, armed: true.
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
-  -d '{\"op\":\"arm\"}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["applied"],d["armed"],d.get("reason"))'
+# 3. prove the boot was CLEAN, not merely UP. A guard-arm means a tier exception
+#    is now a DECLINE, so a broken tier looks healthy from `armed` alone.
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+  -d '{\"op\":\"captures\",\"limit\":5}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["count"],"faults");[print(c["method"],c["exception_type"],c["message"][:80]) for c in d["captures"]]'
 
-# 4. only now send traffic.
+# 4. send traffic.
 ```
 
-Step 2 is now a *confirmation*, not the mechanism: the boot already landed the
-patch at connector creation. The verbs remain the backstop - `ensure_installed`
-re-fits the hook and re-runs the install on `/tier`, `/snapshot` and
-`/policy/reload`, which is what covers a process whose connector factory was
-imported only after the plugin loaded, or a manager class that appeared later. A
-boot where `installed: false` survives step 2 is not "nobody has curled yet": it
-means the hook never saw a tier connector or the install was refused, and
-`refused_methods` / `connector_hook.last` names which.
+Steps 2 and 3 are *confirmations*, not the mechanism. The verbs remain the
+backstop - `ensure_installed` re-fits the hook and re-runs the install on `/tier`,
+`/snapshot` and `/policy/reload`, which is what covers a process whose connector
+factory was imported only after the plugin loaded, or a manager class that
+appeared later. A boot where `armed: false` survives step 2 with the mode `auto` is
+NOT "nobody has armed it yet": it is a refusal, and `boot.refusals` names the gate
+(the install, the live-object check, or the guard's coverage of the class).
 
-An `arm` is refused, never forced, and the refusal kind tells you which gate you
-hit (`arm_block.kind`, `state.kind`, `disarm_reason`):
+The deliberate shortcut in that design is worth naming: the guard covers the nine
+entry points it knows and refuses to wrap what it cannot own, and the boot treats a
+method the class does not define as *not covered* rather than as a failure -
+otherwise a fork that renames or inherits a method would take the whole tier down.
+That is why the BOOT line prints `not_covered=` instead of a bare `guard=YES`.
+
+An `arm` is refused, never forced, by the boot or by a verb, and the refusal kind
+tells you which gate you hit (`arm_block.kind`, `state.kind`, `disarm_reason`):
 
 | kind | meaning | what to do |
 |---|---|---|
@@ -821,12 +993,13 @@ hit (`arm_block.kind`, `state.kind`, `disarm_reason`):
 | `geometry` | the guard vetoed this config: the patch would skip a group that is still `prefix_cacheable=True` | do **not** arm; boot without the tier or fix the geometry |
 | `no_manager` | no `SimpleCPUOffloadScheduler` exists in this process - the tier connector is not configured, or the engine is not built yet | there is nothing to arm here; check the tier env of the engine you reached |
 
-And because `armed: false` on a tier-env boot is now *correct*, every payload
-says so where an operator will read it: `pr56810.boot_default_armed`,
-`pr56810.boot_is_inert`, `pr56810.arm_requires`, and `pr56810.operator_note` - a
-sentence that answers "the engine booted with the tier on, why is it parking
-nothing?". The `/tier` verb repeats `armed`, `boot_default_armed`,
-`operator_note` and a `next_step` at the top level, next to `applied`.
+And because `armed: false` on a tier-env boot is now an *exception to explain*,
+every payload says so where an operator will read it: `pr56810.boot` (the verdict
+and its reasons), `pr56810.boot_default_armed`, `pr56810.boot_is_inert`,
+`pr56810.arm_requires`, and `pr56810.operator_note` - a sentence that answers "the
+engine booted with the tier on, why is it parking nothing?". The `/tier` verb
+repeats `armed`, `boot_default_armed`, `operator_note` and a `next_step` at the top
+level, next to `applied`.
 
 ### The kill switch (runtime, no restart)
 
@@ -957,34 +1130,44 @@ H="x-kvtier-dev-token: $TOK"
 
 ### Every boot with the tier env set: the order traffic goes in
 
-> **The tier does nothing at boot; arming is a deliberate act that requires the
-> fix to be fully installed.**
+> **The boot arms the tier itself when the install verifies; the read-back proves
+> it and the fault ring proves the boot was clean, not merely up.**
 
 ```bash
-# 1. read it back. The BOOT installs the fix (the connector-creation hook runs it
-#    when the tier connector is built, with the live KVCacheConfig); this curl only
-#    CONFIRMS it - and it is still the read that proves the claim. Expect
-#    installed:true, armed:false, arm_block:null, patched_before_first_request:true
+# 1. read the boot verdict. The BOOT installs, guards and arms (the connector-
+#    creation hook runs all three when the tier connector is built, with the live
+#    KVCacheConfig); this curl only CONFIRMS it - and it is still the read that
+#    proves the claim. Expect installed:true, armed:true, boot.mode:"auto",
+#    boot.backport/guard/tier all true, patched_before_first_request:true
 ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["install"]["installed"],d["armed"],d["operator_note"])'
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);b=d["pr56810"]["boot"];print(d["install"]["installed"],d["armed"],b["mode"],b["tier"],b["refusals"],d["operator_note"])'
 
-# 2. arm. Expect applied:true, armed:true. A refusal says its kind:
-#    incomplete_install | geometry | no_manager  (see the table in the backport
-#    section) and leaves the tier disarmed.
+# 2. prove it is CLEAN, not just armed. Guard mode is armed by the boot, so a tier
+#    exception is a recorded DECLINE: `armed:true` alone cannot tell you the tier
+#    is doing work. A non-zero count here means the tier is alive and refusing.
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+  -d '{\"op\":\"captures\",\"limit\":5}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["count"],"faults");[print(c["method"],c["exception_type"],c["message"][:80]) for c in d["captures"]]'
+
+# 3. only a REFUSAL needs a verb now. If step 1 says armed:false with mode "auto",
+#    read boot.refusals - it names the gate (install / live-object check / guard
+#    coverage). To arm by hand once the cause is fixed:
 ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
   -d '{\"op\":\"arm\"}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["applied"],d["armed"],d.get("reason"),d["next_step"])'
 
-# 3. only now let traffic in.
+# 4. now let traffic in.
 ```
 
-Step 1 is a confirmation, not the patch: `install_connector_hook()` runs the
-install inside `Scheduler.__init__` (`core.py:217` plugin load -> `core.py:260`
+Step 1 is a confirmation, not the patch or the arm: `install_connector_hook()` runs
+the install inside `Scheduler.__init__` (`core.py:217` plugin load -> `core.py:260`
 Scheduler -> `scheduler.py:164` `create_connector` -> first request), so an engine
-that has never been spoken to is still a patched engine. If step 1 answers
-`installed:false`, that is a finding, not a to-do: either the hook never saw a
-tier connector in this process (`pr56810.connector_hook`: `fitted`,
+that has never been spoken to is still a patched, guarded, armed engine. If step 1
+answers `installed:false`, that is a finding, not a to-do: either the hook never saw
+a tier connector in this process (`pr56810.connector_hook`: `fitted`,
 `tier_connectors`, `other_connector`, `last`) or a method was refused
-(`refused_methods`, a fingerprint drift).
+(`refused_methods`, a fingerprint drift). If it answers `installed:true, armed:false`
+on an `auto` boot, `boot.refusals` says whether the live-object check or the guard's
+coverage of the class stopped the arm - and in both cases the injector is what keeps
+the engine alive, which is the point of gating rather than hoping.
 
 What a disarmed tier now shields, stated where you will read it: BOTH callers of
 `_select_eager_blocks_to_store` are gated - the three per-step entry points AND
@@ -1013,7 +1196,8 @@ patch at connector creation, a crash here means one of exactly three things:
    construction (`set_armed` refuses it, naming `incomplete_install`) - if you
    ever see it, that is the bug to report, not a thing to work around.
 
-It is NOT what a correctly inert tier looks like - see the next section for that.
+It is NOT what a correctly disarmed-but-armed-tier looks like - see the next
+section for the inert posture, which now requires the opt-out.
 Confirm it in one line (the tier state lives in the engine; the read also re-fits
 the hook and re-runs the install, so it is the repair as well as the diagnosis):
 
@@ -1035,7 +1219,7 @@ ssh llm "grep -a 'not divisible by tokens_per_hash' /tmp/vllm-serve.log | tail -
 # did the hook get fitted, did the install run at connector creation, was it
 # refused? was the tier force-disarmed or an arm refused? did it boot inert (the
 # expected line on every boot with the plugin enabled)?
-ssh llm "grep -aE 'connector-creation hook (fitted|NOT fitted)|install run at CONNECTOR CREATION|connector-creation install was NOT completed|PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)|KV tier INERT at boot' /tmp/vllm-serve.log | tail -12"
+ssh llm "grep -aE 'BOOT\\[(auto|inert)\\]|connector-creation hook (fitted|NOT fitted)|install run at CONNECTOR CREATION|connector-creation install was NOT completed|PR #56810 backport (INSTALLED|NOT installed)|REFUSED to arm|KV tier (ARMED|DISARMED)|boot posture (AUTO|INERT)' /tmp/vllm-serve.log | tail -12"
 ```
 
 If guard mode was armed there is also a structured capture of the fault (guard
@@ -1048,14 +1232,22 @@ ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
 
 ### Tier env is set but nothing is parked / `armed: false` after a boot
 
-**This is the expected inert behaviour, not a bug.** Since `BOOT_ARMED = False`
-an engine that booted with `KV_OFFLOAD_SIZE` / `VLLM_USE_SIMPLE_KV_OFFLOAD` set
-parks and loads NOTHING until someone arms it - the opposite of the old posture,
-where a tier boot was live on the first request (and, with the fix not yet
-installed, a crash on that first request). So:
+**On an `auto` boot this is a finding, not the expected state.** The boot arms the
+tier itself once the install verifies, so an engine that booted with
+`KV_OFFLOAD_SIZE` / `VLLM_USE_SIMPLE_KV_OFFLOAD` set and answers `armed: false` was
+*refused*, and `pr56810.boot.refusals` names the gate that refused it. (The inert
+posture is now a choice: `VLLM_E2_TIER_DEV_BOOT_INERT=1` produces it, and the BOOT
+line says `BOOT[inert]` so the two are never confused.) So:
 
-- `armed: false`, `boot_default_armed: false`, engine healthy -> **normal**. Read
-  `pr56810.operator_note`; if you want the tier, POST `{"op":"arm"}`.
+- `armed: false`, `boot.mode: "inert"` -> **normal, and ordered**: the operator
+  asked for a manual boot. POST `{"op":"arm"}` when you want the tier.
+- `armed: false`, `boot.mode: "auto"`, `boot.refusals` naming the guard -> the
+  guard could not wrap an entry point the class has (a foreign owner marker, or an
+  attribute that is not callable). The tier is unguarded, so arming it would be
+  arming a crash; fix the ownership question the reason names.
+- `armed: false`, `boot.mode: "auto"`, `boot.refusals` naming the live-object check
+  -> the connector instance the engine is holding does not resolve to the patched
+  methods (it was built before the patch was fitted). Read `pr56810.live_check`.
 - `installed: false` -> the connector-creation install did not complete in this
   process. Read `pr56810.connector_hook` FIRST: `fitted: false` means the factory
   was not importable when the plugin loaded (the next verb re-fits it),
@@ -1064,6 +1256,9 @@ installed, a crash on that first request). So:
   worker-process answer. If the hook DID run and the install still failed,
   `refused_methods` names the fingerprint drift, and the tier is disarmed with
   both selector routes gated - park nothing, do not arm, fix the source.
+- `armed: true`, `boot.tier: true`, but nothing parked -> read the guard's captures.
+  An armed tier under an armed guard declines instead of crashing, so "armed and
+  idle" is exactly what a live bug looks like from the outside.
 - `armed: true` with `installed: false` -> impossible by construction; if you
   ever see it, that is the bug to report.
 
@@ -1071,7 +1266,7 @@ Confirm which one you are looking at:
 
 ```bash
 ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("armed","boot_default_armed","operator_note","next_step")}, indent=1)); print(d["install"])'
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);b=d["pr56810"]["boot"];print(json.dumps({k:d[k] for k in ("armed","boot_default_armed","operator_note","next_step")}, indent=1)); print(json.dumps({k:b[k] for k in ("ran","mode","backport","guard","tier","refusals","faults_at_boot")}, indent=1)); print(d["install"])'
 ```
 
 ### Runtime kill: make the tier a strict no-op, NO restart (one curl)
@@ -1144,9 +1339,20 @@ Where to look in `pr56810`:
 
 - `installed` - the **all-or-nothing** verdict: `true` only if every required
   method is patched. `armed` must be `false` whenever this is `false`.
-- `boot_default_armed` / `boot_is_inert` - the tier is disarmed at boot on
-  purpose, so `armed: false` right after a boot with tier env set is the design,
-  not a fault. `operator_note` says which of the two you are looking at, and the
+- `boot` - **what the boot decided, in one place**: `ran`, `mode` (`auto`, or
+  `inert` because `VLLM_E2_TIER_DEV_BOOT_INERT` is set) and `mode_why`, the three
+  verdicts (`backport`, `guard`, `tier`), `refusals` (one string per gate that
+  blocked the arm, each naming its reason), `not_covered` (entry points the guard
+  does not wrap, so `guard: true` never over-claims), `nested` (methods where the
+  guard was composed over another layer instead of replacing it), `live_check`,
+  `manager`, `faults_at_boot` and `faults_now`, `note`, and `line` - the same
+  single line the engine log carries. `ran: false` means this process has no tier
+  to boot (worker rank, or a `MultiConnector`); `line` is written anyway, with the
+  reason.
+- `boot_default_armed` / `boot_is_inert` - the tier is disarmed at *plugin load* on
+  purpose (nothing exists to arm yet), so these describe the load-time posture, not
+  the boot's final state. `armed: false` after an `auto` boot is a refusal to read
+  in `boot.refusals`; `operator_note` says which situation you are in, and the
   `/tier` payload adds `next_step`.
 - `arm_requires` / `arm_block.kind` - arming needs the fix fully installed AND
   the geometry guard passing; a refusal kind is `geometry`, `no_manager` (no
@@ -1292,9 +1498,11 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
   exhaustively: swapping the policy module reference; the store-policy and capacity
   wrappers; the PR #56810 replacements plus the four kill-switch wrappers on the
   offload scheduler and the one wrapper on `KVConnectorFactory.create_connector`
-  (the hook is what installs them, at connector creation, and the tier stays INERT
-  until someone arms - `BOOT_ARMED = False`); a trace ring and its two scheduler
-  wrappers while ARMED (removed on disarm); the guard wrappers while armed or traced
+  (the hook is what installs them, at connector creation, and the same hook then
+  arms the guard and the tier - `BOOT_ARMED = False` only means nothing is armed at
+  *plugin load*, before there is a class to arm); a trace ring and its two
+  scheduler wrappers while ARMED (removed on disarm); the guard wrappers while armed
+  or traced
   (restored by
   identity on disarm); and the worker's diagnostics file when
   `VLLM_E2_TIER_DIAG` names a directory. Every one of those is opt-in, and the two
@@ -1341,7 +1549,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-742 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+846 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1356,14 +1564,30 @@ reload verb, holder-based reload actually changing behaviour (same-size/same-mti
 edit), rollback with the traceback as data, containment (a raising policy and a
 raising engine both come back as data, `BaseException` propagates), the 504/502/503
 answers, that every installed engine method takes exactly one optional argument and
-answers under both dispatch shapes, and that the mount point is exactly the nine
+answers under both dispatch shapes, and that the mount point is exactly the ten
 `/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
 one from loopback with no token, two from a source-bound non-loopback client socket
 on this host's own LAN address (skipped on a box with no such address).
 
-The backport and the kill switch (`tests/test_backport.py`, 65 of them) drive the
+The lookup ledger (`tests/test_lookup_ledger.py`) is the one that proves the
+composition rules instead of asserting them: the cap and the monotonic `dropped`,
+lookups and adopts interleaved in a different order and joined by request id, the
+adopt that never had a lookup, the lookup whose request was skipped, a re-offer after
+a failed allocation, a re-install that must leave exactly ONE guard layer (it walks
+the marker chain and asserts the fork's function is still underneath), a
+backport-replaced method with `backport._layers_of` saying `["guard", "backport"]`,
+a foreign owner marker refused with the refusal QUOTED in the arm reason (not a
+generic "no tier class"), a disarmed ledger that never even evaluates its arguments,
+a trace disarm that cannot blind it, and a fork method that raises - which must
+propagate exactly as it would unwrapped, because the ledger is not guard mode. The
+parked-KV index reading is pinned in `tests/test_snapshot.py`: the live 664-free /
+4372-entries pair reported side by side, per-group counts decoded from the packed key,
+the scan and group caps honoured, a `len()` that raises named as that rather than as
+a missing handle, and three separate ways to get a `reason` instead of a number.
+
+The backport and the kill switch (`tests/test_backport.py`, 67 of them) drive the
 fork's own
 method text (fingerprints match, so the real install path runs) against the
 production geometry, with a poison-pill `resolve_block_hashes` that reproduces
@@ -1399,6 +1623,24 @@ and the engine still gets its connector; the fork's own `create_connector`
 exceptions propagate untouched; a foreign hook marker is refused; and guard mode
 composes with the new wrapper in BOTH fit orders, handing it back by identity.
 
+Bringing the tier up working, unattended, is its own file
+(`tests/test_auto_boot.py`, 30 of them), because the claim is a sequence and a
+sequence needs ordering proven: a clean install arms guard mode and the tier with
+**no verb anywhere in the test**; the guard is armed *before* the tier is armed
+(spy-recorded, not asserted about, so a reorder fails here); a partial install, an
+instance the live-object check cannot make safe, and an entry point the guard
+refused to wrap each refuse to arm and name themselves in the payload and in the
+one BOOT line; `not_covered` reports what the guard does not wrap without vetoing
+the arm - including the production shape where `take_events`/`reset`/
+`update_connector_output` are inherited from the connector base module and can
+never carry a guard layer (an earlier gate read "attribute exists, therefore guard
+it" and would have refused to arm on every real engine); an inherited limit does
+not relax an *owned* unguarded method, which still blocks; a second boot composes
+into exactly one guard layer with the backport's and switch's layers intact
+beneath it; the opt-out resolves with the same falsy vocabulary as every other
+flag and says so in the payload; and a raising tier method becomes a recorded
+decline that survives a disarm, a re-arm and the next boot's `faults=N`.
+
 The debugger verbs add six files:
 
 | File | Tests | What it pins down |
@@ -1406,7 +1648,7 @@ The debugger verbs add six files:
 | `tests/test_kvconfig.py` | 40 | the divisibility table against the fork's assert (`kv_cache_utils.py:2888`), a Mamba group's different `hash_block_size`, the QSA ring recognised by class name, `prefix_cacheable` never inferred from `host_rotation`, the geometry-vs-manager disagreement, every cap honouring `dropped` counts, a missing operand reported as `unknown` and never as safe |
 | `tests/test_kvinspect.py` | 41 | block/request inspection against a production-shaped fake: the packed block-hash decode, `in_cached_map` via the tier's own dict, `coverable_blocks` and `binding_term` recomputed by hand, the `ids_cap`/drop reporting, every "does not exist" answer naming what does |
 | `tests/test_trace_ring.py` | 36 | the ring's fixed capacity and wrap accounting, `read` never walking O(depth), the `gap_records` a slow poller gets, `clear` not resetting `seq`, arming installing and disarming removing the observers, a disarmed ring costing no allocation and no wrap, the step observer returning the fork's value untouched |
-| `tests/test_guard_mode.py` | 46 | every declined method returning the fork's documented no-op shape (and the one method that must re-raise), `BaseException` never swallowed, the metadata rebuild falling back to a re-raise if the fork renames its class, captures bounded with the full text only via the `captures` op, `guard_mode: true` in every payload, disarm restoring the originals by identity, tracing keeping the wrappers alive after a disarm |
+| `tests/test_guard_mode.py` | 49 | every declined method returning the fork's documented no-op shape (and the one method that must re-raise), `BaseException` never swallowed, the metadata rebuild falling back to a re-raise if the fork renames its class, captures bounded with the full text only via the `captures` op, `guard_mode: true` in every payload, disarm restoring the originals by identity, tracing keeping the wrappers alive after a disarm, **no env var that can arm it** (the boot does, and the opt-out can only turn that off) |
 | `tests/test_worker_diag.py` | 43 | the file schema against the reader's contract (`version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters`), the rank name matching the file name, an unknown rank meaning no file at all, the cadence and the time floor, "a change writes now", the empty pool still writing zeros, atomic replace and the no-truncate rule, the size cap trimming prose before data, a full disk failing a step never, `bytes_used` as a proven floor |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
@@ -1469,13 +1711,21 @@ copy of either method. The fork's own tier suite is unaffected: `84 passed`
 
 ## Known limits
 
-* **Guard mode is a development facility.** Armed, it turns a tier exception into a
-  record plus a decline, so a real bug can hide behind a decline that looks like
-  normal "nothing to do" - and `build_connector_meta`'s substitute is an *empty*
-  metadata, which means the worker does nothing that step. It is off at every boot,
-  needs the token, echoes `guard_mode: true` everywhere, and must be disarmed before
-  a production boot. The same reasoning covers tracing: the ring is bounded and the
-  observers are pure, but they are wrappers on the scheduler loop.
+* **Guard mode is a development facility, and the boot arms it.** Armed, it turns a
+  tier exception into a record plus a decline, so a real bug can hide behind a
+  decline that looks like normal "nothing to do" - and `build_connector_meta`'s
+  substitute is an *empty* metadata, which means the worker does nothing that step.
+  That is the price of a boot that cannot be killed by a tier bug, and the trade is
+  deliberate: the alternative is an unguarded `build_connector_meta` taking the
+  EngineCore down on live traffic. The counterweight is evidence, not silence - the
+  fault ring survives the boot, `boot.faults_at_boot`/`faults_now` compare across
+  it, and the ring is named in the boot line itself. **Read
+  `{"op":"captures"}` after every boot**: a tier that is armed, up, and doing no
+  work is a tier that is declining. It needs the token to reach, echoes
+  `guard_mode: true` everywhere, is opt-out-able only as a whole
+  (`VLLM_E2_TIER_DEV_BOOT_INERT`), and must be disarmed before a production boot.
+  The same reasoning covers tracing: the ring is bounded and the observers are pure,
+  but they are wrappers on the scheduler loop.
 * `/status` mirrors `guard_mode` and `trace_armed`; it does not know them. They come
   from the last engine answer this API process saw and are `null` before the first
   one, so a `/status` right after an API restart says *unknown*, not *off* - and

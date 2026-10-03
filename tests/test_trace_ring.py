@@ -327,7 +327,10 @@ def test_an_engine_with_no_scheduler_arms_the_ring_but_installs_nothing():
 
 def test_the_wrappers_stay_out_of_the_way_when_the_ring_is_disarmed_after_guard():
     """Disarming the ring while GUARD MODE is armed must not remove the tier
-    wrappers - guard mode still needs them. The dependency runs one way."""
+    wrappers - guard mode still needs them. The dependency runs one way. The
+    reason now NAMES EVERY consumer (one set of wrappers, three consumers: guard,
+    this ring, the lookup ledger), so the assertion is on the shared predicate's
+    wording rather than on a sentence about guard mode alone."""
     manager_cls, module = fake.fork_class(guard_mode.TARGET_MODULE,
                                           "SimpleCPUOffloadScheduler",
                                           fake.TIER_MANAGER_SOURCE, register=True)
@@ -337,7 +340,7 @@ def test_the_wrappers_stay_out_of_the_way_when_the_ring_is_disarmed_after_guard(
         trace_ring.trace_for_engine(fake.engine(None), {"op": "arm"})
         payload = trace_ring.trace_for_engine(fake.engine(None), {"op": "disarm"})
         assert payload["uninstall"]["tier_wrappers"]["reason"] == (
-            "guard mode is armed, so the tier wrappers stay in place")
+            "still needed by: guard mode; the tier wrappers stay in place")
     finally:
         sys.modules.pop(guard_mode.TARGET_MODULE, None)
 

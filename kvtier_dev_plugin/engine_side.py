@@ -43,6 +43,7 @@ from . import (
     guard_mode,
     kvconfig,
     kvinspect,
+    lookup_ledger,
     snapshot,
     store_hook,
     trace_ring,
@@ -187,14 +188,43 @@ def _make_trace_method():
     return kvtier_dev_trace
 
 
+def _make_lookups_method():
+    def kvtier_dev_lookups(self, args=None):  # noqa: ARG001 - bound method
+        """Read/arm/disarm/clear the bounded LOOKUP LEDGER; `args.op` selects.
+
+        The ledger is what answers "the connector offered N tokens and the
+        scheduler adopted 0 - which rule did that?": it records, per request id,
+        the local hit the scheduler passed IN, the hit the connector returned,
+        and the `num_external_tokens` the scheduler later passed to
+        `update_state_after_alloc`. `op: verdict` classifies every joined pair.
+
+        It owns no method of its own on the tier: the recording rides the guard
+        wrapper, so `arm` installs those wrappers (composed over the backport's,
+        never replacing them) and `disarm` removes them only when no other
+        consumer still needs them.
+        """
+        return lookup_ledger.lookups_for_engine(self, args)
+
+    kvtier_dev_lookups.__doc__ = (
+        "kvtier-dev-plugin: the bounded lookup/adopt LEDGER - pair each "
+        "get_num_new_matched_tokens() offer with the update_state_after_alloc() "
+        "that followed it, read it, or ask for the verdict that classifies the "
+        "hits the scheduler did not adopt. Fixed capacity, capped answers, "
+        "records nothing while disarmed.")
+    return kvtier_dev_lookups
+
+
 def _make_guard_method():
     def kvtier_dev_guard(self, args=None):  # noqa: ARG001 - bound method
         """Guard mode: arm/disarm it, read its state, or fetch the captured faults.
 
-        A DEVELOPMENT facility. Armed it turns a tier exception into a record and
-        a safe decline, which can mask real bugs; the state is echoed in every
-        verb payload as `guard_mode` so a guarded dev engine cannot be mistaken
-        for a production one.
+        A DEVELOPMENT facility, and since the auto boot an ARMED ONE: the boot
+        arms it before it arms the tier, so no store or lookup ever runs
+        unguarded. That is a deliberate trade - a tier bug becomes a recorded
+        DECLINE instead of an engine death - so the fault ring is the evidence a
+        boot was clean, and the state is echoed as `guard_mode` in every verb
+        payload. `disarm` is the operator's override and removes the wrappers when
+        nothing else consumes them.
         """
         return guard_mode.guard_for_engine(self, args)
 
@@ -210,26 +240,21 @@ def _make_tier_method():
     def kvtier_dev_tier(self, args=None):  # noqa: ARG001 - bound method
         """Arm or disarm the KV tier at runtime, without restarting the engine.
 
-        THE TIER IS DISARMED AT BOOT (`backport.BOOT_ARMED = False`), and that is
-        the safety property, not an inconvenience: the plugin's install cannot
-        land at plugin-load time (the manager class does not exist until
-        `core.py:260`), so a boot-armed tier would be a boot-UNPATCHED tier
-        facing the first request. `arm` is therefore the only thing that makes a
-        tier live, and it is refused - naming `geometry`, `no_manager` or
-        `incomplete_install` - unless the fix is fully installed.
+        THE TIER IS DISARMED AT PLUGIN LOAD and the boot ARMS IT at connector
+        creation - but only on a verified install, because arming before the crash
+        fix is in place is the production crash this module exists to prevent, and
+        the connector hook is the first instant the manager class exists. So the
+        boot patches, guards and arms itself, and `arm`/`disarm` are the operator's
+        controls afterwards, not the mechanism that makes a boot work. The opt-out
+        (`config.ENV_BOOT_INERT`) restores the old inert boot; the BOOT log line
+        and `tier.boot` both say which mode ran and what it decided.
 
-        Being unable to land AT PLUGIN LOAD is no longer the same as being unable
-        to land before the first request: `backport.install_connector_hook()`
-        wraps `KVConnectorFactory.create_connector` and runs the install when the
-        tier connector is built, which is the first moment the manager class
-        exists and is still inside the Scheduler's own constructor. So a tier boot
-        patches and geometry-checks itself; the verbs are the backstop, not the
-        mechanism.
-
-        `disarm` makes the connector a strict no-op through the manager methods
-        `backport` wraps: no prefix hit is reported, the metadata it hands the
-        workers is empty, no pending work is claimed, and the finish path queues
-        nothing - which is why a disarm now gates BOTH routes into the selector
+        An ARM is refused - naming `geometry`, `no_manager` or `incomplete_install`
+        - unless the fix is fully installed, and a partial install force-disarms
+        and logs. `disarm` makes the connector a strict no-op through the manager
+        methods `backport` wraps: no prefix hit is reported, the metadata it hands
+        the workers is empty, no pending work is claimed, and the finish path
+        queues nothing - which is why a disarm gates BOTH routes into the selector
         that contains the upstream assert. It is the reason the tier can be turned
         on at all - a knob that needs a 4-minute reboot is not a kill switch. The
         upstream divisibility fix (PR #56810) is installed on the way through every
@@ -252,6 +277,7 @@ _FACTORIES = {
     config.METHOD_TRACE: _make_trace_method,
     config.METHOD_GUARD: _make_guard_method,
     config.METHOD_TIER: _make_tier_method,
+    config.METHOD_LOOKUPS: _make_lookups_method,
 }
 
 
@@ -348,13 +374,15 @@ def register() -> None:
         # that costs a live-traffic reboot rather than degrading the tier.
         #
         # This refusal at boot is EXPECTED and is no longer a fail-open twice
-        # over: the tier's state is `armed: False` from `BOOT_ARMED`, so an engine
-        # that has not been patched schedules no tier work, and the hook above
-        # lands the install anyway the moment the tier connector is built - before
-        # the first request, without anybody curling a verb. The verbs remain the
-        # backstop for a process where the factory is imported after plugin load
-        # (`ensure_installed` re-fits the hook), and arming is what makes any of it
-        # matter (`backport.set_armed` refuses to arm an unpatched tier).
+        # over: at plugin load the tier's state is still `armed: False` from
+        # `BOOT_ARMED`, so an engine that has not been patched schedules no tier
+        # work, and the hook above lands the install anyway the moment the tier
+        # connector is built - before the first request, without anybody curling a
+        # verb. That same hook then GUARDS and ARMS (see `boot_from_connector`), so
+        # "patched but inert" is no longer where a healthy boot ends. The verbs
+        # remain the backstop for a process where the factory is imported after
+        # plugin load (`ensure_installed` re-fits the hook), and arming stays
+        # gated on the install (`backport.set_armed` refuses an unpatched tier).
         tier_fix = backport.install(backport.manager_class())
         # Unlike the store hook, the capacity wrappers MUST land here: the
         # EngineCore collects the handshake and calls the connector's consumer a
@@ -370,21 +398,27 @@ def register() -> None:
         level("kvtier-dev-plugin: connector-creation hook %s", connector_hook)
         level("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
         level("kvtier-dev-plugin: worker diagnostics writer %s", worker_files)
-        # Guard mode is OFF at boot by construction (it has no env var at all),
-        # and saying so at every boot is what makes "was this engine guarded?"
-        # answerable from a log line instead of from a memory.
-        level("kvtier-dev-plugin: guard mode OFF (development-only facility; "
-              "arm it with POST %s/guard, and disarm it before any production "
-              "boot)", config.ROUTE_PREFIX)
-        # Same reasoning for the tier: "was this engine parking KV?" must be
-        # answerable from the boot log. The tier is inert until armed, and only
-        # an arm can prove the fix is in place (see backport.BOOT_ARMED).
-        level("kvtier-dev-plugin: KV tier INERT at boot (armed=False; the "
-              "backport install above is refused until the connector imports "
-              "the manager, and the connector-creation hook lands it then - "
-              "before the first request). It parks nothing until POST %s "
-              "{\"op\":\"arm\"}, and that arm is refused until the PR #56810 fix "
-              "is fully installed", config.ROUTE_PREFIX + config.ROUTE_TIER)
+        # WHAT THE BOOT WILL DO, stated at plugin load, and what it DID stated at
+        # connector creation. Guard mode has no env var of its own and never will
+        # (arming a bug-masking facility from a launcher script is the thing the
+        # guard-mode suite pins); what the operator controls is the ONE opt-out
+        # that turns the boot's own arming OFF. Until the tier connector exists
+        # nothing is installed and nothing is armed, so this line can only name
+        # the posture - the BOOT line from `backport.boot_from_connector` is the
+        # verdict, and it is the line to read.
+        boot_mode_name, boot_mode_why = backport.boot_mode()
+        level("kvtier-dev-plugin: boot posture %s (%s). The verdict line is the "
+              "one starting 'BOOT[%s]' below, written when the tier connector is "
+              "built; until then nothing is patched, guarded or armed",
+              boot_mode_name.upper(), boot_mode_why, boot_mode_name)
+        # The fault ring, said out loud at every boot. Under the auto boot a real
+        # tier bug becomes a DECLINE, not a crash - which is the whole point, and
+        # exactly why "0 faults" is the thing to check rather than "did it boot".
+        level("kvtier-dev-plugin: the guard records every declined tier exception "
+              "in a bounded fault ring; after a boot with the tier armed, a "
+              "non-zero count means the tier is silently NOT doing work it was "
+              "asked to do: POST %s {\"op\":\"captures\"}",
+              config.ROUTE_PREFIX + config.ROUTE_GUARD)
     except Exception:  # noqa: BLE001 - a diagnostic plugin must not break a boot
         logger.exception("kvtier-dev-plugin: engine-side install failed; "
                          "continuing without it")

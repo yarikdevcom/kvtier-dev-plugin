@@ -138,6 +138,260 @@ def _pool_view(pool) -> dict:
             "free_blocks": free}
 
 
+# --- the host-RAM parked-KV HASH INDEX ---------------------------------------
+#
+# THE QUESTION THIS ANSWERS: "how much partial KV is actually retrievable in host
+# RAM right now?" `cpu_pool.free_blocks` cannot answer it, and reading the two
+# numbers side by side without this block is actively misleading:
+#
+#     cpu_pool.total_blocks = 665   cpu_pool.free_blocks = 664   -> "1 in use"
+#     boundary_store_stats.stored = 4372                          -> "4372 parked"
+#
+# Both are true. A parked CPU block is handed BACK TO THE ALLOCATOR when its store
+# finishes (`BlockPool.free_blocks`/`unpin_blocks` only move it in the free queue;
+# block_pool.py:705-741, :770-798), and what keeps it retrievable afterwards is its
+# entry in `cpu_block_pool.cached_block_hash_to_block` - the hash index the fork
+# itself looks hits up in (`get_one_block`, manager.py:605, :940, :1251). Allocator
+# freeness does NOT mean the index is empty. Occupancy of the index is the number
+# that means "retrievable".
+#
+# BOUNDED: one `len()` on a sized container, then at most `MAX_HASH_INDEX_SCAN`
+# keys and `MAX_HASH_INDEX_SAMPLE` values for the per-group split and the sanity
+# sample. Never a full walk of an index that could be 100k entries on a big host.
+MAX_HASH_INDEX_SCAN = 20000
+MAX_HASH_INDEX_GROUPS = 64
+MAX_HASH_INDEX_SAMPLE = 32
+HASH_INDEX_ATTR = "cached_block_hash_to_block"
+HASH_INDEX_MEANING = (
+    "parked entries in the host-RAM KV hash index, NOT allocator allocations: "
+    "this is how much parked KV can be HIT. Distinct from cpu_pool.free_blocks "
+    "- a parked CPU block is returned to the allocator when its store finishes, "
+    "and the index entry is what keeps it retrievable, so a nearly-all-free pool "
+    "can still hold thousands of retrievable blocks")
+# The fork's own recycling contract, read out of the source rather than guessed:
+# an entry is removed SYNCHRONOUSLY when its block is handed out again.
+STALE_ENTRIES_VERDICT = "not_expected_on_pool_paths"
+STALE_ENTRIES_WHY = (
+    "BlockPool.get_new_blocks calls _maybe_evict_cached_block -> "
+    "_remove_cached_block_hashes on every block it hands out "
+    "(block_pool.py:664-688, :725-745), and unpin_blocks documents the blocks it "
+    "releases as readable UNTIL reused (:705-723). So an entry does not outlive "
+    "the bytes it points at on the pool's own paths: the entry is dropped at the "
+    "moment of reuse, not kept over a later overwrite")
+STALE_ENTRIES_NOT_RULED_OUT = (
+    "a fork path that wrote CPU bytes into a block WITHOUT taking it from "
+    "get_new_blocks would defeat the above, and this snapshot cannot see the copy "
+    "itself; the sampled_values_without_hash counter is the empirical tripwire")
+
+
+def _group_of_key(key):
+    """The group id a `BlockHashWithGroupId` key belongs to, or None.
+
+    The fork packs it as 4 big-endian unsigned bytes at the END of the key
+    (kv_cache_utils.py:74-93, `make_block_hash_with_group_id`/`get_group_id`).
+    Read locally rather than imported: this module must not import vllm.
+    """
+    if isinstance(key, (bytes, bytearray)) and len(key) > 4:
+        # "> 4", not ">= 4": 4 bytes would be a group id with an EMPTY hash, which
+        # is not a key the fork can produce (the hash comes first).
+        return int.from_bytes(bytes(key)[-4:], "big")
+    return None
+
+
+def _entry_count(index):
+    """(count, how, refusal_reason). `len()` first - BlockHashToBlockMap defines
+    __len__ over its keys - then any own size/count method.
+
+    A `len()` that RAISES is reported as that, not as "no size handle": the two
+    need different answers from an operator, and a vague reason here would hide a
+    pool that is actively misbehaving.
+    """
+    if hasattr(type(index), "__len__"):
+        try:
+            return len(index), "len", None
+        except Exception as exc:  # noqa: BLE001 - a container that raises is data
+            _error(exc, "hash index len")
+            return (None, "len",
+                    f"{type(index).__name__}.__len__ raised "
+                    f"{type(exc).__name__}: no occupancy number invented")
+    for name in ("num_entries", "count", "size"):
+        getter = getattr(index, name, None)
+        if callable(getter):
+            try:
+                return _int_or_none(getter()), name, None
+            except Exception as exc:  # noqa: BLE001
+                _error(exc, f"hash index {name}")
+                return (None, name,
+                        f"{type(index).__name__}.{name}() raised "
+                        f"{type(exc).__name__}: no occupancy number invented")
+    return (None, None,
+            f"{type(index).__name__} exposes neither len() nor a size/count "
+            f"method: no occupancy number invented")
+
+
+def _hash_index_view(pool, hash_block_size) -> dict:
+    """Occupancy of the CPU pool's parked-KV hash index. Read-only, contained.
+
+    A missing attribute or an unsized container is a `reason` string, never a
+    number: a missing reading is information, a fabricated one is a lie.
+    """
+    out: dict = {"available": False, "attribute": HASH_INDEX_ATTR,
+                 "meaning": HASH_INDEX_MEANING,
+                 "stale_entries": STALE_ENTRIES_VERDICT,
+                 "stale_entries_why": STALE_ENTRIES_WHY,
+                 "stale_entries_not_ruled_out": STALE_ENTRIES_NOT_RULED_OUT,
+                 "retrievable_now_vs_retained": (
+                     "an entry's block is an eviction candidate the moment its "
+                     "store releases it, so this is retrievable NOW, not a "
+                     "retention guarantee: the next stores can reclaim it")}
+    if pool is None:
+        out["reason"] = "no cpu_block_pool bound: no host-RAM tier in this process"
+        return out
+    try:
+        index = getattr(pool, HASH_INDEX_ATTR, None)
+        if index is None:
+            out["reason"] = (f"{type(pool).__name__} has no {HASH_INDEX_ATTR}: the "
+                             f"fork renamed the index, refusing to guess where "
+                             f"parked KV is tracked")
+            return out
+        out["container"] = type(index).__name__
+        count, counted_by, refusal = _entry_count(index)
+        out["counted_by"] = counted_by
+        if count is None:
+            out["reason"] = refusal
+            return out
+        out["available"] = True
+        # Entries, not blocks: a key may map to SEVERAL blocks (the map does not
+        # de-duplicate, block_pool.py:47-51), so count the keys and say what they
+        # are. A hit resolves through get_one_block(), so keys are exactly the
+        # distinct prefixes that can be hit.
+        out["entries"] = count
+        if isinstance(hash_block_size, int) and not isinstance(hash_block_size, bool) \
+                and hash_block_size > 0:
+            out["hash_block_size"] = hash_block_size
+            out["tokens_upper_bound"] = count * hash_block_size
+            out["tokens_note"] = (
+                f"entries x {hash_block_size}: an UPPER BOUND on distinct "
+                "retrievable tokens (one index entry is one hash block; shared "
+                "prefixes are counted once, duplicate parkings are not)")
+        _hash_index_breakdown(index, out)
+        _hash_index_sanity_sample(index, out)
+        return out
+    except Exception as exc:  # noqa: BLE001 - a diagnostic never reaches the scheduler
+        _error(exc, "hash index view")
+        out["reason"] = f"reading {HASH_INDEX_ATTR} raised: " \
+                        f"{type(exc).__name__}"[:200]
+        return out
+
+
+def _hash_index_breakdown(index, out: dict) -> None:
+    """Per-group entry counts, from a BOUNDED key scan. Best effort, and it says
+    which handle it read and when it stopped."""
+    keys = None
+    handle = None
+    for name in ("keys", HASH_INDEX_ATTR, "_cache"):
+        getter = getattr(index, name, None)
+        if callable(getter):
+            try:
+                keys = getter()
+                handle = name + "()"
+                break
+            except Exception as exc:  # noqa: BLE001 - a handle that raises is a miss
+                _error(exc, f"hash index {name}")
+        elif isinstance(getter, dict):
+            keys = getter
+            handle = name
+            break
+    if keys is None:
+        out["per_group"] = None
+        out["per_group_reason"] = (
+            f"no public keys() and no dict-like attribute to enumerate: "
+            f"{type(index).__name__} exposes no key handle")
+        return
+    out["key_handle"] = handle
+    if handle == "_cache":
+        out["key_handle_note"] = (
+            "read through the map's private _cache dict (dev-only, read-only): "
+            "BlockHashToBlockMap has no public key iterator")
+    groups: dict = {}
+    scanned = 0
+    unparsable = 0
+    truncated = False
+    try:
+        for key in keys:
+            if scanned >= MAX_HASH_INDEX_SCAN:
+                truncated = True
+                break
+            scanned += 1
+            group = _group_of_key(key)
+            if group is None:
+                unparsable += 1
+                continue
+            if len(groups) < MAX_HASH_INDEX_GROUPS or group in groups:
+                groups[group] = groups.get(group, 0) + 1
+    except Exception as exc:  # noqa: BLE001 - a half-scan is still a reading
+        _error(exc, "hash index per-group scan")
+        out["per_group_partial"] = True
+    out["entries_scanned"] = scanned
+    out["scan_truncated"] = truncated
+    out["per_group"] = ({str(name): groups[name] for name in sorted(groups)}
+                        if groups else {})
+    out["groups_truncated"] = len(groups) >= MAX_HASH_INDEX_GROUPS
+    out["keys_without_group_id"] = unparsable
+
+
+def _hash_index_sanity_sample(index, out: dict) -> None:
+    """Tripwire for a stale entry, from at most MAX_HASH_INDEX_SAMPLE values.
+
+    A live entry's block still carries its hash and is not the null block. A
+    sampled value that lost its hash while still indexed is exactly the "
+    "stale entry" the count would otherwise silently include.
+    """
+    values = None
+    for name in ("values", "_cache"):
+        handle = getattr(index, name, None)
+        try:
+            if callable(handle):
+                values = handle()
+                break
+            if isinstance(handle, dict):
+                values = handle.values()
+                break
+        except Exception as exc:  # noqa: BLE001 - no sample is a missing reading
+            _error(exc, f"hash index {name}")
+    if values is None:
+        out["sampled_entries"] = 0
+        out["sample_reason"] = "no value handle on the index"
+        return
+    sampled = 0
+    missing_hash = 0
+    null_blocks = 0
+    dicts_of_blocks = 0
+    try:
+        for value in values:
+            if sampled >= MAX_HASH_INDEX_SAMPLE:
+                break
+            sampled += 1
+            if isinstance(value, dict):
+                # A key with more than one block behind it (no de-duplication).
+                dicts_of_blocks += 1
+                value = next(iter(value.values()), None)
+            if value is None:
+                missing_hash += 1
+                continue
+            if getattr(value, "is_null", False):
+                null_blocks += 1
+            if getattr(value, "block_hash", None) is None:
+                missing_hash += 1
+    except Exception as exc:  # noqa: BLE001 - a partial sample is still evidence
+        _error(exc, "hash index sample")
+        out["sample_partial"] = True
+    out["sampled_entries"] = sampled
+    out["sampled_values_without_hash"] = missing_hash
+    out["sampled_null_blocks"] = null_blocks
+    out["sampled_keys_with_multiple_blocks"] = dicts_of_blocks
+
+
 def _copy_boundary_stats(stats) -> dict:
     """Copy the counter dataclass into plain ints (already a copy upstream)."""
     if stats is None:
@@ -195,6 +449,13 @@ def tier_view(manager) -> dict:
         "group_block_sizes": (list(group_sizes) if group_sizes is not None else None),
         "num_cpu_blocks": _int_or_none(getattr(manager, "num_cpu_blocks", None)),
         "cpu_pool": _pool_view(getattr(manager, "cpu_block_pool", None)),
+        # The retrievability half, next to the allocator half because the two must
+        # be read together: `cpu_pool.free_blocks` is freeness, THIS is how much
+        # parked KV a later request can actually hit.
+        "cpu_hash_index": _hash_index_view(getattr(manager, "cpu_block_pool", None),
+                                           _int_or_none(
+                                               getattr(manager, "hash_block_size",
+                                                       None))),
         "gpu_pool": _pool_view(gpu_pool),
         "pending_stores": pending,
         "counts": {
@@ -356,13 +617,14 @@ def backport_section(engine) -> dict:
 
 
 def dev_state_sections() -> dict:
-    """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer.
+    """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer,
+    the lookup ledger.
 
-    These are the three pieces of the plugin that CHANGE what the engine does, so
-    every snapshot publishes them. Guard mode in particular must be impossible to
-    miss: `snapshot_for_engine` also copies it to the top level as `guard_mode`,
-    because a guarded dev engine mistaken for a production one is the single
-    worst way this plugin could hurt.
+    These are the four pieces of the plugin that CHANGE what the engine does (or
+    put a wrapper on its path), so every snapshot publishes them. Guard mode in
+    particular must be impossible to miss: `snapshot_for_engine` also copies it to
+    the top level as `guard_mode`, because a guarded dev engine mistaken for a
+    production one is the single worst way this plugin could hurt.
 
     Function-level imports again: `guard_mode` records into `trace_ring` and
     `kvconfig` reads `guard_mode`, so a module-level import here would be a cycle.
@@ -388,6 +650,17 @@ def dev_state_sections() -> dict:
     except Exception as exc:  # noqa: BLE001
         _error(exc, "worker diag section")
         out["worker_diag"] = {"error": f"{type(exc).__name__}"[:200]}
+    try:
+        # The lookup/adopt ledger. Counters plus a BOUNDED preview: the payload is
+        # polled every few seconds, so the ring itself stays behind the verb and
+        # only `lookup_ledger.preview` (a handful of the newest records) travels.
+        from . import lookup_ledger  # noqa: PLC0415 - cycle, see dev_state_sections
+        out["lookup_ledger"] = lookup_ledger.section()
+        out["lookup_ledger_armed"] = lookup_ledger.is_armed()
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "lookup ledger section")
+        out["lookup_ledger"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["lookup_ledger_armed"] = None
     return out
 
 

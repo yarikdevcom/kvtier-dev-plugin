@@ -45,6 +45,7 @@ REQUEST = config.ROUTE_PREFIX + config.ROUTE_REQUEST
 TRACE = config.ROUTE_PREFIX + config.ROUTE_TRACE
 GUARD = config.ROUTE_PREFIX + config.ROUTE_GUARD
 TIER = config.ROUTE_PREFIX + config.ROUTE_TIER
+LOOKUPS = config.ROUTE_PREFIX + config.ROUTE_LOOKUPS
 
 # (path, http method) for EVERY route this plugin serves. The guard tests are
 # parametrized over it, so a new route is automatically tested for the peer rule,
@@ -54,7 +55,7 @@ PLUGIN_ROUTES = [(STATUS, "get")] + [
     (config.ROUTE_PREFIX + route, verb)
     for route in (config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG, config.ROUTE_BLOCK,
                   config.ROUTE_REQUEST, config.ROUTE_TRACE, config.ROUTE_GUARD,
-                  config.ROUTE_TIER)
+                  config.ROUTE_TIER, config.ROUTE_LOOKUPS)
     for verb in ("get", "post")
 ] + [(RELOAD, "post")]
 

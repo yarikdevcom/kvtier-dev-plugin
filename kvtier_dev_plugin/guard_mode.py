@@ -14,10 +14,17 @@ inside one of them is
   2. converted into that method's DECLINED result, so the scheduler keeps
      running instead of dying inside a tier it does not need.
 
-It is OFF by default, armed only by a token-gated `POST /plugins/kvtier/guard`
-(loopback included), and its state is echoed as `guard_mode: true|false` in
-`status` and in EVERY verb payload, because a guarded dev engine must never be
-mistaken for a production one.
+It is OFF at plugin IMPORT and ARMED BY THE BOOT: `backport.boot_from_connector`
+installs and arms it at connector creation, immediately before it arms the tier,
+so there is no window in which a store or a lookup runs unguarded. Arming it is
+not a favour the tier asks for - an unguarded `build_connector_meta` that raises
+kills the EngineCore, and the boot refuses to arm the tier unless the guard is
+provably a layer of every entry point the class actually has. The state is echoed
+as `guard_mode: true|false` in `status` and in EVERY verb payload, because a
+guarded dev engine must never be mistaken for a production one. There is no env
+var that turns it ON - `VLLM_E2_TIER_DEV_BOOT_INERT` only turns the boot's own
+arming OFF - and `POST /plugins/kvtier/guard {"armed": false}` is the operator's
+disarm, which also removes the wrappers when nothing else consumes them.
 
 **A guard hides bugs.** A declined store is a park that did not happen; a
 declined `get_num_new_matched_tokens` is a prefix hit the tier refused; a
@@ -58,9 +65,11 @@ TARGET AND HOUSE RULES
 `vllm/v1/simple_kv_offload/manager.py` / `SimpleCPUOffloadScheduler`, resolved
 only through `sys.modules` (same discipline as `store_hook` and
 `engine_side._engine_core_class`) and never imported. Stdlib only. The wrapper
-is installed only while guard mode or the trace ring is armed, so the default
-state runs the fork's methods unwrapped. Everything is `Exception`-contained and
-counted through `snapshot._error`; the capture path itself cannot raise.
+is installed while guard mode, the trace ring OR the lookup ledger is armed (one
+set of wrappers, three consumers, and `wrapper_customers()` is the question every
+removal must ask first), so the default state runs the fork's methods unwrapped.
+Everything is `Exception`-contained and counted through `snapshot._error`; the
+capture path itself cannot raise.
 """
 
 from __future__ import annotations
@@ -70,7 +79,7 @@ import sys
 import time
 import traceback
 
-from . import snapshot, trace_ring
+from . import lookup_ledger, snapshot, trace_ring
 
 logger = None  # set by engine_side.attach_logger-style wiring; None stays quiet
 
@@ -237,12 +246,78 @@ def is_armed() -> bool:
     return bool(_state["armed"])
 
 
+def fault_count() -> int:
+    """How many tier exceptions the guard has caught and declined. Never raises.
+
+    The public accessor for the counter the BOOT line prints: "0 faults after
+    boot" is the only evidence that an auto-guarded boot is silently declining
+    something, so the boot line and the snapshot both have to read it without
+    reaching into this module's state.
+    """
+    try:
+        return int(_state.get("caught") or 0)
+    except Exception:  # noqa: BLE001 - an unreadable counter is 0, never a raise
+        return 0
+
+
+def wrapper_customers() -> list:
+    """Which armed facilities still need the class wrappers. Never raises.
+
+    THE SHARED-PREDICATE RULE. The guard wrappers are ONE set of class attributes
+    serving THREE consumers: guard mode itself (capture + decline), the trace ring
+    (a record per tier entry point) and the lookup ledger (the offer/adopt pair).
+    Every uninstaller must ask this question instead of eyeballing one other
+    consumer, or a disarm of one silently blinds the others - `set_guard_mode
+    (False)` used to check only `trace_ring`, so a ledger armed on its own lost
+    its recording the moment anyone toggled guard mode. Called AFTER the caller
+    has cleared its own armed flag, so a consumer that just disarmed is absent.
+    """
+    out: list = []
+    if bool(_state["armed"]):
+        out.append("guard mode")
+    for name, probe in (("the trace ring", trace_ring.is_armed),
+                        ("the lookup ledger", lookup_ledger.is_armed)):
+        try:
+            if probe():
+                out.append(name)
+        except Exception:  # noqa: BLE001, S112 - a missing consumer counts as gone
+            continue
+    return out
+
+
 def manager_class():
     """The offload scheduler class if this process already imported it."""
     module = sys.modules.get(TARGET_MODULE)
     if module is None:
         return None
     return getattr(module, TARGET_CLASS, None)
+
+
+def sibling_layer(fn):
+    """Which layer of THIS package `fn` is, or None if it is not one of ours.
+
+    THE LAYER-AWARE OWNERSHIP QUESTION. "Is this attribute ours?" cannot be asked
+    only about guard mode's own marker, and cannot be answered from `__module__`
+    either: `backport` REPLACES a method with a compiled copy that carries the
+    FORK's `__module__` (so a copy looks like the fork's own body, and in a test
+    fixture built outside the fork's module it looks like a stranger's). The
+    markers are the truth, so ask the module that owns the marker vocabulary -
+    `backport`, lazily, which is the same direction its own `_layer_kinds()`
+    imports this module for. Never raises: an unreadable attribute is "not ours",
+    which is the safe answer because it leads to a refusal, not to an overwrite.
+    """
+    if fn is None:
+        return None
+    try:
+        from . import backport  # noqa: PLC0415 - lazy: backport imports us lazily
+        inner = backport._function_of(fn)
+        for attr, tag, kind in ((backport.SWITCH_ATTR, backport.SWITCH_TAG, "switch"),
+                                (backport.OWNER_ATTR, backport.OWNER_TAG, "backport")):
+            if getattr(inner, attr, None) == tag:
+                return kind
+    except Exception as exc:  # noqa: BLE001 - "not ours" is the safe answer
+        snapshot._error(exc, "guard sibling layer")
+    return None
 
 
 def manager_of(engine):
@@ -459,8 +534,20 @@ def _capture(exc: BaseException, method: str, manager, args, kwargs,
 
 # --- what to record on success (the trace ring's per-step facts) ------------
 
-def _record_success(method: str, result, args) -> None:
-    """A few records per step, from the values the call already returned."""
+def _record_success(method: str, result, args, manager=None) -> None:
+    """A few records per step, from the values the call already returned.
+
+    TWO READERS of the same already-live values, and neither is a reason to fit a
+    second wrapper over the same method: the trace ring (what happened, in order)
+    and the LOOKUP LEDGER (the `get_num_new_matched_tokens` offer paired with the
+    `update_state_after_alloc` adopt, joined per request id). The ledger hook runs
+    FIRST and outside the trace `try` below, so a ledger fault cannot be charged to
+    the trace path or hide a trace record; it is contained and counted in its own
+    module. `manager` is the tier object the call was made on - the ledger only
+    ever asks it for `block_size`/`hash_block_size`.
+    """
+    if method in lookup_ledger.LEDGER_METHODS and lookup_ledger.is_armed():
+        lookup_ledger.record_from_call(method, args, result, manager)
     if not trace_ring.is_armed():
         return
     try:
@@ -518,7 +605,7 @@ def _make_wrapper(method: str, original):
         _state["calls"] += 1
         if not _state["armed"]:
             result = original(self, *args, **kwargs)
-            _record_success(method, result, args)
+            _record_success(method, result, args, self)
             return result
         try:
             result = original(self, *args, **kwargs)
@@ -538,7 +625,7 @@ def _make_wrapper(method: str, original):
             _capture(exc, method, self, args, kwargs, declined=True)
             _state["declined"] += 1
             return safe_decline
-        _record_success(method, result, args)
+        _record_success(method, result, args, self)
         return result
 
     setattr(_wrapped, OWNER_ATTR, OWNER_TAG)
@@ -614,7 +701,8 @@ def install(cls) -> dict:
                                f"plugin's owner marker, refusing to overwrite")
                 continue
             replaced = owner == OWNER_TAG
-            if not replaced:
+            under = None if replaced else sibling_layer(original)
+            if not replaced and under is None:
                 home = getattr(original, "__module__", None)
                 if home != TARGET_MODULE and not str(home or "").startswith(
                         SIBLING_PACKAGE):
@@ -625,6 +713,15 @@ def install(cls) -> dict:
                 if home != TARGET_MODULE:
                     # Ours, from a sibling module: compose on top of it, and say so.
                     report["nested"].append(method)
+            elif under is not None:
+                # A layer of THIS package that is not ours - `backport`'s replaced
+                # copy, or one of its kill-switch wrappers. Composed with, never
+                # refused (that would leave the most fault-prone entry points
+                # unguarded behind an "armed" payload) and never replaced. Reported
+                # under `nested` like any other composition, because `__module__`
+                # cannot be trusted to identify our own copies here: the compiled
+                # replacements carry the FORK's module name on purpose.
+                report["nested"].append(method)
             if replaced:
                 original = getattr(original, ORIGINAL_ATTR, original)
                 report["replaced"].append(method)
@@ -742,7 +839,8 @@ def set_guard_mode(armed: bool, engine=None) -> dict:
     else:
         _state["armed"] = False
         _state["disarms"] += 1
-        if not trace_ring.is_armed():
+        customers = wrapper_customers()
+        if not customers:
             manager = None
             try:
                 manager = manager_of(engine)
@@ -750,11 +848,12 @@ def set_guard_mode(armed: bool, engine=None) -> dict:
                 snapshot._error(exc, "guard disarm manager_of")
             cls = type(manager) if manager is not None else manager_class()
             report["uninstall"] = uninstall(cls)
-            report["reason"] = ("guard mode OFF; wrappers removed (the trace ring "
-                                "is disarmed too, so nothing is wrapped)")
+            report["reason"] = ("guard mode OFF; wrappers removed (nothing else "
+                                "consumes them: no trace ring, no lookup ledger)")
         else:
-            report["reason"] = ("guard mode OFF; the wrappers STAY because the "
-                                "trace ring is armed. Tracing captures faults as "
+            report["reason"] = ("guard mode OFF; the wrappers STAY because "
+                                + " and ".join(customers)
+                                + " still need them. Tracing captures faults as "
                                 "data and re-raises them: nothing is swallowed.")
     _state["arm_reason"] = report["reason"]
     return report
@@ -818,6 +917,7 @@ def section(include_captures: int = 0,
         "skip_detail": list(_state.get("skip_detail") or []),
         "nested": list(_state.get("nested") or []),
         "calls": int(_state["calls"]),
+        "wrapper_customers": wrapper_customers(),
         "caught": int(_state["caught"]),
         "declined": int(_state["declined"]),
         "re_raised": int(_state["re_raised"]),

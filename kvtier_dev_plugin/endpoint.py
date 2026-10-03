@@ -15,6 +15,8 @@ it):
     POST /plugins/kvtier/trace           arm / disarm / clear / read   [TOKEN]
     GET  /plugins/kvtier/guard           guard-mode state                   [read]
     POST /plugins/kvtier/guard           arm / disarm / fetch captures   [TOKEN]
+    GET  /plugins/kvtier/lookups         the lookup/adopt ledger's newest records
+    POST /plugins/kvtier/lookups         arm / disarm / clear / verdict    [TOKEN]
     POST /plugins/kvtier/policy/reload   reload <package dir>/policy.py  [TOKEN]
 
 GET takes its arguments from query parameters, POST from a JSON object body.
@@ -82,9 +84,11 @@ GUARD MODE IS A DEVELOPMENT FACILITY. `POST /plugins/kvtier/guard {"armed":
 true}` makes the tier's entry points turn an exception into a record plus a safe
 decline, which is how you develop against a live engine without an outage. It can
 also MASK REAL BUGS: a declined store is silent, and a decline can leave tier
-state half-advanced. It is off at every boot (there is no env var for it), its
-state is echoed as `guard_mode` by `status` and by every verb, and it must be
-DISARMED before any production boot.
+state half-advanced. THE BOOT ARMS IT (before it arms the tier, so nothing runs
+unguarded); there is no env var that turns it ON, only
+`VLLM_E2_TIER_DEV_BOOT_INERT`, which turns the boot's own arming off. Its state is
+echoed as `guard_mode` by `status` and by every verb, the fault ring is the
+evidence a boot was clean, and it must be DISARMED before any production boot.
 
 Timeout: nothing in the engine bounds a utility call (the sync client blocks on
 `future.result()`, core_client.py:971, and the async client just awaits its
@@ -350,6 +354,11 @@ ARG_SPECS: dict[str, dict] = {
                                              "max": 4000}},
     config.ROUTE_TIER: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm")}},
+    config.ROUTE_LOOKUPS: {"op": {"kind": "enum", "values": ("read", "arm",
+                                                             "disarm", "clear",
+                                                             "status", "verdict")},
+                           "cap": {"kind": "int", "min": 16, "max": 4096},
+                           "limit": {"kind": "int", "min": 1, "max": 256}},
 }
 
 
@@ -462,12 +471,14 @@ def query_arguments(request: Request, route: str) -> dict:
 
 # --- the dev-state mirror ---------------------------------------------------
 
-DEV_STATE_KEYS = ("guard_mode", "trace_armed")
+DEV_STATE_KEYS = ("guard_mode", "trace_armed", "lookup_ledger_armed")
 DEV_STATE_UNKNOWN_NOTE = (
-    "no engine answer has been seen by this API process yet, so guard mode is "
-    "UNKNOWN here, not false. The engine's own answer in any verb payload "
-    "(snapshot/kvconfig/block/request/trace/guard) is authoritative; the "
-    "default at every engine boot is guard_mode=false.")
+    "no engine answer has been seen by this API process yet, so guard mode, the "
+    "trace ring and the lookup ledger are UNKNOWN here, not false. The engine's "
+    "own answer in any verb payload "
+    "(snapshot/kvconfig/block/request/trace/guard/lookups) is authoritative; the "
+    "default at every engine boot is guard_mode=false, trace_armed=false, "
+    "lookup_ledger_armed=false.")
 
 
 def note_dev_state(request: Request, payload, source: str) -> None:
@@ -520,7 +531,8 @@ def dev_state_view(request: Request) -> dict:
     state = getattr(request.app.state, STATE_KEY, None)
     entry = state.get("dev_state") if isinstance(state, dict) else None
     if not isinstance(entry, dict) or not entry:
-        return {"guard_mode": None, "trace_armed": None, "source": None,
+        return {"guard_mode": None, "trace_armed": None,
+                "lookup_ledger_armed": None, "source": None,
                 "epoch": None, "observed_at": None, "age_seconds": None,
                 "note": DEV_STATE_UNKNOWN_NOTE}
     observed = entry.get("observed_at")
@@ -529,6 +541,7 @@ def dev_state_view(request: Request) -> dict:
         age = round(max(0.0, time.time() - observed), 3)
     return {"guard_mode": entry.get("guard_mode"),
             "trace_armed": entry.get("trace_armed"),
+            "lookup_ledger_armed": entry.get("lookup_ledger_armed"),
             "source": entry.get("source"), "epoch": entry.get("epoch"),
             "observed_at": observed, "age_seconds": age,
             "note": ("mirrored from the engine's own answers in this API "
@@ -549,7 +562,8 @@ def status_payload(dev_state: dict | None = None) -> dict:
         refusal = str(exc)
     allowed = config.allow_networks()
     mirrored = dev_state if isinstance(dev_state, dict) else {
-        "guard_mode": None, "trace_armed": None, "note": DEV_STATE_UNKNOWN_NOTE}
+        "guard_mode": None, "trace_armed": None, "lookup_ledger_armed": None,
+        "note": DEV_STATE_UNKNOWN_NOTE}
     return {
         "plugin": config.PLUGIN_NAME,
         "enabled": config.enabled(),
@@ -585,6 +599,7 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # do. `source`/`age_seconds` say how current the claim is.
         "guard_mode": mirrored.get("guard_mode"),
         "trace_armed": mirrored.get("trace_armed"),
+        "lookup_ledger_armed": mirrored.get("lookup_ledger_armed"),
         "dev_state": mirrored,
         "worker_diagnostics": {
             "env": config.ENV_DIAG_DIR,
@@ -605,36 +620,59 @@ def status_payload(dev_state: dict | None = None) -> dict:
             "note": "the KV tier's runtime kill switch and the status of the "
                     "upstream PR #56810 backport (excluding non-prefix-cacheable "
                     "KV groups from store/load, which a hybrid geometry needs or "
-                    "the store path asserts). THE TIER IS DISARMED AT BOOT "
-                    "(pr56810.boot_default_armed: false): an engine booted with "
-                    "tier env parks nothing until someone POSTs "
-                    "{\"op\":\"arm\"}, and that is the expected inert state, not "
-                    "a fault - read pr56810.operator_note. Disarmed, the "
+                    "the store path asserts). THE BOOT BRINGS THE TIER UP WORKING: "
+                    "when the tier connector is built, the connector-creation hook "
+                    "installs the backport, installs the guard, and ARMS the tier - "
+                    "but only if all three verify, so a boot that cannot prove the "
+                    "fix is in place leaves the tier DISARMED and says which check "
+                    "failed. `pr56810.boot` is that verdict (mode, backport, guard, "
+                    "tier, refusal reasons, fault count at boot) and its `line` is "
+                    "the one line written to the engine log. "
+                    f"{config.ENV_BOOT_INERT}=1 is the explicit opt-out back to "
+                    "the old inert boot. `armed: false` on a boot that did not opt "
+                    "out is a FAULT TO READ, not the expected state - read "
+                    "pr56810.operator_note and boot.refusals. Disarmed, the "
                     "connector reports no prefix hit, hands the workers empty "
                     "store/load lists and claims no pending work, so the engine "
                     "serves from GPU KV alone - no engine restart. "
                     "`pr56810.installed: false` means the divisibility fix is NOT "
                     "fully live (see `pr56810.refused_methods`) and a hybrid "
                     "geometry will still crash the store path. The tier can NEVER "
-                    "be armed unless the fix is fully installed and the geometry "
-                    "guard passes: an `arm` is refused, not applied, otherwise, "
-                    "and `pr56810.arm_block`/`disarm_reason` say why "
-                    "(distinguishing `geometry`, `no_manager` - nothing to arm in "
-                    "this process - and `incomplete_install`). Boot sequence: "
-                    "`GET /tier?op=status` (the verb installs the fix; expect "
-                    "installed:true, armed:false) -> `POST /tier "
-                    "{\"op\":\"arm\"}` (expect armed:true) -> only then traffic. "
-                    "Read the state from the engine in `snapshot` or the engine's "
+                    "be armed - by the boot or by a verb - unless the fix is fully "
+                    "installed and the geometry guard passes: an `arm` is refused, "
+                    "not applied, otherwise, and `pr56810.arm_block`/"
+                    "`disarm_reason` say why (distinguishing `geometry`, "
+                    "`no_manager` - nothing to arm in this process - and "
+                    "`incomplete_install`). After a boot, the thing to READ is "
+                    "pr56810.boot.line plus guard.captures (a non-zero fault count "
+                    "means the tier is declining work, silently). `op: status` "
+                    "re-runs the install as a backstop; `arm`/`disarm` remain the "
+                    "operator's controls afterwards. Read the state from the "
+                    "engine in `snapshot` or the engine's "
                     "`" + config.ROUTE_PREFIX + config.ROUTE_TIER + "` route.",
             "ops": ["status", "arm", "disarm"],
         },
         "development_facilities": {
             "guard_mode": "DEVELOPMENT ONLY. Armed, it turns a KV-tier exception "
-                          "into a captured record plus a safe decline. Off at "
-                          "every boot (no env var exists for it); arm it with "
-                          "POST /plugins/kvtier/guard and DISARM it before any "
-                          "production boot. It never swallows a BaseException.",
+                          "into a captured record plus a safe decline. THE BOOT "
+                          "ARMS IT, before it arms the tier, so no store or lookup "
+                          "ever runs unguarded; no env var turns it ON "
+                          f"({config.ENV_BOOT_INERT} only turns the boot's arming "
+                          "off) and POST /plugins/kvtier/guard is the operator's "
+                          "arm/disarm. BECAUSE IT MASKS REAL BUGS, the fault ring "
+                          "is the evidence a boot was clean: read "
+                          "POST /plugins/kvtier/guard {\"op\":\"captures\"} after "
+                          "every boot and DISARM before any production boot. It "
+                          "never swallows a BaseException.",
             "trace": "bounded ring, opt-in, nothing wrapped while disarmed",
+            "lookup_ledger": "bounded ring of get_num_new_matched_tokens "
+                             "offers joined to their update_state_after_alloc "
+                             "adopts, per request id. Opt-in: it records nothing "
+                             "until armed (POST /plugins/kvtier/lookups "
+                             "{\"op\":\"arm\"}), it changes no scheduling "
+                             "decision, and `op: verdict` names the records where "
+                             "the scheduler adopted 0 of a positive offer. Its "
+                             "preview is in `snapshot.lookup_ledger`.",
         },
     }
 
@@ -898,6 +936,44 @@ async def route_tier_post(request: Request):
     args = await body_arguments(request, config.ROUTE_TIER)
     return as_json(await engine_call(request, config.METHOD_TIER, args,
                                      source="tier verb"))
+
+
+@router.get(config.ROUTE_LOOKUPS)
+async def route_lookups(request: Request):
+    """The lookup/adopt ledger's newest records. Token required even for this
+    read, as for `/trace`: the same door arms the recorder."""
+    await _guard_dev_state_route(request)
+    args = dict(query_arguments(request, config.ROUTE_LOOKUPS))
+    args.setdefault("op", "read")
+    return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
+                                     source="lookup ledger read"))
+
+
+@router.post(config.ROUTE_LOOKUPS)
+async def route_lookups_post(request: Request):
+    """The LOOKUP LEDGER - the `get_num_new_matched_tokens` offer paired with the
+    `update_state_after_alloc` adopt, per request id.
+
+    `{op: read|arm|disarm|clear|status|verdict, cap?, limit?}`. It exists because
+    the live engine logs "update_state_after_alloc called with no external tokens
+    but get_num_new_matched_tokens() recorded a pending CPU hit": the connector
+    offered a positive number of host-RAM tokens and the scheduler adopted zero,
+    and nothing said which rule did it. Each record carries the local hit the
+    scheduler passed IN, the hit returned, and the `num_external_tokens` the
+    scheduler later passed; `op: verdict` classifies the pairs and reports the
+    `dropped_to_zero` ones with `local % block_size`, so the partial-tail rule can
+    be confirmed or refuted from data.
+
+    DEVELOPMENT ONLY and it changes no decision: it records what the scheduler
+    already did. `arm` installs the tier wrappers it reads through (composed over
+    the PR #56810 backport's own layers, never replacing them) and `disarm`
+    removes them only when nothing else still needs them. The ring has a hard
+    capacity, a monotonic `dropped` count, and records nothing while disarmed.
+    """
+    await _guard_dev_state_route(request)
+    args = await body_arguments(request, config.ROUTE_LOOKUPS)
+    return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
+                                     source="lookup ledger verb"))
 
 
 @router.post(config.ROUTE_RELOAD)

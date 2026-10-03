@@ -23,6 +23,7 @@ from test_routes import (
     BLOCK,
     GUARD,
     KVCONFIG,
+    LOOKUPS,
     PROXY,
     RELOAD,
     REQUEST,
@@ -228,6 +229,73 @@ def test_the_guard_route_is_gated_the_same_way_and_carries_its_op(engine,
     assert engine.calls[-1] == (config.METHOD_GUARD, ({"op": "status"},))
 
 
+def test_the_lookup_ledger_route_is_gated_like_the_trace_ring(engine, armed_token):
+    """Token in every shape, the read included: the same door arms the recorder."""
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    assert client.get(LOOKUPS).status_code == 403
+    assert engine.calls == []
+    denied = client.post(LOOKUPS, json={"op": "arm"})
+    assert denied.status_code == 403
+    assert TOKEN_HEADER in denied.json()["detail"]
+    assert engine.calls == []
+    assert client.get(LOOKUPS, headers=token_headers()).status_code == 200
+
+
+def test_a_lookup_read_defaults_to_read_and_a_verdict_travels_as_an_op(engine,
+                                                                       armed_token):
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    client.get(LOOKUPS, headers=token_headers())
+    assert engine.calls == [(config.METHOD_LOOKUPS, ({"op": "read"},))]
+    client.get(LOOKUPS, params={"op": "verdict", "limit": 8},
+               headers=token_headers())
+    assert engine.calls[-1] == (config.METHOD_LOOKUPS,
+                                ({"op": "verdict", "limit": 8},))
+
+
+def test_arming_the_ledger_over_http_reaches_the_ledger_verb_method(engine,
+                                                                    armed_token):
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    response = client.post(LOOKUPS, json={"op": "arm", "cap": 64},
+                           headers=token_headers())
+    assert response.status_code == 200
+    assert engine.calls == [(config.METHOD_LOOKUPS, ({"op": "arm", "cap": 64},))]
+
+
+@pytest.mark.parametrize("body,fragment", [
+    ({"op": "launch"}, "op must be one of"),
+    ({"op": "arm", "cap": 4}, "cap must be >= 16"),
+    ({"op": "arm", "cap": 10 ** 6}, "cap must be <= 4096"),
+    ({"op": "read", "limit": 0}, "limit must be >= 1"),
+    ({"op": "read", "depth": 64}, "unsupported request keys"),
+])
+def test_a_lookup_argument_outside_its_bounds_is_refused(engine, armed_token, body,
+                                                        fragment):
+    """GET and POST share the spec: `depth` is a /trace key and must not smuggle
+    itself into a /lookups body, and the cap's bounds are the ring's own."""
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    response = client.post(LOOKUPS, json=body, headers=token_headers())
+    assert response.status_code == 400
+    assert fragment in response.json()["detail"]
+    assert engine.calls == []
+
+
+def test_status_mirrors_the_ledger_only_when_the_engine_said_so(engine,
+                                                                armed_token):
+    """`lookup_ledger_armed` is dev state: null until an engine answer claims it,
+    never a guessed false."""
+    app = build_app(FakeAsyncLLM(engine))
+    client = client_for(app)
+    assert client.get(STATUS).json()["lookup_ledger_armed"] is None
+    engine.result = {"version": 1, "guard_mode": False, "trace_armed": False,
+                     "lookup_ledger_armed": True, "epoch": "e1"}
+    # /lookups is token-gated in every shape, so the mirror is fed through the
+    # token path - the same door that arms the recorder.
+    client.get(LOOKUPS, headers=token_headers())
+    status = client.get(STATUS).json()
+    assert status["lookup_ledger_armed"] is True
+    assert status["dev_state"]["source"] == "lookup ledger read"
+
+
 @pytest.mark.parametrize("body,fragment", [
     ({"op": "launch"}, "op must be one of"),
     ({"op": "arm", "depth": 1}, "depth"),
@@ -325,10 +393,12 @@ def test_status_advertises_the_surface_it_actually_serves(engine):
     prefix = config.ROUTE_PREFIX
     assert status["routes"] == [prefix + route for route in config.ROUTES]
     assert sorted(status["routes"]) == sorted([
-        STATUS, SNAPSHOT, KVCONFIG, BLOCK, REQUEST, TRACE, GUARD, TIER, RELOAD])
+        STATUS, SNAPSHOT, KVCONFIG, BLOCK, REQUEST, TRACE, GUARD, TIER, LOOKUPS,
+        RELOAD])
     assert status["dev_state_routes"] == [prefix + config.ROUTE_TRACE,
                                           prefix + config.ROUTE_GUARD,
-                                          prefix + config.ROUTE_TIER]
+                                          prefix + config.ROUTE_TIER,
+                                          prefix + config.ROUTE_LOOKUPS]
     assert status["engine_methods"] == list(config.METHODS)
     assert "DEVELOPMENT ONLY" in status["development_facilities"]["guard_mode"]
     assert "BaseException" in status["development_facilities"]["guard_mode"]
@@ -366,12 +436,12 @@ def test_the_validator_is_one_table_for_every_route():
     accident, so the table names every route the config declares."""
     for route in (config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG, config.ROUTE_BLOCK,
                   config.ROUTE_REQUEST, config.ROUTE_TRACE, config.ROUTE_GUARD,
-                  config.ROUTE_TIER):
+                  config.ROUTE_TIER, config.ROUTE_LOOKUPS):
         assert route in endpoint.ARG_SPECS, route
     assert set(endpoint.ARG_SPECS) == {config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG,
                                        config.ROUTE_BLOCK, config.ROUTE_REQUEST,
                                        config.ROUTE_TRACE, config.ROUTE_GUARD,
-                                       config.ROUTE_TIER}
+                                       config.ROUTE_TIER, config.ROUTE_LOOKUPS}
 
 
 @pytest.mark.parametrize("route,raw,expected", [

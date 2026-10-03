@@ -59,9 +59,16 @@ def fail(module, *names):
 
 # --- the default: off, and un-configurable ----------------------------------
 
-def test_guard_mode_is_off_and_there_is_no_env_var_to_turn_it_on():
-    """A facility that can mask bugs must not be reachable from a launcher script.
-    `config.py` owns every env var this plugin reads; none of them is a guard."""
+def test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off():
+    """A facility that can mask bugs must not be arming-able from a launcher script.
+
+    `config.py` owns every env var this plugin reads; none of them is a guard. The
+    boot DOES arm guard mode (so an unguarded store or lookup never runs), but there
+    is no env var that arms it on a boot that did not arm it: the one variable that
+    touches the question, `VLLM_E2_TIER_DEV_BOOT_INERT`, can only turn the boot's
+    arming OFF. An operator can therefore stop the boot guarding an engine from a
+    launcher script, and cannot start it doing so from one.
+    """
     assert guard_mode.is_armed() is False
     assert guard_mode._state["arms"] == 0
     # config.py owns every env var this plugin reads. None of them is a guard: an
@@ -69,6 +76,14 @@ def test_guard_mode_is_off_and_there_is_no_env_var_to_turn_it_on():
     env_names = [name for name in dir(config) if name.startswith("ENV_")]
     assert env_names, "config owns no env vars at all?"
     assert not [name for name in env_names if "GUARD" in name.upper()]
+    # And the one variable that does touch guard mode is an opt-OUT, so its very
+    # name has to say so: a variable called something neutral that armed a dev
+    # facility would be this test's failure wearing a different hat.
+    assert "INERT" in config.ENV_BOOT_INERT
+    with_guard_arming = [name for name in env_names
+                         if any(w in name.upper() for w in
+                                ("ARM", "GUARD", "TIER_ARM"))]
+    assert with_guard_arming == []
 
 
 def test_a_wrapper_from_a_sibling_module_is_composed_with_not_refused(tier):

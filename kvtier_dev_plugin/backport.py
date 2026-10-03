@@ -105,10 +105,24 @@ prefix_cacheable_group_ids`. `geometry_guard()` recomputes the set of groups
 the patch would skip from a live `KVCacheConfig` and, if any of them reports
 `prefix_cacheable=True`, REFUSES to install and names the group.
 
-THE BOOT DEFAULT IS DISARMED (`BOOT_ARMED = False`)
---------------------------------------------------
-THE TIER DOES NOTHING AT BOOT; ARMING IS A DELIBERATE ACT THAT REQUIRES THE FIX
-TO BE FULLY INSTALLED. Why the boot default had to change:
+THE BOOT DEFAULT IS DISARMED AT IMPORT; THE BOOT ITSELF ARMS ONCE IT VERIFIES
+--------------------------------------------------------------------------------
+At plugin IMPORT the tier does nothing (`BOOT_ARMED = False`). At CONNECTOR
+CREATION - the first instant the manager class exists - the boot runs
+`boot_from_connector()`: install PR #56810, arm GUARD MODE, and arm the TIER,
+but ONLY on a verified install (every method patched, the live object safe, the
+geometry guard passed, and the guard actually wrapped the methods that exist).
+Anything less leaves the tier disarmed and says why in one BOOT log line.
+
+Why the disarmed-at-import posture must stay: the arm gate is the ONLY thing
+standing between a half-patched store path and the production crash, and at
+plugin-load time nothing is patched yet - see the fail-open history below.
+Why the boot now finishes the job instead of waiting for a human: a restart
+nobody follows up on used to leave the box either doing nothing or (before the
+connector hook existed) UNPATCHED in front of live traffic. Patched-but-inert is
+still available with `VLLM_E2_TIER_DEV_BOOT_INERT=1`.
+
+Why the boot default had to change:
 
 * `vllm` calls `load_general_plugins()` at `core.py:217`, but the Scheduler - and
   with it the connector and the offload manager - is not constructed until
@@ -122,8 +136,10 @@ TO BE FULLY INSTALLED. Why the boot default had to change:
 Booted armed, that combination meant the FIRST request reached the UNPATCHED
 store selector and died on the assert - a fail-open whose only defence was an
 operator remembering to curl a verb first. `BOOT_ARMED = False` removes the
-reliance on remembering: a tier boot is inert until someone arms it, and the arm
-is gated on the proof (see the all-or-nothing contract below).
+reliance on remembering in the direction that mattered: a tier boot stopped being
+live in front of traffic before it was patched. What it could not do was make the
+boot WORK - every tier boot still needed a human to arm it - which is why the boot
+now arms it itself at connector creation, on proof (`boot_from_connector`).
 
 That fixes "inert", not "patched", so the second half closed the other gap: the
 install is no longer left to verbs. `install_connector_hook()` (fitted by
@@ -139,12 +155,25 @@ The arm gate therefore seeks proof rather than trusting its caller:
 `set_armed(True)` runs `_arm_proof()` (an install onto the class, when a class is
 resolvable) before deciding, and `tier_for_engine` calls `ensure_installed`
 (the live manager's class, WITH its `KVCacheConfig`, so the geometry guard
-actually checks) before every op. A cold-boot arm sequence is:
+actually checks) before every op. A cold-boot sequence is:
 
-  (boot) connector creation -> wrappers fitted + the fix installed, tier disarmed
-  POST /tier {"op":"status"}  -> confirms it against the live manager; armed:false
+  (import) tier disarmed, nothing patched
+  (boot) connector creation -> install() -> wrappers fitted + the fix installed,
+           guard mode armed, and the tier ARMED if - and only if - the install
+           verified; one BOOT line states which of the three landed
+  POST /tier {"op":"status"}  -> confirms it against the live manager
   POST /tier {"op":"arm"}     -> refuses unless installed AND the guard passed
   (a refusal names its kind: "geometry" | "no_manager" | "incomplete_install")
+
+AUTO-ARMING IS STRICTER THAN A MANUAL ARM IN ONE RESPECT: it also requires a
+LIVE manager (so the live-object check actually ran against the instance the
+engine will call) and a guard that wrapped every entry point the class HAS.
+`set_armed(True)` from the verb does not require those, because a human reading
+the payload is the check. A method the fork simply does not define
+(`take_events`) is reported under `boot.not_covered` and does NOT block the
+auto-arm - refusing to arm for a method that cannot exist would mean the boot
+never works on a fork that trimmed its own interface, which is the opposite of
+the point.
 
 WHAT THE KILL SWITCH GATES (and what it still cannot reach)
 -----------------------------------------------------------
@@ -312,11 +341,25 @@ REPLACED = ("_estimate_lazy_target_blocks", "update_state_after_alloc",
 SWITCH_METHODS = ("get_num_new_matched_tokens", "build_connector_meta",
                   "has_pending_stores", "_queue_finished_eager_store")
 
-# THE TIER IS DISARMED AT BOOT. See "THE BOOT DEFAULT IS DISARMED" above: the
-# install cannot land at plugin-load time (the manager class does not exist
-# yet), so a boot-armed tier is a boot-unpatched tier facing live traffic.
-# The only way this becomes True at boot is someone editing this file.
+# THE TIER IS DISARMED AT IMPORT. See "THE BOOT DEFAULT IS DISARMED AT IMPORT" at
+# the top of this file: the install cannot land at plugin-load time (the manager
+# class does not exist yet), so a boot-armed tier is a boot-UNPATCHED tier facing
+# live traffic. The boot ARMS it later, at connector creation, and only on a
+# verified install (`boot_from_connector`); this flag is the state BEFORE that
+# moment, and `VLLM_E2_TIER_DEV_BOOT_INERT=1` makes it the state FOREVER.
 BOOT_ARMED = False
+
+# The two boot postures, named so the log line, the payload and the operator all
+# use one vocabulary. `auto` = the boot finishes the job (install, guard, arm);
+# `inert` = the pre-autoboot posture: install only, every effect by hand.
+BOOT_MODE_AUTO = "auto"
+BOOT_MODE_INERT = "inert"
+
+# The BOOT line names at most this many refusal reasons / not-covered methods, so
+# one line cannot be long enough to be unreadable; the FULL detail stays in the
+# `/tier` and `/status` payloads (`boot.refusals`, `boot.not_covered`).
+MAX_BOOT_ITEMS = 6
+MAX_BOOT_ITEM_CHARS = 220
 
 # The refusal kinds an arm can get, so `arm_block.kind` has a closed vocabulary.
 ARM_BLOCK_KINDS = ("geometry", "no_manager", "incomplete_install")
@@ -327,7 +370,7 @@ _state = {
     "skips": 0,
     "skip_reason": None,
     "class": None,
-    "armed": BOOT_ARMED,                 # inert at boot; arming is deliberate
+    "armed": BOOT_ARMED,            # inert at IMPORT; the boot arms it on proof
     "disarm_calls": 0,
     "arm_calls": 0,
     "fully_installed": False,            # every method in METHODS patched/verified
@@ -355,6 +398,12 @@ _state = {
     "hook_installs": 0,
     "hook_errors": 0,
     "hook_last": None,
+    # THE BOOT VERDICT: what the connector-creation boot actually achieved, and
+    # the one line that says so. None = no boot has run in this process yet (no
+    # tier connector built), which is NOT the same as "the boot failed".
+    "boot": None,
+    "boots": 0,
+    "boot_line": None,
 }
 
 
@@ -372,7 +421,7 @@ def reset_state_for_tests() -> None:
         "hook_fitted": False, "hook_reason": None, "hook_fits": 0,
         "hook_calls": 0, "hook_tier_connectors": 0, "hook_no_manager": 0,
         "hook_other_connector": 0, "hook_installs": 0, "hook_errors": 0,
-        "hook_last": None,
+        "hook_last": None, "boot": None, "boots": 0, "boot_line": None,
     })
 
 
@@ -1446,6 +1495,350 @@ def connector_factory_class():
     return getattr(module, CONNECTOR_FACTORY_CLASS, None)
 
 
+# --- THE BOOT: install, guard, arm - in that order --------------------------
+#
+# WHAT RUNS, AND WHY IT RUNS HERE. `register()` cannot do any of this: it runs at
+# `core.py:217`, while the manager class is first imported inside
+# `KVConnectorFactory.create_connector`, so the connector-creation hook is the
+# earliest instant at which any of it is possible - and it is still inside
+# `Scheduler.__init__`, long before the first request. The boot order is:
+#
+#   install(cls, config, manager)  -> kill-switch wrappers FIRST, then PR #56810,
+#                                     all-or-nothing, with the LIVE-object check
+#   guard                          -> `guard_mode` armed and its wrappers fitted,
+#                                     composed OVER the layers just installed and
+#                                     never replacing them, so there is no window
+#                                     in which a store or a lookup runs unguarded
+#   arm                            -> `set_armed(True)` ONLY if the install
+#                                     verified: every method patched, the live
+#                                     instance checked and safe, and no entry
+#                                     point the class actually HAS left unguarded
+#
+# ARMING IS GATED ON PROOF, NOT ON OPTIMISM. A verified install is the state a
+# manual `POST {"op":"arm"}` already had to prove; the boot seeks the same proof
+# through the same `set_armed()` gate, which re-runs `_arm_block_reason()` itself
+# - a second request for proof, not a second and weaker rule. It adds ONE
+# requirement over a human arm: the LIVE-OBJECT CHECK MUST HAVE RUN AND PASSED. A
+# human reading `live_check: unchecked` can decide; a boot cannot, because
+# patching a class whose one live instance is missing an attribute the patched
+# body reads is the 2026-10-03 12:41 engine death.
+#
+# WORKING OVER PERFECT, STATED PLAINLY: an entry point the fork does not define
+# at all (`take_events` on this fork is one) is reported under `not_covered` and
+# does NOT block the auto-arm. Refusing to arm because of a method that cannot
+# exist would mean the boot never works on a trimmed fork, which is the opposite
+# of the point. It is reported, not hidden.
+
+def boot_mode() -> tuple:
+    """("auto" | "inert", why an operator would read it). Read fresh, per boot.
+
+    `VLLM_E2_TIER_DEV_BOOT_INERT` set = the old inert boot (install only, every
+    effect by hand). Unset = auto. That variable only ever DISABLES a boot effect:
+    nothing in this package reads an env var that WARMS a dev facility up, which
+    is the property `test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off`
+    pins. An operator can turn the working boot OFF from a launcher script; they
+    cannot arm guard mode from one.
+    """
+    if config.boot_inert():
+        return BOOT_MODE_INERT, (config.ENV_BOOT_INERT + " is set: the boot "
+                                 "installs and stops there (no guard, no arming). "
+                                 "Arm by hand: POST " + tier_route()
+                                 + ' {"op":"arm"}')
+    return BOOT_MODE_AUTO, (config.ENV_BOOT_INERT + " unset (the default): at "
+                            "connector creation the boot installs PR #56810, arms "
+                            "the guard, and arms the tier once the install "
+                            "verifies")
+
+
+def _guard_layer_on(cls, method) -> bool:
+    """Is the guard a layer of `cls.method`, wherever it sits in the stack?
+
+    Layer-aware on purpose: `guard_mode.install()` composes its wrapper OVER the
+    backport's and the switch's, and a later install by another module of this
+    package could put a layer outside it. Asking `_layers_of()` for a `guard` kind
+    answers "is an exception here captured and declined?" about the attribute the
+    scheduler actually resolves, which is the question the auto-arm gate needs.
+    """
+    try:
+        current = getattr(cls, method, None)
+        if current is None:
+            return False
+        layers, _bottom = _layers_of(_function_of(current))
+        return any(kind == "guard" for kind, _wrapper in layers)
+    except Exception as exc:  # noqa: BLE001 - unreadable counts as "not guarded"
+        snapshot._error(exc, "backport guard coverage")
+        return False
+
+
+def _class_owns(cls, method) -> bool:
+    """Does THIS class own `method`, or only inherit it from some other module?
+
+    THE QUESTION THAT DECIDES WHETHER THE BOOT EVER ARMS ON A REAL ENGINE.
+    `guard_mode.install()` will not shadow a method whose home is neither the fork's
+    manager module nor this package - it refuses to take over another module's
+    method, and that rule is correct. But `SimpleCPUOffloadScheduler` inherits
+    `take_events`, `reset` and `update_connector_output` from the connector BASE
+    class (`vllm.distributed.kv_transfer.kv_connector.v1.base`), so on a real engine
+    those three can NEVER carry a guard layer. A gate that read "the class has the
+    attribute, therefore the guard must own it" would refuse to arm on every real
+    boot: fail-closed, safe, and a feature that works in a test fixture and nowhere
+    else. So the gate asks who OWNS the attribute: an entry point this class (or the
+    fork's own module) defines is a hole if it is unguarded; one it merely inherits
+    from a module the guard will not touch is a known, reported limit.
+
+    Fails CLOSED on an unreadable MRO: "cannot tell" reads as "owned", which sends
+    the decision to `_guard_layer_on`, where unreadable reads as "not guarded".
+
+    The home is read from the FUNCTION, falling back to the defining class, because
+    that is the same question `guard_mode.install()` asks when it decides whether an
+    attribute is ours to wrap - the gate and the guard must agree, or the gate
+    blocks on a method the guard was never going to touch.
+    """
+    try:
+        for klass in getattr(cls, "__mro__", None) or (cls,):
+            found = vars(klass).get(method)
+            if found is None:
+                continue
+            home = getattr(_function_of(found), "__module__", None) \
+                or getattr(klass, "__module__", None)
+            return home == TARGET_MODULE
+        return False
+    except Exception as exc:  # noqa: BLE001 - unreadable ownership is a hole
+        snapshot._error(exc, "backport method ownership")
+        return True
+
+
+def _guard_coverage(cls) -> dict:
+    """What the guard covers on THIS class, and what it does not. Reads only.
+
+    `wrapped`     methods whose live attribute carries a guard layer.
+    `not_covered` methods the guard cannot cover on this class: ones the fork
+                  renamed or dropped (nothing to guard) AND ones the class only
+                  inherits from a module outside the fork's own, which
+                  `guard_mode.install()` will not shadow (see `_class_owns`). They
+                  do NOT block the auto-arm, but they are reported - the payload
+                  must say what is NOT covered rather than imply completeness.
+    `refused`     entry points THIS class owns that carry no guard layer (a foreign
+                  owner marker, an attribute that is not callable, or an install
+                  that declined them). These DO block the auto-arm: running the
+                  tier with a live hole in the guard is the exact state the box
+                  tool has always refused.
+    """
+    from . import guard_mode  # noqa: PLC0415 - sibling layer, lazy by idiom
+    out = {"wrapped": [], "not_covered": [], "refused": []}
+    if cls is None:
+        out["not_covered"] = list(guard_mode.WRAPPED_METHODS)
+        return out
+    for method in guard_mode.WRAPPED_METHODS:
+        if getattr(cls, method, None) is None:
+            out["not_covered"].append(method)
+        elif _guard_layer_on(cls, method):
+            out["wrapped"].append(method)
+        elif not _class_owns(cls, method):
+            out["not_covered"].append(method)
+        else:
+            out["refused"].append(method)
+    return out
+
+
+def _boot_guard(cls) -> dict:
+    """Arm GUARD MODE and fit its wrappers on the live class. Never raises.
+
+    Goes through `set_guard_mode()` - the one mutation that owns the armed flag -
+    and only falls back to installing on `cls` directly for the case where the
+    module-level class is not resolvable but the connector's manager class is.
+    Idempotent either way: a method already carrying a guard layer is re-bound to
+    ITS `ORIGINAL`, so a re-run cannot nest a guard inside a guard.
+    """
+    from . import guard_mode  # noqa: PLC0415 - sibling layer, lazy by idiom
+    out = {"armed": False, "installed": False, "nested": [], "reason": None}
+    try:
+        report = guard_mode.set_guard_mode(True, None)
+        install_report = report.get("install") or {}
+        if not install_report.get("installed") and cls is not None:
+            install_report = guard_mode.install(cls)
+        out["armed"] = bool(guard_mode.is_armed())
+        out["installed"] = bool(install_report.get("installed"))
+        out["nested"] = list(install_report.get("nested") or [])
+        out["reason"] = (report.get("reason") if out["installed"] else
+                         (install_report.get("reason") or report.get("reason")))
+        return out
+    except Exception as exc:  # noqa: BLE001 - a guard we cannot fit is a report
+        snapshot._error(exc, "backport boot guard")
+        out["reason"] = f"{type(exc).__name__}: {exc}"[:MAX_BOOT_ITEM_CHARS]
+        return out
+
+
+def boot_from_connector(cls, install_report, manager) -> dict:
+    """THE BOOT, run by the connector-creation hook. Never raises.
+
+    Three verdicts and one log line: `backport` (the fix fully installed AND the
+    live instance safe), `guard` (wrappers on, and armed), `tier` (armed, and only
+    armed because the first two verified). It reports the install verdict rather
+    than re-deciding it, and the arm goes back through `set_armed()`, which
+    re-checks the gate - so a partial install still force-disarms and logs loudly
+    exactly as it did before the boot was automated.
+    """
+    report = install_report if isinstance(install_report, dict) else {}
+    boot = {"mode": None, "mode_why": None, "backport": False, "guard": False,
+            "guard_armed": False, "tier": False, "faults_at_boot": 0,
+            "refusals": [], "not_covered": [], "nested": [], "live_check": None,
+            "manager": type(manager).__name__ if manager is not None else None,
+            "install_reason": report.get("reason"), "line": None}
+    try:
+        mode, why = boot_mode()
+        boot["mode"], boot["mode_why"] = mode, why
+        live = report.get("live_check") or {}
+        boot["live_check"] = live
+
+        # "Verified" is the install's own all-or-nothing verdict AND a live-object
+        # check that ran on the instance the engine is about to call. No manager
+        # means no such check, and a boot cannot make the judgement a human would
+        # make from `live_check: unchecked` - so it declines, and says so.
+        installed = bool(report.get("installed"))
+        live_ok = bool(live.get("ok")) and manager is not None
+        boot["backport"] = installed and live_ok
+        if not installed:
+            boot["refusals"].append("backport: {}".format(
+                report.get("reason") or "the install did not complete"))
+        elif not live_ok:
+            boot["refusals"].append(
+                "backport: the live-object check did not pass: {}".format(
+                    live.get("reason") or "no live manager was checked, so an "
+                    "instance constructed BEFORE the patch was fitted would be "
+                    "unverified"))
+
+        if mode == BOOT_MODE_INERT:
+            boot["refusals"].append(
+                f"guard: not installed ({config.ENV_BOOT_INERT})")
+            boot["refusals"].append(
+                f"tier: not armed ({config.ENV_BOOT_INERT})")
+        else:
+            guard = _boot_guard(cls)
+            boot["guard"] = bool(guard["installed"])
+            boot["guard_armed"] = bool(guard["armed"])
+            boot["nested"] = list(guard.get("nested") or [])
+            coverage = _guard_coverage(cls)
+            boot["not_covered"] = list(coverage["not_covered"])
+            if not boot["guard"]:
+                boot["refusals"].append("guard: {}".format(
+                    guard.get("reason") or "the wrappers were not installed"))
+            if coverage["refused"]:
+                boot["refusals"].append("guard: no layer on {}".format(
+                    ", ".join(coverage["refused"])))
+
+            if boot["backport"] and boot["guard"] and not coverage["refused"]:
+                state = set_armed(True)
+                boot["tier"] = bool(state.get("armed")) and not state.get("refused")
+                if not boot["tier"]:
+                    boot["refusals"].append("tier: {}".format(
+                        state.get("reason") or "arming was refused"))
+            else:
+                blocked = ("the install is not verified" if not boot["backport"]
+                           else ("the guard is not installed" if not boot["guard"]
+                                 else "the guard left entry points unwrapped"))
+                boot["refusals"].append(f"tier: not armed, {blocked}")
+            boot["faults_at_boot"] = guard_mode_faults()
+
+        _state["boots"] += 1
+        _state["boot"] = boot
+        boot["line"] = boot_line(boot)
+        _state["boot_line"] = boot["line"]
+        # THE ONE LINE THE OPERATOR READS. WARNING, so it survives a quieter log
+        # level, and unconditional, so "did this boot come up working?" is
+        # answerable from the log without curling a verb or remembering a runbook.
+        logger.warning("kvtier-dev-plugin: %s", boot["line"])
+        return boot
+    except Exception as exc:  # noqa: BLE001 - a boot report never breaks a boot
+        snapshot._error(exc, "backport boot")
+        boot["refusals"].append(f"boot: {type(exc).__name__}: {exc}"
+                                [:MAX_BOOT_ITEM_CHARS])
+        _state["boot"] = boot
+        boot["line"] = boot_line(boot)
+        _state["boot_line"] = boot["line"]
+        logger.warning("kvtier-dev-plugin: %s", boot["line"])
+        return boot
+
+
+def guard_mode_faults() -> int:
+    """The guard's fault counter, through its public accessor. Never raises."""
+    from . import guard_mode  # noqa: PLC0415 - sibling layer, lazy by idiom
+    try:
+        return int(guard_mode.fault_count())
+    except Exception:  # noqa: BLE001 - an unreadable counter reads as 0
+        return 0
+
+
+def boot_line(boot: dict) -> str:
+    """THE boot line: one line, fixed field order, bounded.
+
+    `BOOT[mode] backport=YES|NO guard=YES|NO tier=ARMED|DISARMED faults=N ...`
+
+    Refusals and not-covered methods appear only when non-empty and each is
+    capped - the full detail is in the payload - but the line says how many were
+    left out, so a truncated line can never read as a complete one.
+    """
+    parts = ["BOOT[{}]".format(boot.get("mode") or "?")]
+    parts.append("backport={}".format("YES" if boot.get("backport") else "NO"))
+    parts.append("guard={}".format("YES" if boot.get("guard") else "NO"))
+    parts.append("tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
+    parts.append("faults={}".format(int(boot.get("faults_at_boot") or 0)))
+    if boot.get("nested"):
+        parts.append("guard_over={}".format(
+            ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
+    refusals = list(boot.get("refusals") or [])
+    if refusals:
+        parts.append("refused={}".format(" | ".join(
+            item[:MAX_BOOT_ITEM_CHARS] for item in refusals[:MAX_BOOT_ITEMS])))
+        if len(refusals) > MAX_BOOT_ITEMS:
+            parts.append("refused_more={}".format(len(refusals) - MAX_BOOT_ITEMS))
+    not_covered = list(boot.get("not_covered") or [])
+    if not_covered:
+        parts.append("not_covered={}".format(
+            ",".join(not_covered[:MAX_BOOT_ITEMS])))
+        if len(not_covered) > MAX_BOOT_ITEMS:
+            parts.append("not_covered_more={}".format(
+                len(not_covered) - MAX_BOOT_ITEMS))
+    if boot.get("guard_armed"):
+        parts.append('faults=POST {} {{"op":"captures"}}'.format(
+            config.ROUTE_PREFIX + config.ROUTE_GUARD))
+    return " ".join(parts)
+
+
+def boot_section() -> dict:
+    """The BOOT verdict for `status`/`snapshot`/`/tier`. The same keys every path.
+
+    `ran: false` is a DISTINCT answer from "the boot failed": no tier connector
+    has been built in this process yet, so nothing has been decided.
+    """
+    boot = _state.get("boot")
+    mode, why = boot_mode()
+    if not isinstance(boot, dict):
+        return {"ran": False, "mode": mode, "mode_why": why, "boots": 0,
+                "backport": False, "guard": False, "guard_armed": False,
+                "tier": False, "faults_at_boot": 0, "refusals": [],
+                "not_covered": [], "nested": [], "live_check": None,
+                "install_reason": None, "manager": None,
+                "line": _state.get("boot_line"),
+                "faults_now": guard_mode_faults(),
+                "note": ("no tier connector has been built in this process yet, so "
+                         "the boot has decided nothing: the connector-creation "
+                         "hook is what runs the install, the guard and the arm"),
+                "error": None}
+    out = dict(boot)
+    out["ran"] = True
+    out["boots"] = int(_state.get("boots") or 0)
+    out["mode"] = boot.get("mode") or mode
+    out["mode_why"] = boot.get("mode_why") or why
+    out["faults_now"] = guard_mode_faults()
+    out["note"] = ("the connector-creation boot: install, then guard, then arm on "
+                   "a verified install. faults_now above faults_at_boot means the "
+                   "guard has DECLINED something since boot - a silent miss by "
+                   "design; read the captures.")
+    out["error"] = None
+    return out
+
+
 def _is_tier_connector(connector) -> bool:
     """Is this object the simple-CPU offload connector (or a subclass)?
 
@@ -1464,6 +1857,27 @@ def _is_tier_connector(connector) -> bool:
     return False
 
 
+def boot_note(reason: str) -> dict:
+    """The BOOT line for a process that has NO tier to boot. Same format.
+
+    A worker (no `scheduler_manager`) and a connector nested inside a
+    `MultiConnector` are both normal, non-fatal answers - but an operator who
+    greps for `BOOT` and finds nothing cannot tell "the plugin decided not to
+    arm" from "the plugin never ran". So they report the same line shape, with
+    the reason, and the payload's `boot.ran` stays false.
+    """
+    mode, why = boot_mode()
+    boot = {"mode": mode, "mode_why": why, "backport": False, "guard": False,
+            "guard_armed": False, "tier": False, "faults_at_boot": 0,
+            "refusals": [reason], "not_covered": [], "nested": [],
+            "live_check": None, "manager": None, "install_reason": None,
+            "line": None}
+    boot["line"] = boot_line(boot)
+    _state["boot_line"] = boot["line"]
+    logger.warning("kvtier-dev-plugin: %s", boot["line"])
+    return boot
+
+
 def _after_connector_created(connector) -> None:
     """The install moment. Contained: the engine ALWAYS gets its connector.
 
@@ -1479,6 +1893,9 @@ def _after_connector_created(connector) -> None:
             _state["hook_other_connector"] += 1
             _state["hook_last"] = (f"{type(connector).__name__}: not the tier "
                                    f"connector, nothing installed")
+            boot_note(f"tier: not armed, {type(connector).__name__} is not the "
+                      f"tier connector (a tier nested inside it is the known "
+                      f"gap: see disarm_limits)")
             return
         manager = getattr(connector, "scheduler_manager", None)
         if manager is None:
@@ -1493,6 +1910,8 @@ def _after_connector_created(connector) -> None:
             logger.info("kvtier-dev-plugin: connector hook saw a tier connector "
                         "with no scheduler_manager (worker role) - normal, "
                         "nothing installed")
+            boot_note("tier: not armed, this process builds no scheduler_manager "
+                      "(worker role: it runs no tier scheduler code)")
             return
         _state["hook_tier_connectors"] += 1
         cls = type(manager)
@@ -1506,18 +1925,24 @@ def _after_connector_created(connector) -> None:
                                f"reason={report.get('reason') or 'none'}")
         # LOUD, because this is the state an operator must be able to read from
         # the boot log without curling anything: patched before the first request,
-        # or refused and therefore disarmed.
+        # or refused. These two lines describe the INSTALL verdict only - what
+        # happened to the tier is the BOOT line's job, written next.
         if report.get("installed"):
             logger.warning("kvtier-dev-plugin: PR #56810 install run at CONNECTOR "
-                           "CREATION (before the first request): %s; tier still "
-                           "DISARMED until POST %s {\"op\":\"arm\"}",
-                           _state["hook_last"], tier_route())
+                           "CREATION (before the first request): %s",
+                           _state["hook_last"])
         else:
             logger.warning("kvtier-dev-plugin: connector-creation install was NOT "
-                           "completed (%s) - the tier is DISARMED with its "
-                           "kill-switch wrappers fitted, so BOTH routes to the "
-                           "divisibility assert are gated and arming is refused",
+                           "completed (%s) - the tier keeps its kill-switch "
+                           "wrappers fitted, so BOTH routes to the divisibility "
+                           "assert are gated and arming is refused",
                            _state["hook_last"])
+        # THE BOOT SEQUENCE: guard wrappers (armed, composed over the layers just
+        # fitted), then the tier arm - and the arm only if the install verified.
+        # After the install verdict lines above, so the BOOT line is the last
+        # thing the boot writes and the one line an operator reads. Contained:
+        # the engine still got its connector whatever happens here.
+        boot_from_connector(cls, report, manager)
     except Exception as exc:  # noqa: BLE001 - a hook must never break a connector
         _state["hook_errors"] += 1
         _state["hook_last"] = f"hook raised {type(exc).__name__}: {exc}"[:200]
@@ -1898,24 +2323,32 @@ def _operator_note(armed: bool, installed: bool) -> str:
     """The one-line answer to "the engine booted with tier env set - why is it
     parking nothing?".
 
-    Inert-at-boot is deliberate, and the confusion it causes is the price of not
-    crashing on the first request; the JSON pays that price here, so an operator
-    reading `pr56810` or a `/tier` payload never has to know the design to read
-    the state correctly.
+    Inert-at-boot is still the posture of a boot that could not verify, and the
+    confusion it causes is the price of not crashing on the first request; the
+    JSON pays that price here, so an operator reading `pr56810` or a `/tier`
+    payload never has to know the design to read the state correctly. With the
+    auto boot the DISARMED branch is now the FAILURE case, not the expected one,
+    and the note says so and points at the one log line that explains it.
     """
     route = tier_route()
     if armed:
-        return ("ARMED: the tier parks and restores KV. Nothing arms the tier at "
-                "boot (BOOT_ARMED is False), so this state is the result of an "
-                f"explicit POST {route} {{\"op\":\"arm\"}}.")
+        return ("ARMED: the tier parks and restores KV. In the default boot mode "
+                "this is what a verified install produces on its own; with "
+                f"{config.ENV_BOOT_INERT} set it is the result of an explicit "
+                f'POST {route} {{"op":"arm"}}. Either way the BOOT log line names '
+                "the mode that ran.")
     if installed:
-        return ("DISARMED - the boot default, not a fault. A tier boot parks "
-                f"nothing until someone POSTs {route} {{\"op\":\"arm\"}}; "
-                "installed=true, so that arm is allowed right now.")
+        return ("DISARMED although the fix is fully installed, so this is NOT the "
+                "expected result of an auto boot: either "
+                f"{config.ENV_BOOT_INERT} is set (inert boot, by the operator's "
+                "order) or the guard did not wrap what the class has. Read the "
+                f"BOOT line (`boot.line`, `boot.refusals`); arming is allowed "
+                f"right now: POST {route} {{\"op\":\"arm\"}}.")
     return ("DISARMED and NOT fully installed, so arming is refused until every "
-            "required method is patched (see refused_methods / arm_block). "
-            "Parking nothing after a boot with tier env set is the expected "
-            "inert state, not a bug.")
+            "required method is patched (see refused_methods / arm_block / "
+            "boot.refusals). With the fix incomplete, parking nothing is the "
+            "safe state, not a bug - but it is no longer the expected boot "
+            "outcome, and the BOOT line says which install failed and why.")
 
 
 def _next_step(refusal: dict | None) -> str:
@@ -1986,6 +2419,7 @@ def tier_for_engine(engine, args=None) -> dict:
         # the answer supposed to be no?".
         out["armed"] = bool(_state["armed"])
         out["boot_default_armed"] = bool(BOOT_ARMED)
+        out["boot"] = boot_section()
         out["operator_note"] = out["tier"]["operator_note"]
         refusal = out.get("state") if isinstance(out.get("state"), dict) else None
         out["next_step"] = (_next_step(refusal) if refusal and refusal.get("refused")
@@ -2023,10 +2457,16 @@ def _fields(**overrides) -> dict:
         "skips": int(_state["skips"]),
         "skip_reason": _state["skip_reason"],
         "armed": bool(_state["armed"]),
-        # THE BOOT POSTURE, stated in the payload. `armed: false` immediately
-        # after a boot with tier env set is BY DESIGN (`BOOT_ARMED`), and
-        # `operator_note` says so in the same object - otherwise the first thing
-        # an operator concludes is that the tier is broken.
+        # THE BOOT POSTURE, stated in the payload: `boot` is the verdict of the
+        # connector-creation boot (mode, the three parts, their refusal reasons,
+        # the faults the guard had caught at boot and has caught since), and
+        # `boot_line` is the exact text the boot logged. `boot.ran: false` means
+        # no tier connector has been built in this process yet.
+        "boot": boot_section(),
+        "boot_line": _state.get("boot_line"),
+        # The STATE AT IMPORT, which is not the same claim as the boot verdict:
+        # the tier starts disarmed and the boot arms it only on a verified
+        # install, so `boot_default_armed` stays false in every mode.
         "boot_default_armed": bool(BOOT_ARMED),
         "boot_is_inert": not BOOT_ARMED,
         "arm_requires": ("the PR #56810 fix fully installed AND the geometry "
@@ -2052,6 +2492,7 @@ def _fields(**overrides) -> dict:
                                                  "reason": block["reason"]},
         "arm_calls": int(_state["arm_calls"]),
         "disarm_calls": int(_state["disarm_calls"]),
+        "boots": int(_state.get("boots") or 0),
         "methods": {name: dict(v) for name, v in _state["method_verdicts"].items()},
         "replaced": list(REPLACED),
         "wrapped": ["__init__"],

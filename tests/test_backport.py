@@ -54,16 +54,26 @@ def reset_backport_state():
     that makes an arm-refusal test pass for the wrong reason. The boot default
     comes from `backport.BOOT_ARMED`, so a test that wants an ARMED tier has to
     arm it - which is the production story.
+
+    `guard_mode._state` is restored here too, because the connector-creation BOOT
+    now arms guard mode as one of its three parts: a test that drives
+    `create_connector` arms it PROCESS-WIDE, and without this the next test in the
+    session (in another file, with no idea a boot ever ran) reads `guard_mode:
+    true` and fails. The wrappers themselves cannot leak - every class here is
+    built fresh by `FX.build_fork_class` - but the armed flag can.
     """
     saved = dict(backport._state)
     saved_verdicts = dict(backport._state["method_verdicts"])
     saved_switch = dict(backport._state["switch_verdicts"])
+    saved_guard = dict(guard_mode._state)
     backport.reset_state_for_tests()
     yield
     backport._state.clear()
     backport._state.update(saved)
     backport._state["method_verdicts"] = saved_verdicts
     backport._state["switch_verdicts"] = saved_switch
+    guard_mode._state.clear()
+    guard_mode._state.update(saved_guard)
 
 
 # --- fakes ------------------------------------------------------------------
@@ -1093,19 +1103,26 @@ def test_the_disarm_gates_the_finished_request_store_path_too():
     assert "connector-creation" in limits["enforced_by_wrappers_fitted_at"]
 
 
-def test_the_payload_says_why_an_idle_tier_is_expected():
-    """Inert-at-boot is a design decision; the JSON has to explain it.
+def test_the_payload_says_why_an_idle_tier_is_not_supposed_to_be_idle():
+    """An idle tier is now a STATE TO EXPLAIN, not the boot default.
 
-    Otherwise the first thing an operator concludes from `armed: false` on a
-    tier-env boot is that the tier is broken - the exact confusion this design
-    buys with its safety.
+    Before the auto boot, `armed: false` with `installed: true` was what every
+    boot looked like and the note had to say "expected, not a fault". Now the
+    boot arms on a verified install, so that combination means the operator
+    turned the boot inert or the guard could not wrap the class - and the note
+    has to point at the one line that says which. An operator reading `armed:
+    false` must never have to know the design to read the state correctly.
     """
     _install_with_metadata()
     installed_note = backport.section()["operator_note"]
-    assert "boot default" in installed_note and "arm" in installed_note
+    assert config.ENV_BOOT_INERT in installed_note, "says what could have caused it"
+    assert "BOOT" in installed_note, "points at the line that explains it"
+    assert "arm" in installed_note, "and at what to do about it"
 
     backport.set_armed(True)
-    assert backport.section()["operator_note"].startswith("ARMED")
+    armed_note = backport.section()["operator_note"]
+    assert armed_note.startswith("ARMED")
+    assert config.ENV_BOOT_INERT in armed_note, "says which mode produced it"
 
     backport.reset_state_for_tests()
     drifted = _switch_standin_methods(
@@ -1113,7 +1130,8 @@ def test_the_payload_says_why_an_idle_tier_is_expected():
     backport.install(drifted)
     note = backport.section()["operator_note"]
     assert "NOT fully installed" in note
-    assert "expected" in note
+    assert "safe" in note, "an incomplete install is the safe state, still"
+    assert "boot.refusals" in note
 
 
 def test_the_tier_verb_reports_its_refusal_kind_and_next_step():
@@ -1614,7 +1632,8 @@ def test_create_connector_lands_the_patch_before_any_verb(monkeypatch):
     `scheduler.py:164` and `kv_transfer_state.py:90` - then lands the install on
     the way out. After it returns, the class carries every marker and the
     geometry guard has seen a LIVE config, which a class-only install can never
-    do. The tier is still disarmed: patching is not arming.
+    do. And, since the boot finishes the job, the tier is ARMED by that same boot:
+    the install verified, so there is nothing left for a human to do.
     """
     cls = _six_group_class()
     factory, connector_cls, built = _fake_vllm_modules(monkeypatch, cls)
@@ -1641,7 +1660,9 @@ def test_create_connector_lands_the_patch_before_any_verb(monkeypatch):
     assert section["patched_before_first_request"] is True
     assert section["geometry"]["checked"] is True, "the LIVE config was guarded"
     assert section["geometry"]["ok"] is True
-    assert section["armed"] is False, "patching is not arming"
+    assert section["armed"] is True, "a verified install arms itself"
+    assert section["boot"]["ran"] is True
+    assert section["boot"]["tier"] is True and section["boot"]["guard"] is True
     hook = section["connector_hook"]
     assert hook["fitted"] is True and hook["tier_connectors"] == 1
     assert hook["installs_run"] == 1 and hook["errors"] == 0

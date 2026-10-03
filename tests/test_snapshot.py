@@ -338,3 +338,209 @@ def test_snapshot_reports_how_long_it_took_and_its_own_counters(reset_snapshot_s
     # A read-side snapshot must not cost milliseconds. This is a smoke ceiling
     # for a stub, not a performance claim; real numbers come from build_us.
     assert payload["build_us"] < 100_000
+
+
+# --- the host-RAM parked-KV hash index ---------------------------------------
+#
+# WHY THIS BLOCK EXISTS. The live snapshot reported
+#
+#     cpu_pool.total_blocks = 665   cpu_pool.free_blocks = 664
+#     boundary_store_stats.stored = 4372
+#
+# and read those two together they look like a contradiction. They are not: a
+# parked CPU block is returned to the ALLOCATOR when its store finishes, and what
+# keeps it retrievable is its entry in `cached_block_hash_to_block` - the index the
+# fork itself resolves hits through (get_one_block, manager.py:605, :940, :1251).
+# Allocator freeness does NOT mean the index is empty. These tests pin that the
+# reading is real, bounded, and labelled so it cannot be misread as freeness.
+
+def packed(hash_bytes: bytes, group: int) -> bytes:
+    """`make_block_hash_with_group_id` (kv_cache_utils.py:74-82): hash bytes then
+    the group id as 4 big-endian unsigned bytes."""
+    return hash_bytes + group.to_bytes(4, "big", signed=False)
+
+
+class FakeCachedBlock:
+    """A KVCacheBlock as the index sees it: an id, a hash, and the null flag."""
+
+    def __init__(self, block_id: int, block_hash=None, is_null=False) -> None:
+        self.block_id = block_id
+        self.block_hash = block_hash
+        self.is_null = is_null
+
+
+class FakeHashIndex:
+    """`BlockHashToBlockMap`: __len__ over its keys, private `_cache`, and NO
+    public key iterator - which is exactly why the reader falls back to `_cache`
+    and says it did."""
+
+    def __init__(self, cache=None) -> None:
+        self._cache = dict(cache or {})
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def get_one_block(self, key):
+        blocks = self._cache.get(key)
+        if isinstance(blocks, dict):
+            return next(iter(blocks.values()))
+        return blocks
+
+
+class ExplodingIndex:
+    def __len__(self) -> int:
+        raise RuntimeError("the index lied")
+
+
+class IndexPool(FakePool):
+    """A CPU pool that carries the parked-KV index, like the fork's."""
+
+    def __init__(self, total, free, index) -> None:
+        super().__init__(total, free)
+        self.cached_block_hash_to_block = index
+
+
+def filled(count, groups=6):
+    """An index of `count` entries spread over `groups` groups, each with a live
+    block behind it, exactly as the fork's map holds them."""
+    cache = {}
+    for i in range(count):
+        key = packed(b"h%05d" % i, i % groups)
+        cache[key] = FakeCachedBlock(i, key)
+    return FakeHashIndex(cache)
+
+
+def index_view(index, hash_block_size=64):
+    return snapshot._hash_index_view(
+        IndexPool(665, 664, index), hash_block_size)
+
+
+def test_the_index_reports_how_much_parked_kv_is_retrievable_not_how_free_the_pool_is():
+    """The live contradiction, reproduced: a pool that reads 664/665 free with
+    thousands of retrievable entries."""
+    pool = IndexPool(665, 664, filled(4372))
+    view = snapshot._hash_index_view(pool, 64)
+    assert view["available"] is True
+    assert view["entries"] == 4372
+    assert view["counted_by"] == "len"
+    assert view["tokens_upper_bound"] == 4372 * 64
+    assert "UPPER BOUND" in view["tokens_note"]
+    # The label is the whole point: it must say what it is NOT.
+    assert "free_blocks" in view["meaning"]
+    assert "allocator" in view["meaning"]
+    # And the ALLOCATOR half is still reported next to it, unchanged: the two
+    # numbers mean different things and the payload shows both.
+    assert snapshot._pool_view(pool) == {"bound": True, "total_blocks": 665,
+                                         "free_blocks": 664}
+
+
+def test_per_group_counts_come_from_the_packed_group_id_and_say_how_they_were_read():
+    index = FakeHashIndex({packed(b"a", 0): FakeCachedBlock(1, packed(b"a", 0)),
+                           packed(b"b", 3): FakeCachedBlock(2, packed(b"b", 3)),
+                           packed(b"c", 3): FakeCachedBlock(3, packed(b"c", 3)),
+                           packed(b"d", 4): FakeCachedBlock(4, packed(b"d", 4))})
+    view = index_view(index)
+    assert view["per_group"] == {"0": 1, "3": 2, "4": 1}
+    assert view["key_handle"] == "_cache"
+    assert "private _cache" in view["key_handle_note"], (
+        "reaching past the public surface must be admitted in the payload")
+    assert view["entries_scanned"] == 4
+    assert view["scan_truncated"] is False
+
+
+def test_len_counts_keys_not_blocks_and_a_multi_block_key_is_visible():
+    """`BlockHashToBlockMap` does not de-duplicate (block_pool.py:47-51): one key
+    can hold several blocks. `entries` is DISTINCT HIT-ABLE PREFIXES, and the
+    sample says when a key is holding more than one block."""
+    key = packed(b"dup", 0)
+    index = FakeHashIndex({key: {7: FakeCachedBlock(7, key),
+                                 8: FakeCachedBlock(8, key)},
+                           packed(b"solo", 0): FakeCachedBlock(9, packed(b"solo", 0))})
+    view = index_view(index)
+    assert view["entries"] == 2
+    assert view["sampled_keys_with_multiple_blocks"] == 1
+
+
+def test_a_stale_entry_would_show_up_as_a_sampled_value_without_a_hash():
+    """The tripwire: a live entry's block still carries its hash. An entry whose
+    block lost the hash is the stale case the count would otherwise hide."""
+    good = packed(b"g", 0)
+    index = FakeHashIndex({good: FakeCachedBlock(1, good),
+                           packed(b"s", 0): FakeCachedBlock(2, None),
+                           packed(b"n", 0): FakeCachedBlock(3, packed(b"n", 0),
+                                                            is_null=True)})
+    view = index_view(index)
+    assert view["sampled_entries"] == 3
+    assert view["sampled_values_without_hash"] == 1
+    assert view["sampled_null_blocks"] == 1
+
+
+def test_the_staleness_question_is_answered_with_evidence_not_dodged():
+    """`stale_entries` must be a verdict plus the reasoning that a reader can
+    check, and it must name what it cannot rule out."""
+    view = index_view(FakeHashIndex())
+    assert view["stale_entries"] == "not_expected_on_pool_paths"
+    assert "get_new_blocks" in view["stale_entries_why"]
+    assert "_remove_cached_block_hashes" in view["stale_entries_why"]
+    assert "cannot see the copy" in view["stale_entries_not_ruled_out"]
+    assert "eviction candidate" in view["retrievable_now_vs_retained"]
+
+
+def test_a_pool_without_the_index_says_so_and_invents_no_number():
+    view = snapshot._hash_index_view(FakePool(665, 664), 64)
+    assert view["available"] is False
+    assert "entries" not in view
+    assert "has no cached_block_hash_to_block" in view["reason"]
+    assert snapshot._hash_index_view(None, 64)["available"] is False
+
+
+def test_an_unsized_index_invents_no_number():
+    view = index_view(object())
+    assert view["available"] is False
+    assert "entries" not in view
+    assert "no occupancy number invented" in view["reason"]
+
+
+def test_an_index_whose_len_raises_is_contained_and_named(reset_snapshot_state):
+    """A container whose len() RAISES must not be reported like one that has no
+    size handle: those two need different answers from an operator."""
+    view = index_view(ExplodingIndex())
+    assert view["available"] is False
+    assert "entries" not in view
+    assert view["counted_by"] == "len"
+    assert "__len__ raised RuntimeError" in view["reason"]
+    assert snapshot.error_counters()["errors"] == 1
+
+
+def test_the_key_scan_is_bounded_and_says_when_it_stopped(monkeypatch):
+    monkeypatch.setattr(snapshot, "MAX_HASH_INDEX_SCAN", 10)
+    view = index_view(filled(25, groups=1))
+    assert view["entries"] == 25
+    assert view["entries_scanned"] == 10
+    assert view["scan_truncated"] is True
+
+
+def test_the_group_cap_is_honoured(monkeypatch):
+    monkeypatch.setattr(snapshot, "MAX_HASH_INDEX_GROUPS", 3)
+    view = index_view(filled(6, groups=6))
+    assert len(view["per_group"]) == 3
+    assert view["groups_truncated"] is True
+
+
+def test_a_key_too_short_to_carry_a_group_id_is_counted_not_decoded():
+    index = FakeHashIndex({b"": FakeCachedBlock(1, b""),
+                           b"abcd": FakeCachedBlock(2, b"abcd"),
+                           packed(b"e", 1): FakeCachedBlock(3, packed(b"e", 1))})
+    view = index_view(index)
+    assert view["keys_without_group_id"] == 2
+    assert view["per_group"] == {"1": 1}
+
+
+def test_the_tier_view_carries_the_index_next_to_the_allocator_it_is_not_the_same_as():
+    index = FakeHashIndex({packed(b"a", 0): FakeCachedBlock(1, packed(b"a", 0))})
+    manager = FakeManager(cpu_pool=IndexPool(665, 664, index))
+    tier = snapshot.snapshot_for_engine(make_engine(manager), _NullHolder())["tier"]
+    assert tier["cpu_pool"]["free_blocks"] == 664
+    assert tier["cpu_hash_index"]["entries"] == 1
+    assert tier["cpu_hash_index"]["meaning"]
+    assert tier["boundary_store_stats"]["available"] is True

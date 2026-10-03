@@ -18,6 +18,18 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
   VLLM_E2_TIER_DEV_TIMEOUT  -- seconds the HTTP layer waits for the engine
                                utility call before answering 504. Default 5.0,
                                clamped to [0.05, 60.0]; garbage falls back.
+  VLLM_E2_TIER_DEV_BOOT_INERT -- THE BOOT OPT-OUT. UNSET (the default) = the
+                               boot brings the tier up WORKING: at connector
+                               creation the plugin installs PR #56810, arms GUARD
+                               MODE, and arms the tier -- and only arms it, if the
+                               install VERIFIES (all methods patched, live object
+                               safe). Set it to anything not in
+                               {"", "0", "false", "off", "no"} to get the old
+                               inert boot back: patched at connector creation, no
+                               guard, tier left disarmed until a human POSTs
+                               {"op":"arm"}. It never ARMS anything by itself:
+                               truthy = inert, falsy = auto. `status` and the
+                               engine's BOOT log line both say which mode ran.
   VLLM_E2_TIER_DEV_ALLOW    -- comma-separated list of IP addresses or CIDR
                                networks allowed in ADDITION to loopback, e.g.
                                `192.168.2.64,192.168.2.120` or `192.168.2.0/24`.
@@ -63,6 +75,12 @@ ENV_ENABLE = "VLLM_E2_TIER_DEV"
 ENV_TOKEN = "VLLM_E2_TIER_DEV_TOKEN"  # noqa: S105 - a variable NAME, not a secret
 ENV_TIMEOUT = "VLLM_E2_TIER_DEV_TIMEOUT"
 ENV_ALLOW = "VLLM_E2_TIER_DEV_ALLOW"  # empty/unset = loopback only
+# THE BOOT OPT-OUT. Unset = the boot arms (guard + tier) once the install
+# verifies; truthy = the old inert boot. The name deliberately says what it
+# DISABLES rather than what it enables: no env var of this plugin ARMS guard mode,
+# which is the property `test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off`
+# pins. The boot arms it; this variable only takes the boot back to inert.
+ENV_BOOT_INERT = "VLLM_E2_TIER_DEV_BOOT_INERT"
 
 # --- the worker-side diagnostics writer (`worker_diag.py`) ------------------
 # The directory one JSON file per rank is written into, on the ENGINE's host. The
@@ -101,18 +119,20 @@ METHOD_INSPECT = "kvtier_dev_inspect"
 METHOD_TRACE = "kvtier_dev_trace"
 METHOD_GUARD = "kvtier_dev_guard"
 METHOD_TIER = "kvtier_dev_tier"
+METHOD_LOOKUPS = "kvtier_dev_lookups"
 
 # Every engine method this plugin owns, in attach order. `attach_methods` walks
 # this, so a new verb cannot be attached in one place and forgotten elsewhere.
 METHODS = (METHOD_SNAPSHOT, METHOD_RELOAD_POLICY, METHOD_KVCONFIG, METHOD_INSPECT,
-           METHOD_TRACE, METHOD_GUARD, METHOD_TIER)
+           METHOD_TRACE, METHOD_GUARD, METHOD_TIER, METHOD_LOOKUPS)
 
 # All HTTP surface lives here, never under /v1 (see docs/usage/security.md:349:
 # `--api-key` only protects the /v1, /v2, /inference, /cohere prefixes).
 ROUTE_PREFIX = "/plugins/kvtier"
 
 # Route names, for status and the tests. The verbs that CAN change dev state
-# (`/guard`, `/trace`) require the token in every shape, loopback included.
+# (`/guard`, `/trace`, `/tier`, `/lookups`) require the token in every shape,
+# loopback included.
 ROUTE_STATUS = "/status"
 ROUTE_SNAPSHOT = "/snapshot"
 ROUTE_RELOAD = "/policy/reload"
@@ -122,16 +142,17 @@ ROUTE_REQUEST = "/request"
 ROUTE_TRACE = "/trace"
 ROUTE_GUARD = "/guard"
 ROUTE_TIER = "/tier"
+ROUTE_LOOKUPS = "/lookups"
 
 # The same routes as one tuple, in the order a reader wants them, so `status`
 # and the tests enumerate the surface from ONE place. Suffixes: the router
 # carries ROUTE_PREFIX itself.
 ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUEST,
-          ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_RELOAD)
+          ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS, ROUTE_RELOAD)
 
 # The routes that can change engine dev state. Token in every shape, loopback
 # included - see endpoint.require_dev_state_token.
-DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER)
+DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS)
 
 # Name used for logs, for `VLLM_PLUGINS` allowlisting and as the entry-point
 # name in both groups. One name allowlists both halves at once.
@@ -166,6 +187,17 @@ class PolicyPathError(ValueError):
 def enabled() -> bool:
     """Master switch. False unless VLLM_E2_TIER_DEV says otherwise."""
     return os.environ.get(ENV_ENABLE, "").strip().lower() not in _FALSY
+
+
+def boot_inert() -> bool:
+    """True = the INERT boot (patch only: no guard, no tier arming).
+
+    The same falsy set as `enabled()`, so `0`/`false`/`off`/`no`/empty all mean
+    "not inert" = the auto boot. Read per call, never at import: the mode an
+    operator wants changes with a restart of the engine, not a re-install, and
+    `status` reports the mode it read at the last boot.
+    """
+    return os.environ.get(ENV_BOOT_INERT, "").strip().lower() not in _FALSY
 
 
 def token_configured() -> bool:

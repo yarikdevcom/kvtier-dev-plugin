@@ -263,10 +263,16 @@ def _install_observers(engine) -> dict:
 def _remove_observers(engine) -> dict:
     from . import guard_mode, step_trace  # noqa: PLC0415
     reports = {"step_observers": step_trace.uninstall(engine)}
-    if guard_mode.is_armed():
+    # Ask EVERY consumer, not just guard mode: the same class attributes feed the
+    # guard, this ring and the lookup ledger, and `disarm()` above has already
+    # cleared the trace flag, so a non-empty list means someone else is still
+    # recording through these wrappers.
+    customers = guard_mode.wrapper_customers()
+    if customers:
         reports["tier_wrappers"] = {
             "uninstalled": False,
-            "reason": "guard mode is armed, so the tier wrappers stay in place"}
+            "reason": ("still needed by: " + ", ".join(customers)
+                       + "; the tier wrappers stay in place")}
     else:
         manager = guard_mode.manager_of(engine)
         cls = type(manager) if manager is not None else guard_mode.manager_class()
