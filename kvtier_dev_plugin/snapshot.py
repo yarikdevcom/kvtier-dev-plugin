@@ -161,6 +161,16 @@ def _pool_view(pool) -> dict:
 MAX_HASH_INDEX_SCAN = 20000
 MAX_HASH_INDEX_GROUPS = 64
 MAX_HASH_INDEX_SAMPLE = 32
+# A map value is a KVCacheBlock, or a {block_id: block} dict when one key carries
+# several blocks (the map does not de-duplicate, block_pool.py:47-51). A fan-out
+# wider than this is a fork this reader does not understand, and it refuses the
+# block view instead of counting a prefix of it.
+MAX_BLOCKS_PER_KEY = 8
+# The per-group block-id sets are the ONLY container this scan grows beyond a
+# counter: at most one id is added per key, so the total is bounded by the key
+# scan itself - MAX_HASH_INDEX_SCAN ints worst case, and in production the pool
+# size, not the entry count, is the ceiling (665 blocks per rank here).
+MAX_PARKED_BLOCK_IDS = MAX_HASH_INDEX_SCAN
 HASH_INDEX_ATTR = "cached_block_hash_to_block"
 HASH_INDEX_MEANING = (
     "parked entries in the host-RAM KV hash index, NOT allocator allocations: "
@@ -274,7 +284,7 @@ def _hash_index_view(pool, hash_block_size) -> dict:
                 f"entries x {hash_block_size}: an UPPER BOUND on distinct "
                 "retrievable tokens (one index entry is one hash block; shared "
                 "prefixes are counted once, duplicate parkings are not)")
-        _hash_index_breakdown(index, out)
+        _hash_index_breakdown(index, out, pool)
         _hash_index_sanity_sample(index, out)
         return out
     except Exception as exc:  # noqa: BLE001 - a diagnostic never reaches the scheduler
@@ -284,9 +294,109 @@ def _hash_index_view(pool, hash_block_size) -> dict:
         return out
 
 
-def _hash_index_breakdown(index, out: dict) -> None:
-    """Per-group entry counts, from a BOUNDED key scan. Best effort, and it says
-    which handle it read and when it stopped."""
+# --- parked BLOCKS and the primary/secondary key split ----------------------
+#
+# `per_group` counts KEYS of the hash index, and the groups do not mint keys at the
+# same rate per parked span. The primary hash is one key per `block_size`-token
+# span; the fine-graining group ALSO mints its intra-block secondary hashes, and
+# they are inserted against the SAME `cpu_block` with `num_tokens=None`
+# (manager.py:1039-1044) - dictionary entries that cost no block and no bytes. So
+# `per_group` is inflated by a per-group divisor that is not in the payload, and a
+# consumer that sums or mins it is wrong in a way it cannot discover.
+#
+# Measured live on 2026-10-05 (read-only GET /plugins/kvtier/snapshot, idle box):
+# `per_group {0:94, 1:94, 2:94, 3:95, 5:317}` against `cpu_pool.total_blocks = 665`
+# - group 5 carries 3.4x the keys of its siblings, and the ratio DRIFTS (317,
+# 317, 318, 320, 320, 320 over six polls of one idle minute), which is exactly why
+# no fixed divisor may be divided by anywhere downstream.
+#
+# What a consumer needs instead is spans, and spans ARE blocks: one parked span
+# occupies exactly one CPU block per group (every group's GPU block goes into one
+# list and `get_new_blocks()` takes that many DISTINCT ids via `popleft_n()`,
+# manager.py:755-758 / block_pool.py:678). Hence distinct block ids per group.
+PARKED_BLOCKS_MEANING = (
+    "distinct CPU BLOCKS behind the index keys of each group, from the same bounded "
+    "scan as `per_group`: one parked span occupies one block per group, so this is "
+    "SPANS parked in the group. Unlike `per_group` it is not inflated by the "
+    "fine-graining group's secondary hashes (same cpu_block, num_tokens=None, "
+    "manager.py:1039-1044). min() over the PREFIX-CACHEABLE groups only is the "
+    "joint depth a whole-model resume can use; x tier.block_size gives tokens")
+PARKED_BLOCKS_SOURCE = (
+    "one pass over the same key scan as `per_group`: per key, one map lookup plus "
+    "at most MAX_BLOCKS_PER_KEY attribute reads, and one set.add of an int. The "
+    "only container growth is the per-group id sets, bounded by "
+    "MAX_PARKED_BLOCK_IDS ints in total (one id per scanned key at most, and in "
+    "practice by the pool size - 665 blocks per rank here)")
+KEY_SPLIT_MEANING = (
+    "per-group split of `per_group` by what the entry IS. primary = the key the "
+    "block itself carries (block.block_hash, the one whose num_tokens was recorded "
+    "by set_block_hash); secondary = an extra key under which the SAME block is "
+    "also indexed (BlockPool.cached_block_hashes_by_block, populated by "
+    "_insert_block_hash at block_pool.py:641 from manager.py:1039-1044). "
+    "primary[g] should equal parked_blocks_per_group[g]: that equality is the "
+    "cross-check, and key_split_matches_blocks states it")
+
+
+def _index_value_of(index, keys):
+    """(fn(key) -> map value, how). Two handles, in preference order.
+
+    The map's own dict is preferred because its value carries the key's FULL block
+    set; the public `get_one_block()` is what a HIT resolves to, so a key holding
+    several blocks is necessarily collapsed to one - and the payload has to say so.
+    """
+    if isinstance(keys, dict):
+        return keys.get, "map value via _cache: a key's full block set is visible"
+    get_one = getattr(index, "get_one_block", None)
+    if callable(get_one):
+        return (get_one,
+                "get_one_block(): what a hit resolves to, so a key carrying "
+                "several blocks is counted as the one a hit would use")
+    return None, None
+
+
+def _key_blocks_and_kind(key, value, by_block):
+    """(block_ids | None, kind | None) for one index entry. O(1) attribute reads.
+
+    `block_ids` is None when the value is not the shape the fork documents (then
+    the whole block view is refused, not guessed). `kind` is None when the entry is
+    neither the block's own key nor a member of that block's extra-hash set - the
+    case the key split must NOT quietly file under "secondary".
+    """
+    if value is None:
+        return None, None
+    blocks = value
+    if not isinstance(blocks, dict):
+        blocks = (value,)
+    if len(blocks) > MAX_BLOCKS_PER_KEY:
+        return None, None
+    ids: list = []
+    own = False
+    extra = False
+    for block in (blocks.values() if isinstance(value, dict) else blocks):
+        block_id = getattr(block, "block_id", None)
+        if isinstance(block_id, bool) or not isinstance(block_id, int):
+            return None, None
+        ids.append(block_id)
+        if getattr(block, "block_hash", None) == key:
+            own = True
+        elif by_block is not None and key in by_block.get(block_id, ()):
+            extra = True
+    if own:
+        return ids, "primary"
+    if extra and by_block is not None:
+        return ids, "secondary"
+    return ids, None
+
+
+def _hash_index_breakdown(index, out: dict, pool=None) -> None:
+    """Per-group entry counts AND per-group parked BLOCK counts, from ONE bounded
+    key scan. Best effort, and it says which handle it read and when it stopped.
+
+    The key counts alone are not enough for a consumer: the groups mint keys at
+    different rates per span (see PARKED_BLOCKS_MEANING), so a sum or a min over
+    `per_group` is an upper bound wearing an occupancy's name. The block counts are
+    what a consumer needs, and they come from this same pass at no extra scan cost.
+    """
     keys = None
     handle = None
     for name in ("keys", HASH_INDEX_ATTR, "_cache"):
@@ -307,16 +417,34 @@ def _hash_index_breakdown(index, out: dict) -> None:
         out["per_group_reason"] = (
             f"no public keys() and no dict-like attribute to enumerate: "
             f"{type(index).__name__} exposes no key handle")
+        _refuse(out, "parked_blocks_per_group",
+                out["per_group_reason"])
+        _refuse(out, "per_group_primary", out["per_group_reason"])
+        out["per_group_secondary"] = None
+        out["per_group_secondary_reason"] = out["per_group_reason"]
         return
     out["key_handle"] = handle
     if handle == "_cache":
         out["key_handle_note"] = (
             "read through the map's private _cache dict (dev-only, read-only): "
             "BlockHashToBlockMap has no public key iterator")
+    value_of, blocks_via = _index_value_of(index, keys)
+    by_block = getattr(pool, "cached_block_hashes_by_block", None)
+    if not isinstance(by_block, dict):
+        by_block = None
     groups: dict = {}
+    block_sets: dict = {}
+    primary: dict = {}
+    secondary: dict = {}
     scanned = 0
     unparsable = 0
     truncated = False
+    partial = False
+    ids_stored = 0
+    ids_capped = False
+    unresolvable = 0
+    unclassified = 0
+    multi_block = 0
     try:
         for key in keys:
             if scanned >= MAX_HASH_INDEX_SCAN:
@@ -329,15 +457,181 @@ def _hash_index_breakdown(index, out: dict) -> None:
                 continue
             if len(groups) < MAX_HASH_INDEX_GROUPS or group in groups:
                 groups[group] = groups.get(group, 0) + 1
+                if value_of is None:
+                    continue
+                if ids_stored >= MAX_PARKED_BLOCK_IDS:
+                    ids_capped = True
+                    continue
+                ids, kind = _key_blocks_and_kind(key, value_of(key), by_block)
+                if ids is None:
+                    # A value this reader cannot turn into block ids. Refused
+                    # below, per field: a count of the keys it understood would
+                    # look like a count of the index.
+                    unresolvable += 1
+                    continue
+                if len(ids) > 1:
+                    multi_block += 1
+                bucket = block_sets.get(group)
+                if bucket is None:
+                    bucket = block_sets[group] = set()
+                bucket.update(ids)
+                ids_stored += len(ids)
+                if kind is None:
+                    unclassified += 1
+                elif kind == "primary":
+                    primary[group] = primary.get(group, 0) + 1
+                else:
+                    secondary[group] = secondary.get(group, 0) + 1
     except Exception as exc:  # noqa: BLE001 - a half-scan is still a reading
         _error(exc, "hash index per-group scan")
-        out["per_group_partial"] = True
+        partial = True
     out["entries_scanned"] = scanned
     out["scan_truncated"] = truncated
     out["per_group"] = ({str(name): groups[name] for name in sorted(groups)}
                         if groups else {})
     out["groups_truncated"] = len(groups) >= MAX_HASH_INDEX_GROUPS
     out["keys_without_group_id"] = unparsable
+    if partial:
+        out["per_group_partial"] = True
+    blocks_ok = _publish_parked_blocks(
+        out, groups, block_sets, truncated=truncated, partial=partial,
+        groups_truncated=out["groups_truncated"], ids_capped=ids_capped,
+        unresolvable=unresolvable, multi_block=multi_block,
+        value_missing=value_of is None, blocks_via=blocks_via,
+        scanned=scanned, unparsable=unparsable)
+    _publish_key_split(out, groups, primary, secondary, by_block=by_block,
+                       truncated=truncated, partial=partial,
+                       unclassified=unclassified, blocks_ok=blocks_ok,
+                       block_sets=block_sets, scanned=scanned,
+                       unparsable=unparsable)
+
+
+def _refuse(out: dict, field: str, reason: str) -> None:
+    """Publish a field as null WITH its reason. Never a 0, never a guess: a missing
+    reading is information, a fabricated one is a lie (and every `or 0` in this
+    session's history turned into a number somebody believed)."""
+    out[field] = None
+    out[field + "_reason"] = reason
+
+
+def _publish_parked_blocks(out: dict, groups: dict, block_sets: dict, *,
+                           truncated: bool, partial: bool,
+                           groups_truncated: bool, ids_capped: bool,
+                           unresolvable: int, multi_block: int,
+                           value_missing: bool, blocks_via: str | None,
+                           scanned: int, unparsable: int) -> bool:
+    """Emit `parked_blocks_per_group`, or the reason it is absent. True if emitted."""
+    out["parked_blocks_meaning"] = PARKED_BLOCKS_MEANING
+    out["parked_blocks_source"] = PARKED_BLOCKS_SOURCE
+    field = "parked_blocks_per_group"
+    if not groups:
+        # An index that is genuinely empty is a real zero; an index whose keys this
+        # reader could not attribute to a group is not.
+        if scanned == 0:
+            out[field] = {}
+        else:
+            _refuse(out, field,
+                    f"{unparsable} of {scanned} scanned keys carried no parsable "
+                    "group id and no key did: no group is claimable")
+        return False
+    if value_missing:
+        _refuse(out, field,
+                "the index exposes neither a _cache dict nor get_one_block(), so no "
+                "block identity is reachable: keys can be counted, blocks cannot")
+    elif truncated:
+        _refuse(out, field,
+                f"the key scan stopped at {MAX_HASH_INDEX_SCAN} entries "
+                "(scan_truncated): a distinct-block count over a PREFIX of the "
+                "index silently under-counts, which is the error class this field "
+                "exists to remove")
+    elif partial:
+        _refuse(out, field, "the key scan raised mid-pass (per_group_partial): a "
+                            "half-count of distinct blocks would be a number with "
+                            "no stated coverage")
+    elif groups_truncated:
+        _refuse(out, field,
+                f"more than {MAX_HASH_INDEX_GROUPS} groups were seen, so a min() "
+                "over the published groups would be a min over a subset of them")
+    elif ids_capped:
+        _refuse(out, field,
+                f"the block-id sets hit their {MAX_PARKED_BLOCK_IDS}-id bound; "
+                "the count is a prefix, not the set")
+    elif unresolvable:
+        _refuse(out, field,
+                f"{unresolvable} index values were neither a KVCacheBlock nor a "
+                f"block dict with int ids (fan-out > {MAX_BLOCKS_PER_KEY} counts as "
+                "ununderstood): counting the readable ones would mislabel a partial"
+                " as a total")
+    else:
+        out[field] = {str(name): len(block_sets[name])
+                      for name in sorted(block_sets)}
+        out["parked_blocks_seen_via"] = blocks_via
+        out["keys_backed_by_multiple_blocks"] = multi_block
+        return True
+    return False
+
+
+def _publish_key_split(out: dict, groups: dict, primary: dict, secondary: dict, *,
+                       by_block, truncated: bool, partial: bool,
+                       unclassified: int, blocks_ok: bool,
+                       block_sets: dict, scanned: int, unparsable: int) -> None:
+    """Emit `per_group_primary`/`per_group_secondary`, or why they are absent.
+
+    The discriminator is structural, not a divisor: a key is PRIMARY when the block
+    it points at carries that key as its own `block_hash` (the one insert that got
+    to call `set_block_hash`, and the only one that carried a real `num_tokens`),
+    and SECONDARY when the pool's own extra-hash set for that block id contains it
+    (`cached_block_hashes_by_block`, block_pool.py:641). Anything else is an
+    unclassified entry and refuses the split outright.
+    """
+    out["per_group_key_split_meaning"] = KEY_SPLIT_MEANING
+    if not groups:
+        if scanned == 0:
+            out["per_group_primary"] = {}
+            out["per_group_secondary"] = {}
+        else:
+            _refuse(out, "per_group_primary",
+                    f"{unparsable} of {scanned} scanned keys carried no parsable "
+                    "group id and no key did: no group is claimable")
+            out["per_group_secondary"] = None
+            out["per_group_secondary_reason"] = out["per_group_primary_reason"]
+        return
+    if by_block is None:
+        _refuse(out, "per_group_primary",
+                "the CPU pool exposes no cached_block_hashes_by_block dict: a key "
+                "that is not its block's own hash cannot be POSITIVELY identified "
+                "as an extra-hash entry, and 'not primary' is not the same claim as "
+                "'secondary'")
+        out["per_group_secondary"] = None
+        out["per_group_secondary_reason"] = out["per_group_primary_reason"]
+        return
+    if unclassified:
+        _refuse(out, "per_group_primary",
+                f"{unclassified} entries were neither their block's own hash nor a "
+                "member of that block's extra-hash set - a fork this reader does "
+                "not fully model, so the split is withheld")
+        out["per_group_secondary"] = None
+        out["per_group_secondary_reason"] = out["per_group_primary_reason"]
+        return
+    if truncated or partial:
+        _refuse(out, "per_group_primary",
+                "the key scan was truncated or raised mid-pass: a partial split "
+                "would not sum to per_group and the cross-check would be noise")
+        out["per_group_secondary"] = None
+        out["per_group_secondary_reason"] = out["per_group_primary_reason"]
+        return
+    out["per_group_primary"] = {str(name): primary.get(name, 0)
+                                for name in sorted(groups)}
+    out["per_group_secondary"] = {str(name): secondary.get(name, 0)
+                                  for name in sorted(groups)}
+    if blocks_ok:
+        # The cross-check the consumers asked for: one primary key per block, so the
+        # two must agree entry for entry. A disagreement means the "one block per
+        # span" premise (or a multi-block key) is what failed, not the arithmetic.
+        out["key_split_matches_blocks"] = (
+            out["per_group_primary"]
+            == {str(name): len(block_sets[name]) for name in sorted(block_sets)})
+
 
 
 def _hash_index_sanity_sample(index, out: dict) -> None:

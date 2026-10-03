@@ -328,8 +328,16 @@ def test_the_shipped_policy_is_loadable_and_cheap():
     assert holder.ensure_loaded()["ok"] is True
     result = holder.decide({"tier": {"present": False}})
     assert result["verdict"] == "no-tier"
+    # The keys here are the ones `snapshot.tier_view()` actually emits. This
+    # fixture used to hand the policy a `cpu_free_blocks` key the producer has
+    # never written - the same phantom the policy itself read - which is how the
+    # "nearly full" assertion passed while the real ratio was fabricated.
     result = holder.decide({"tier": {"present": True, "num_cpu_blocks": 100,
-                                     "cpu_free_blocks": 5, "counts": {},
+                                     "cpu_pool": {"bound": True,
+                                                  "total_blocks": 100,
+                                                  "free_blocks": 5},
+                                     "counts": {},
                                      "boundary_store_stats": {}}})
-    assert result["verdict"] == "cpu-pool-nearly-full"
+    assert result["verdict"] == "cpu-pool-pinned-high"
+    assert result["cpu_pinned_ratio"] == 0.95
     assert isinstance(snapshot.json_safe({"policy": result}), dict)

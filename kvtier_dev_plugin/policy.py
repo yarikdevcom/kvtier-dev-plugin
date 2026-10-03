@@ -83,14 +83,39 @@ THE KILL SWITCH (two steps, no restart, no new endpoint):
     2. `curl -X POST -H "x-kvtier-dev-token: $TOK" \
            http://127.0.0.1:8000/plugins/kvtier/policy/reload`
 
-Then `GET /plugins/kvtier/snapshot` and read `store_hook.vetoes` (rising) and
-`tier.boundary_store_stats.stored` (flat). New parking stops immediately; a
-copy already handed to the workers still completes and is freed normally.
-Restarting the engine keeps the veto only if the file still says so.
+Then `GET /plugins/kvtier/snapshot` and read `store_hook.vetoes` (rising). New
+parking stops immediately; a copy already handed to the workers still completes
+and is freed normally. Restarting the engine keeps the veto only if the file
+still says so.
+
+DO NOT PROVE THE KILL SWITCH WITH `tier.boundary_store_stats.stored`: that
+dataclass is documented upstream as "cumulative counters for BOUNDARY HAND-OFF
+stores" (manager.py:113-123) and only the boundary loop increments it
+(manager.py:682-723). The positional eager path (`_select_eager_blocks_to_store`,
+manager.py:803-915) parks blocks without touching `published`/`stored` at all, so
+`stored` is one store path out of two - flat `stored` does not prove parking
+stopped, and "blocks stored" read off it undercounts real parking.
 """
 
 # Bump this so `GET /plugins/kvtier/snapshot` visibly proves a reload landed.
-VERSION = 2
+VERSION = 3
+
+# Below this share of the pool pinned by in-flight copies there is nothing to
+# report. NOTE: this is PINNED-ness, not occupancy - see `decide`.
+NEARLY_FULL_RATIO = 0.9
+
+
+def _count(value):
+    """A real counter, or None. Never a defaulted 0.
+
+    The default IS the bug this helper exists to kill: `tier.get(k) or 0` on a
+    key the snapshot does not emit silently turns "I do not know" into
+    "0 free blocks", which is the most alarming answer the pool can give. A bool
+    is not a count and a float is not a maintained counter, so both are None.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def decide(view):
@@ -98,25 +123,78 @@ def decide(view):
 
     `view` keys that exist today (everything is `.get()`-guarded because the
     engine may be running without the offload connector, or with a fork that
-    renamed something):
+    renamed something). These are the names `snapshot.tier_view()` ACTUALLY
+    emits - verified against the producer by
+    `tests/test_policy_input_contract.py`, which fails if a name read here is
+    not a name the snapshot writes:
 
-      view["tier"]  -> {"present", "mode", "num_cpu_blocks", "cpu_free_blocks",
-                        "pending_stores", "counts", "boundary_store_stats", ...}
+      view["tier"]  -> {"present", "mode", "num_cpu_blocks",
+                        "cpu_pool": {"bound", "total_blocks", "free_blocks"},
+                        "cpu_hash_index": {"entries", "tokens_upper_bound", ...},
+                        "gpu_pool", "pending_stores", "counts",
+                        "boundary_store_stats", ...}
       view["scheduler"] -> {"connector", "requests", "running", "waiting"}
       view["epoch"], view["ts"], view["mono"]
+
+    TWO THINGS THIS REPORTS, AND THE TRAP BETWEEN THEM
+    --------------------------------------------------
+    1. PINNED share: `cpu_pool.free_blocks` is the allocator's free-queue count.
+       A parked CPU block is handed BACK to that queue when its copy finishes
+       (`snapshot.py:144-167` reads the contract out of block_pool.py:705-741),
+       and what keeps it retrievable is its entry in the hash index. So
+       `total - free` is "blocks pinned by an in-flight copy right now", NOT
+       "how full the arena is". The old code called it `cpu_used_ratio` and
+       called the result "cpu-pool-nearly-full"; both names are a lie, and the
+       ratio it printed (1.0) was fabricated from a key that does not exist.
+       Occupancy from these two counters is impossible - do not reintroduce it.
+    2. CAPACITY PRESSURE: `boundary_store_stats.dropped_cpu_full` is the only
+       counter that means "a store was refused because the pool could not give a
+       block". It is what a "is the tier full?" verdict must be built from.
+    Retrievability itself is `cpu_hash_index.entries` / `tokens_upper_bound`,
+    reported below for the reader to weigh against the run's token count.
+
+    `cpu_free_blocks` is NOT a tier-view key - it is the name the per-block STORE
+    CONTEXT gives the same number (`store_hook.build_store_ctx`). Reading it off
+    `tier` used to be this file's behaviour and it produced
+    `cpu_used_ratio: 1.0` on every pass, because `or 0` turned a missing key into
+    zero free blocks. Numerator and denominator must come from the SAME pool
+    object, so both come from `tier["cpu_pool"]`; `tier["num_cpu_blocks"]` is the
+    manager's cap and only serves as the denominator fallback.
 
     Returns: any JSON-serialisable object. Keep it small.
     """
     tier = view.get("tier") or {}
     counts = tier.get("counts") or {}
     stats = tier.get("boundary_store_stats") or {}
+    pool = tier.get("cpu_pool") or {}
+    index = tier.get("cpu_hash_index") or {}
 
-    total = tier.get("num_cpu_blocks") or 0
-    free = tier.get("cpu_free_blocks") or 0
-    used_ratio = 0.0
-    if total > 0:
-        used_ratio = round((total - free) / total, 4)
+    total = _count(pool.get("total_blocks"))
+    if total is None:
+        total = _count(tier.get("num_cpu_blocks"))
+    free = _count(pool.get("free_blocks"))
 
+    # A missing input stays missing: no default, no fabricated number. The
+    # verdict then says so instead of guessing in either direction.
+    missing_inputs = []
+    if total is None:
+        missing_inputs.append("cpu_pool.total_blocks")
+    if free is None:
+        missing_inputs.append("cpu_pool.free_blocks")
+    pinned = None
+    pinned_ratio = None
+    if not missing_inputs:
+        if total <= 0:
+            missing_inputs.append("cpu_pool.total_blocks (zero-capacity pool)")
+        elif free > total:
+            # More free than the pool has: the two counters disagree, so any
+            # ratio computed from them is meaningless rather than optimistic.
+            missing_inputs.append("cpu_pool.free_blocks exceeds total_blocks")
+        else:
+            pinned = total - free
+            pinned_ratio = round(pinned / total, 4)
+
+    dropped_cpu_full = _count(stats.get("dropped_cpu_full")) or 0
     drops = 0
     for key in ("dropped_cpu_full", "dropped_request_gone", "dropped_null_block",
                 "dropped_not_hashed"):
@@ -125,10 +203,19 @@ def decide(view):
             drops += value
 
     if not tier.get("present"):
+        # No tier at all: its pool keys are legitimately absent, so this wins
+        # over the unknown-pinned verdict instead of screaming about it.
         verdict = "no-tier"
-    elif used_ratio >= 0.9:
-        verdict = "cpu-pool-nearly-full"
-    elif drops > 0 and stats.get("stored", 0) == 0:
+    elif dropped_cpu_full > 0:
+        # The only true "the arena could not take a store" signal.
+        verdict = "cpu-pool-full-dropping-stores"
+    elif missing_inputs:
+        verdict = "cpu-pool-pinned-unknown"
+    elif pinned_ratio >= NEARLY_FULL_RATIO:
+        # Nearly every block is PINNED by an in-flight copy. That is a
+        # throughput signal, not an occupancy one: parked blocks are not pinned.
+        verdict = "cpu-pool-pinned-high"
+    elif drops > 0 and (stats.get("stored") or 0) == 0:
         verdict = "storing-nothing"
     else:
         verdict = "ok"
@@ -136,7 +223,18 @@ def decide(view):
     return {
         "version": VERSION,
         "verdict": verdict,
-        "cpu_used_ratio": used_ratio,
+        # None means "not derivable", and `missing_inputs` names why. It is
+        # never a number invented from an absent key.
+        "cpu_pinned_ratio": pinned_ratio,
+        "cpu_pinned_blocks": pinned,
+        "cpu_pool_total_blocks": total,
+        "cpu_pool_free_blocks": free,
+        # "Free" = unpinned, so these are the retrievability numbers to read
+        # against a run's token count; the pool counters cannot answer it.
+        "parked_entries": _count(index.get("entries")),
+        "parked_tokens_upper_bound": _count(index.get("tokens_upper_bound")),
+        "dropped_cpu_full": dropped_cpu_full,
+        "missing_inputs": missing_inputs,
         "declined_stores": drops,
         "in_flight_store_blocks": counts.get("in_flight_store_gpu_blocks", 0),
     }

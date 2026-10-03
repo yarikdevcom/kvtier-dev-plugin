@@ -509,7 +509,10 @@ that index:
 |---|---|
 | `entries` | `len()` of the map: distinct `(hash, group)` keys. The map does not de-duplicate (`block_pool.py:47-51`), so this is *hit-able prefixes*, not blocks - `sampled_keys_with_multiple_blocks` says when a key holds more than one |
 | `tokens_upper_bound` | `entries × hash_block_size`, labelled an upper bound |
-| `per_group` | distinct entries per KV-cache group, from the 4 packed big-endian bytes of each key (`kv_cache_utils.py:74-93`); a capped scan (`MAX_HASH_INDEX_SCAN`), and `key_handle` admits when it had to read the map's private `_cache` |
+| `per_group` | distinct entries per KV-cache group, from the 4 packed big-endian bytes of each key (`kv_cache_utils.py:74-93`); a capped scan (`MAX_HASH_INDEX_SCAN`), and `key_handle` admits when it had to read the map's private `_cache`. **Keys, not spans** - see the granularity trap below |
+| `parked_blocks_per_group` | distinct CPU **blocks** behind those keys, per group, from the *same* scan: one parked span occupies one block per group (`get_new_blocks` takes distinct ids, `manager.py:755-758` / `block_pool.py:678`), so this is **spans parked in the group**. `min()` over the prefix-cacheable groups × `tier.block_size` is the true joint coverage; `sum()` ÷ `cpu_pool.total_blocks` is the true occupancy. Refused (null + `parked_blocks_per_group_reason`) on a truncated/partial scan, a group-cap hit, the `MAX_PARKED_BLOCK_IDS` bound, or a value that is not a block - never a prefix, never a 0 |
+| `per_group_primary` / `per_group_secondary` | the split of `per_group` by what each entry *is*: primary = the key the block itself carries (`block.block_hash`, the one insert that got a real `num_tokens`), secondary = an extra key the pool also files for that block (`cached_block_hashes_by_block`, `block_pool.py:641` fed by `manager.py:1039-1044`). Withheld whole when any entry is neither - "not primary" is not "secondary" |
+| `key_split_matches_blocks`, `keys_backed_by_multiple_blocks` | the cross-check: one primary key per block, so the two maps must agree. `False` names the case that broke the premise (a key holding several blocks, `block_pool.py:47-51`) instead of leaving a consumer to divide by a guessed divisor |
 | `sampled_values_without_hash`, `sampled_null_blocks` | the empirical tripwire for a stale entry, from at most 32 values |
 
 On staleness the fork's contract is checkable rather than guessable:
@@ -524,6 +527,27 @@ eviction candidate the moment its store releases it, so the count is *retrievabl
 now*, not *retained*. A missing attribute, an unsized container or a `len()` that
 raises comes back as a `reason` string with no `entries` key at all - a missing
 reading is information, a fabricated one is a lie.
+
+### The granularity trap: `per_group` is not spans
+
+The groups do **not** mint keys at the same rate per parked span. The primary hash is
+one key per `block_size`-token span; the fine-graining group also mints its
+intra-block hashes at the `hash_block_size` ticks, inserted against the **same**
+`cpu_block` with `num_tokens=None` (`manager.py:1039-1044`) - dictionary entries that
+cost no block and no bytes. Live, 2026-10-05, idle box:
+
+```
+per_group                  {0:98, 1:98, 2:98, 3:99, 5:308}   sum 701 keys
+parked_blocks_per_group    {0:98, 1:98, 2:98, 3:99, 5: 77}   sum 470 blocks
+occupancy of a 665-block arena   701/665 -> 1.00 (a lie)  vs  470/665 = 70.7%
+joint depth a 5-group resume can use   min(per_group)=98 (over-reports 27%)  vs 77
+```
+
+There is **no divisor in the payload to divide by**, and the ratio is not even stable
+(`per_group[5]` measured 317, 317, 318, 320, 320, 320 across six polls of one idle
+minute), so a hardcoded `/4` is a fabrication waiting to be wrong. Consume
+`parked_blocks_per_group`; the key fields stay for the cross-check and because a proxy
+and a dashboard already read them.
 
 
 ## Guard mode: develop against a live engine without an outage (`guard_mode.py`)

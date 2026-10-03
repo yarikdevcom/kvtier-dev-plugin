@@ -536,6 +536,64 @@ def test_a_key_too_short_to_carry_a_group_id_is_counted_not_decoded():
     assert view["per_group"] == {"1": 1}
 
 
+class ExtraHashSetPool(IndexPool):
+    """A CPU pool that also carries `cached_block_hashes_by_block` - the pool's own
+    record of the EXTRA hashes filed under a block it already hashed
+    (block_pool.py:188, populated at :641 by the secondary inserts at
+    manager.py:1039-1044). It is what makes a secondary key positively identifiable
+    instead of merely "not the primary"."""
+
+    def __init__(self, total, free, index, extra=None) -> None:
+        super().__init__(total, free, index)
+        self.cached_block_hashes_by_block = dict(extra or {})
+
+
+# The live fixture, measured read-only from the running engine on 2026-10-05:
+# group 5 is the fine-graining group (fa_group_index=5, fa_block_size=3200,
+# hash_block_size=800 -> a primary plus the 800/1600/2400 secondary ticks), the
+# others mint one key per span. 701 KEYS, 470 BLOCKS, 665-block arena.
+LIVE_SPANS_BY_GROUP = {0: 98, 1: 98, 2: 98, 3: 99, 5: 77}
+LIVE_KEYS_PER_SPAN = {0: 1, 1: 1, 2: 1, 3: 1, 5: 4}
+LIVE_PER_GROUP = {group: LIVE_SPANS_BY_GROUP[group] * LIVE_KEYS_PER_SPAN[group]
+                  for group in LIVE_SPANS_BY_GROUP}
+BLOCK_SIZE_TOKENS = 3200
+
+
+def mint(spans_by_group, keys_per_group, fine_tick_is_own_hash=False):
+    """An index and its pool's extra-hash set, minted the way the fork mints them.
+
+    One span == one CPU block per group (`get_new_blocks()` hands out distinct ids,
+    manager.py:755-758 / block_pool.py:678). A group that fine-grains adds its
+    intra-block hashes as EXTRA KEYS pointing at the SAME block, one of which is
+    the block's own `block_hash` and the rest of which land in
+    `cached_block_hashes_by_block` - keys that cost no block and no bytes.
+    """
+    cache, extra, block_id = {}, {}, 0
+    for group in sorted(spans_by_group):
+        spans = spans_by_group[group]
+        ticks = keys_per_group.get(group, 1)
+        for span in range(spans):
+            seed = b"s%04d" % span
+            keys = [packed(seed if tick == 0 else seed + b"t%d" % tick, group)
+                    for tick in range(ticks)]
+            own = keys[-1] if fine_tick_is_own_hash else keys[0]
+            block = FakeCachedBlock(block_id, own)
+            cache[keys[0]] = block
+            for key in keys[1:]:
+                cache[key] = block
+            if ticks > 1:
+                extra[block_id] = {key for key in keys if key != own}
+            block_id += 1
+    return FakeHashIndex(cache), extra
+
+
+def live_shaped_view(hash_block_size=800):
+    """`cpu_hash_index` for the live 2026-10-05 geometry: 701 keys, 470 blocks."""
+    index, extra = mint(LIVE_SPANS_BY_GROUP, LIVE_KEYS_PER_SPAN)
+    return snapshot._hash_index_view(
+        ExtraHashSetPool(665, 664, index, extra), hash_block_size)
+
+
 def test_the_tier_view_carries_the_index_next_to_the_allocator_it_is_not_the_same_as():
     index = FakeHashIndex({packed(b"a", 0): FakeCachedBlock(1, packed(b"a", 0))})
     manager = FakeManager(cpu_pool=IndexPool(665, 664, index))
@@ -544,3 +602,183 @@ def test_the_tier_view_carries_the_index_next_to_the_allocator_it_is_not_the_sam
     assert tier["cpu_hash_index"]["entries"] == 1
     assert tier["cpu_hash_index"]["meaning"]
     assert tier["boundary_store_stats"]["available"] is True
+
+
+# --- parked BLOCKS per group, and the primary/secondary key split -----------
+#
+# Why these exist: `per_group` counts KEYS of `BlockHashToBlockMap`, and the groups
+# mint keys at different rates per parked span - the fine-graining group also mints
+# its intra-block secondary hashes against the SAME cpu_block with num_tokens=None
+# (manager.py:1039-1044), which cost dictionary entries and zero bytes. A consumer
+# that sums or mins key counts publishes an upper bound and cannot know it. The live
+# arithmetic that started this (2026-10-05, idle box):
+#
+#     per_group  {0:98, 1:98, 2:98, 3:99, 5:308}  -> sum 701 keys / 665 blocks = 1.00
+#     the truth  {0:98, 1:98, 2:98, 3:99, 5: 77}  -> sum 470 blocks / 665 = 70.7%
+#     joint depth  min(blocks) = 77 spans  -> 77 x 3200 = 246,400 tokens
+# and the key-based min over-reports that joint depth by 27% (98 spans, not 77).
+
+
+def test_parked_blocks_per_group_counts_spans_not_keys_on_the_live_geometry():
+    view = live_shaped_view()
+    # The key counts, unchanged: additive only, a consumer already reads them.
+    assert view["per_group"] == {str(g): LIVE_PER_GROUP[g] for g in LIVE_PER_GROUP}
+    assert view["entries"] == 701 and sum(view["per_group"].values()) == 701
+    # The new field: distinct blocks per group = spans parked in that group.
+    assert view["parked_blocks_per_group"] == {"0": 98, "1": 98, "2": 98,
+                                               "3": 99, "5": 77}
+    assert sum(view["parked_blocks_per_group"].values()) == 470
+    # True occupancy, computable at last, and the bound it replaces.
+    assert abs(470 / 665 - 0.707) < 1e-3
+    assert min(sum(view["per_group"].values()) / 665, 1.0) == 1.0, (
+        "the key-based ratio clamps to 'saturated' - that is the fabrication")
+    # Joint coverage a five-group resume can actually use.
+    assert min(view["parked_blocks_per_group"].values()) == 77
+    assert (min(view["parked_blocks_per_group"].values()) * BLOCK_SIZE_TOKENS
+            == 77 * 3200 == 246400)
+    assert "SPANS" in view["parked_blocks_meaning"]
+    assert "MAX_PARKED_BLOCK_IDS" in view["parked_blocks_source"]
+
+
+def test_the_key_split_lets_a_consumer_cross_check_the_divisor_not_guess_it():
+    view = live_shaped_view()
+    assert view["per_group_primary"] == {"0": 98, "1": 98, "2": 98, "3": 99, "5": 77}
+    assert view["per_group_secondary"] == {"0": 0, "1": 0, "2": 0, "3": 0, "5": 231}
+    for group in LIVE_PER_GROUP:
+        keys = view["per_group"][str(group)]
+        assert (view["per_group_primary"][str(group)]
+                + view["per_group_secondary"][str(group)]) == keys
+    # One primary key per block, so the split and the block counts must agree; a
+    # False here is the divisor assumption failing, stated as a field.
+    assert view["key_split_matches_blocks"] is True
+    assert "cached_block_hashes_by_block" in view["per_group_key_split_meaning"]
+
+
+def test_the_discriminator_is_the_blocks_own_hash_not_which_tick_minted_first():
+    """A partial tail can be hashed FIRST, making the 800-tick key the block's own
+    hash and the 3200-tick one the extra. The counts must not care which it is."""
+    index, extra = mint(LIVE_SPANS_BY_GROUP, LIVE_KEYS_PER_SPAN,
+                        fine_tick_is_own_hash=True)
+    view = snapshot._hash_index_view(
+        ExtraHashSetPool(665, 664, index, extra), 800)
+    spans = {str(g): s for g, s in LIVE_SPANS_BY_GROUP.items()}
+    assert view["parked_blocks_per_group"] == spans
+    assert view["per_group_primary"] == spans
+    assert view["key_split_matches_blocks"] is True
+
+
+def test_a_pool_without_an_extra_hash_set_withholds_the_split_but_not_the_blocks():
+    """A fork that renames `cached_block_hashes_by_block` loses the SPLIT, not the
+    block counts: 'not the primary' is not the same claim as 'secondary'."""
+    index, _extra = mint(LIVE_SPANS_BY_GROUP, LIVE_KEYS_PER_SPAN)
+    view = snapshot._hash_index_view(IndexPool(665, 664, index), 800)
+    assert view["parked_blocks_per_group"] == {
+        str(g): s for g, s in LIVE_SPANS_BY_GROUP.items()}
+    assert view["per_group_primary"] is None
+    assert view["per_group_secondary"] is None
+    assert "cached_block_hashes_by_block" in view["per_group_primary_reason"]
+    assert "cached_block_hashes_by_block" in view["per_group_secondary_reason"]
+
+
+def test_an_entry_the_reader_cannot_classify_omits_the_split_instead_of_zeroing_it():
+    """The requirement in its sharp form: one entry that is neither its block's own
+    hash nor in that block's extra-hash set means the reader does not fully model
+    this fork. It must NOT be filed under secondary, and the split must not be
+    published with a plausible-looking 0."""
+    index, extra = mint(LIVE_SPANS_BY_GROUP, LIVE_KEYS_PER_SPAN)
+    stranger = packed(b"stranger", 5)
+    index._cache[stranger] = FakeCachedBlock(99, packed(b"elsewhere", 5))
+    view = snapshot._hash_index_view(
+        ExtraHashSetPool(665, 664, index, extra), 800)
+    assert view["per_group"]["5"] == 309          # keys: still counted
+    assert view["parked_blocks_per_group"]["5"] == 78   # blocks: one more span
+    assert view["per_group_primary"] is None
+    assert view["per_group_secondary"] is None
+    assert "neither their block's own hash" in view["per_group_primary_reason"]
+    assert "key_split_matches_blocks" not in view
+
+
+def test_a_truncated_key_scan_refuses_the_block_counts_rather_than_a_prefix():
+    """`per_group` keeps its historical partial-scan behaviour; the block view is
+    refused, because a min() over a prefix of the index is exactly the silent
+    under-count this field exists to remove."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(snapshot, "MAX_HASH_INDEX_SCAN", 10)
+        view = index_view(filled(25, groups=1))
+    assert view["scan_truncated"] is True
+    assert view["per_group"] == {"0": 10}
+    assert view["parked_blocks_per_group"] is None
+    assert "PREFIX" in view["parked_blocks_per_group_reason"]
+    assert view["per_group_primary"] is None
+    assert view["per_group_secondary"] is None
+
+
+def test_the_parked_block_set_bound_is_honoured_explicitly(monkeypatch):
+    """The one container the scan grows is capped, and hitting the cap is a refusal
+    rather than a quietly truncated count."""
+    index, extra = mint({0: 10}, {0: 1})
+    with monkeypatch.context() as mp:
+        mp.setattr(snapshot, "MAX_PARKED_BLOCK_IDS", 5)
+        view = snapshot._hash_index_view(
+            ExtraHashSetPool(665, 664, index, extra), 800)
+    assert view["per_group"] == {"0": 10}
+    assert view["parked_blocks_per_group"] is None
+    assert "bound" in view["parked_blocks_per_group_reason"]
+
+
+def test_an_index_value_that_is_not_a_block_refuses_the_block_view():
+    """A value this reader cannot turn into block ids makes the WHOLE block view
+    absent: counting the entries it did understand would mislabel a partial as a
+    total, which is the failure mode this payload was built to avoid."""
+    index, extra = mint({0: 3, 5: 2}, {0: 1, 5: 4})
+    index._cache[packed(b"junk", 0)] = "not a block"
+    view = snapshot._hash_index_view(ExtraHashSetPool(665, 664, index, extra), 800)
+    assert view["available"] is True              # the key counts survive
+    assert view["per_group"] == {"0": 4, "5": 8}
+    assert view["parked_blocks_per_group"] is None
+    assert "neither a KVCacheBlock nor a block dict" in (
+        view["parked_blocks_per_group_reason"])
+
+
+def test_a_key_carrying_several_blocks_is_counted_and_named():
+    """The map does not de-duplicate (block_pool.py:47-51), so one key CAN hold
+    several blocks - the one case where distinct blocks over-counts spans. It is
+    counted, named, and the cross-check says so."""
+    key = packed(b"dup", 0)
+    index = FakeHashIndex({
+        key: {7: FakeCachedBlock(7, key), 8: FakeCachedBlock(8, packed(b"own8", 0))},
+        packed(b"solo", 0): FakeCachedBlock(9, packed(b"solo", 0)),
+    })
+    view = snapshot._hash_index_view(
+        ExtraHashSetPool(665, 664, index, {8: {key}}), 800)
+    assert view["parked_blocks_per_group"] == {"0": 3}
+    assert view["keys_backed_by_multiple_blocks"] == 1
+    # Both keys are a primary: `dup` is block 7's own hash, `solo` is block 9's.
+    # Two primary keys, three blocks - the over-count the next field names.
+    assert view["per_group_primary"] == {"0": 2}
+    assert view["per_group_secondary"] == {"0": 0}
+    assert view["key_split_matches_blocks"] is False, (
+        "3 blocks behind 1 primary key: the one-block-per-span premise is what "
+        "broke here, and the field must say so")
+
+
+def test_an_empty_index_is_a_real_zero_not_a_refusal():
+    view = index_view(FakeHashIndex())
+    assert view["per_group"] == {}
+    assert view["parked_blocks_per_group"] == {}
+    assert view["per_group_primary"] == {}
+    assert view["per_group_secondary"] == {}
+    assert "parked_blocks_per_group_reason" not in view
+
+
+def test_keys_with_no_parsable_group_id_refuse_the_block_view_too():
+    """An index whose keys carry no group id is NOT an empty index, and `{}` would
+    read as "nothing parked"."""
+    index = FakeHashIndex({b"": FakeCachedBlock(1, b""),
+                           b"abcd": FakeCachedBlock(2, b"abcd")})
+    view = snapshot._hash_index_view(ExtraHashSetPool(665, 664, index, {}), 800)
+    assert view["per_group"] == {}
+    assert view["keys_without_group_id"] == 2
+    assert view["parked_blocks_per_group"] is None
+    assert "no group is claimable" in view["parked_blocks_per_group_reason"]
+    assert view["per_group_primary"] is None
