@@ -727,8 +727,23 @@ def _live_manager(cls, config=None):
     119-line constructor and cannot run without a real vllm config. `__new__`
     gives an instance whose `type()` IS the patched class - which is exactly what
     `ensure_installed` reads - and leaves `__init__` uninvolved.
+
+    The instance carries the constructor's attribute set MINUS
+    `prefix_cacheable_group_ids`: that is what an instance constructed before
+    the patch actually looks like, and what `backport._live_object_check`
+    now asserts and back-fills (see tests/test_live_object_order.py). The
+    attribute donor is the same `_SelectorSelf` as `_production_manager`.
     """
     manager = cls.__new__(cls)
+    helper = _SelectorSelf()
+    for attr in ("group_block_sizes", "hash_block_size", "block_size",
+                 "cpu_kv_cache_config", "cpu_coordinator", "cpu_block_pool",
+                 "enable_kv_cache_events", "_gpu_block_pool"):
+        setattr(manager, attr, getattr(helper, attr))
+    manager._lazy_mode = False
+    manager._reqs_to_store = {}
+    manager._pending_cpu_hits = {}
+    manager._reqs_to_load = {}
     manager.kv_cache_config = config if config is not None else our_shape_config()
     return manager
 
@@ -1425,6 +1440,12 @@ def _production_manager(cls, request_id="req-1"):
     mgr._classify_store_candidate = helper._classify_store_candidate
     mgr._cached_gpu_block = helper._cached_gpu_block
     mgr.kv_cache_config = our_shape_config()
+    # The remaining constructor-set attributes `update_state_after_alloc`
+    # reads: the live-object check requires them because the patched body
+    # does (manager.py __init__ sets all three on every real instance).
+    mgr._lazy_mode = False
+    mgr._pending_cpu_hits = {}
+    mgr._reqs_to_load = {}
     state = _State(_Request(2, request_id), len(GROUP_BLOCK_SIZES))
     mgr._reqs_to_store = {request_id: state}
     mgr._store_block_ids, mgr._ring_ids = ring_and_cacheable_ids()
@@ -1814,24 +1835,25 @@ def test_the_finish_wrapper_survives_guard_mode_wrapping_on_top(reset_dev_state)
 
 def test_the_switch_fitted_after_guard_mode_composes_and_still_declines(
         reset_dev_state):
-    """The other order: guard first, the switch on top of it.
+    """The other order: guard first, the switch landing UNDER it.
 
-    `_install_switch` refuses only a foreign SWITCH marker, so it wraps the guard
-    wrapper rather than dropping it - and its own ORIGINAL_ATTR points at that
-    wrapper, so re-installs stay one switch deep. Guard's uninstall then sees OUR
-    marker on the outside, reports the method as `left`, and restores nothing:
-    it cannot unwind a layer it no longer owns, which is what keeps the kill
-    switch on the class.
+    Since the 2026-10-03 live-object work, `_install_switch` descends its own
+    layers: with guard already wrapped, the switch is fitted beneath the guard
+    and the guard is rebuilt on top (composition preserved, kill switch still
+    the first thing the engine's own code sees). Guard's `uninstall` then
+    restores OUR wrapper by identity - a clean unwind to the switch, so the
+    gate survives a full guard cycle either way.
     """
     cls = _six_group_class()
     guard_report = guard_mode.install(cls)
     assert "build_connector_meta" in guard_report["attached"]
-    guard_meta = cls.__dict__["build_connector_meta"]
 
     backport.install(cls, our_shape_config())
-    ours = cls.__dict__["build_connector_meta"]
-    assert getattr(ours, backport.ORIGINAL_ATTR) is guard_meta, \
-        "the switch composes on top of the guard wrapper, it does not drop it"
+    top = cls.__dict__["build_connector_meta"]
+    # Guard OUTSIDE, our switch under it - never the other way round.
+    assert getattr(top, guard_mode.OWNER_ATTR, None) == guard_mode.OWNER_TAG
+    under = getattr(top, guard_mode.ORIGINAL_ATTR, None)
+    assert getattr(under, backport.SWITCH_ATTR, None) == backport.SWITCH_TAG
 
     calls = _spy_the_selector(cls)
     mgr = _production_manager(cls)
@@ -1840,8 +1862,9 @@ def test_the_switch_fitted_after_guard_mode_composes_and_still_declines(
     assert guard_mode.is_armed() is False
 
     out = guard_mode.uninstall(cls)
-    assert "build_connector_meta" in out["left"], "guard is the INNER layer here"
-    assert cls.__dict__["build_connector_meta"] is ours, "the switch survives"
+    assert "build_connector_meta" in out["restored"]
+    assert cls.__dict__["build_connector_meta"] is under, \
+        "unwinding the guard must hand back exactly our switch wrapper"
     assert isinstance(cls.build_connector_meta(mgr, None), EmptyMetadata)
 
 

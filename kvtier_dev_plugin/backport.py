@@ -192,6 +192,56 @@ data (empty metadata), not as a second patch. `has_pending_block_frees` is
 already always False on this connector (it does not override the base
 implementation, `base.py:625`). See `disarm_limits()` for what this cannot undo.
 
+THE LIVE OBJECT IS THE AUTHORITY (production CONSTRUCTS FIRST)
+--------------------------------------------------------------
+Both production incidents (2026-10-03) were ONE mistake: assuming a class-
+first, patch-then-construct world, while production constructs first and our
+layers arrive afterwards. `SimpleCPUOffloadScheduler` is built INSIDE
+`create_connector`, before any hook fits the class, and no second instance is
+ever constructed. Two consequences, now both closed:
+
+* The additive `prefix_cacheable_group_ids` came ONLY from the `__init__`
+  wrapper, which never runs for an already-built instance, while the patched
+  methods reading it went live on the class: the only instance that mattered
+  raised `AttributeError: 'SimpleCPUOffloadScheduler' object has no attribute
+  'prefix_cacheable_group_ids'` (engine death 12:41, patched selector line 35).
+  Fix: the install BACK-FILLS the attribute onto the live instance at install
+  time from the same source upstream uses (`cpu_kv_cache_config.
+  prefix_cacheable_group_ids`, the fork exposes it as a `cached_property` on
+  `KVCacheConfig`, falling back to `kv_cache_config` and REPORTING which one
+  was used), keeps the `__init__` wrapper for re-initialised engines, and the
+  install verdict ASSERTS the live object is safe (`_live_object_check`):
+  every attribute the fingerprint-verified bodies read off `self` must be
+  present (and the new one an int-sequence). A live manager we cannot make
+  safe is an install failure - `installed: false`, refused ARM with kind
+  `incomplete_install`, force-disarmed - so patched code never runs against
+  an object it would crash on. A class-only install (no manager visible)
+  reports the check as unchecked; the connector-creation hook and every verb
+  run it against the real manager.
+* A re-install while guard mode is armed fingerprinted OUR OWN guard wrapper
+  of `update_state_after_alloc` and reported "the fork changed this function
+  since 10b8e07" - blaming the fork for our own layering, refusing the
+  install and auto-disarming a healthy tier. Fix: fingerprinting DESCENDS our
+  own layers (backport/switch/guard markers + ORIGINAL chains) and hashes the
+  body underneath; a refusal now says the body UNDERNEATH our layers changed,
+  and the fork-blaming wording is reserved for that real case. Re-installs
+  rebuild the copy under the guard wrapper, preserving nesting, and
+  `already_installed` sees through the layers so the polling path stays off
+  the recompile. `patched` and `installed` in every payload now come from the
+  SAME all-or-nothing verdict and can never disagree.
+
+WHAT IT MEANS CONCRETELY: every attribute the patched bodies read off `self`
+is set by the fork's own (fingerprint-verified) `__init__` - which already
+RAN on a construct-first instance - EXCEPT the one this patch adds.
+`_estimate_lazy_target_blocks` is a staticmethod: it reads nothing off `self`
+(it reads `kv_cache_config.prefix_cacheable_group_ids` from its ARGUMENT, and
+only ever runs inside `__init__`, so a construct-first instance cannot be
+exposed to it). The live check therefore enumerates the `self` reads of the
+three replaced bodies (`cpu_kv_cache_config`, `block_size`, `hash_block_size`,
+`cpu_coordinator`, `cpu_block_pool`, `group_block_sizes`,
+`enable_kv_cache_events`, `_lazy_mode`, `_reqs_to_store`, `_pending_cpu_hits`,
+`_reqs_to_load`, `_gpu_block_pool`) plus the one added attribute.
+
 THE ALL-OR-NOTHING INSTALL CONTRACT (never armed unless the fix is complete)
 ----------------------------------------------------------------------------
 The invariant this module exists to guarantee: THE TIER IS NEVER ARMED UNLESS
@@ -290,6 +340,7 @@ _state = {
     "method_verdicts": {},               # name -> {"patched","reason","sha_ok"}
     "switch_verdicts": {},               # name -> {"wrapped","reason"}
     "geometry": None,                    # last guard result
+    "live_check": None,                  # last live-object verdict
     "fallbacks": 0,
     "last_error": None,
     # The connector-creation hook: the moment the manager class EXISTS, which is
@@ -316,6 +367,7 @@ def reset_state_for_tests() -> None:
         "disarm_reason": None, "disarm_detail": None, "arm_refusals": 0,
         "last_arm_refusal": None,
         "method_verdicts": {}, "switch_verdicts": {}, "geometry": None,
+        "live_check": None,
         "fallbacks": 0, "last_error": None,
         "hook_fitted": False, "hook_reason": None, "hook_fits": 0,
         "hook_calls": 0, "hook_tier_connectors": 0, "hook_no_manager": 0,
@@ -380,6 +432,196 @@ def _fingerprint_verdict(name, fn) -> tuple[bool, str | None, str | None]:
     if live is None:
         return False, None, expected
     return live == expected, live, expected
+
+
+# --- our own layers: the wrappers THIS package fits -------------------------
+#
+# `install()` composes layers (guard over switch over the fork's body), so a
+# class attribute can be one of OUR wrappers by the time a re-install runs.
+# Two rules follow, both from the 2026-10-03 construct-first incidents:
+# * a fingerprint must be taken on the body UNDERNEATH our layers, never on
+#   the layer itself (hashing guard_mode's `_wrapped` and then reporting "the
+#   fork changed this function" sent an operator hunting a fork update that
+#   does not exist);
+# * `already_installed` must see our marker THROUGH the layers, or every poll
+#   re-compiles three upstream functions on the serving loop.
+
+def _layer_kinds():
+    """(owner_attr, owner_tag, kind, original_attr) for every layer we own.
+
+    The guard's constants are read from `guard_mode` itself (lazy: same
+    package, no cycle - guard_mode imports neither backport nor engine_side),
+    so the tag values cannot drift from what the guard actually stamps.
+    """
+    from . import guard_mode  # noqa: PLC0415 - sibling layer, lazy by idiom
+    return (
+        (SWITCH_ATTR, SWITCH_TAG, "switch", ORIGINAL_ATTR),
+        (OWNER_ATTR, OWNER_TAG, "backport", ORIGINAL_ATTR),
+        (guard_mode.OWNER_ATTR, guard_mode.OWNER_TAG, "guard",
+         guard_mode.ORIGINAL_ATTR),
+    )
+
+
+def _layers_of(fn):
+    """Walk one class attribute down through our own layers.
+
+    Returns `(layers, bottom)`: `layers` is `[(kind, body), ...]` outermost
+    first with kind in {"switch", "backport", "guard"}; `bottom` is the first
+    body NOT marked as ours - normally the fork's own function, or a foreign
+    plugin's body (which is then just a body we must vouch for by
+    fingerprint), or None when an ORIGINAL chain is broken. The walk is
+    depth-capped: our factories cannot cycle, but a hand-damaged ORIGINAL
+    attribute must yield `bottom: None` (a refusal), never a hang inside the
+    step loop's thread.
+    """
+    kinds = _layer_kinds()
+    layers: list = []
+    current = _function_of(fn) if fn is not None else None
+    while current is not None:
+        if len(layers) > 16:
+            return layers, None  # a cycle is a broken chain, not a bottom
+        under = None
+        hit = None
+        for attr, tag, kind, orig_attr in kinds:
+            if getattr(current, attr, None) == tag:
+                under = getattr(current, orig_attr, None)
+                hit = kind
+                break
+        if hit is None:
+            return layers, current
+        layers.append((hit, current))
+        current = _function_of(under) if under is not None else None
+    return layers, None
+
+
+def _rewrap(name, base, layers_above):
+    """Rebuild our wrapper layers (outermost-first list) on top of `base`.
+
+    A `backport` layer is REPLACED by `base` (the freshly compiled copy IS
+    that layer); a `switch` layer is rebuilt by its factory; a `guard` layer
+    is rebuilt by `guard_mode._make_wrapper` (same package, the same factory
+    its own `install()` composes with - so guard semantics, decline table and
+    markers are unchanged under a re-install). Never touches any callable
+    that is not ours.
+    """
+    from . import guard_mode  # noqa: PLC0415 - see _layer_kinds
+    body = base
+    for kind, _wrapper in reversed(layers_above):
+        if kind == "backport":
+            continue  # `body` already replaces the previous backport layer
+        if kind == "switch":
+            body = _SWITCH_FACTORIES[name](body)
+        elif kind == "guard":
+            body = guard_mode._make_wrapper(name, body)
+    return body
+
+
+# --- the live-object check (attributes the patched bodies read) -------------
+
+_MISSING = object()
+
+# The `self` reads of the three fingerprint-verified replacement bodies,
+# enumerated from the stored source (the `__init__` wrapper reads only
+# `cpu_kv_cache_config`, already listed). Existence-checked on the live
+# instance: on a construct-first instance the fork's own constructor RAN, so
+# a missing one means a fork we no longer recognize - and the patched body
+# would raise inside the step loop. `_gpu_block_pool` is included by NAME
+# only: the fork legitimately keeps it None until bind_gpu_block_pool.
+REQUIRED_LIVE_ATTRIBUTES = (
+    "cpu_kv_cache_config", "block_size", "hash_block_size", "cpu_coordinator",
+    "cpu_block_pool", "group_block_sizes", "enable_kv_cache_events",
+    "_lazy_mode", "_reqs_to_store", "_pending_cpu_hits", "_reqs_to_load",
+    "_gpu_block_pool",
+)
+
+
+def _is_int_group_ids(value) -> bool:
+    """True for a tuple/list/set/frozenset of ints (empty allowed)."""
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        return False
+    return all(isinstance(item, int) and not isinstance(item, bool)
+               for item in value)
+
+
+def _live_object_check(manager) -> dict:
+    """Assert the LIVE instance is safe for the patched bodies, and back-fill
+    the one attribute this patch ADDS. Contained; never raises.
+
+    Upstream's `__init__` addition sets `self.prefix_cacheable_group_ids =
+    self.cpu_kv_cache_config.prefix_cacheable_group_ids`, but the `__init__`
+    WRAPPER only fires for instances constructed AFTER install - production
+    constructs first. So: back-fill from the same source (the fork exposes
+    `prefix_cacheable_group_ids` as a `cached_property` on `KVCacheConfig`,
+    which is what `cpu_kv_cache_config` is), fall back to `kv_cache_config`
+    and say which was used; then require every other `self` read to be
+    present. A manager we cannot make safe is a REFUSAL (the caller
+    disarms), because the patched methods would raise AttributeError on the
+    only instance that matters. `manager is None` is `checked: False` - a
+    class-only install cannot see an instance and says so honestly.
+    """
+    out = {"checked": False, "ok": False, "manager": None, "source": None,
+           "backfilled": False, "missing": [], "reason": None}
+    try:
+        if manager is None:
+            out["reason"] = ("no live manager visible at install time: the "
+                             "check ran against the class only, so an "
+                             "instance constructed BEFORE the patch was "
+                             "fitted was not verified")
+            return out
+        out["checked"] = True
+        out["manager"] = type(manager).__name__
+        pcids = getattr(manager, "prefix_cacheable_group_ids", None)
+        if pcids is None:
+            source = None
+            cpu_cfg = getattr(manager, "cpu_kv_cache_config", None)
+            gpu_cfg = getattr(manager, "kv_cache_config", None)
+            for cfg, name in ((cpu_cfg, "cpu_kv_cache_config"),
+                              (gpu_cfg, "kv_cache_config")):
+                value = getattr(cfg, "prefix_cacheable_group_ids", None)
+                if value is not None:
+                    pcids = value
+                    source = (f"{name}.prefix_cacheable_group_ids"
+                              + ("" if name == "cpu_kv_cache_config" else
+                                 " (fallback; cpu_kv_cache_config carries "
+                                 "none)"))
+                    break
+            if pcids is None:
+                out["reason"] = ("live manager has no prefix_cacheable_group_ids "
+                                 "and no config can supply it (checked "
+                                 "cpu_kv_cache_config then kv_cache_config): "
+                                 "the patched methods would raise "
+                                 "AttributeError on the only instance that "
+                                 "matters")
+                return out
+            if not _is_int_group_ids(pcids):
+                out["reason"] = (f"prefix_cacheable_group_ids from "
+                                 f"{source} is not a sequence of ints "
+                                 f"({type(pcids).__name__})")
+                return out
+            object.__setattr__(manager, "prefix_cacheable_group_ids",
+                               tuple(pcids))
+            out["backfilled"] = True
+            out["source"] = f"back-filled from {source}"
+        else:
+            if not _is_int_group_ids(pcids):
+                out["reason"] = (f"live prefix_cacheable_group_ids is not a "
+                                 f"sequence of ints ({type(pcids).__name__})")
+                return out
+            out["source"] = "already present on the live instance"
+        out["missing"] = [attr for attr in REQUIRED_LIVE_ATTRIBUTES
+                          if getattr(manager, attr, _MISSING) is _MISSING]
+        if out["missing"]:
+            out["reason"] = ("live manager is missing attribute(s) the "
+                             f"patched methods read: {out['missing']}")
+            return out
+        out["ok"] = True
+        return out
+    except Exception as exc:  # noqa: BLE001 - a manager we cannot read is a refusal
+        _state["fallbacks"] += 1
+        snapshot._error(exc, "backport live-object check")
+        out["reason"] = f"live-object check raised {type(exc).__name__}: {exc}"[:200]
+        out["ok"] = False
+        return out
 
 
 # --- the geometry guard -----------------------------------------------------
@@ -657,6 +899,13 @@ def _install_switch(cls, name) -> dict:
     engine's own function (it never reimplements it), so a changed body cannot
     be silently mispatched the way a copied loop can. Ownership discipline and
     the original-binding are identical to store_hook.
+
+    Guard-mode composition: when the current attribute is one of OUR layers
+    (guard armed before this install ran, or a re-install arriving while the
+    guard sits on top), the switch goes UNDER it and the guard is rebuilt on
+    top - nesting preserved, never replaced. A stack that already contains a
+    switch layer is left untouched, so a re-install can neither nest a second
+    switch nor strip the guard off it.
     """
     report = {"wrapped": False, "reason": None}
     existing = cls.__dict__.get(name)
@@ -676,6 +925,33 @@ def _install_switch(cls, name) -> dict:
     if owner == SWITCH_TAG:
         # Re-bind to the FORK's function, so a re-install cannot nest wrappers.
         existing = getattr(existing, ORIGINAL_ATTR, existing)
+        setattr(cls, name, _SWITCH_FACTORIES[name](existing))
+        report["wrapped"] = True
+        return report
+    layers, bottom = _layers_of(existing)
+    if layers:
+        kinds = [kind for kind, _ in layers]
+        if "switch" in kinds:
+            report["wrapped"] = True
+            report["reason"] = ("already wrapped (verified our switch layer "
+                                f"under kvtier-dev-plugin layers: {kinds})")
+            return report
+        if "backport" in kinds:
+            # METHODS and SWITCH_METHODS are disjoint; a backport layer here
+            # means a stack we cannot rebuild faithfully. Say so, do not guess.
+            report["reason"] = (f"{name} sits under a backport layer we cannot "
+                                "rebuild for a switch method, refusing")
+            return report
+        if bottom is None or not callable(bottom):
+            report["reason"] = (f"the ownership chain under our layers "
+                                f"({kinds}) does not end in a callable body")
+            return report
+        setattr(cls, name, _rewrap(name, _SWITCH_FACTORIES[name](bottom), layers))
+        report["wrapped"] = True
+        report["reason"] = ("wrapped under kvtier-dev-plugin's own layer(s) "
+                            f"({kinds}); composition preserved, the body "
+                            "underneath is the engine's own function")
+        return report
     setattr(cls, name, _SWITCH_FACTORIES[name](existing))
     report["wrapped"] = True
     return report
@@ -683,12 +959,22 @@ def _install_switch(cls, name) -> dict:
 
 # --- installation -----------------------------------------------------------
 
-def install(cls, kv_cache_config=None) -> dict:
+def install(cls, kv_cache_config=None, manager=None) -> dict:
     """Fit the kill-switch wrappers, then backport PR #56810 onto `cls`.
 
     Never raises. Idempotent and marker-guarded like store_hook. A stale
     fingerprint is a per-method refusal, so one moved function cannot make the
     others silently wrong: the verdict for each is reported independently.
+
+    `manager` is the LIVE `SimpleCPUOffloadScheduler` instance this class will
+    actually run (the connector-creation hook and `ensure_installed` have it;
+    class-only callers do not). When present, the install must leave THAT
+    object safe: production constructs first, so the `__init__` wrapper alone
+    cannot deliver the additive attribute - `_live_object_check` back-fills it
+    and verifies every other `self` read. A live manager we cannot make safe
+    fails the whole install (disarmed, `incomplete_install`), because patched
+    methods running against an instance missing their input is the exact
+    engine death of 2026-10-03 12:41.
 
     THE ORDER IS THE POINT: the wrappers go on FIRST, before the geometry guard
     and before a single upstream body is compiled. The backport can be refused
@@ -699,7 +985,8 @@ def install(cls, kv_cache_config=None) -> dict:
     half-installed class with the finish route still wide open.
     """
     report = {"installed": False, "class": None, "reason": None,
-              "methods": {}, "switch": {}, "geometry": None}
+              "methods": {}, "switch": {}, "geometry": None,
+              "live_check": None}
     try:
         if cls is None:
             # THE BOOT CASE (`register()` runs at core.py:217, the Scheduler - and
@@ -749,6 +1036,44 @@ def install(cls, kv_cache_config=None) -> dict:
             report["auto_disarmed"] = True
             report["disarm_reason"] = "geometry"
             return _refuse(report, guard.get("reason"))
+
+        # THE LIVE OBJECT IS CHECKED BEFORE ANY METHOD BODY IS PATCHED: on a
+        # construct-first engine, patching the class while the one live
+        # instance cannot carry the new attribute is the 12:41 crash. A failed
+        # check therefore refuses the METHODS loop entirely (the kill-switch
+        # wrappers above keep both selector routes gated in the meantime).
+        # A manager-less install must NOT forget a veto a manager-carrying
+        # install already got - the same preservation rule as the geometry
+        # guard above (`_arm_proof` installing onto the class cannot make a
+        # live instance safe, and did before this rule; a test caught it).
+        prior_live = _state["live_check"]
+        if (manager is None and prior_live and prior_live.get("checked")
+                and not prior_live.get("ok")):
+            live = dict(prior_live)
+        else:
+            live = _live_object_check(manager)
+            if manager is not None or prior_live is None:
+                _state["live_check"] = live
+        report["live_check"] = live
+        if manager is None and live.get("checked") and not live.get("ok"):
+            # Preserved veto: refuse exactly as the checked install did.
+            reason = (f"live-object check failed: {live.get('reason')}")[:400]
+            _state["fully_installed"] = False
+            _state["refused_methods"] = []
+            report["refused_methods"] = []
+            report["auto_disarmed"] = True
+            report["disarm_reason"] = "incomplete_install"
+            _force_disarm("incomplete_install", reason)
+            return _refuse(report, reason)
+        if manager is not None and not live["ok"]:
+            reason = (f"live-object check failed: {live.get('reason')}")[:400]
+            _state["fully_installed"] = False
+            _state["refused_methods"] = []
+            report["refused_methods"] = []
+            report["auto_disarmed"] = True
+            report["disarm_reason"] = "incomplete_install"
+            _force_disarm("incomplete_install", reason)
+            return _refuse(report, reason)
 
         for name in METHODS:
             verdict = _install_one(cls, name)
@@ -836,6 +1161,16 @@ def _install_one(cls, name) -> dict:
             return {"patched": False,
                     "reason": f"carries another plugin's backport marker ({held!r})"}
 
+    layers, bottom = _layers_of(_function_of(existing) if existing is not None
+                                else None)
+    if layers:
+        # The current attribute is one of OUR layers (guard mode sits on top
+        # of this method, or of our copy of it). The fingerprint belongs to
+        # the body UNDERNEATH - never to our own wrapper (that produced the
+        # "the fork changed this function since 10b8e07" refusal that blamed
+        # the fork for our own composition and auto-disarmed a healthy tier).
+        return _install_under_layers(cls, name, layers, bottom)
+
     if name == "__init__":
         fn, _ = _underlying(cls, name)
         if fn is None:
@@ -851,6 +1186,61 @@ def _install_one(cls, name) -> dict:
         setattr(cls, name, _make_init_wrapper(fn))
         return {"patched": True, "sha_ok": True, "reason": "wrapped (additive)"}
     return _install_copy(cls, name)
+
+
+def _install_under_layers(cls, name, layers, bottom) -> dict:
+    """Re-fit our copy BENEATH our own layers; fingerprint the body beneath.
+
+    `layers` is outermost-first and non-empty (so is guard mode's wrapper,
+    a switch layer, or our previous copy). The fork's body is `bottom`; it
+    alone is fingerprinted. On a match, the copy is rebuilt from it and every
+    layer is rebuilt on top (nesting preserved, guard semantics unchanged);
+    on a mismatch the refusal says what is true - the body UNDERNEATH our
+    layers changed - and never blames our own wrapper (or the fork, for our
+    wrapper's fingerprint). This is also the path where guard was armed
+    BEFORE the backport ever installed: `bottom` is then the pristine fork
+    function, and the result is the same composed stack.
+    """
+    kinds = [kind for kind, _ in layers]
+    report = {"patched": False, "reason": None, "sha_ok": None,
+              "live_sha256": None, "expected_sha256": None}
+    if bottom is None:
+        report["reason"] = (f"the ownership chain under our layers ({kinds}) is "
+                            "broken (an ORIGINAL attribute is missing)")
+        return report
+    ok, live, expected = _fingerprint_verdict(name, _function_of(bottom))
+    report.update(sha_ok=ok, live_sha256=live, expected_sha256=expected)
+    if not ok:
+        if live is None:
+            report["reason"] = (
+                f"{name}: the fork's own body underneath kvtier-dev-plugin's "
+                f"layer(s) ({' + '.join(kinds)}) has no readable source; "
+                "refusing to patch a body we cannot vouch for")
+        else:
+            report["reason"] = (
+                "source fingerprint mismatch UNDER kvtier-dev-plugin's own "
+                f"layer(s) ({' + '.join(kinds)}): the fork's own body "
+                "underneath changed since 10b8e07 "
+                f"(live {str(live)[:12]} != expected {str(expected)[:12]}); "
+                "refusing to patch a body we can no longer vouch for "
+                "(the refusal is NOT about our own wrapper)")
+        return report
+    if name == "__init__":
+        base = _make_init_wrapper(_function_of(bottom))
+    else:
+        base = _compile_copy(name, pr56810_sources.SOURCES[name]["source"],
+                             _function_of(bottom))
+        if base is None:
+            report["reason"] = ("compiled copy is missing its own fingerprint "
+                                "anchor")
+            return report
+    setattr(cls, name, _rewrap(name, base, layers))
+    report["patched"] = True
+    report["reason"] = (f"installed under kvtier-dev-plugin's own layer(s) "
+                        f"({' + '.join(kinds)}); the current implementation "
+                        "is our wrapper, and the fork's body underneath was "
+                        "fingerprint-verified")
+    return report
 
 
 def _config_of(_cls):
@@ -885,23 +1275,29 @@ def _refuse(report, reason):
 
 
 def already_installed(cls) -> bool:
-    """True when every method we own on `cls` still carries our marker.
+    """True when every method we own still carries OUR LAYER on `cls`.
 
-    A cheap read-only check (seven `getattr`s, no hashing, no `compile`) that
-    lets the polling path skip the install entirely. It is deliberately NOT a
-    memo of "we installed once": if another plugin, or a module reload, replaced
-    one of our methods, the marker disappears and the next call does the work
-    again. That is the point - it is a claim about the class as it is NOW.
+    A cheap read-only check (a handful of `getattr`s through the ownership
+    chains, no hashing, no `compile`) that lets the polling path skip the
+    install entirely. It is deliberately NOT a memo of "we installed once": if
+    another plugin, or a module reload, replaced one of our methods, the marker
+    disappears and the next call does the work again. That is the point - it is
+    a claim about the class as it is NOW.
+
+    Layer-aware (2026-10-03): a method whose current attribute is guard mode's
+    wrapper OVER our layer still counts - our code is live beneath it, and
+    claiming otherwise every few seconds would push three upstream recompiles
+    onto the serving loop while a dev guard is armed.
     """
     if cls is None:
         return False
-    for name in METHODS:
+    for name, wanted in ([(n, "backport") for n in METHODS]
+                         + [(n, "switch") for n in SWITCH_METHODS]):
         raw = cls.__dict__.get(name)
-        if raw is None or getattr(_function_of(raw), OWNER_ATTR, None) != OWNER_TAG:
+        if raw is None:
             return False
-    for name in SWITCH_METHODS:
-        raw = cls.__dict__.get(name)
-        if raw is None or getattr(_function_of(raw), SWITCH_ATTR, None) != SWITCH_TAG:
+        layers, _bottom = _layers_of(_function_of(raw))
+        if not layers or all(kind != wanted for kind, _ in layers):
             return False
     return True
 
@@ -956,6 +1352,29 @@ def ensure_installed(engine) -> dict:
             out["refused_methods"] = []
             return out
         # Markers verified on every method: the fix is fully in place on this
+        # class. The LIVE OBJECT is re-verified too (cheap attribute reads):
+        # markers on the class prove nothing about an instance constructed
+        # between two polls by a half-patched boot, and the back-fill is
+        # idempotent, so this is also where a late-arriving manager gets its
+        # additive attribute.
+        live = _live_object_check(manager)
+        if manager is not None or _state["live_check"] is None:
+            _state["live_check"] = live
+        if manager is not None and not live["ok"]:
+            report = {"installed": False, "class": getattr(cls, "__name__", None),
+                      "reason": None, "methods": {}, "switch": {},
+                      "geometry": guard, "live_check": live}
+            out = _refuse(report,
+                          f"live-object check failed: {live.get('reason')}")
+            # Same rule as install(): a patched class over an instance that
+            # would raise is the crash, not an install. Refuse, disarm, and
+            # the arm gate keeps the patched code unreachable.
+            _force_disarm("incomplete_install", report["reason"])
+            out["auto_disarmed"] = True
+            out["disarm_reason"] = "incomplete_install"
+            out["refused_methods"] = []
+            return out
+        # Markers verified on every method: the fix is fully in place on this
         # class. Publish that so `installed` is honest on the polling path too.
         _state["fully_installed"] = True
         _state["refused_methods"] = []
@@ -963,9 +1382,10 @@ def ensure_installed(engine) -> dict:
                 "reason": "already installed (markers verified, nothing to do)",
                 "methods": dict(_state["method_verdicts"]),
                 "switch": dict(_state["switch_verdicts"]), "geometry": guard,
+                "live_check": live,
                 "refused_methods": [], "auto_disarmed": bool(_state["auto_disarmed"]),
                 "disarm_reason": _state["disarm_reason"]}
-    return install(cls, config)
+    return install(cls, config, manager)
 
 
 def manager_of(engine):
@@ -1076,7 +1496,8 @@ def _after_connector_created(connector) -> None:
             return
         _state["hook_tier_connectors"] += 1
         cls = type(manager)
-        report = install(cls, getattr(manager, "kv_cache_config", None))
+        report = install(cls, getattr(manager, "kv_cache_config", None),
+                         manager)
         wrapped = sum(1 for v in report["switch"].values() if v.get("wrapped"))
         _state["hook_installs"] += 1
         _state["hook_last"] = (f"{getattr(cls, '__name__', '?')}: "
@@ -1276,7 +1697,9 @@ def _arm_block_reason() -> dict | None:
     if not _state["fully_installed"]:
         refused = list(_state['refused_methods'])
         attempted = bool(refused) or bool(_state["method_verdicts"])
-        if not attempted and manager_class() is None:
+        live = _state.get("live_check") or {}
+        live_failed = bool(live.get("checked")) and not live.get("ok")
+        if not attempted and not live_failed and manager_class() is None:
             return {"kind": "no_manager",
                     "reason": f"no {TARGET_CLASS} exists in this process "
                               f"({TARGET_MODULE} is not imported) and nothing has "
@@ -1285,6 +1708,12 @@ def _arm_block_reason() -> dict | None:
                               "or the engine is not built yet. Arming here would "
                               "set a flag nothing reads."}
         names = ", ".join(refused) if refused else "(none attempted)"
+        if live_failed:
+            # The methods may all be patched on the class and STILL be an
+            # incomplete fix: the patch lives on the class AND the instance,
+            # and the instance is the one the engine runs. Same kind, because
+            # "not fully in place" is exactly what it means.
+            names = f"{names}; live-object check: {live.get('reason')}"
         return {"kind": "incomplete_install",
                 "reason": f"the PR #56810 fix is not fully installed; refused "
                           f"method(s): {names}. The tier stays disarmed until "
@@ -1310,6 +1739,12 @@ def _arm_proof() -> None:
         return
     geometry = _state["geometry"]
     if geometry and geometry.get("checked") and not geometry.get("ok"):
+        return
+    live = _state.get("live_check") or {}
+    if live.get("checked") and not live.get("ok"):
+        # Same rule as the geometry veto: a class-only install cannot make the
+        # live instance safe, so seeking proof here could only paper over a
+        # refusal that a manager-carrying install already proved.
         return
     cls = manager_class()
     if cls is None:
@@ -1569,8 +2004,14 @@ def tier_for_engine(engine, args=None) -> dict:
 
 def _fields(**overrides) -> dict:
     block = _arm_block_reason()
+    # `patched` and `installed` answer the SAME question and come from the SAME
+    # verdict, and always will: the historical `patched` ("an install ran at
+    # some point") kept reporting true after a later install was REFUSED - the
+    # 2026-10-03 payload said tier.patched: true while installed: false. A
+    # counter of past attempts is not a claim about the class; the all-or-
+    # nothing verdict is, so both fields read `_state["fully_installed"]`.
     fields = {
-        "patched": bool(_state["installs"] or _state["reinstalls"]),
+        "patched": bool(_state["fully_installed"]),
         "class": _state["class"],
         "module": TARGET_MODULE,
         "pr": "56810",
@@ -1598,6 +2039,8 @@ def _fields(**overrides) -> dict:
         # are not, so a partial install is visible, not just a failed one.
         "installed": bool(_state["fully_installed"]),
         "refused_methods": list(_state["refused_methods"]),
+        "live_check": (dict(_state["live_check"]) if _state["live_check"]
+                       else None),
         "auto_disarmed": bool(_state["auto_disarmed"]),
         "disarm_reason": _state["disarm_reason"],
         "disarm_detail": _state["disarm_detail"],
@@ -1639,8 +2082,11 @@ def section(manager=None) -> dict:
     live_armed = None
     try:
         live_cls = type(manager)
-        attr = getattr(live_cls, "_select_eager_blocks_to_store", None)
-        live_patched = getattr(attr, OWNER_ATTR, None) == OWNER_TAG
+        raw = live_cls.__dict__.get("_select_eager_blocks_to_store")
+        layers, _bottom = _layers_of(_function_of(raw)) if raw is not None \
+            else ([], None)
+        # Layer-aware: our copy UNDER guard mode's wrapper is still live code.
+        live_patched = any(kind == "backport" for kind, _ in layers)
         live_armed = bool(_state["armed"])
     except Exception as exc:  # noqa: BLE001 - a manager that lies is data
         snapshot._error(exc, "backport live view")
