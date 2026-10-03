@@ -416,6 +416,41 @@ _SRC__SELECT_EAGER_BLOCKS_TO_STORE = '''    def _select_eager_blocks_to_store(
         return gpu_block_ids, advanced_per_group, block_meta
 '''
 
+# --- the POST-patch fingerprints: what "the fix is already in the tree" means --
+#
+# `orig_sha256` above answers "is this the v0.30.0 body we know how to replace?".
+# These answer the other half: "is this ALREADY the upstream #56810 body?". That
+# question is what lets the runtime backport stand down on an engine whose own
+# source tree carries the fix (the tracked `config/box/kvtier-pr56810/` patch in
+# the llm-api repo), instead of wrapping a fixed body and reporting a fork change
+# that never happened.
+#
+# Pinned as literals on purpose: each value is `sha256(SOURCES[name]["source"])`,
+# so `test_pinned_post_patch_fingerprints_match_the_stored_bodies` fails if a
+# body is ever edited without re-pinning, exactly like `orig_sha256` does.
+PATCHED_SHA256 = {
+    '__init__': '70cea026db307075bf736554c5b6eace54017fc977898093579568d89fa8c21a',
+    '_estimate_lazy_target_blocks':
+        '21e73419defaae87ec69d79e820ba3c61843d6dcdccec070c95042d00d16d9b2',
+    'update_state_after_alloc':
+        'f7543190de8e17e8ebe159a2fcc94ef04dcb4ade9dd64f7e146f7c1321eb4a51',
+    '_select_eager_blocks_to_store':
+        'd39d9df7f72e0dbff2508eed458843b99c6028b3a1c4b2cc09eebb1ab20c68f3',
+}
+
+# Whole-file fingerprints of the tracked patch, for the operator-facing line
+# (the tool in the llm-api repo is what applies them; these are for reporting).
+MANAGER_FILE_SHA256_PRE = (
+    '3cc841ff97e4ec237800d4f81dcb5dfb5191c639f275a32892915e8b1af43eb7')
+MANAGER_FILE_SHA256_POST = (
+    'e4b00291991cfd6fdcabb8a22379b119073fca63341d2f488954b280b4a996eb')
+
+# Where the ORIGINAL bodies above came from, so a fingerprint can be traced to a
+# commit rather than to a claim.
+FORK_PIN_HEAD = '10b8e073321f22113da977856b5d5593ab6fa5d5'
+UPSTREAM_ISSUE = 'vllm-project/vllm#56396'   # the crash on the first store request
+UPSTREAM_PR = 'vllm-project/vllm#56810'      # the fix, +9/-1 in manager.py
+
 SOURCES = {
     '__init__': {
         "source": _SRC___INIT__,

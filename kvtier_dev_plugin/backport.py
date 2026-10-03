@@ -329,6 +329,15 @@ ORIGINAL_ATTR = "__kvtier_dev_backport_original__"
 SWITCH_ATTR = "__kvtier_dev_switch_owner__"
 SWITCH_TAG = "kvtier-dev-plugin/switch-1"
 
+# THE STAND-DOWN VERDICT. When the engine's OWN source tree already carries the
+# upstream #56810 bodies (the tracked, apply/verify/rollback-able patch the
+# operator installs with `config/box/kvtier-patch.sh`), the runtime backport
+# installs NOTHING and says so with this one token. It exists because patching
+# from outside a process we do not control has now cost three production
+# incidents; nine lines in the engine's own file ends the class, and this is the
+# half that keeps the two mechanisms from stacking on each other.
+IN_TREE_FIXED = "already_fixed_in_tree"
+
 METHODS = ("__init__", "_estimate_lazy_target_blocks",
            "update_state_after_alloc", "_select_eager_blocks_to_store")
 # __init__ is wrapped; the other three are replaced by the upstream copy.
@@ -404,6 +413,12 @@ _state = {
     "boot": None,
     "boots": 0,
     "boot_line": None,
+    # THE STAND-DOWN: the last in-tree-fix classification, and how many times we
+    # stood down. `in_tree_notice` is the log-once flag (the snapshot polls this
+    # every few seconds, so the stand-down must not log per poll).
+    "in_tree": None,
+    "in_tree_standdowns": 0,
+    "in_tree_notice": False,
 }
 
 
@@ -422,6 +437,7 @@ def reset_state_for_tests() -> None:
         "hook_calls": 0, "hook_tier_connectors": 0, "hook_no_manager": 0,
         "hook_other_connector": 0, "hook_installs": 0, "hook_errors": 0,
         "hook_last": None, "boot": None, "boots": 0, "boot_line": None,
+        "in_tree": None, "in_tree_standdowns": 0, "in_tree_notice": False,
     })
 
 
@@ -1008,6 +1024,112 @@ def _install_switch(cls, name) -> dict:
 
 # --- installation -----------------------------------------------------------
 
+def in_tree_state(cls) -> dict:
+    """Classify each backported method against the engine's OWN source text.
+
+    Per method, exactly one of:
+      `in_tree_fixed` - the body IS the upstream #56810 text (the patch has been
+                        applied to the engine's own file; stand down),
+      `unpatched`     - the body IS the v0.30.0 text we know how to replace,
+      `other`         - neither: the fork changed this function (or a third
+                        plugin replaced it) - the runtime path already refuses
+                        these per method, and this function only names them,
+      `unreadable`    - no source to hash (a refusal, never a guess),
+      `missing`       - the method is not on this class at all.
+
+    The hash is taken on the body the engine would ACTUALLY RUN, found by
+    walking DOWN through our own layers with `_layers_of()` - never on the layer
+    itself. That is the whole lesson of the third incident: hashing our own guard
+    wrapper and reporting "the fork changed this function" sent an operator
+    hunting a fork update that does not exist. Two consequences fall out of that
+    choice, and both are load-bearing:
+      * a class we patched at RUNTIME classifies as `unpatched` (the bottom is
+        still the fork's original), so a stand-down can never be claimed for our
+        own copy, and the runtime fallback stays the honest answer; and
+      * an in-tree-fixed class stays `in_tree_fixed` even with guard/switch
+        layers on top of it, which is what lets a re-poll stand down too.
+
+    Read-only and never raises into the caller: a classification we cannot make
+    is reported as such.
+    """
+    out = {"checked": False, "reason": None, "methods": {},
+           "fixed": [], "unpatched": [], "other": [],
+           "all_fixed": False, "partial": False}
+    if cls is None:
+        out["reason"] = (f"no {TARGET_CLASS} is available to inspect")
+        return out
+    for name in METHODS:
+        entry = pr56810_sources.SOURCES[name]
+        patched = pr56810_sources.PATCHED_SHA256[name]
+        raw = cls.__dict__.get(name)
+        fn = _function_of(raw) if raw is not None else None
+        layers, bottom = _layers_of(fn) if fn is not None else ([], None)
+        info = {"state": None, "reason": None, "live_sha256": None,
+                "orig_sha256": entry["orig_sha256"], "patched_sha256": patched,
+                "layers": [kind for kind, _ in layers]}
+        body = _function_of(bottom) if bottom is not None else None
+        if body is None:
+            info["state"] = "missing"
+            info["reason"] = (f"{name} is not defined on this class" if fn is None
+                              else "the ownership chain under our layers is broken")
+        else:
+            live = fingerprint_of(body)
+            info["live_sha256"] = live
+            if live is None:
+                info["state"] = "unreadable"
+                info["reason"] = ("the engine's own body has no readable source")
+            elif live == patched:
+                info["state"] = IN_TREE_FIXED
+            elif live == entry["orig_sha256"]:
+                info["state"] = "unpatched"
+            else:
+                info["state"] = "other"
+                info["reason"] = (f"live {live[:12]} is neither the v0.30.0 body "
+                                  f"({str(entry['orig_sha256'])[:12]}) nor the "
+                                  f"#56810 body ({patched[:12]})")
+        out["methods"][name] = info
+        if info["state"] == IN_TREE_FIXED:
+            out["fixed"].append(name)
+        elif info["state"] == "unpatched":
+            out["unpatched"].append(name)
+        else:
+            out["other"].append(name)
+    out["checked"] = True
+    out["all_fixed"] = len(out["fixed"]) == len(METHODS)
+    # `partial` is the state that must never be accepted: some of the fix is in
+    # the tree and some is not, so the crash lives on in whichever half did not
+    # land. It is reported as a refusal by install(), not patched over.
+    out["partial"] = bool(out["fixed"]) and not out["all_fixed"]
+    if out["all_fixed"]:
+        out["reason"] = IN_TREE_FIXED
+    elif out["partial"]:
+        behind = out["unpatched"] + out["other"]
+        out["reason"] = (
+            f"in the tree already: {', '.join(out['fixed'])}; "
+            f"still on the v0.30.0 or a fork-changed body: "
+            f"{', '.join(behind)}")
+    return out
+
+
+def _in_tree_verdict(name, state) -> dict:
+    """The per-method verdict for a body the engine already carries fixed.
+
+    `patched: True` because the requirement the flag reports is satisfied - the
+    body that runs is the upstream one - while NOTHING on the class was touched.
+    Callers must read `already_fixed_in_tree` alongside it to know we installed
+    no code of our own.
+    """
+    info = state["methods"][name]
+    return {"patched": True, "sha_ok": True,
+            "already_fixed_in_tree": True,
+            "live_sha256": info["live_sha256"],
+            "in_tree_sha256": info["patched_sha256"],
+            "expected_sha256": info["orig_sha256"],
+            "reason": f"{IN_TREE_FIXED}: the engine's own {name} already carries "
+                      f"the upstream #{pr56810_sources.UPSTREAM_PR.rsplit('#', 1)[-1]} "
+                      "body, so the runtime backport installed nothing"}
+
+
 def install(cls, kv_cache_config=None, manager=None) -> dict:
     """Fit the kill-switch wrappers, then backport PR #56810 onto `cls`.
 
@@ -1124,8 +1246,46 @@ def install(cls, kv_cache_config=None, manager=None) -> dict:
             _force_disarm("incomplete_install", reason)
             return _refuse(report, reason)
 
+        # THE STAND-DOWN, decided BEFORE any body is compiled: if the engine's
+        # own file already carries the upstream #56810 text, installing our copy
+        # on top would be a second, invisible patch of a file we now track - and
+        # the fingerprint guard would (correctly, from its point of view) refuse
+        # the fixed body and blame the fork. So we look first, and act on three
+        # states:
+        #   all four in-tree fixed -> install nothing, report `already_fixed_in_tree`
+        #   some fixed, some not   -> REFUSE. A half-applied in-tree patch keeps
+        #                             the crash alive in whichever half did not
+        #                             land, and quietly patching the rest from a
+        #                             plugin is how the fix becomes unauditable.
+        #   none fixed             -> exactly the runtime path as before, which
+        #                             is the working fallback for a box where the
+        #                             patch has not been applied.
+        in_tree = in_tree_state(cls)
+        report["in_tree"] = in_tree
+        _state["in_tree"] = in_tree
+        if in_tree.get("partial"):
+            # Fail closed and say which methods are which. The kill-switch
+            # wrappers fitted above are what keep both routes into the crashing
+            # selector gated while the operator fixes the tree.
+            reason = (f"the engine is PARTIALLY patched in-tree "
+                      f"({in_tree['reason']}); refusing to complete a "
+                      "half-applied in-tree #56810 patch from a plugin - apply "
+                      "the tracked patch (or roll it back) so the engine's own "
+                      "file is one whole state")
+            _state["fully_installed"] = False
+            _state["refused_methods"] = []
+            report["refused_methods"] = []
+            report["auto_disarmed"] = True
+            report["disarm_reason"] = "incomplete_install"
+            _force_disarm("incomplete_install", reason)
+            return _refuse(report, reason)
+        stand_down = bool(in_tree.get("all_fixed"))
+        if stand_down:
+            report["already_fixed_in_tree"] = True
+
         for name in METHODS:
-            verdict = _install_one(cls, name)
+            verdict = (_in_tree_verdict(name, in_tree) if stand_down
+                       else _install_one(cls, name))
             report["methods"][name] = verdict
             _state["method_verdicts"][name] = verdict
 
@@ -1144,7 +1304,20 @@ def install(cls, kv_cache_config=None, manager=None) -> dict:
         _state["refused_methods"] = refused
 
         if fully_installed:
-            if _state["installs"] == 0:
+            if stand_down:
+                # Nothing was installed, so the install/reinstall counters stay
+                # untouched: they count code we fitted, and claiming a fit we did
+                # not make would make `INSTALLED` a lie in the log. Logged once per
+                # episode - the snapshot polls the install path every few seconds.
+                _state["in_tree_standdowns"] += 1
+                if not _state["in_tree_notice"]:
+                    _state["in_tree_notice"] = True
+                    logger.warning(
+                        "kvtier-dev-plugin: PR #56810 is ALREADY FIXED IN TREE "
+                        "on %s (all %d methods carry the upstream body); runtime "
+                        "backport STOOD DOWN, nothing installed",
+                        report["class"], len(METHODS))
+            elif _state["installs"] == 0:
                 _state["installs"] += 1
                 logger.warning(
                     "kvtier-dev-plugin: PR #56810 backport INSTALLED on %s "
@@ -1684,6 +1857,11 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             "guard_armed": False, "tier": False, "faults_at_boot": 0,
             "refusals": [], "not_covered": [], "nested": [], "live_check": None,
             "manager": type(manager).__name__ if manager is not None else None,
+            # WHERE the fix comes from: "in_tree" (the engine's own file carries
+            # it, the runtime backport stood down) or "runtime" (our copies are
+            # live on the class). `backport: True` alone cannot tell those apart,
+            # and after this work `in_tree` is the state every box should reach.
+            "backport_source": None,
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -1698,6 +1876,9 @@ def boot_from_connector(cls, install_report, manager) -> dict:
         installed = bool(report.get("installed"))
         live_ok = bool(live.get("ok")) and manager is not None
         boot["backport"] = installed and live_ok
+        if installed:
+            boot["backport_source"] = (
+                "in_tree" if report.get("already_fixed_in_tree") else "runtime")
         if not installed:
             boot["refusals"].append("backport: {}".format(
                 report.get("reason") or "the install did not complete"))
@@ -1779,7 +1960,14 @@ def boot_line(boot: dict) -> str:
     left out, so a truncated line can never read as a complete one.
     """
     parts = ["BOOT[{}]".format(boot.get("mode") or "?")]
-    parts.append("backport={}".format("YES" if boot.get("backport") else "NO"))
+    # IN_TREE, not YES, when the engine's own file carries the fix: the fix is
+    # equally in effect, but a box that says YES is a box still being patched at
+    # runtime from a plugin, and that is the difference an operator acting on
+    # this line needs to see.
+    if boot.get("backport_source") == "in_tree" and boot.get("backport"):
+        parts.append("backport=IN_TREE")
+    else:
+        parts.append("backport={}".format("YES" if boot.get("backport") else "NO"))
     parts.append("guard={}".format("YES" if boot.get("guard") else "NO"))
     parts.append("tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
     parts.append("faults={}".format(int(boot.get("faults_at_boot") or 0)))
