@@ -40,6 +40,7 @@ from . import (
     backport,
     config,
     cpu_capacity,
+    evictions,
     guard_mode,
     kvconfig,
     kvinspect,
@@ -100,6 +101,11 @@ def _make_snapshot_method():
         cpu_capacity.ensure_installed()
         cpu_capacity.adopt_if_missed(self)
         backport.ensure_installed(self)
+        # Arm the LRU-eviction counter on the live CPU pool once, so the arena's
+        # steady state (99.9% full, parked spans recycled to serve new stores) is
+        # visible instead of argued about. Fail-closed to a null section, never a
+        # zero, if the pool cannot be wrapped. See evictions.py.
+        evictions.adopt_if_missed(self)
         return snapshot.snapshot_for_engine(self, get_holder())
 
     kvtier_dev_snapshot.__doc__ = (

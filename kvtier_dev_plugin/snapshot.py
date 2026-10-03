@@ -780,11 +780,32 @@ def tier_view(manager) -> dict:
     }
 
 
+def evictions_section(engine) -> dict:
+    """The LRU-eviction view: the arena's steady state, made visible.
+
+    Function-level import because `evictions` imports THIS module (for
+    `_error`), the same cycle `store_hook_section`/`cpu_capacity_section` avoid
+    this way. Contained: a section that cannot be built is a reason, never a
+    500 - and it must never be a bare zero (an unwrapped pool reports nulls).
+    """
+    from . import evictions  # noqa: PLC0415 - cycle, see store_hook_section
+    try:
+        return evictions.section(engine)
+    except Exception as exc:  # noqa: BLE001 - the shape must survive regardless
+        _error(exc, "evictions section")
+        return evictions.empty_section(f"{type(exc).__name__}: {exc}")
+
+
 def build_view(engine) -> dict:
     """One pass over the engine's scheduler-side state. Reads only."""
     scheduler = getattr(engine, "scheduler", None)
     connector = getattr(scheduler, "connector", None)
     manager = getattr(connector, "scheduler_manager", None)
+    tier = tier_view(manager)
+    # The eviction counter rides the tier view (the arena lives here), but it is
+    # the one tier field that needs the ENGINE (for its corroboration), so it is
+    # attached below tier_view(manager) rather than inside it.
+    tier["evictions"] = evictions_section(engine)
     return {
         "version": PROTOCOL_VERSION,
         "epoch": epoch(),
@@ -799,7 +820,7 @@ def build_view(engine) -> dict:
             "running": _count(getattr(scheduler, "running", None)),
             "waiting": _count(getattr(scheduler, "waiting", None)),
         },
-        "tier": tier_view(manager),
+        "tier": tier,
     }
 
 

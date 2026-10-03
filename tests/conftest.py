@@ -20,6 +20,7 @@ import fakes_debug  # noqa: E402 - the shared fake engine structures
 
 from kvtier_dev_plugin import (  # noqa: E402
     config,
+    evictions,
     guard_mode,
     lookup_ledger,
     snapshot,
@@ -70,22 +71,28 @@ def reset_dev_state():
              "step": dict(step_trace._state),
              "guard": dict(guard_mode._state),
              "worker": dict(worker_diag._state),
+             "evictions": dict(evictions._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
     guard_mode.reset_state_for_tests()
     worker_diag.reset_state_for_tests()
+    evictions.reset_state_for_tests()
     lookup_ledger.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
+           "evictions": evictions._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
-    # see fakes_debug._named_class), then reset the counters.
+    # see fakes_debug._named_class), then reset the counters. The eviction wrap
+    # is INSTANCE-level on a per-test fake pool (never a shared named class), so
+    # unwrap_everything has nothing to remove; resetting _state clears `watched`.
     fakes_debug.unwrap_everything()
     for key, state in (("trace", trace_ring._state), ("step", step_trace._state),
                        ("guard", guard_mode._state),
                        ("worker", worker_diag._state),
+                       ("evictions", evictions._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])
