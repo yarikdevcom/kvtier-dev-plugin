@@ -41,6 +41,7 @@ so these routes answer between requests.
 | `kvtier_dev_plugin/engine_side.py` | `vllm.general_plugins` entry: attaches the eight engine methods, fits the connector-creation hook, wires the logger and the worker-writer retry |
 | `kvtier_dev_plugin/snapshot.py` | the read side + the containment boundary, and the `guard`/`trace`/`worker_diag`/`lookup_ledger` sections of the snapshot, including the `tier.cpu_hash_index` parked-KV reading. Stdlib only |
 | `kvtier_dev_plugin/lookup_ledger.py` | **development only**: the bounded ring that joins each `get_num_new_matched_tokens` offer to the `update_state_after_alloc` adopt that followed it, and the verdict that classifies the hits the scheduler did not adopt |
+| `kvtier_dev_plugin/miss_attribution.py` | **development only**: the per-request *why did this request miss* attribution that rides the lookup ledger's records (query length, hit, residues, a derived first-miss position, a verdict from a fixed enum), the MEASURED host-RAM retention depth, and the free-order witness that confirms or refutes the prefix-root eviction hypothesis |
 | `kvtier_dev_plugin/kvconfig.py` | `kvconfig`: the KV-cache geometry and the divisibility verdict the tier's first store depends on |
 | `kvtier_dev_plugin/kvinspect.py` | `inspect`: one block, or one request, per group, with every id list capped |
 | `kvtier_dev_plugin/trace_ring.py` | the bounded event ring and the `trace` verb (arming installs the observers, disarming removes them) |
@@ -86,6 +87,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
 | `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
+| `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
@@ -549,6 +551,146 @@ minute), so a hardcoded `/4` is a fabrication waiting to be wrong. Consume
 `parked_blocks_per_group`; the key fields stay for the cross-check and because a proxy
 and a dashboard already read them.
 
+
+## Why THIS request missed, and how much the RAM tier can retain (`miss_attribution.py`)
+
+Aggregate instruments cannot answer "why did THIS 176k-token request get
+`cached_tokens = 0` while its neighbour hit 97%". This capability turns every tier
+lookup into ONE ledger entry - riding the lookup ledger's existing ring, keyed by
+request id - with a cause attached, plus a measured answer to "how many tokens can
+the RAM tier actually retain".
+
+```bash
+# arm it (token-gated, like every other shape of /lookups)
+ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/lookups \
+  -H 'content-type: application/json' -d '{\"op\":\"arm\",\"cap\":256}'"
+
+# the per-request attributions (optionally &verdict=root_missing)
+ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=requests&limit=32'"
+ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=depth'"   # measured retention
+ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=order'"   # root-eviction witness
+ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=rates'"   # unit-checked ratios only
+```
+
+`op=depth` answers **without arming anything**, and the same block is in
+`snapshot.tier.cpu_retained_depth`: "how much can the tier retain" is a question
+about the pool, not about the observer.
+
+### The ledger entry (every numeric field carries its unit)
+
+| Field | Unit | What it is |
+|-------|------|-----------|
+| `num_tokens` | tokens | `request.num_tokens` |
+| `local_as_passed` | tokens | the block-aligned local hit the scheduler handed the connector (`scheduler.py:973-979`) |
+| `local_mod_block`, `local_mod_hash` | tokens | `% block_size` / `% hash_block_size`; `local_mod_block` is 0 **by construction** from the scheduler, so a non-zero value means a different caller |
+| `ext_query_hashes` | hash blocks | `len(request.block_hashes) - local/hash_block_size`: the slice `manager.py:352` actually queries |
+| `ext_query_tokens_possible` | tokens | what the tier COULD match, before its own caps |
+| `ext_query_tokens_capped` | tokens | what it MAY match: `min(possible, num_tokens - 1 - local)` (`manager.py:359-362`) |
+| `ext_hit_tokens` | tokens | the connector's offer (the ledger's `hit_returned`) |
+| `residue_tokens` | tokens | `capped - offered`: the prefix queried and NOT served |
+| `total_residue_tokens` | tokens | `num_tokens - local - offered`: everything recomputed |
+| `walk_matched_spans`, `first_miss_span` | spans | **derived**: a strict prefix walk (`single_type_kv_cache_manager.py:806-808`, "a missing block implies every later block misses too", the loop `break`s) makes depth and the failing index ONE fact, so `matched = offered // span_tokens` |
+| `first_miss_token_offset` | tokens | the absolute prompt offset where the walk stopped |
+| `joint_hit_tokens`, `clamp_residue_tokens` | tokens | from the tier's own `cpu_coordinator.find_longest_cache_hit`: the reconciled hit and `num_uncached_common_prefix_tokens`, which `manager.py:362` otherwise throws away |
+| `group_depths_tokens`, `independent_group_depths_tokens` | tokens per group | after reconciliation (full-attention groups are TRUNCATED to the hit, `kv_cache_coordinator.py:966-973`), and from the opt-in deep probe, which does not reconcile |
+
+`hash_value` is still never read anywhere in this package - and neither is
+`block.block_hash`: only ids, lengths and counts.
+
+### What may be claimed, and what may not
+
+Verdicts: `hit`, `no_verdict`, `zero_by_alignment_gate`,
+`zero_by_skip_reading_prefix_cache`, `zero_by_last_token_rule`,
+`zero_by_no_hashes_left`, `cold_cache`, `pool_pressure`, `root_missing`,
+`clamp_at_group<idx>`, `clamp_group_ambiguous`, `clamp_limited`,
+`partial_hit_clamp_suspected`, `unknown` - all 14 are reachable, and the test suite
+fails if one stops being so.
+
+Not computable, and published as such (`undeterminable`) rather than guessed:
+
+* **`content_diverged@<offset>`** - separating "the client changed the prompt at
+  token N" from "the block at chain index N is gone" requires knowing that a
+  DIFFERENT hash was ever parked at that index. That needs the hash value (never
+  read here) or a per-request hash history (never kept). The ledger publishes the
+  POSITION and refuses the cause.
+* **per-request GPU eviction** - the connector sees the tier's answer, never the GPU
+  coordinator's walk. VRAM is visible only as a census (`gpu_census.py`) and engine
+  counters, so a per-request VRAM verdict would be a guess about a walk this module
+  cannot see.
+* **a single clamping group on the normal path** - the returned per-group lists are
+  truncated to the reconciled hit, so every full-attention group ties at the minimum
+  and the binder is indistinguishable from the truncated. Only
+  `find_longest_cache_hit_per_group` (`kv_cache_coordinator.py:984`) names it, and it
+  is a re-lookup through `BlockPool.get_cached_block` (dict reads, no `touch`, no
+  queue move), so it is opt-in (`deep: true`), sampled (`sample_every`, default 20)
+  and hard-capped (`MAX_DEEP_PROBES`, 64).
+
+`op=rates` refuses any ratio that mixes units - scheduler steps
+(`_load_event_counter`, `manager.py:537`) against blocks (`evictions_total`) against
+tokens - because that division is exactly what produced a wrong production
+conclusion.
+
+### Measured retention: three answers 785x apart, resolved by measuring
+
+The authoritative path in the running tree is
+`num_cpu_blocks = max(1, num_gpu_blocks * cpu_capacity_bytes // kv_cache_tensors[0].size)`
+(`manager.py:273-275`); there is no `cpu_block_size = lcm(...) * sum(page_sizes)`
+formula in it. The disputed part was never the pool size, it was what one slot
+means:
+
+* a CPU slot is **one GROUP's span**: the store loop allocates inside the per-group
+  loop (`manager.py:711`, `:757`), so a 3,200-token prefix costs ONE SLOT PER
+  prefix-cacheable group (five on this box - group 4, the QSA scratch ring, is
+  skipped by `manager.py:838` and parks nothing).
+* therefore `index_entries x hash_block_size` counts INDEX KEYS at 40-token
+  granularity rather than spans and under-counts by `block_size / hash_block_size`
+  (80x); `total_blocks x block_size` ignores the per-group multiplication
+  (over-counts by the group count); and `GiB / summed page sizes` assumes one slot
+  holds every group at once, which the per-group allocation refutes.
+* `joint_parked_tokens_max` is the `min` over the prefix-cacheable groups of
+  `spans x group_block_sizes[g]` - ONE conversation's retrievable depth;
+  `aggregate_parked_group_tokens` is the total volume across conversations. On the
+  measured box (1,331 slots, 1,330 parked, spans `[3200 x5, 8]`, per-group parked
+  `[259,259,260,260,-,292]`): ~828,800 tokens of joint depth right now and a
+  one-conversation ceiling (`per_conversation_ceiling_tokens`) of ~850,000 tokens.
+  A 200k-token prefix costs ~313 of 1,331 slots, so the RAM tier is NOT structurally
+  incapable of rescuing one.
+* **`free` is not `empty`.** `BlockPool.free_blocks` appends HASHED blocks back into
+  the free queue as reuse candidates (`block_pool.py:796-798`), so
+  `cpu_pool.free_blocks == parked spans` is the FULL-tier signature. The retrievable
+  number is `cached_idle` (+ `referenced_hashed`, pinned mid-restore but still
+  parked), and `free_uncached` is what is genuinely empty.
+
+### The free-order witness: a hypothesis, made falsifiable
+
+`kv_cache_coordinator.py:413` frees the GPU path's blocks with `reversed(...)`, and
+`FreeKVCacheBlockQueue`'s own docstring (`kv_cache_utils.py:257-262`) says the tail
+of a chain must sit at the FRONT of the queue and that the reversing is done
+OUTSIDE that class. `v1/simple_kv_offload/` contains **zero** `reversed()` calls,
+and its four `cpu_block_pool.free_blocks(...)` sites (`manager.py:1113`, `:1121`,
+`:1272`, `:1297`) pass chain order. `free_blocks` appends hashed blocks in the order
+given and `get_new_blocks` pops the front - so chain order in would mean the parked
+ROOT is queued before its own tail, and since a missing root makes every later block
+unhit-able, the whole tail would be worthless. `op=order` MEASURES it: a
+park-sequence number per CPU block id (one int array the size of the pool), then per
+`free_blocks()` call the up/down tally of consecutive pairs, published as
+`CONFIRMED`, `REFUTED`, or `INCONCLUSIVE` (blocks parked before arming carry no
+sequence, so arm first). A confirming trace is `root_first > root_last` with
+`asc_pairs` ~ the chain length per group and `desc_pairs` ~ the number of group
+joins. What it does NOT claim is in the payload too: it measures the ORDER blocks
+enter the free queue, not whether allocation pressure then pops that root before a
+restore needs it.
+
+### Cost, bounds, and what it never touches
+
+Measured on this host: 0.07 us disarmed (one branch), 3.4 us median / 4.8 us p99
+armed for a hit, 8.5 us including the coordinator observation, and 0.75 ms per pool
+walk - memoised to one per second and paid only on a zero-hit lookup. The
+attribution rides the ledger's ring (`cap` 16..4096, default 256), holds NO engine
+block reference (proven with weak references: holding one is the refcount bug class
+PR #56810 addresses), and `op=requests` REFUSES over `MAX_REQUESTS_BYTES` (200 KB,
+about 100 attributed records at ~1.9 KB each) rather than silently shortening the
+list of requests that missed.
 
 ## Guard mode: develop against a live engine without an outage (`guard_mode.py`)
 
@@ -1573,7 +1715,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-846 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+1001 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1610,6 +1752,32 @@ parked-KV index reading is pinned in `tests/test_snapshot.py`: the live 664-free
 4372-entries pair reported side by side, per-group counts decoded from the packed key,
 the scan and group caps honoured, a `len()` that raises named as that rather than as
 a missing handle, and three separate ways to get a `reason` instead of a number.
+
+Per-request miss attribution (`tests/test_miss_attribution.py`, 45 of them) is
+pinned on the numbers and on the honesty of the gaps: the query length, the cap the
+fork puts on it and the residue, each carrying the unit it claims; the derived
+first-miss position and the walk property it is derived from; every verdict in the
+enum reachable or the file fails; a clamp group named ONLY when the probe's minimum
+actually binds the served length (and never the parked-nothing scratch ring);
+`unknown` emitted when the CPU pool cannot be measured, instead of a confident
+`root_missing`; that nothing recorded keeps an engine block alive (weak references,
+because holding one is the PR #56810 bug class); the ledger bounded under 5,000
+lookups; a `requests` read REFUSING over its byte budget instead of silently
+returning a shorter list of "the requests that missed"; the measured retention split
+into joint and aggregate from UNEQUAL per-group spans (a fixture where the groups tie
+cannot tell a minimum from a maximum); `free != empty`, including the pinned-but-
+parked spans; the free-order witness both CONFIRMING and REFUTING, and reporting
+`INCONCLUSIVE` when it has seen nothing; the coordinator and pool wraps being
+instance-level and restoring the stored originals; a ratio of scheduler steps against
+blocks being refused outright; the file mirror env-gated and stopping at its cap; and
+that a GENERATOR free list (`manager.py:1297`) reaches the engine's own
+`free_blocks` INTACT - observing it first would leave the engine freeing nothing,
+which is how a read-only witness would have become a leak; and ten source mutations
+run against `_decide` and the retention arithmetic
+(`offered > 0` -> `>=`, a residue sign flip, an alignment-gate sign flip,
+`first_miss_span` off by one, joint `min` -> `max`, dropping the referenced spans
+from the parked total, the deep-probe budget ignored, and the generator guard
+        removed) each one shown to break a test.
 
 The backport and the kill switch (`tests/test_backport.py`, 67 of them) drive the
 fork's own

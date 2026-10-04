@@ -32,7 +32,8 @@ from kvtier_dev_plugin import (  # noqa: E402
 ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             config.ENV_ALLOW, config.ENV_DIAG_DIR, config.ENV_DIAG_EPOCH,
             config.ENV_DIAG_INTERVAL, config.ENV_DIAG_MIN_INTERVAL,
-            config.ENV_DIAG_RANK, config.ENV_BOOT_INERT)
+            config.ENV_DIAG_RANK, config.ENV_BOOT_INERT,
+            config.ENV_MISS_LOG)
 
 
 @pytest.fixture(autouse=True)

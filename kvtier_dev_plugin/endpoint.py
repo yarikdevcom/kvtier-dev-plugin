@@ -356,9 +356,19 @@ ARG_SPECS: dict[str, dict] = {
                                "values": ("status", "arm", "disarm")}},
     config.ROUTE_LOOKUPS: {"op": {"kind": "enum", "values": ("read", "arm",
                                                              "disarm", "clear",
-                                                             "status", "verdict")},
+                                                             "status", "verdict",
+                                                             "requests", "depth",
+                                                             "order", "rates")},
                            "cap": {"kind": "int", "min": 16, "max": 4096},
-                           "limit": {"kind": "int", "min": 1, "max": 256}},
+                           "limit": {"kind": "int", "min": 1, "max": 256},
+                           # capability 9: filter `requests` by one verdict string.
+                           "verdict": {"kind": "str",
+                                       "max_chars": MAX_ARG_STRING_CHARS},
+                           # opt-in per-group deep probes (one extra read-only
+                           # lookup per `sample_every` lookups, hard-capped).
+                           "deep": {"kind": "bool"},
+                           "sample_every": {"kind": "int", "min": 1,
+                                            "max": 100000}},
 }
 
 

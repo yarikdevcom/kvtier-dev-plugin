@@ -105,6 +105,12 @@ ENV_DIAG_MIN_INTERVAL = "VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS"
 # rather than written, because the reader classifies a file whose `rank` does not
 # match its file name as mislabeled.
 ENV_DIAG_RANK = "VLLM_E2_TIER_DIAG_RANK"
+# The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
+# line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
+# env-only on purpose: an HTTP argument naming a path the engine appends to would
+# be a write surface this plugin does not have anywhere else. See
+# miss_attribution.py (bounded by MAX_MIRROR_BYTES, which it stops at, counted).
+ENV_MISS_LOG = "VLLM_E2_TIER_MISS_LOG"
 
 logger = logging.getLogger("kvtier_dev_plugin.config")
 

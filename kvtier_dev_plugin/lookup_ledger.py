@@ -79,6 +79,7 @@ engine. Disarmed, `record_from_call()` is one dict lookup and a return.
 
 from __future__ import annotations
 
+import json
 import time
 
 from . import snapshot
@@ -288,12 +289,17 @@ def _write(record: dict) -> dict | None:
 # --- the hot path ------------------------------------------------------------
 
 def record_lookup(req_id, local, hit_returned, load_kv_async=None,
-                  block_size=None, hash_block_size=None) -> None:
+                  block_size=None, hash_block_size=None, attribution=None) -> None:
     """One offer: what came in, what went back. Never raises; disarmed: 1 branch.
 
     `hit_returned` is None when the connector gave no verdict at all (the fork's
     `(None, False)`, which makes the scheduler SKIP the request - no adopt ever
     follows), and 0 when it simply found no host copy.
+
+    `attribution` is the `miss_attribution.attribute()` dict for this same call
+    (capability 9). It rides on THIS record rather than a second ledger because
+    the question it answers - "why did THIS request miss" - is per request id, and
+    this ring is already keyed by request id.
     """
     if not _state["armed"]:
         return
@@ -314,6 +320,7 @@ def record_lookup(req_id, local, hit_returned, load_kv_async=None,
             if (aligned is not None and block) else None,
             "block_size": block,
             "hash_block_size": _int_or_none(hash_block_size),
+            "attribution": attribution if isinstance(attribution, dict) else None,
             "mono_ns": time.monotonic_ns(),
         })
         if record is None:
@@ -409,7 +416,9 @@ def record_from_call(method, args, result, manager=None) -> None:
                 else None
             record_lookup(_req_id(request), local, hit, async_flag, block_size,
                           getattr(manager, "hash_block_size", None) if manager
-                          else None)
+                          else None,
+                          attribution=_attribute_safely(request, local, result,
+                                                        manager))
         elif method == METHOD_ADOPT:
             request = arguments[0] if len(arguments) > 0 else None
             adopted = arguments[2] if len(arguments) > 2 else None
@@ -418,6 +427,22 @@ def record_from_call(method, args, result, manager=None) -> None:
         _state["record_errors"] += 1
         _state["last_error"] = f"{type(exc).__name__}"[:120]
         snapshot._error(exc, "lookup ledger hook")
+
+
+def _attribute_safely(request, local, result, manager):
+    """`miss_attribution.observe_connector()`, contained twice over.
+
+    The attribution is an ADDITION to a record that is written anyway; nothing it
+    can do is worth losing the ledger's own row, so the whole call is wrapped and
+    a failure lands in the ledger's error counter with the record still written.
+    """
+    try:
+        from . import miss_attribution  # noqa: PLC0415 - cycle: it reads our ring
+        return miss_attribution.observe_connector(request, local, result, manager)
+    except Exception as exc:  # noqa: BLE001 - the ledger outlives the attribution
+        _state["record_errors"] += 1
+        snapshot._error(exc, "lookup ledger attribution hook")
+        return None
 
 
 # --- reading -----------------------------------------------------------------
@@ -465,6 +490,64 @@ def read(limit=None) -> dict:
             "entries": [_preview(record) for record in window],
             "truncated": len(live) > len(window),
             "dropped": int(_state["dropped"])}
+
+
+# --- per-request miss attribution (capability 9) -----------------------------
+
+MAX_REQUESTS_BYTES = 200_000        # the whole payload's budget, refused not cut
+MAX_ATTRIBUTED_LIMIT = 128          # records per `requests` read, at most
+
+
+def _fit_count(entries: list, budget: int, overhead: int = 512) -> int:
+    """How many of `entries` fit in `budget`, from the largest one's size."""
+    if not entries:
+        return 0
+    largest = max(len(json.dumps(entry, separators=(",", ":"), default=str))
+                  for entry in entries)
+    return max(0, (budget - overhead) // max(1, largest))
+
+
+def requests(limit=None, verdict: str | None = None) -> dict:
+    """The attributed lookup records, oldest first, with the verdicts attached.
+
+    Reads the SAME ring as `read()` - one ledger, one join, one bound - and adds
+    nothing to it. Two bounds protect the response: `MAX_ATTRIBUTED_LIMIT` records
+    and `MAX_REQUESTS_BYTES` bytes. When the caller's `limit` cannot fit, this
+    REFUSES with the largest limit that would, because a silently shortened list
+    of "the requests that missed" is how a diagnostic starts lying.
+    """
+    wanted = DEFAULT_LIMIT if limit is None else limit
+    if isinstance(wanted, bool) or not isinstance(wanted, int) or wanted <= 0:
+        wanted = DEFAULT_LIMIT
+    wanted = min(wanted, MAX_ATTRIBUTED_LIMIT)
+    live = [record for record in _live_records() if record["kind"] == KIND_LOOKUP]
+    if isinstance(verdict, str) and verdict:
+        live = [record for record in live
+                if str((record.get("attribution") or {}).get("verdict",
+                                                              "")) == verdict]
+    window = live[-wanted:]
+    preview = [_preview(record) for record in window]
+    fit = _fit_count(preview, MAX_REQUESTS_BYTES)
+    _state["reads"] += 1
+    if preview and fit < len(preview):
+        return {"armed": bool(_state["armed"]), "refused": (
+            f"{len(preview)} attributed records do not fit the "
+            f"{MAX_REQUESTS_BYTES}-byte budget; the largest limit that does is "
+            f"{fit}"), "limit_requested": wanted, "would_fit": fit,
+            "entries": [], "count": 0, "live": int(_state["live"]),
+            "dropped": int(_state["dropped"])}
+    return {"armed": bool(_state["armed"]), "count": len(preview),
+            "limit": wanted, "live": int(_state["live"]),
+            "entries": preview,
+            "truncated": len(live) > len(preview),
+            "dropped": int(_state["dropped"]),
+            "estimated_bytes": sum(len(json.dumps(entry, separators=(",", ":"),
+                                                  default=str))
+                                   for entry in preview),
+            "budget_bytes": MAX_REQUESTS_BYTES,
+            "verdict_filter": verdict if isinstance(verdict, str) else None,
+            "units": "see snapshot.miss_attribution.units: every *_tokens field "
+                     "is tokens, *_spans is spans, *_hash is hash blocks"}
 
 
 # --- the verdict -------------------------------------------------------------
@@ -675,14 +758,28 @@ def section(preview: int = DEFAULT_PREVIEW) -> dict:
     out["pending_requests"] = sorted(_pending)[: 8]
     out["pending_requests_truncated"] = len(_pending) > 8
     out["not_covered"] = list(NOT_COVERED)
+    out["attributed_records"] = sum(
+        1 for record in _live_records()
+        if isinstance(record.get("attribution"), dict))
+    out["miss_attribution"] = _attribution_section()
     out["warning"] = ("read-only: the ledger changes nothing about what the "
                       "scheduler adopts, and it records nothing until armed")
     return out
 
 
+def _attribution_section() -> dict:
+    """The attribution block, contained: a broken observer cannot break a snapshot."""
+    try:
+        return _attribution().section()
+    except Exception as exc:  # noqa: BLE001 - the snapshot must answer regardless
+        snapshot._error(exc, "lookup ledger attribution section")
+        return {"available": False, "reason": f"{type(exc).__name__}"[:120]}
+
+
 # --- the verb ----------------------------------------------------------------
 
-LOOKUPS_OPS = ("read", "arm", "disarm", "clear", "status", "verdict")
+LOOKUPS_OPS = ("read", "arm", "disarm", "clear", "status", "verdict",
+               "requests", "depth", "order", "rates")
 MUTATING_LOOKUPS_OPS = ("arm", "disarm", "clear")
 
 
@@ -715,23 +812,39 @@ def lookups_for_engine(engine, args=None) -> dict:
                     (report["reason"] or "") + " | the ring is armed but NOTHING "
                     "is wrapped yet, so nothing will be recorded: "
                     + _install_refusal_summary(report["install"]))
+            report["miss_attribution"] = _arm_attribution(engine, arguments)
             payload = {"op": "arm", **report}
         elif op == "disarm":
             report = disarm()
             report["uninstall"] = _uninstall_if_alone(engine)
             _state["uninstall"] = report["uninstall"]
+            report["miss_attribution"] = _disarm_attribution(engine)
             payload = {"op": "disarm", **report}
         elif op == "clear":
             payload = {"op": "clear", **clear()}
         elif op == "status":
             payload = {"op": "status", "counters": counters(),
-                       "wrapper_customers": guard_mode.wrapper_customers()}
+                       "wrapper_customers": guard_mode.wrapper_customers(),
+                       "miss_attribution": _attribution().counters()}
         elif op == "verdict":
             payload = {"op": "verdict", **verdict(arguments.get("limit"))}
+        elif op == "requests":
+            payload = {"op": "requests",
+                       **requests(arguments.get("limit"),
+                                  arguments.get("verdict"))}
+        elif op == "depth":
+            payload = {"op": "depth", "retained_depth": _retained_depth(engine)}
+        elif op == "order":
+            payload = {"op": "order", "free_order": _order_report(
+                arguments.get("limit"))}
+        elif op == "rates":
+            payload = {"op": "rates", "rates": _rates()}
         else:
             payload = {"op": "read", **read(arguments.get("limit"))}
+
         unknown = sorted(key for key in arguments
-                         if key not in ("op", "cap", "limit"))
+                         if key not in ("op", "cap", "limit", "verdict", "deep",
+                                        "sample_every"))
         payload["version"] = PROTOCOL_VERSION
         payload["epoch"] = str(snapshot.epoch())
         payload["ts"] = round(time.time(), 6)
@@ -749,6 +862,63 @@ def lookups_for_engine(engine, args=None) -> dict:
                 "epoch": str(snapshot.epoch()),
                 "error": f"{type(exc).__name__}: {exc}"[:300],
                 "counters": snapshot.error_counters()}
+
+
+def _attribution():
+    """`miss_attribution`, imported at call time (it reads this module's ring)."""
+    from . import miss_attribution  # noqa: PLC0415 - cycle, see _attribute_safely
+    return miss_attribution
+
+
+def _arm_attribution(engine, arguments) -> dict:
+    """Arm capability 9 on the same verb, because it is the same question.
+
+    `deep`/`sample_every` are optional arm-time arguments. The FILE MIRROR is
+    deliberately env-only (`VLLM_E2_TIER_MISS_LOG`): an HTTP argument that names a
+    path the engine then appends to is a write surface this plugin does not have
+    anywhere else, and no diagnostic is worth becoming one. A failure here is
+    reported in the payload and cannot fail the ledger's own arming.
+    """
+    try:
+        return _attribution().arm(cap=arguments.get("cap"),
+                                  deep=arguments.get("deep"),
+                                  sample_every=arguments.get("sample_every"),
+                                  engine=engine)
+    except Exception as exc:  # noqa: BLE001 - the ledger stays armed regardless
+        snapshot._error(exc, "lookups arm attribution")
+        return {"armed": False, "error": f"{type(exc).__name__}"[:120]}
+
+
+def _disarm_attribution(engine) -> dict:
+    try:
+        return _attribution().disarm(engine)
+    except Exception as exc:  # noqa: BLE001, S110 - same containment as the arm
+        snapshot._error(exc, "lookups disarm attribution")
+        return {"armed": True, "error": f"{type(exc).__name__}"[:120]}
+
+
+def _retained_depth(engine=None) -> dict:
+    try:
+        return _attribution().retained_depth(engine=engine)
+    except Exception as exc:  # noqa: BLE001 - a measurement is never a 500
+        snapshot._error(exc, "lookups depth")
+        return {"available": False, "reason": f"{type(exc).__name__}"[:120]}
+
+
+def _order_report(limit) -> dict:
+    try:
+        return _attribution().order_report(limit)
+    except Exception as exc:  # noqa: BLE001
+        snapshot._error(exc, "lookups order")
+        return {"installed": False, "reason": f"{type(exc).__name__}"[:120]}
+
+
+def _rates() -> dict:
+    try:
+        return _attribution().rates()
+    except Exception as exc:  # noqa: BLE001
+        snapshot._error(exc, "lookups rates")
+        return {"allowed": {}, "refused": [f"{type(exc).__name__}"[:120]]}
 
 
 def _install_refusal_summary(install) -> str:

@@ -819,6 +819,28 @@ def gpu_census_section(engine) -> dict:
         return gpu_census.empty_section(f"{type(exc).__name__}: {exc}")
 
 
+def retained_depth_section(engine) -> dict:
+    """How much prefix the host-RAM tier can serve RIGHT NOW, MEASURED.
+
+    Three readings of the live numbers differed by ~785x because each DERIVED
+    capacity from a different thing (index keys, pool size x block size, a GiB
+    division). This section measures it off the live CPU pool with
+    `gpu_census._walk` and the live `group_block_sizes`, and it is published even
+    when the miss ledger is disarmed: "how much can the tier retain" is a question
+    about the pool, not about the observer.
+
+    Contained like every other section - a refusal with a reason, never a zero and
+    never an exception into the engine. Function-level import for the same reason
+    as `gpu_census_section`.
+    """
+    from . import miss_attribution  # noqa: PLC0415 - cycle, see lookup_ledger
+    try:
+        return miss_attribution.retained_depth(engine=engine)
+    except Exception as exc:  # noqa: BLE001 - the shape must survive regardless
+        _error(exc, "retained depth section")
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def build_view(engine) -> dict:
     """One pass over the engine's scheduler-side state. Reads only."""
     scheduler = getattr(engine, "scheduler", None)
@@ -833,6 +855,9 @@ def build_view(engine) -> dict:
     # scheduler's own `kv_cache_manager.block_pool`) so it survives a boot whose
     # tier connector is absent, and its group labels come from `kv_cache_config`.
     tier["gpu_pool_census"] = gpu_census_section(engine)
+    # The RAM tier's retained depth, measured from the CPU pool the same way, and
+    # readable unarmed: this is the number that was three different numbers.
+    tier["cpu_retained_depth"] = retained_depth_section(engine)
     return {
         "version": PROTOCOL_VERSION,
         "epoch": epoch(),

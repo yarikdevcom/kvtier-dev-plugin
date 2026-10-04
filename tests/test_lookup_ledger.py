@@ -789,5 +789,13 @@ def test_the_route_and_the_argument_spec_exist():
     assert config.METHOD_LOOKUPS in config.METHODS
     spec = __import__("kvtier_dev_plugin.endpoint",
                       fromlist=["ARG_SPECS"]).ARG_SPECS[config.ROUTE_LOOKUPS]
-    assert set(spec) == {"op", "cap", "limit"}
+    assert set(spec) == {"op", "cap", "limit", "verdict", "deep", "sample_every"}
     assert "verdict" in spec["op"]["values"]
+    # Capability 9 rides this verb rather than a new route: `requests` is the
+    # per-request attribution, `depth` the measured retention, `order` the
+    # free-order witness, `rates` the unit-checked ratios. `mirror` is NOT here on
+    # purpose: the file mirror is env-only, because an HTTP argument naming a path
+    # the engine appends to is a write surface this plugin does not have elsewhere.
+    for op in ("requests", "depth", "order", "rates"):
+        assert op in spec["op"]["values"], op
+    assert "mirror" not in spec, "the file mirror stays env-only"
