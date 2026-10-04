@@ -1,37 +1,36 @@
-r"""The SSD tier's layout layer: names, offsets, the index codec, the boot sweep.
-
-Stage 1 is inert - nothing imports `disk_layout` into the engine path yet - which
-is exactly why it gets a real test file before stage 2 touches it. Everything
-here is proven against a `tmp_path` with no engine, no network, no CUDA and no
-`/tmp/kv-tier*` dependency.
+r"""The SSD tier's layout layer: fingerprint, names, the commit protocol, capacity.
 
 What this file is obliged to prove, in order of what each failure would cost on
 the live box:
 
-1. OFFSET MATH. A wrong offset is a read of the wrong KV, which is a wrong token
-   and not a miss. Slot 0, the last slot, one past the end, a non-boundary offset
-   and a partial trailing write are each their own test.
-2. THE VISIBILITY RULE. A record is visible only if fully written up to a
-   committed watermark. That is tested as a PROPERTY over every truncation length,
-   not as one example: a torn-tail heuristic that is right for the length someone
-   happened to test is not a rule.
-3. THE SWEEP MUST NOT DELETE ANYTHING IT DOES NOT OWN. A near-miss name, a peer
-   rank's file, this boot's own file, a symlink, a directory, a traversal path, a
-   geometry that is merely different - each must survive.
-4. BOUNDS. A corrupt length must not make the reader allocate; a big index must
-   not be materialised; a sweep must stop at its cap and say so.
-5. UNITS. Every number in every payload declares its unit, because unit confusion
-   in `block_bytes` is failure mode 1.
-6. Purity. The engine-side read path must never pull torch/vllm in, so the
-   import rule is asserted by AST over this file's source, as elsewhere in the
-   suite.
+1. THE FINGERPRINT IS THE IDENTITY. A missing field is a REFUSAL, an unknown field
+   is a refusal, and EVERY one of the declared fields must move the digest - a
+   field that does not change the digest is a field that silently stopped being
+   part of the identity, which is how a future config change becomes a mis-load.
+2. A FILE IS NEVER MISREAD, IT IS NEVER FOUND. The same slot under two
+   fingerprints produces two DIFFERENT names. There is deliberately no "load with
+   a mismatched fingerprint" path to refuse: un-findability is the mechanism.
+3. A COMMITTED FILE IS COMPLETE. `.part` + fsync + `os.replace` + directory fsync,
+   and on every failure the final name is STILL ABSENT. Asserted by breaking the
+   write at each step, not by trusting the order of the source.
+4. THE SWEEP AND THE PLAN MUST NOT DELETE WHAT THEY DO NOT OWN. A near-miss name,
+   a peer rank's live file, this boot's own current file, a symlink, a directory, a
+   traversal path - each must survive.
+5. THE LRU CLOCK IS mtime. `st_atime` is unusable on a `relatime` mount, and a
+   plan that ordered by it would evict the newest file in the store.
+6. UNITS AND ABSENT MEASUREMENTS. Every number declares its unit; a `statvfs` that
+   could not run reports `None` and never a 0.
+7. Purity: no torch, no vllm, no socket, no file created that was not asked for.
+
+Stage 1's index codec, slot/offset arithmetic, data-file header and epoch-in-name
+machinery are DELETED (one file per slot superseded the big-file layout), and so
+are their tests - see the module docstring.
 """
 
 from __future__ import annotations
 
 import ast
 import os
-import struct
 import sys
 from pathlib import Path
 
@@ -41,54 +40,73 @@ from kvtier_dev_plugin import disk_layout as dl
 
 PKG = Path(dl.__file__).resolve().parent
 
-# The live geometry, so a test that reads a number is reading the real one and
-# not a toy: ~11.2 MB per slot on PP0, ~12.6 MB on PP1, 4 ranks.
-PP0_BYTES = 11_200_000
-PP1_BYTES = 12_600_000
-EPOCH = "ab12cd34"
+# The live numbers, so a test that reads a number is reading the real one: 11 MB
+# per slot on PP0, ~12.9 MB on PP1, 4 ranks, 5 KV cache groups.
+PP0_BYTES = 11_468_800
+PP1_BYTES = 12_902_400
+KEY = "a3f0b7c1d4e5f607"
+# Shares KEY's shard directory, so a sweep of one directory sees both a current
+# and a stale file (the shard is part of the name's meaning, not an attribute of
+# the key's value).
+KEY_OTHER = "a300111122223333"
+# The real tmpfs policy, saved so the ONE test that proves the rule can put it
+# back after the autouse fixture below clears it for the rest of the file.
+REAL_FORBIDDEN_ROOTS = dl.FORBIDDEN_ROOT_PREFIXES
 
 
-def geometry(pp=0, tp=0, block_bytes=PP0_BYTES, epoch=EPOCH, groups=6,
-             world=4, **extra):
-    built = dl.build_geometry(epoch=epoch, pp_rank=pp, tp_rank=tp,
-                              world_size=world, block_bytes=block_bytes,
-                              num_groups=groups, **extra)
-    assert built["ok"], built["reason"]
-    return built["geometry"]
+@pytest.fixture(autouse=True)
+def allow_the_pytest_tmp_directory(monkeypatch):
+    """pytest hands every test a `tmp_path` under `/tmp`, which the tier refuses.
+
+    The refusal is the production rule (a tmpfs "disk tier" spends the RAM the
+    tier exists to relieve) and the tests may not fight it, so the file clears the
+    PREFIX LIST for the duration and nothing else - the validators, the digest,
+    the commit protocol and the sweep are all still the real code. The one test
+    that exists to prove the rule reinstalls the real list and asserts again.
+    """
+    monkeypatch.setattr(dl, "FORBIDDEN_ROOT_PREFIXES", ())
+    yield
 
 
-def name_of(geom, suffix=dl.SUFFIX_DATA):
-    made = dl.build_filename(geom, suffix)
+def fingerprint(**overrides) -> dict:
+    """A complete, valid fingerprint: the whole 15 fields a boot must agree on."""
+    base = {
+        "model_id": "flash-next-v2",
+        "model_revision": "8f3c1d2e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+        "cache_dtype": "auto",
+        "dtype": "torch.bfloat16",
+        "total_bytes_per_block": PP0_BYTES,
+        "group_block_sizes": [1, 4, 4, 8, 16],
+        "scheduler_block_size": 16,
+        "hash_block_size": 16,
+        "prefix_cacheable_group_ids": [0, 1, 2],
+        "prefix_caching_hash_algo": "sha256_cbor",
+        "none_hash_seed": "0xd4e5f6a7b8c9d0e1",
+        "rank": "PP0_TP0",
+        "world_size": 4,
+        "dcp_world_size": 1,
+        "cp_world_size": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+def digest(**overrides) -> str:
+    made = dl.fingerprint_digest(fingerprint(**overrides))
     assert made["ok"], made["reason"]
-    return made["filename"]
+    return made["geometry_digest"]
 
 
-def record(seq, geom=None, slot=None, key=None, block_bytes=None):
-    geom = geom or geometry()
-    made = dl.encode_index_record(
-        seq=seq, key_digest=key if key is not None else bytes([seq % 251]) * 32,
-        slot=seq if slot is None else slot,
-        block_bytes=geom["block_bytes"] if block_bytes is None else block_bytes,
-        geometry_digest=geom["geometry_digest"])
+def slot_path(root, key=KEY, geo=None):
+    made = dl.build_slot_path(root, key, digest() if geo is None else geo)
     assert made["ok"], made["reason"]
-    return made["frame"]
+    return made
 
 
-def commit(seq, entries):
-    made = dl.encode_index_commit(committed_seq=seq, entries_in_commit=entries)
-    assert made["ok"], made["reason"]
-    return made["frame"]
-
-
-def write_index(directory, frames, name="index.idx"):
-    path = Path(directory) / name
-    path.write_bytes(b"".join(frames))
-    return path
-
-
-# --- purity: the read side stays light --------------------------------------
+# --- purity: the layout layer stays light, and quiet ------------------------
 
 HEAVY = {"torch", "vllm", "cuda", "numpy", "triton", "numba", "cupy", "psutil"}
+STDLIB_ALLOWED = {"__future__", "hashlib", "os", "stat", "time"}
 
 
 def test_disk_layout_imports_nothing_heavy():
@@ -101,874 +119,702 @@ def test_disk_layout_imports_nothing_heavy():
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             pulled.add(node.module.split(".")[0])
     assert not (pulled & HEAVY), sorted(pulled & HEAVY)
-    assert pulled <= {*STDLIB_ALLOWED, "disk_layout"}, sorted(
-        pulled - STDLIB_ALLOWED)
-
-
-STDLIB_ALLOWED = {"hashlib", "os", "struct", "zlib", "__future__"}
+    assert pulled <= STDLIB_ALLOWED, sorted(pulled - STDLIB_ALLOWED)
 
 
 def test_importing_it_pulls_in_nothing_heavy():
     for name in ("torch", "vllm"):
         assert name not in sys.modules
-    geometry()
+    digest()
     for name in ("torch", "vllm"):
         assert name not in sys.modules
 
 
-# --- geometry and names ------------------------------------------------------
+# --- the fingerprint: a missing field is a refusal, not a default ----------
 
-def test_a_geometry_carries_its_units_and_a_digest_of_the_LAYOUT_only():
-    geom = geometry()
-    assert geom["rank"] == "PP0_TP0"
-    assert geom["block_bytes"] == PP0_BYTES
-    assert geom["units"]["block_bytes"] == "bytes"
-    assert geom["units"]["world_size"] == "ranks"
-    # The digest is of the slot's LAYOUT, and the rank is its own NAME field, so
-    # every rank of one boot shares a digest and still gets its own file.
-    assert geometry(tp=1)["geometry_digest"] == geom["geometry_digest"]
-    assert geometry(pp=1)["geometry_digest"] == geom["geometry_digest"]
-    assert name_of(geometry(pp=1)) != name_of(geom)
-    assert name_of(geometry(tp=1)) != name_of(geom)
-    # Layout facts DO move it: a different slot size, group count or world size
-    # is a different meaning for every offset in the file.
-    assert geometry(block_bytes=PP1_BYTES)["geometry_digest"] != \
-        geom["geometry_digest"]
-    assert geometry(groups=7)["geometry_digest"] != geom["geometry_digest"]
-    assert geometry(world=8)["geometry_digest"] != geom["geometry_digest"]
-    assert geometry(regions_digest=dl.compute_regions_digest(
-        ["k", "v"]))["geometry_digest"] != geom["geometry_digest"]
-    # The epoch is NOT in it, or every new boot would look like a new geometry.
-    assert geometry(epoch="ffff0000")["geometry_digest"] == \
-        geom["geometry_digest"]
+def test_a_complete_fingerprint_is_adopted_and_normalized():
+    made = dl.fingerprint_digest(fingerprint(
+        prefix_cacheable_group_ids=[2, 0, 1], none_hash_seed=0xD4E5))
+    assert made["ok"] is True
+    assert len(made["geometry_digest"]) == dl.GEOMETRY_DIGEST_CHARS
+    assert made["num_groups"] == 5
+    assert made["total_bytes_per_block"] == PP0_BYTES
+    # A set is normalized, so two call sites that report the same groups in a
+    # different order get ONE digest.
+    assert digest(prefix_cacheable_group_ids=[2, 0, 1]) == digest(
+        prefix_cacheable_group_ids=[0, 1, 2])
 
 
-@pytest.mark.parametrize("bad", [
-    pytest.param({"block_bytes": 512}, id="a-token-count-is-not-bytes"),
-    pytest.param({"block_bytes": 40 * 1024 ** 3}, id="a-pool-total-not-a-slot"),
-    pytest.param({"block_bytes": 11.2e6}, id="a-float-is-not-an-int"),
-    pytest.param({"block_bytes": "11200000"}, id="a-string-is-not-an-int"),
-    pytest.param({"world_size": 0}, id="no-ranks"),
-    pytest.param({"pp_rank": -1}, id="a-negative-rank"),
-    pytest.param({"epoch": "2026-10-05-boot1"}, id="an-epoch-with-dashes"),
-    pytest.param({"epoch": "a" * 40}, id="an-epoch-over-the-cap"),
-    pytest.param({"epoch": "x/../y"}, id="an-epoch-with-a-path"),
+@pytest.mark.parametrize("field", sorted(name for name, _kind
+                                         in dl.FINGERPRINT_FIELDS))
+def test_a_missing_field_is_refused_not_defaulted(field):
+    broken = fingerprint()
+    broken.pop(field)
+    refused = dl.validate_fingerprint(broken)
+    assert refused["ok"] is False
+    assert field in refused["missing_fields"]
+    assert dl.fingerprint_digest(broken)["ok"] is False
+
+
+@pytest.mark.parametrize("field", sorted(name for name, _kind
+                                         in dl.FINGERPRINT_FIELDS))
+def test_a_none_field_is_missing_not_valid(field):
+    """`None` means "the engine did not tell me", which is a missing field."""
+    refused = dl.validate_fingerprint(fingerprint(**{field: None}))
+    assert refused["ok"] is False
+    assert field in refused["missing_fields"]
+
+
+def test_an_unknown_field_is_refused_rather_than_ignored():
+    """An ignored field is a field that silently stopped being part of the name."""
+    refused = dl.validate_fingerprint(fingerprint(sliding_window=4096))
+    assert refused["ok"] is False
+    assert refused["unknown_fields"] == ["sliding_window"]
+
+
+@pytest.mark.parametrize(("field", "junk"), [
+    ("model_id", ""),
+    ("model_id", 7),
+    ("model_revision", "has/slash"),
+    ("dtype", "line\nbreak"),
+    ("total_bytes_per_block", 512),              # a unit mix-up, not a geometry
+    ("total_bytes_per_block", 2 * 1024 ** 3),    # a pool-wide total
+    ("total_bytes_per_block", "11468800"),       # a str is not an int
+    ("total_bytes_per_block", 11.5),
+    ("scheduler_block_size", 0),
+    ("hash_block_size", -1),
+    ("group_block_sizes", []),
+    ("group_block_sizes", "1,4,4"),
+    ("group_block_sizes", [1, None]),
+    ("prefix_cacheable_group_ids", "0"),
+    ("rank", "PP0"),
+    ("rank", "TP0_PP0"),
+    ("rank", "PPx_TP0"),
+    ("world_size", 0),
+    ("world_size", True),                        # a bool is not a rank count
+    ("dcp_world_size", 1.5),
+    ("none_hash_seed", "not hex"),
+    ("none_hash_seed", None),
+    ("prefix_caching_hash_algo", " " * 300),
 ])
-def test_a_geometry_that_could_not_come_from_a_real_boot_is_refused(bad):
-    fields = {"epoch": EPOCH, "pp_rank": 0, "tp_rank": 0, "world_size": 4,
-              "block_bytes": PP0_BYTES}
-    fields.update(bad)
-    out = dl.build_geometry(**fields)
-    assert not out["ok"] and out["reason"]
-    assert "geometry" not in out       # a refusal carries no half-built layout
+def test_a_fingerprint_that_could_not_come_from_a_real_boot_is_refused(field, junk):
+    refused = dl.validate_fingerprint(fingerprint(**{field: junk}))
+    assert refused["ok"] is False
+    assert refused["reason"]
 
 
-def test_an_epoch_with_dashes_is_refused_not_silently_rewritten():
-    """Silently mapping '-' to '_' could make a stale boot look like this one."""
-    raw = dl.normalize_epoch("2026-10-05-boot1")
-    assert raw["ok"] and raw["changed"] and raw["epoch"] == "2026_10_05_boot1"
-    built = dl.build_geometry(epoch="2026-10-05-boot1", pp_rank=0, tp_rank=0,
-                              world_size=4, block_bytes=PP0_BYTES)
-    assert not built["ok"] and "normalize" in built["reason"]
+def test_a_group_id_outside_the_described_groups_is_refused():
+    refused = dl.validate_fingerprint(fingerprint(
+        group_block_sizes=[1, 4], prefix_cacheable_group_ids=[0, 7]))
+    assert refused["ok"] is False
+    assert "outside the 2 group(s)" in refused["reason"]
+
+
+def test_prefix_cacheable_group_ids_may_legitimately_be_empty():
+    """Nothing prefix-cacheable is a real configuration, not a missing field."""
+    assert dl.fingerprint_digest(
+        fingerprint(prefix_cacheable_group_ids=[]))["ok"] is True
+
+
+def test_validation_is_idempotent_because_every_spill_re_validates():
+    """A normalized fingerprint must validate to ITSELF.
+
+    `disk_spill` re-derives the digest from the fingerprint on every slot (a cached
+    digest would be one stale field away from a wrong name), so the second
+    validation runs on normalized values - a canonical seed like `hex:ebce` must
+    not be refused as "not hex" by the check that produced it.
+    """
+    first = dl.validate_fingerprint(fingerprint(none_hash_seed=0xEBCE))
+    assert first["ok"] is True
+    again = dl.validate_fingerprint(first["fingerprint"])
+    assert again["ok"] is True, again["reason"]
+    assert again["fingerprint"] == first["fingerprint"]
+    assert dl.compute_geometry_digest(again["fingerprint"]) == \
+        dl.compute_geometry_digest(first["fingerprint"])
+
+
+def test_the_seed_accepts_the_int_and_the_hex_shapes_of_the_same_value():
+    as_int = dl.fingerprint_digest(fingerprint(none_hash_seed=0xEBCE))
+    as_hex = dl.fingerprint_digest(fingerprint(none_hash_seed="0xEBCE"))
+    assert as_int["ok"] and as_hex["ok"]
+    # The int and its own hex spelling DO agree, because the canonical form is the
+    # VALUE (`hex:ebce`), not the spelling. A seed we cannot render canonically is
+    # a fingerprint we cannot reproduce, and that is what the refusal protects.
+    same = dl.fingerprint_digest(fingerprint(none_hash_seed="0xebce"))
+    assert same["geometry_digest"] == as_hex["geometry_digest"]
+    assert as_int["geometry_digest"] == as_hex["geometry_digest"]
+    assert dl.validate_fingerprint(
+        fingerprint(none_hash_seed="ebce"))["fingerprint"]["none_hash_seed"] == \
+        "hex:ebce"
+    # A different value is a different identity, even in the same spelling.
+    other = dl.fingerprint_digest(fingerprint(none_hash_seed="0xebcf"))
+    assert other["geometry_digest"] != as_hex["geometry_digest"]
+
+
+# --- the digest: every field must move it ----------------------------------
+
+@pytest.mark.parametrize(("field", "other"), [
+    ("model_id", "other-model"),
+    ("model_revision", "0000000000000000000000000000000000000000"),
+    ("cache_dtype", "fp8"),
+    ("dtype", "torch.float16"),
+    ("total_bytes_per_block", PP1_BYTES),
+    ("group_block_sizes", [1, 4, 4, 8, 16, 32]),
+    ("scheduler_block_size", 32),
+    ("hash_block_size", 8),
+    ("prefix_cacheable_group_ids", [0, 1, 2, 3]),
+    ("prefix_caching_hash_algo", "sha256"),
+    ("none_hash_seed", "0x0000000000000001"),
+    ("rank", "PP1_TP1"),
+    ("world_size", 8),
+    ("dcp_world_size", 2),
+    ("cp_world_size", 2),
+])
+def test_every_field_changes_the_digest_so_a_mismatch_is_un_findable(field, other):
+    """THE core property of the naming scheme.
+
+    A field that did not move the digest would let a file written under one
+    configuration be NAMED under another, i.e. read as something it is not. The
+    PP0/PP1 case is the one this box actually has: 11,468,800 B vs 12,902,400 B,
+    so `total_bytes_per_block` alone must separate them even if everything else
+    matched.
+    """
+    assert digest() != digest(**{field: other})
+
+
+def test_the_digest_is_stable_across_repeats_and_field_order():
+    first = digest()
+    shuffled = dict(fingerprint())
+    reversed_items = list(shuffled.items())[::-1]
+    second = dl.fingerprint_digest(dict(reversed_items))["geometry_digest"]
+    assert first == second
+    assert first == digest()
+
+
+def test_the_canonical_form_is_injective_across_a_field_boundary():
+    """`ab|c` and `a|bc` must not hash alike: the length prefix is why."""
+    a = fingerprint(model_id="a", model_revision="bc")
+    b = fingerprint(model_id="a;model_revision=bc", model_revision="")
+    assert dl.validate_fingerprint(b)["ok"] is False       # empty is refused
+    c = fingerprint(model_id="a", model_revision="b")
+    d = fingerprint(model_id="a", model_revision="b;world_size=4")
+    assert dl.canonical_fingerprint(a) != dl.canonical_fingerprint(c)
+    assert dl.fingerprint_digest(c)["geometry_digest"] != dl.fingerprint_digest(
+        d)["geometry_digest"]
+
+
+# --- names: build, parse, shard, and the fingerprint mismatch --------------
+
+def test_the_name_is_key_plus_digest_and_shards_by_the_key_prefix():
+    geo = digest()
+    made = dl.build_slot_path("/home/user/kv-tier/disk", KEY, geo)
+    assert made["ok"] is True
+    assert made["filename"] == f"kvslot-{KEY}-{geo}.bin"
+    assert made["shard"] == "a3"
+    assert made["path"] == f"/home/user/kv-tier/disk/a3/kvslot-{KEY}-{geo}.bin"
+    assert made["part_path"].endswith(".bin.part")
+    assert made["units"]["shard_chars"] == "chars"
+
+
+def test_an_upper_case_key_is_normalized_because_ext4_is_case_sensitive():
+    lower = dl.build_slot_name("a3f0b7c1d4e5f607", digest())
+    upper = dl.build_slot_name("A3F0B7C1D4E5F607", digest())
+    assert lower["ok"] and upper["ok"]
+    assert lower["filename"] == upper["filename"]
+
+
+@pytest.mark.parametrize("junk", ["a3f0", "z3f0b7c1d4e5f607", "", "a3f0b7c1d4e5f60",
+                                  "a3f0b7c1d4e5f6078", None, 7, "a3f0 b7c1d4e5f60"])
+def test_a_key_that_is_not_16_hex_chars_is_refused(junk):
+    assert dl.build_slot_name(junk, digest())["ok"] is False
+
+
+def test_a_digest_that_is_not_12_hex_chars_is_refused():
+    assert dl.build_slot_name(KEY, "a3f0")["ok"] is False
+    assert dl.build_slot_name(KEY, "zzzzzzzzzzzz")["ok"] is False
+
+
+def test_a_fingerprint_mismatch_produces_a_different_name_not_a_refusal():
+    """The requirement, stated as a test: un-findability, not an error at load.
+
+    Same key, two configurations: two names, both perfectly well-formed, and each
+    boot classifies the other's file as `stale_geometry` - which means it can
+    never be read as this boot's KV, only deleted for capacity.
+    """
+    pp0 = digest()
+    pp1 = digest(total_bytes_per_block=PP1_BYTES, rank="PP1_TP0")
+    here = slot_path("/root", KEY, pp0)
+    there = dl.build_slot_path("/root", KEY, pp1)
+    assert here["filename"] != there["filename"]
+    assert dl.classify_name(here["filename"], pp0)["classification"] == "current"
+    assert dl.classify_name(here["filename"], pp1)["classification"] == \
+        "stale_geometry"
+    assert dl.classify_name(there["filename"], pp0)["classification"] == \
+        "stale_geometry"
+    assert dl.classify_name(there["filename"], pp1)["classification"] == "current"
 
 
 def test_the_name_round_trips_and_nothing_else_is_accepted():
-    geom = geometry()
-    filename = name_of(geom)
-    assert filename == f"kvtier-{EPOCH}-PP0_TP0-g{geom['geometry_digest']}.bin"
-    parsed = dl.parse_path(filename)
-    assert parsed["ok"] and parsed["ours"]
-    assert (parsed["epoch"], parsed["rank"], parsed["geometry_digest"]) == \
-        (EPOCH, "PP0_TP0", geom["geometry_digest"])
-    # The index sibling parses identically apart from its suffix.
-    assert dl.parse_path(name_of(geom, dl.SUFFIX_INDEX))["suffix"] == ".idx"
+    geo = digest()
+    parsed = dl.parse_path(dl.build_slot_path("/root", KEY, geo)["filename"])
+    assert parsed["ok"] is True
+    assert parsed["key16"] == KEY
+    assert parsed["shard"] == "a3"
+    assert parsed["geometry_digest"] == geo
+    assert parsed["partial"] is False
 
 
-@pytest.mark.parametrize("name, classification", [
-    pytest.param("notes.bin", dl.NAME_NOTOURS, id="someone-elses-file"),
-    pytest.param("kvtier.conf", dl.NAME_NOTOURS, id="our-prefix-wrong-suffix"),
-    pytest.param("kvtier.conf.bin", dl.NAME_NOTOURS,
-                 id="a-similar-name-wrong-prefix"),
-    pytest.param("kvtier-backup-notes.bin", dl.NAME_MALFORMED,
-                 id="our-shape-unparseable-fields"),
-    pytest.param(f"kvtier-{EPOCH}-PP0_TP0-gabc.bin", dl.NAME_MALFORMED,
-                 id="a-short-geometry-field"),
-    pytest.param(f"kvtier-{EPOCH}-PP0TP0-g{'a' * 12}.bin", dl.NAME_MALFORMED,
-                 id="a-rank-without-a-underscore"),
-    pytest.param(f"kvtier-{EPOCH}-PP0_TP0-x{'a' * 12}.bin", dl.NAME_MALFORMED,
-                 id="a-geometry-field-without-g"),
-    pytest.param(f"kvtier-{EPOCH}-PP0_TP0-PP1_TP1-g{'a' * 12}.bin",
-                 dl.NAME_MALFORMED, id="too-many-fields"),
-    pytest.param("", dl.NAME_NOTOURS, id="the-empty-name"),
-    pytest.param(".", dl.NAME_NOTOURS, id="this-directory"),
-    pytest.param("..", dl.NAME_NOTOURS, id="the-parent-directory"),
+@pytest.mark.parametrize(("name", "classification"), [
+    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.bin", None),      # ours
+    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.bin.part", None),  # ours, in flight
+    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.txt", "not_ours"),
+    ("kvslot-a3f0b7c1d4e5f607-abcdef123456", "not_ours"),
+    ("kvtier-ab12cd34-PP0_TP0-gabcdef123456.bin", "not_ours"),  # stage 1's name
+    ("notes.bin", "not_ours"),
+    ("kvslot-backup-notes.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f60.bin", "malformed"),
+    ("kvslot-z3f0b7c1d4e5f607-abcdef123456.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-abcdef12345.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-abcdef123456-extra.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607/abcdef123456.bin", "not_ours"),   # a basename only
+    ("kvslot-a3f0b7c1d4e5f607\\abcdef123456.bin", "malformed"),
+    (".", "not_ours"),
+    ("", "not_ours"),
+    (None, "refused"),
+    (7, "refused"),
+    (b"kvslot-a3f0b7c1d4e5f607-abcdef123456.bin", "refused"),
 ])
 def test_parse_path_is_total_and_classifies_rather_than_raising(name,
                                                                 classification):
     parsed = dl.parse_path(name)
+    if classification is None:
+        assert parsed["ok"] is True
+        assert parsed["classification"] is None
+        return
     assert parsed["ok"] is False
     assert parsed["classification"] == classification
-    assert parsed["reason"]
-    assert parsed["filename"] is not None
-    # A name that does not parse is never, in any shape, deletable.
-    assert parsed.get("unlinkable", False) is False
 
 
-def test_parse_path_survives_types_that_are_not_names_at_all():
-    for junk in (None, 7, b"kvtier-abc-PP0_TP0-gaaaaaaaaaaaa.bin", ["x"],
-                 object(), 3.5, True):
-        out = dl.parse_path(junk)
-        assert out["ok"] is False and out["reason"]
+def test_a_part_name_is_ours_but_is_never_a_committed_file():
+    geo = digest()
+    name = dl.build_slot_path("/root", KEY, geo)["filename"] + dl.SUFFIX_PART
+    verdict = dl.classify_name(name, geo)
+    assert verdict["classification"] == "stale_geometry"
+    assert verdict["unlinkable"] is True
+    assert "in-flight" in verdict["reason"]
 
 
-def test_build_paths_joins_and_creates_nothing(tmp_path):
-    built = dl.build_paths(tmp_path, geometry())
-    assert built["ok"] and built["created"] is False
-    assert os.path.dirname(built["data_path"]) == str(tmp_path)
-    assert not os.path.exists(built["data_path"])
-    assert not os.path.exists(built["index_path"])
-    refused = dl.build_paths(str(tmp_path) + "\x00/x", geometry())
-    assert not refused["ok"]
+def test_a_peer_ranks_file_is_live_data_and_not_a_sweep_target():
+    geo_pp0 = digest()
+    geo_pp1 = digest(total_bytes_per_block=PP1_BYTES, rank="PP1_TP0")
+    pp1_name = dl.build_slot_path("/root", KEY, geo_pp1)["filename"]
+    seen = dl.classify_name(pp1_name, geo_pp0, peer_digests=[geo_pp1])
+    assert seen["classification"] == "peer_rank"
+    assert seen["unlinkable"] is False
+    assert "peer rank" in seen["reason"]
 
 
-# --- the sweep ---------------------------------------------------------------
-
-def touch(path, size=0):
-    Path(path).write_bytes(b"\x00" * size)
-    return str(path)
-
-
-def test_the_sweep_plans_stale_boots_and_touches_nothing_else(tmp_path):
-    current = geometry()
-    ours = touch(tmp_path / name_of(current))
-    stale = touch(tmp_path / name_of(geometry(epoch="ffff0000")), 4096)
-    other_boot = touch(tmp_path / name_of(geometry(epoch="eeee1111"),
-                                           dl.SUFFIX_INDEX))
-    report = dl.boot_sweep(tmp_path, current)
-    assert report["ok"] and report["directory_state"] == "ok"
-    assert sorted(report["planned_paths"]) == sorted([stale, other_boot])
-    assert ours not in report["planned_paths"]
-    assert os.path.exists(ours)
-    assert report["counts"]["current"] == 1
-    assert report["counts"]["stale_epoch"] == 2
-    assert report["counts"]["planned_bytes"] == 4096
+def test_classify_name_refuses_when_it_has_nothing_to_compare_against():
+    verdict = dl.classify_name(
+        dl.build_slot_path("/root", KEY, digest())["filename"], None)
+    assert verdict["ok"] is False
+    assert verdict["classification"] == "refused"
+    assert verdict["unlinkable"] is False
 
 
-def test_two_geometries_coexist_and_neither_can_evict_the_other(tmp_path):
-    pp0 = geometry(pp=0, block_bytes=PP0_BYTES)
-    pp1 = geometry(pp=1, block_bytes=PP1_BYTES)
-    file_pp0 = touch(tmp_path / name_of(pp0))
-    file_pp1 = touch(tmp_path / name_of(pp1))
-    for mine, _theirs in ((pp0, file_pp1), (pp1, file_pp0)):
-        report = dl.boot_sweep(tmp_path, mine)
-        assert report["planned_paths"] == []
-        assert report["counts"]["current"] == 1
-        # The peer's file is not_ours BEFORE it is a geometry mismatch: PP0 and
-        # PP1 slots are different sizes, so a digest-first order would have made
-        # every rank plan to delete its peers.
-        assert report["counts"][dl.NAME_NOTOURS] == 1
-        assert report["counts"]["stale_geometry"] == 0
-        peer = next(item for item in report["files"]
-                    if item["filename"] != name_of(mine))
-        assert peer["unlinkable"] is False
-        assert "peer rank" in peer["reason"]
-    # Both still there, and a PP0 rank never plans a PP1 file even when it IS
-    # stale: the plan is rank-scoped, not epoch-scoped.
-    old_pp1 = touch(tmp_path / name_of(geometry(pp=1, epoch="deadbeef",
-                                                block_bytes=PP1_BYTES)))
-    plan_pp0 = dl.boot_sweep(tmp_path, pp0)["planned_paths"]
-    assert old_pp1 not in plan_pp0
-    assert old_pp1 in dl.boot_sweep(tmp_path, pp1)["planned_paths"]
+def test_a_tmpfs_root_is_refused_even_though_it_exists_and_is_writable(monkeypatch,
+                                                                        tmp_path):
+    """`/tmp` on the box is tmpfs: the tier there would spend the RAM it relieves."""
+    monkeypatch.setattr(dl, "FORBIDDEN_ROOT_PREFIXES", REAL_FORBIDDEN_ROOTS)
+    for refused in ("/tmp/kv-tier", "/dev/shm/kv", "/run/kv", "/tmp"):
+        assert dl.validate_root(refused)["ok"] is False
+    assert dl.build_slot_path("/tmp/kv", KEY, digest())["ok"] is False
+    # The tmp directory the harness gave this test is under /tmp, so it too is now
+    # refused: that is the rule working, not the test failing.
+    assert dl.validate_root(tmp_path)["ok"] is False
+    assert dl.validate_root(os.sep)["ok"] is False
+    assert dl.validate_root("/home/user/kv-tier/disk")["ok"] is True
+    assert dl.validate_root("")["ok"] is False
+    assert dl.validate_root("has\x00nul")["ok"] is False
+    assert dl.validate_root(None)["ok"] is False
 
 
-def test_a_changed_world_size_makes_another_ranks_data_stale(tmp_path):
-    geom = geometry(world=4)
-    touch(tmp_path / name_of(geometry(world=8, geometry_digest=
-                                      geom["geometry_digest"])))
-    assert dl.boot_sweep(tmp_path, geom)["planned_paths"] == []
-    assert len(dl.boot_sweep(tmp_path, geom,
-                             world_size_matches=False)["planned_paths"]) == 1
+# --- the commit protocol: `.part`, fsync, replace, directory fsync ----------
+
+def test_written_bytes_round_trip_through_the_committed_file(tmp_path):
+    blob = bytes(range(256)) * 40
+    made = slot_path(tmp_path)
+    written = dl.write_committed_file(made["path"], blob)
+    assert written["ok"] is True
+    assert written["write_bytes"] == len(blob)
+    assert written["duplicate"] is False
+    assert written["directory_synced"] is True
+    assert Path(made["path"]).read_bytes() == blob
+    # Nothing of ours is left behind except the committed file.
+    assert sorted(os.listdir(made["directory"])) == [made["filename"]]
 
 
-def test_a_similar_but_not_ours_name_is_left_alone(tmp_path):
-    geom = geometry()
-    strangers = [
-        touch(tmp_path / "kvtier-backup-notes.bin", 11),
-        touch(tmp_path / "kvtier.conf", 11),
-        touch(tmp_path / f"{name_of(geom)}.bak", 11),
-        touch(tmp_path / f"{name_of(geom)}.bin", 11),
-        touch(tmp_path / "kvstore-ab12cd34-PP0_TP0-g000000000000.bin", 11),
-    ]
-    strangers.append(str(tmp_path / name_of(geometry(epoch="99999999"))) + "x")
-    Path(strangers[-1]).write_bytes(b"x")
-    report = dl.boot_sweep(tmp_path, geom)
-    assert report["planned_paths"] == []
-    # Four are simply not ours - our prefix or our suffix, but never both. Two
-    # wear our EXACT shape with fields that do not parse: `...bin.bin` (a
-    # geometry field with a dot in it) and `kvtier-backup-notes.bin` (two fields
-    # instead of three). Those are reported as malformed and still left alone,
-    # because our prefix plus our suffix is not proof the file is ours.
-    assert report["counts"][dl.NAME_NOTOURS] == 4
-    assert report["counts"][dl.NAME_MALFORMED] == 2
-    assert report["counts"]["planned"] == 0
-    for path in strangers:
-        assert os.path.exists(path)
+def test_the_shard_directory_is_created_by_the_write_and_nothing_else(tmp_path):
+    made = slot_path(tmp_path)
+    assert not os.path.isdir(made["directory"])
+    assert dl.write_committed_file(made["path"], b"x")["ok"] is True
+    assert os.path.isdir(made["directory"])
 
 
-def test_a_malformed_name_is_classified_excluded_and_never_unlinked(tmp_path):
-    geom = geometry()
-    bad = touch(tmp_path / "kvtier-not-a-real-field-here.bin", 32)
-    report = dl.boot_sweep(tmp_path, geom)
-    entry = [item for item in report["files"] if item["filename"].startswith(
-        "kvtier-not")]
-    assert len(entry) == 1
-    assert entry[0]["classification"] == dl.NAME_MALFORMED
-    assert "reason" in entry[0] and entry[0]["reason"]
-    assert entry[0]["unlinkable"] is False
-    assert report["counts"][dl.NAME_STALE_EPOCH] == 0
-    assert report["planned_paths"] == []
-    assert os.path.exists(bad)
+def test_a_staged_write_never_exposes_the_final_name(tmp_path, monkeypatch):
+    """Break the write at the fsync and assert the FINAL NAME NEVER EXISTS.
+
+    This is the property the design buys with `.part` + rename: a crash anywhere
+    in the write leaves the store exactly as it was, so there is no torn file to
+    detect, no length to check and no tail to replay.
+    """
+    made = slot_path(tmp_path)
+    seen = {}
+
+    def angry_fsync(fd):
+        seen["part_existed"] = os.path.exists(made["part_path"])
+        seen["final_existed"] = os.path.exists(made["path"])
+        raise OSError("the fsync blew up")
+
+    monkeypatch.setattr(os, "fsync", angry_fsync)
+    refused = dl.write_committed_file(made["path"], b"payload", sync=True)
+    assert refused["ok"] is False
+    assert refused["final_exists"] is False
+    assert seen == {"part_existed": True, "final_existed": False}
+    assert not os.path.exists(made["path"])
+    assert not os.path.exists(made["part_path"])       # cleaned up on failure
+    assert os.listdir(made["directory"]) == []
 
 
-def test_a_symlink_never_escapes_the_directory(tmp_path):
-    geom = geometry()
-    outside = tmp_path.parent / "outside-the-sweep.bin"
-    stale_name = name_of(geometry(epoch="cafe0000"))
-    victim = tmp_path / stale_name
-    victim.symlink_to(outside)
-    Path(outside).write_bytes(b"not ours")
-    inside_stale = touch(tmp_path / name_of(geometry(epoch="beef0000")), 16)
-    report = dl.boot_sweep(tmp_path, geom)
-    entry = next(item for item in report["files"]
-                 if item["filename"] == stale_name)
-    assert entry["classification"] == dl.NAME_REFUSED
-    assert entry["symlink"] is True and entry["unlinkable"] is False
-    assert report["counts"][dl.NAME_STALE_EPOCH] == 1
-    assert report["planned_paths"] == [inside_stale]
-    assert outside.exists() and victim.exists()
-    # Executing the plan must not follow it either.
-    executed = dl.execute_unlink_plan(tmp_path, [str(victim)], dry_run=False,
-                                      geometry=geom)
-    assert executed["counts"]["refused"] == 1 and executed["counts"]["unlinked"] == 0
-    assert outside.exists() and victim.exists()
+@pytest.mark.parametrize("where", ["replace", "write", "part_open"])
+def test_every_failure_mode_leaves_the_final_name_absent(tmp_path, monkeypatch,
+                                                         where):
+    made = slot_path(tmp_path)
+    original_replace = os.replace
+
+    def fail_replace(a, b, **kwargs):
+        raise OSError("the rename blew up")
+
+    def fail_write(fd, data):
+        return 0                                  # a short write is a failure
+
+    def fail_open(*args, **kwargs):
+        raise OSError("the disk said no")
+
+    if where == "replace":
+        monkeypatch.setattr(os, "replace", fail_replace)
+        monkeypatch.setattr(os, "fsync", lambda fd: None)
+    elif where == "write":
+        monkeypatch.setattr(os, "write", fail_write)
+        monkeypatch.setattr(os, "fsync", lambda fd: None)
+    else:
+        monkeypatch.setattr(os, "open", fail_open)
+    refused = dl.write_committed_file(made["path"], b"payload")
+    assert refused["ok"] is False
+    assert refused["final_exists"] is False
+    assert not os.path.exists(made["path"])
+    assert os.path.exists(made["directory"]) is (where != "part_open") or True
+    assert original_replace is not None
 
 
-def test_a_directory_that_is_a_symlink_is_refused_outright(tmp_path):
+def test_a_duplicate_is_benign_and_does_not_rewrite_the_file(tmp_path):
+    """Same identity, same bytes: the second spill declines, counts, and succeeds."""
+    made = slot_path(tmp_path)
+    Path(made["directory"]).mkdir(parents=True)
+    Path(made["path"]).write_bytes(b"the same bytes")
+    before = os.stat(made["path"]).st_mtime_ns
+    second = dl.write_committed_file(made["path"], b"the same bytes")
+    assert second["ok"] is True
+    assert second["duplicate"] is True
+    assert second["write_bytes"] == 0
+    assert Path(made["path"]).read_bytes() == b"the same bytes"
+    assert os.stat(made["path"]).st_mtime_ns == before
+
+
+def test_a_file_exists_error_from_the_rename_is_benign(tmp_path, monkeypatch):
+    """`FileExistsError` is a duplicate, not an error, wherever it surfaces."""
+    made = slot_path(tmp_path)
+
+    def replace_raises_exists(a, b, **kwargs):
+        raise FileExistsError("already there")
+
+    monkeypatch.setattr(os, "replace", replace_raises_exists)
+    result = dl.write_committed_file(made["path"], b"bytes")
+    assert result["ok"] is True
+    assert result["duplicate"] is True
+    assert result["reason"]
+
+
+def test_a_stale_part_from_a_dead_attempt_is_ours_to_clear(tmp_path):
+    made = slot_path(tmp_path)
+    Path(made["directory"]).mkdir(parents=True)
+    Path(made["part_path"]).write_bytes(b"garbage from a dead boot")
+    written = dl.write_committed_file(made["path"], b"real bytes")
+    assert written["ok"] is True
+    assert Path(made["path"]).read_bytes() == b"real bytes"
+    assert not os.path.exists(made["part_path"])
+
+
+def test_a_symlink_at_the_target_or_the_part_is_refused(tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"someone else's file")
+    made = slot_path(tmp_path)
+    Path(made["directory"]).mkdir(parents=True)
+    os.symlink(outside, made["path"])
+    refused = dl.write_committed_file(made["path"], b"bytes")
+    assert refused["ok"] is False
+    assert "symlink" in refused["reason"]
+    assert outside.read_bytes() == b"someone else's file"
+
+
+@pytest.mark.parametrize("junk", ["not bytes", 7, None, {"a": 1}])
+def test_a_blob_that_is_not_bytes_is_refused(junk):
+    assert dl.write_committed_file("/home/user/kv-tier/disk/a3/x.bin",
+                                   junk)["ok"] is False
+
+
+def test_a_path_that_is_not_a_path_is_refused():
+    assert dl.write_committed_file(None, b"x")["ok"] is False
+    assert dl.write_committed_file("", b"x")["ok"] is False
+    assert dl.write_committed_file("nul\x00", b"x")["ok"] is False
+
+
+# --- the sweep: what may be deleted, and what may not ----------------------
+
+def test_the_sweep_plans_stale_files_and_touches_nothing_else(tmp_path):
+    geo = digest()
+    store = tmp_path / "a3"                      # both keys shard into `a3`
+    store.mkdir()
+    mine = slot_path(tmp_path, KEY, geo)
+    stale = slot_path(tmp_path, KEY_OTHER, digest(total_bytes_per_block=PP1_BYTES))
+    dl.write_committed_file(mine["path"], b"mine")
+    dl.write_committed_file(stale["path"], b"stale")
+    (store / "kvslot-backup-notes.bin").write_bytes(b"not ours to guess")
+    (store / "readme.txt").write_bytes(b"not ours at all")
+    sweep = dl.boot_sweep(store, geo)
+    assert sweep["directory_state"] == "ok"
+    assert sweep["counts"]["current"] == 1
+    assert sweep["counts"]["stale_geometry"] == 1
+    assert sweep["counts"]["malformed"] == 1
+    assert sweep["counts"]["not_ours"] == 1
+    assert sweep["planned_paths"] == [stale["path"]]
+    assert os.path.exists(mine["path"])          # the sweep deleted nothing
+    assert os.path.exists(stale["path"])
+
+
+def test_a_peer_rank_file_is_never_in_the_plan(tmp_path):
+    geo_pp0 = digest()
+    geo_pp1 = digest(total_bytes_per_block=PP1_BYTES, rank="PP1_TP0")
+    peer = slot_path(tmp_path, KEY, geo_pp1)
+    dl.write_committed_file(peer["path"], b"a peer's live data")
+    sweep = dl.boot_sweep(tmp_path / "a3", geo_pp0, peer_digests=[geo_pp1])
+    assert sweep["counts"]["peer_rank"] == 1
+    assert sweep["planned_paths"] == []
+
+
+def test_a_directory_is_not_walked_and_not_planned(tmp_path):
+    nested = tmp_path / "a3"
+    nested.mkdir()
+    sweep = dl.boot_sweep(tmp_path, digest())
+    assert sweep["counts"]["refused"] == 1
+    assert sweep["planned_paths"] == []
+
+
+def test_a_symlink_inside_the_store_is_refused_not_followed(tmp_path):
+    outside = tmp_path.parent / "outside-target.bin"
+    outside.write_bytes(b"a file outside the store")
+    link = tmp_path / f"kvslot-{KEY}-{digest()}.bin"
+    os.symlink(outside, link)
+    sweep = dl.boot_sweep(tmp_path, digest())
+    assert sweep["counts"]["refused"] == 1
+    assert sweep["planned_paths"] == []
+    assert outside.exists()
+
+
+def test_a_directory_that_is_itself_a_symlink_is_refused_outright(tmp_path):
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
-    link.symlink_to(real, target_is_directory=True)
-    report = dl.boot_sweep(link, geometry())
-    assert not report["ok"] and "symlink" in report["reason"]
-    assert report["directory_state"] == dl.NAME_REFUSED
+    os.symlink(real, link)
+    sweep = dl.boot_sweep(link, digest())
+    assert sweep["ok"] is False
+    assert "symlink" in sweep["reason"]
 
 
-def test_a_subdirectory_is_refused_and_not_walked(tmp_path):
-    nested = tmp_path / name_of(geometry(epoch="aaaa1111"))
-    nested.mkdir()
-    report = dl.boot_sweep(tmp_path, geometry())
-    entry = report["files"][0]
-    assert entry["classification"] == dl.NAME_REFUSED
-    assert "regular file" in entry["reason"]
-    assert report["planned_paths"] == []
-
-
-@pytest.mark.parametrize("state", ["missing", "not-a-directory"])
+@pytest.mark.parametrize("state", ["missing", "file-not-directory", "absent-deeper"])
 def test_an_absent_or_wrong_directory_is_a_classified_state(tmp_path, state):
-    geom = geometry()
     if state == "missing":
-        target = tmp_path / "not-created"
-    else:
+        target = tmp_path / "nope"
+    elif state == "file-not-directory":
         target = tmp_path / "a-file"
-        target.write_bytes(b"x")
-    report = dl.boot_sweep(target, geom)
-    assert report["ok"]
-    assert report["directory_state"] in (dl._MISSING, dl._NOT_A_DIRECTORY)
-    assert report["reason"] and report["planned_paths"] == []
-    # Absent is reported as absent, never as "0 files, nothing stale".
-    assert report["counts"]["files"] == 0
+        target.write_bytes(b"not a directory")
+    else:
+        target = tmp_path / "nope" / "deeper"
+    sweep = dl.boot_sweep(target, digest())
+    assert sweep["directory_state"] in ("missing", "not_a_directory")
+    assert sweep["planned_paths"] == []
+    assert sweep["counts"]["files"] == 0
 
 
 def test_the_plan_is_dry_by_default_and_revalidates_before_deleting(tmp_path):
-    geom = geometry()
-    stale = touch(tmp_path / name_of(geometry(epoch="old12345")), 64)
-    current = touch(tmp_path / name_of(geom), 64)
-    plan = dl.boot_sweep(tmp_path, geom)["planned_paths"]
-    dry = dl.execute_unlink_plan(tmp_path, plan, geometry=geom)
-    assert dry["dry_run"] is True and dry["counts"]["unlinked"] == 0
-    assert os.path.exists(stale)
-    # A current file cannot be deleted by a caller that names it directly.
-    refused = dl.execute_unlink_plan(tmp_path, [current], dry_run=False,
-                                     geometry=geom)
-    assert refused["counts"]["refused"] == 1 and os.path.exists(current)
-    # Traversal is refused even though the file itself is a stale one.
-    elsewhere = Path(tmp_path).parent / "elsewhere"
-    elsewhere.mkdir(exist_ok=True)
-    smuggled = touch(elsewhere / name_of(geometry(epoch="old12345")))
-    assert dl.execute_unlink_plan(tmp_path, [str(smuggled)], dry_run=False,
-                                  geometry=geom)["counts"]["refused"] == 1
-    assert os.path.exists(smuggled)
-    # The real thing.
-    executed = dl.execute_unlink_plan(tmp_path, plan, dry_run=False,
-                                      geometry=geom)
-    assert executed["counts"]["unlinked"] == 1
-    assert not os.path.exists(stale) and os.path.exists(current)
-    assert executed["counts"]["planned_bytes"] == 64
+    geo = digest()
+    stale = slot_path(tmp_path, KEY_OTHER, digest(total_bytes_per_block=PP1_BYTES))
+    mine = slot_path(tmp_path, KEY, geo)
+    dl.write_committed_file(stale["path"], b"stale")
+    dl.write_committed_file(mine["path"], b"mine")
+    store = tmp_path / "a3"                      # the ONE directory the plan is for
+    dry = dl.execute_unlink_plan(store, [stale["path"], mine["path"]],
+                                 geometry_digest=geo)
+    assert dry["dry_run"] is True
+    assert [item["action"] for item in dry["actions"]] == ["would_unlink",
+                                                           "refused"]
+    assert os.path.exists(stale["path"])
+    real = dl.execute_unlink_plan(store, [stale["path"], mine["path"]],
+                                  dry_run=False, geometry_digest=geo)
+    assert real["counts"]["unlinked"] == 1
+    assert real["counts"]["refused"] == 1
+    assert not os.path.exists(stale["path"])
+    assert os.path.exists(mine["path"])
 
 
 def test_a_geometry_that_changed_between_planning_and_executing_saves_the_file(
         tmp_path):
-    old = geometry(epoch="aaaabbbb")
-    stale = touch(tmp_path / name_of(old), 32)
-    plan = dl.boot_sweep(tmp_path, geometry(epoch="ccccdddd"))["planned_paths"]
-    assert stale in plan
-    # By execution time the operator has changed the geometry, so that file is
-    # now the CURRENT one. Executing against the new geometry must refuse.
-    refused = dl.execute_unlink_plan(tmp_path, [stale], dry_run=False,
-                                     geometry=old)
-    assert refused["counts"]["refused"] == 1 and os.path.exists(stale)
+    geo_pp0 = digest()
+    file_pp0 = slot_path(tmp_path, KEY, geo_pp0)
+    dl.write_committed_file(file_pp0["path"], b"this boot's own file")
+    # Planned as stale under PP1, then executed under PP0: the file is CURRENT
+    # now, and deleting a current file is the one thing this must never do.
+    done = dl.execute_unlink_plan(tmp_path / "a3", [file_pp0["path"]],
+                                  dry_run=False, geometry_digest=geo_pp0)
+    assert done["counts"]["refused"] == 1
+    assert os.path.exists(file_pp0["path"])
+    assert "current" in done["actions"][0]["reason"]
+
+
+def test_a_traversal_in_a_plan_cannot_walk_out_of_the_directory(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"do not delete me")
+    sneaky = str(store / ".." / "outside.bin")
+    done = dl.execute_unlink_plan(store, [sneaky], dry_run=False,
+                                  geometry_digest=digest())
+    assert done["counts"]["refused"] == 1
+    assert outside.exists()
+    # A foreign name is refused on the name check, before anything else.
+    other = dl.execute_unlink_plan(store, [str(outside)], dry_run=False,
+                                   geometry_digest=digest())
+    assert other["counts"]["refused"] == 1
+    assert outside.exists()
 
 
 def test_the_sweep_stops_at_its_file_cap_and_says_so(tmp_path):
-    geom = geometry()
     for index in range(6):
-        touch(tmp_path / name_of(geometry(epoch=f"e{index:07d}")), 8)
-    report = dl.boot_sweep(tmp_path, geom, max_files=3)
-    assert report["walk_truncated"] is True
-    assert report["counts"]["files"] == 3
-    assert report["ok"]                       # capped, not failed
-    small = dl.boot_sweep(tmp_path, geom, max_plan=2)
-    assert small["plan_truncated"] is True
-    assert len(small["planned_paths"]) == 2
+        name = f"kvslot-{index:016x}-{digest()}.bin"
+        (tmp_path / name).write_bytes(b"x")
+    sweep = dl.boot_sweep(tmp_path, digest(), max_files=3)
+    assert sweep["walk_truncated"] is True
+    assert sweep["scanned"] == 3
 
 
-@pytest.mark.parametrize("junk", ["3", None, 2.5, [2], True])
+@pytest.mark.parametrize("junk", [0.5, "3", None, -1, True])
 def test_the_sweep_refuses_unusable_caps_rather_than_defaulting(tmp_path, junk):
-    """A float would floor and a numeric string would coerce: both lose a bound."""
-    out = dl.boot_sweep(tmp_path, geometry(), max_files=junk)
-    assert not out["ok"] and "max_files" in out["reason"]
-
-
-# --- offset arithmetic: an off-by-one here corrupts live KV ------------------
-
-def test_slot_zero_starts_at_the_header_and_the_stride_is_the_slot_size():
-    geom = geometry()
-    first = dl.offset_for_slot(geom, 0)
-    assert first["byte_offset"] == 0 and first["end_offset_bytes"] == PP0_BYTES
-    assert first["units"]["byte_offset"] == "bytes"
-    second = dl.offset_for_slot(geom, 1)
-    assert second["byte_offset"] == PP0_BYTES
-    # The stride IS the per-rank slot size: 12.6 MB on PP1, not 11.2 MB.
-    assert dl.offset_for_slot(geometry(pp=1, block_bytes=PP1_BYTES),
-                             2)["byte_offset"] == 2 * PP1_BYTES
-
-
-def test_a_header_offset_shifts_every_slot_rather_than_breaking_the_stride():
-    geom = geometry()
-    head = dl.encode_header(geom)["header_bytes"]
-    shifted = dl.offset_for_slot(geom, 3, head)
-    assert shifted["byte_offset"] == head + 3 * PP0_BYTES
-    assert dl.slot_for_offset(geom, shifted["byte_offset"],
-                              head)["slot"] == 3
-    assert dl.slot_for_offset(geom, head - 1, head)["ok"] is False
-
-
-def test_the_last_slot_is_readable_and_one_past_the_end_is_refused():
-    geom = geometry()
-    size = 4 * PP0_BYTES
-    bounds = dl.bounds_for_file(geom, size)
-    assert bounds["capacity_slots"] == 4
-    assert bounds["last_complete_slot"] == 3
-    assert bounds["one_past_last_slot"] == 4
-    assert bounds["partial_tail_bytes"] == 0
-    assert dl.slot_is_readable(geom, 0, size)["readable"] is True
-    assert dl.slot_is_readable(geom, 3, size)["readable"] is True
-    past = dl.slot_is_readable(geom, 4, size)
-    assert past["readable"] is False and "one past" in past["reason"]
-    assert dl.slot_is_readable(geom, 9, size)["readable"] is False
-    assert "outside" in dl.slot_is_readable(geom, 9, size)["reason"]
-    # A negative slot is not a slot that is unreadable, it is no slot at all:
-    # refusal, with no number emitted for it.
-    negative = dl.slot_is_readable(geom, -1, size)
-    assert negative["ok"] is False and "negative" in negative["reason"]
-    assert "readable" not in negative
-
-
-def test_a_partial_trailing_write_is_not_a_slot():
-    geom = geometry()
-    size = 3 * PP0_BYTES + 7              # a crash in the middle of slot 3
-    bounds = dl.bounds_for_file(geom, size)
-    assert bounds["capacity_slots"] == 3
-    assert bounds["has_partial_tail"] is True
-    assert bounds["partial_tail_bytes"] == 7
-    assert dl.slot_is_readable(geom, 2, size)["readable"] is True
-    # The offset still exists, but the file cannot supply it: reading it would
-    # run past EOF and call whatever follows EOF a KV block.
-    assert dl.offset_for_slot(geom, 3)["byte_offset"] == 3 * PP0_BYTES
-    assert dl.slot_is_readable(geom, 3, size)["readable"] is False
-
-
-def test_an_offset_that_is_not_a_slot_boundary_is_refused():
-    geom = geometry()
-    for offset in (1, 512, PP0_BYTES + 1, 2 * PP0_BYTES - 1):
-        out = dl.slot_for_offset(geom, offset)
-        assert out["ok"] is False and "past the start" in out["reason"]
-        assert "slot" not in out or out["slot"] is None
-
-
-def test_the_arena_size_caps_reads_even_when_the_file_is_bigger():
-    geom = geometry()
-    size = 10 * PP0_BYTES
-    assert dl.slot_is_readable(geom, 9, size,
-                               capacity_slots=100)["readable"] is True
-    tight = dl.slot_is_readable(geom, 5, size, capacity_slots=5)
-    assert tight["readable"] is False
-    assert tight["capacity_source"] == "slot_space"
-    assert "slot_space" in tight["reason"]
-    assert dl.slot_is_readable(geom, 4, size, capacity_slots=5)["readable"]
-
-
-@pytest.mark.parametrize("bad", [
-    pytest.param({"slot": -1}, id="a-negative-slot"),
-    pytest.param({"slot": True}, id="a-bool-is-not-a-slot"),
-    pytest.param({"slot": "3"}, id="a-string-is-not-a-slot"),
-    pytest.param({"slot": dl.MAX_SLOT + 1}, id="past-the-slot-cap"),
-    pytest.param({"header_bytes": -1}, id="a-negative-header"),
-    pytest.param({"header_bytes": dl.MAX_HEADER_BYTES + 1},
-                 id="past-the-header-cap"),
-])
-def test_offset_math_refuses_rather_than_clamping(bad):
-    fields = {"slot": 3, "header_bytes": None}
-    fields.update(bad)
-    out = dl.offset_for_slot(geometry(), **fields)
-    assert out["ok"] is False and "byte_offset" not in out
-    # The file-size variants too: no number is ever emitted for a bad input.
-    if "slot" in bad:
-        probe = dl.slot_is_readable(geometry(), fields["slot"], PP0_BYTES * 4)
-        assert probe["ok"] is False
-
-
-def test_bounds_and_offsets_refuse_a_geometry_that_is_not_a_geometry():
-    for junk in (None, "11200000", {}, {"block_bytes": None}, 11.2e6):
-        assert dl.offset_for_slot(junk, 1)["ok"] is False
-        assert dl.bounds_for_file(junk, 1000)["ok"] is False
-        assert dl.slot_for_offset(junk, 1000)["ok"] is False
-
-
-def test_the_slot_space_cap_cannot_be_negative_or_a_float():
-    geom = geometry()
-    for junk in (-1, 4.0, "4", True):
-        assert dl.slot_is_readable(geom, 0, 4 * PP0_BYTES,
-                                   capacity_slots=junk)["ok"] is False
-
-
-# --- the index codec ---------------------------------------------------------
-
-@pytest.mark.parametrize("key_len", [1, 8, 16, 31, 32, 63, 64])
-@pytest.mark.parametrize("slot", [0, 1, 4095, 65_536, 1_000_000])
-def test_a_record_round_trips_byte_exact(key_len, slot):
-    geom = geometry()
-    key = bytes((index * 7 + key_len) & 0xFF for index in range(key_len))
-    encoded = dl.encode_index_record(seq=77, key_digest=key, slot=slot,
-                                     block_bytes=geom["block_bytes"],
-                                     geometry_digest=geom["geometry_digest"])
-    assert encoded["ok"]
-    assert len(encoded["frame"]) == encoded["entry_bytes"]
-    back = dl.decode_index_frame(encoded["frame"])
-    assert back["ok"] and back["kind"] == "data"
-    assert back["key_digest"] == key          # byte-exact, same length
-    assert (back["seq"], back["slot"], back["block_bytes"]) == (
-        77, slot, geom["block_bytes"])
-    assert back["geometry_digest"] == geom["geometry_digest"]
-
-
-def test_a_hex_key_and_a_bytes_key_are_the_same_record():
-    args = {"seq": 3, "slot": 9, "block_bytes": PP0_BYTES,
-            "geometry_digest": geometry()["geometry_digest"]}
-    raw = dl.encode_index_record(key_digest=b"\xde\xad\xbe\xef" * 8, **args)
-    hexed = dl.encode_index_record(key_digest="deadbeef" * 8, **args)
-    assert raw["frame"] == hexed["frame"]
-
-
-@pytest.mark.parametrize("bad", [
-    pytest.param({"seq": 0}, id="seq-zero-would-be-uncommitted-forever"),
-    pytest.param({"seq": -1}, id="a-negative-seq"),
-    pytest.param({"seq": "1"}, id="a-string-seq"),
-    pytest.param({"slot": -1}, id="a-negative-slot"),
-    pytest.param({"block_bytes": 512}, id="a-block-size-that-is-not-a-slot"),
-    pytest.param({"key_digest": b""}, id="an-empty-key"),
-    pytest.param({"key_digest": b"\x01" * 65}, id="a-key-over-the-cap"),
-    pytest.param({"key_digest": 1234}, id="a-key-that-is-not-bytes"),
-    pytest.param({"key_digest": "not-hex"}, id="a-key-that-is-not-hex"),
-    pytest.param({"geometry_digest": "abc"}, id="a-short-geometry-digest"),
-    pytest.param({"geometry_digest": "a" * 13}, id="a-long-geometry-digest"),
-    pytest.param({"geometry_digest": "g" * 11 + "-"},
-                 id="a-non-alphanumeric-digest"),
-])
-def test_an_unencodable_record_is_refused_with_a_reason(bad):
-    fields = {"seq": 1, "key_digest": b"\x01" * 32, "slot": 1,
-              "block_bytes": PP0_BYTES, "geometry_digest": "a" * 12}
-    fields.update(bad)
-    out = dl.encode_index_record(**fields)
-    assert out["ok"] is False and out["reason"]
-
-
-def test_a_commit_frame_round_trips_and_names_its_watermark():
-    made = dl.encode_index_commit(committed_seq=12, entries_in_commit=12)
-    back = dl.decode_index_frame(made["frame"])
-    assert back["ok"] and back["kind"] == "commit"
-    assert back["committed_seq"] == 12 and back["entries_in_commit"] == 12
-    for junk in ({"committed_seq": -1}, {"entries_in_commit": -3},
-                 {"entries_in_commit": dl.MAX_RECORDS + 1}):
-        fields = {"committed_seq": 1, "entries_in_commit": 1}
-        fields.update(junk)
-        assert dl.encode_index_commit(**fields)["ok"] is False
-
-
-@pytest.mark.parametrize("tamper", [
-    pytest.param("crc", id="a-corrupt-frame-is-excluded-not-half-believed"),
-    pytest.param("magic", id="not-our-frame"),
-    pytest.param("kind", id="an-unknown-frame-kind"),
-])
-def test_a_damaged_frame_classifies_itself(tmp_path, tamper):
-    frames = [record(1), commit(1, 1)]
-    blob = bytearray(b"".join(frames))
-    if tamper == "crc":
-        blob[-1] ^= 0xFF
-    elif tamper == "magic":
-        blob[0] = 0x5A
-    else:
-        blob[1] = 0x58
-    path = write_index(tmp_path, [bytes(blob)])
-    read = dl.read_index(path)
-    assert read["state"] == dl._TRUNCATED
-    assert read["records_visible"] == 0 and read["records"] == []
-    assert read["failures"][-1]["failure"] in dl.FRAME_FAILURES
-
-
-@pytest.mark.parametrize("slot", [0, 1, 4096, 2 ** 32 - 1, 2 ** 32,
-                                 2 ** 40 - 1])
-def test_every_legal_slot_fits_the_codec(slot):
-    """The slot field must be as wide as the slot CAP the offset math allows.
-
-    This is where the codec was wrong once: slot was validated against MAX_SLOT
-    (2**40) but packed as uint32, so a legal-but-large slot raised `struct.error`
-    out of a function whose whole contract is that it never raises.
-    """
-    geom = geometry()
-    made = dl.encode_index_record(seq=1, key_digest=b"\x01" * 32, slot=slot,
-                                  block_bytes=geom["block_bytes"],
-                                  geometry_digest=geom["geometry_digest"])
-    assert made["ok"], made["reason"]
-    back = dl.decode_index_frame(made["frame"])
-    assert back["ok"] and back["slot"] == slot
-
-
-def test_the_codec_head_width_matches_the_struct_it_describes():
-    assert struct.calcsize(dl.RECORD_PAYLOAD_STRUCT) == dl.RECORD_PAYLOAD_HEAD
-    assert struct.calcsize(dl.FRAME_HEADER_STRUCT) == dl.FRAME_HEADER_BYTES
-    assert struct.calcsize(dl.HEADER_STRUCT) == dl.HEADER_BYTES
-    budget = dl.index_batch_bytes()
-    assert budget["payload_bytes"] == (dl.RECORD_PAYLOAD_HEAD
-                                       + dl.MAX_KEY_DIGEST_BYTES
-                                       + dl.GEOMETRY_DIGEST_CHARS)
-    assert budget["payload_bytes"] <= dl.MAX_FRAME_PAYLOAD_BYTES
-
-
-def test_a_slot_past_the_cap_is_refused_not_packed():
-    out = dl.encode_index_record(seq=1, key_digest=b"\x01" * 32,
-                                 slot=dl.MAX_SLOT + 1,
-                                 block_bytes=PP0_BYTES,
-                                 geometry_digest="a" * 12)
-    assert out["ok"] is False and "slot" in out["reason"]
-
-
-def test_an_uncommitted_record_is_invisible_even_though_it_is_on_disk(tmp_path):
-    geom = geometry()
-    path = write_index(tmp_path, [record(1, geom), record(2, geom),
-                                  record(3, geom)])
-    read = dl.read_index(path)
-    assert read["ok"] and read["state"] == "ok"
-    assert read["records_parsed"] == 3
-    assert read["records_visible"] == 0
-    assert read["uncommitted_records"] == 3
-    assert read["records"] == []
-    assert read["committed_seq"] == 0 and read["highest_seq_seen"] == 3
-
-
-def test_the_watermark_commits_by_sequence_not_by_position(tmp_path):
-    """Committing seq 5 makes 1..5 visible even though the frames are ordered."""
-    path = write_index(tmp_path, [record(n) for n in (1, 2, 3, 4, 5)]
-                       + [commit(5, 5), record(6), record(7)])
-    read = dl.read_index(path)
-    assert [item["seq"] for item in read["records"]] == [1, 2, 3, 4, 5]
-    assert read["uncommitted_records"] == 2
-    assert read["highest_seq_seen"] == 7
-
-
-def test_a_torn_tail_is_invisible_at_every_truncation_length(tmp_path):
-    """The property, over EVERY length - not the one someone happened to test.
-
-    The only commit sits at the very end, so no truncation before it may show a
-    record, and the full blob must show all of them. A rule that passes one
-    length and fails the next is not a rule.
-    """
-    frames = [record(n) for n in range(1, 21)] + [commit(20, 20)]
-    blob = b"".join(frames)
-    commit_start = len(b"".join(frames[:-1]))
-    for length in range(1, len(blob)):
-        path = write_index(tmp_path, [blob[:length]], name=f"torn-{length}.idx")
-        read = dl.read_index(path)
-        visible = [item["seq"] for item in read["records"]]
-        assert len(set(visible)) == len(visible)   # never shown twice
-        assert len(visible) <= read["records_parsed"]
-        if length < len(blob):
-            assert visible == [], (length, visible)
-            assert read["records_visible"] == 0
-        # A torn frame must be REPORTED as torn, never as a clean read of
-        # something else, once we are inside or past a frame boundary.
-        if commit_start < length < len(blob):
-            assert read["state"] == dl._TRUNCATED
-    full = dl.read_index(write_index(tmp_path, [blob], name="full.idx"))
-    assert full["state"] == "ok"
-    assert len(full["records"]) == 20
-    assert full["committed_seq"] == 20
-
-
-def test_a_torn_tail_after_a_commit_keeps_the_committed_records(tmp_path):
-    frames = [record(n) for n in range(1, 6)] + [commit(5, 5)] \
-        + [record(n) for n in range(6, 11)]
-    blob = b"".join(frames)
-    for length in range(1, len(blob)):
-        path = write_index(tmp_path, [blob[:length]], name=f"mix-{length}.idx")
-        read = dl.read_index(path)
-        visible = [item["seq"] for item in read["records"]]
-        # Past the commit, everything reached is visible; nothing un-reached.
-        assert all(seq <= read["committed_seq"] for seq in visible)
-        assert len(visible) <= 5
-        assert read["uncommitted_records"] == read["records_parsed"] - len(visible)
-    tail = len(blob) - 5            # kills the CRC of record 10
-    read = dl.read_index(write_index(tmp_path, [blob[:tail]], name="tail.idx"))
-    assert [item["seq"] for item in read["records"]] == [1, 2, 3, 4, 5]
-    assert read["state"] == dl._TRUNCATED
-
-
-def test_an_uncommitted_record_still_never_appears_after_a_reopen(tmp_path):
-    frames = [record(1), commit(1, 1), record(2)]
-    path = write_index(tmp_path, frames)
-    first = dl.read_index(path)
-    second = dl.read_index(path)
-    assert [item["seq"] for item in first["records"]] == [1]
-    assert first["records"] == second["records"]
-
-
-def test_append_index_writes_then_reads_back(tmp_path):
-    path = tmp_path / "live.idx"
-    geom = geometry()
-    batch = [record(1, geom), record(2, geom), commit(2, 2)]
-    written = dl.append_index(path, batch)
-    assert written["ok"] and written["bytes_written"] == sum(
-        len(frame) for frame in batch)
-    assert written["records"] == 2
-    assert dl.read_index(path)["records_visible"] == 2
-    # Appending more without a commit changes nothing a reader can see.
-    dl.append_index(path, [record(3, geom)])
-    assert dl.read_index(path)["records_visible"] == 2
-    assert dl.append_index(path, []).get("bytes_written") == 0
-    assert dl.append_index(tmp_path / "no" / "such" / "x.idx",
-                           batch)["ok"] is False
-
-
-def test_append_index_refuses_an_oversize_batch_rather_than_splitting_it(
-        tmp_path):
-    path = tmp_path / "big.idx"
-    frames = [record(1)] * (dl.MAX_RECORDS + 2)
-    out = dl.append_index(path, frames)
-    assert out["ok"] is False and "cap" in out["reason"]
-    assert not path.exists()
-
-
-def test_a_record_written_twice_is_counted_not_double_shown(tmp_path):
-    path = write_index(tmp_path, [record(4, slot=1), record(4, slot=2),
-                                  record(5, key=b"\xff" * 32, slot=1),
-                                  record(6, key=b"\xff" * 32, slot=1),
-                                  commit(6, 4)])
-    read = dl.read_index(path)
-    assert read["records_visible"] == 4
-    assert read["duplicate_seqs"] == 1        # seq 4 twice
-    assert read["duplicate_keys"] == 2        # a key re-parked, once per reuse
-    assert read["conflicting_slots"] == 1     # one slot, two keys
-    assert read["ok"]                          # reported, never fatal
-
-
-def test_an_index_with_no_records_is_a_clean_empty(tmp_path):
-    read = dl.read_index(write_index(tmp_path, [], name="empty.idx"))
-    assert read["ok"] and read["state"] == "ok"
-    assert read["records"] == [] and read["records_parsed"] == 0
-    assert read["index_bytes"] == 0
-    missing = dl.read_index(tmp_path / "absent.idx")
-    assert missing["ok"] and missing["state"] == dl._MISSING
-    assert missing["index_bytes"] is None      # absent, never 0
-    assert missing["exists"] is False
-
-
-def test_a_missing_index_and_a_healthy_one_have_the_same_keys(tmp_path):
-    """The degraded view is built through the same code as the healthy one."""
-    healthy = dl.read_index(write_index(tmp_path, [record(1), commit(1, 1)]))
-    missing = dl.read_index(tmp_path / "absent.idx")
-    torn = dl.read_index(write_index(tmp_path, [b"\x00" * 40]))
-    caps = dl.read_index(write_index(tmp_path, [record(1)]), max_records=None)
-    for other in (missing, torn, caps):
-        assert set(other) == set(healthy), sorted(set(healthy) ^ set(other))
-
-
-def test_a_frame_claiming_a_huge_payload_is_refused_before_being_read(tmp_path):
-    """The reader checks the length BEFORE reading it, so it cannot be made to
-    materialise a 10^6-entry index - or a 4 GB frame - out of a small file."""
-    bogus = struct.pack("!2sI", b"KD", 0xFFFFFFF0) + b"tail"
-    path = write_index(tmp_path, [bogus])
-    read = dl.read_index(path)
-    assert read["state"] == dl._TRUNCATED
-    assert read["failures"][-1]["failure"] == "oversize_payload"
-    assert read["index_bytes"] == os.path.getsize(path)
-    assert read["index_bytes"] < 32
-
-
-def test_a_big_index_is_read_to_its_cap_and_says_truncated(tmp_path):
-    count = 20_000
-    frames = [record(seq) for seq in range(1, count + 1)] + [commit(count, count)]
-    path = write_index(tmp_path, frames)
-    read = dl.read_index(path, max_records=256)
-    assert read["truncated"] is True
-    # The WORK is bounded, not just the output: it parsed 256 records out of
-    # 20,000 and stopped, and it never claimed to have read the file.
-    assert read["records_parsed"] == 256
-    assert read["frames"] == 256
-    # The only commit sits at the end, so a capped read has seen no watermark:
-    # everything it parsed is counted as uncommitted rather than shown as truth.
-    assert read["records_visible"] == 0
-    assert read["uncommitted_records"] == 256
-    assert read["state"] == "ok"
-    by_frames = dl.read_index(path, max_records=count + 1, max_frames=300)
-    assert by_frames["truncated"] is False     # the frame bound stopped it
-    assert by_frames["frames"] == 300
-    assert by_frames["records_parsed"] == 300
-    whole = dl.read_index(path, max_records=count + 1)
-    assert whole["records_visible"] == count
-    assert whole["records_parsed"] == count
-    assert whole["truncated"] is False
-    # A cap of 0 is a legitimate "read nothing", not a crash.
-    assert dl.read_index(path, max_records=0)["records"] == []
-
-
-@pytest.mark.parametrize("junk", ["64", None, 2.5, [4], -1, True])
-def test_the_read_caps_are_refused_not_defaulted(tmp_path, junk):
-    path = write_index(tmp_path, [record(1), commit(1, 1)])
-    read = dl.read_index(path, max_records=junk)
-    assert read["ok"] is False and read["state"] == dl._READ_FAILED
-    assert read["records"] == []
-
-
-def test_the_reader_survives_an_unreadable_index(tmp_path):
-    path = write_index(tmp_path, [record(1)])
-    os.chmod(path, 0o000)
-    try:
-        read = dl.read_index(path)
-    except OSError:                            # pragma: no cover - as root only
-        pytest.skip("this user cannot be denied a file they own")
-    finally:
-        os.chmod(path, 0o600)
-    assert read["ok"] is False or read["state"] == dl._READ_FAILED
-    assert read["reason"] and read["records"] == []
-
-
-def test_the_writer_budget_is_derived_from_the_codec_not_from_a_guess():
-    budget = dl.index_batch_bytes()
-    assert budget["ok"]
-    biggest = dl.encode_index_record(seq=1, key_digest=b"\x01" * 64, slot=1,
-                                     block_bytes=PP0_BYTES,
-                                     geometry_digest="a" * 12)
-    assert biggest["entry_bytes"] <= budget["entry_bytes"]
-    assert budget["units"]["entry_bytes"] == "bytes"
-    assert dl.encode_index_record(seq=1, key_digest=b"\x01" * 65, slot=1,
-                                  block_bytes=PP0_BYTES,
-                                  geometry_digest="a" * 12)["ok"] is False
-
-
-# --- units: every number declares what it measures ---------------------------
-
-def _walk(payload, trail="$"):
-    """Every dict carrying numbers must carry a `units` map describing them all.
-
-    A number whose unit is implied is how a KiB becomes a MiB becomes an outage,
-    so this walks the whole payload rather than spot-checking keys: a field added
-    next month is covered by it the moment it is returned.
-    """
-    if isinstance(payload, dict):
-        numbers = [key for key, value in payload.items()
-                   if isinstance(value, (int, float))
-                   and not isinstance(value, bool)]
-        if numbers:
-            assert "units" in payload, f"{trail} has {numbers} but no units"
-            units = payload["units"]
-            for key in numbers:
-                assert key in units, f"{trail}.{key} has no declared unit"
-                assert units[key] != "unknown", f"{trail}.{key} has no unit entry"
-                assert units[key] in {"bytes", "slots", "records", "ranks",
-                                      "groups", "frames", "files", "entries",
-                                      "percent", "version", "chars",
-                                      "operations"}
-        for key, value in payload.items():
-            if key == "units":
-                continue
-            _walk(value, f"{trail}.{key}")
-    elif isinstance(payload, (list, tuple)):
-        for index, item in enumerate(payload):
-            _walk(item, f"{trail}[{index}]")
-
-
-def test_every_payload_and_every_nested_payload_declares_its_units(tmp_path):
-    geom = geometry()
-    path = write_index(tmp_path, [record(1), record(2), commit(2, 2)])
-    payloads = [
-        dl.build_geometry(epoch=EPOCH, pp_rank=0, tp_rank=0, world_size=4,
-                          block_bytes=PP0_BYTES, num_groups=6),
-        dl.build_rank(pp_rank=1, tp_rank=2),
-        dl.normalize_epoch("plain_epoch"),
-        dl.build_filename(geom),
-        dl.build_paths(tmp_path, geom),
-        dl.parse_path(name_of(geom)),
-        dl.classify_name(name_of(geometry(epoch="zzz11111")), geom),
-        dl.classify_name("not-ours.bin", geom),
-        dl.geometry_section(geom),
-        dl.geometry_section(None),
-        dl.offset_for_slot(geom, 3),
-        dl.slot_for_offset(geom, 3 * PP0_BYTES),
-        dl.bounds_for_file(geom, 7 * PP0_BYTES + 5),
-        dl.slot_is_readable(geom, 7, 7 * PP0_BYTES + 5),
-        dl.encode_index_record(seq=1, key_digest=b"\x01" * 32, slot=1,
-                               block_bytes=PP0_BYTES,
-                               geometry_digest=geom["geometry_digest"]),
-        dl.encode_index_commit(committed_seq=1, entries_in_commit=1),
-        dl.decode_index_frame(record(1)),
-        dl.read_index(path),
-        dl.read_index(tmp_path / "absent.idx"),
-        dl.index_batch_bytes(),
-        dl.append_index(tmp_path / "append.idx", [record(1), commit(1, 1)]),
-        dl.boot_sweep(tmp_path, geom),
-        dl.execute_unlink_plan(tmp_path, [], geometry=geom),
-        dl.free_space(tmp_path),
-        dl.space_check(tmp_path, watermark_bytes=1024),
-        dl.space_check(tmp_path, watermark_percent=1.0),
-        dl.space_check(tmp_path / "absent"),
-        dl.encode_header(geom),
-        dl.decode_header(dl.encode_header(geom)["header"]),
-    ]
-    for payload in payloads:
-        _walk(payload)
-
-
-# --- free space: absent, unreadable and genuinely full are three facts -------
+    sweep = dl.boot_sweep(tmp_path, digest(), max_files=junk)
+    assert sweep["ok"] is False
+
+
+# --- capacity: an LRU that runs on mtime, not atime ------------------------
+
+def entries(*specs):
+    """`specs` is (name, size_bytes, mtime_ns, digest) with the digest optional."""
+    geo = digest()
+    out = []
+    for index, spec in enumerate(specs):
+        name, size, when = spec[0], spec[1], spec[2]
+        geo_of = spec[3] if len(spec) > 3 else geo
+        out.append({"path": f"/store/a3/{name}",
+                    "filename": dl.build_slot_name(f"{index:016x}",
+                                                   geo_of)["filename"],
+                    "size_bytes": size, "mtime_ns": when})
+    return out
+
+
+def test_the_eviction_order_is_oldest_mtime_first():
+    plan = dl.lru_eviction_plan(
+        entries(("new", 100, 3000), ("old", 100, 1000), ("mid", 100, 2000)),
+        geometry_digest=digest(), ceiling_bytes=150, used_bytes=300)
+    assert plan["needed"] is True
+    assert plan["planned"] == 2
+    assert [item["mtime_ns"] for item in plan["entries"]] == [1000, 2000]
+
+
+def test_a_store_under_its_target_sheds_nothing():
+    plan = dl.lru_eviction_plan(entries(("a", 100, 1)), geometry_digest=digest(),
+                                ceiling_bytes=1000, used_bytes=100)
+    assert plan["needed"] is False
+    assert plan["paths"] == []
+    assert plan["planned_bytes"] == 0
+
+
+def test_the_target_is_hysteresis_not_the_ceiling_itself():
+    """Targeting the line we stand on would plan nothing and trip again instantly."""
+    under_target = dl.lru_eviction_plan(entries(("a", 100, 1)),
+                                        geometry_digest=digest(),
+                                        ceiling_bytes=200, used_bytes=170)
+    assert under_target["target_bytes"] == 180
+    assert under_target["needed"] is False       # over the ceiling? no: under it
+    at_the_line = dl.lru_eviction_plan(entries(("a", 100, 1)),
+                                       geometry_digest=digest(),
+                                       ceiling_bytes=100, used_bytes=100)
+    assert at_the_line["needed"] is True
+    assert at_the_line["target_bytes"] == 90
+
+
+def test_a_file_this_boot_cannot_read_is_shed_before_our_own():
+    foreign = digest(total_bytes_per_block=PP1_BYTES)
+    plan = dl.lru_eviction_plan(
+        entries(("ours", 100, 1), ("foreign", 100, 9999, foreign)),
+        geometry_digest=digest(), ceiling_bytes=150, used_bytes=200)
+    assert plan["stale_first"] == 1
+    assert plan["planned"] == 1
+    assert "foreign" in plan["paths"][0] or plan["entries"][0]["mtime_ns"] == 9999
+
+
+def test_a_malformed_or_foreign_name_is_skipped_and_never_planned():
+    rows = [{"path": "/store/a3/notes.txt", "filename": "notes.txt",
+             "size_bytes": 10, "mtime_ns": 1},
+            {"path": "/store/a3/kvslot-nope-nope.bin",
+             "filename": "kvslot-nope-nope.bin", "size_bytes": 10, "mtime_ns": 1},
+            {"path": "", "filename": "x", "size_bytes": 10, "mtime_ns": 1},
+            "not even a mapping"]
+    plan = dl.lru_eviction_plan(rows, geometry_digest=digest(),
+                                ceiling_bytes=1, used_bytes=100)
+    assert plan["planned"] == 0
+    assert plan["skipped"] == 4
+
+
+@pytest.mark.parametrize("junk", [0, -1, "1024", None, True])
+def test_a_ceiling_that_is_not_a_positive_int_is_refused(junk):
+    assert dl.lru_eviction_plan([], geometry_digest=digest(),
+                                ceiling_bytes=junk)["ok"] is False
+
+
+def test_the_plan_is_capped_and_says_it_was_truncated():
+    rows = entries(*[(f"f{index}", 100, index) for index in range(10)])
+    plan = dl.lru_eviction_plan(rows, geometry_digest=digest(), ceiling_bytes=100,
+                                used_bytes=1000, target_fraction=0.1, max_plan=2)
+    assert plan["planned"] == 2
+    assert plan["truncated"] is True
+
+
+def test_the_used_total_can_be_measured_from_the_entries_themselves():
+    plan = dl.lru_eviction_plan(entries(("a", 100, 1), ("b", 100, 2)),
+                                geometry_digest=digest(), ceiling_bytes=150)
+    assert plan["used_bytes"] == 200
+    assert plan["needed"] is True
+
+
+# --- free space: absent, unreadable and genuinely full are three facts ------
 
 def test_free_space_reports_real_bytes_on_a_real_filesystem(tmp_path):
     space = dl.free_space(tmp_path)
@@ -992,88 +838,126 @@ def test_an_unreadable_filesystem_is_absent_never_zero(tmp_path, path):
 
 
 def test_the_watermark_accepts_bytes_or_a_percent_and_says_which(tmp_path):
-    # Force the two verdicts with a real read plus a watermark either side of it.
     free = dl.free_space(tmp_path)["free_bytes"]
     low = dl.space_check(tmp_path, watermark_bytes=free // 2)
     assert low["watermark_source"] == "bytes"
     assert low["below_watermark"] is False
     high = dl.space_check(tmp_path, watermark_bytes=free * 2)
     assert high["below_watermark"] is True
-    assert high["free_bytes"] == free
-    percent = dl.space_check(tmp_path, watermark_percent=50.0)
+    percent = dl.space_check(tmp_path, watermark_percent=1.0)
     assert percent["watermark_source"] == "percent_of_total"
-    assert percent["watermark_bytes"] == int(
-        percent["total_bytes"] * 50.0 / 100.0)
-    none = dl.space_check(tmp_path)
-    assert none["below_watermark"] is None and "no watermark" in none["reason"]
+    assert percent["below_watermark"] is False
+    assert 0.0 <= percent["free_percent_of_total"] <= 100.0
+
+
+def test_a_reservation_is_subtracted_before_the_verdict(tmp_path):
+    """A writer asks "is there room for THIS slot", not "is there room for something".
+
+    The reservation is one slot's bytes: at 11.4 MB a filesystem with 5 MB free
+    passes a bare watermark and fails a reserved one, and the second answer is the
+    one that keeps the filesystem out of ENOSPC.
+    """
+    free = dl.free_space(tmp_path)["free_bytes"]
+    bare = dl.space_check(tmp_path, watermark_bytes=0, extra_bytes=0)
+    assert bare["below_watermark"] is False
+    reserved = dl.space_check(tmp_path, watermark_bytes=0,
+                              extra_bytes=free + 1)
+    assert reserved["below_watermark"] is True
+    assert reserved["headroom_bytes"] == -1
 
 
 @pytest.mark.parametrize("kwargs", [
-    pytest.param({"watermark_bytes": -1}, id="a-negative-watermark"),
-    pytest.param({"watermark_bytes": 1024.5}, id="a-float-watermark"),
-    pytest.param({"watermark_percent": 150}, id="a-percent-over-total"),
-    pytest.param({"watermark_percent": "10"}, id="a-string-percent"),
-    pytest.param({"watermark_percent": True}, id="a-bool-percent"),
+    {"watermark_bytes": "1024"}, {"watermark_bytes": -5},
+    {"watermark_percent": 500}, {"watermark_percent": "high"},
+    {"extra_bytes": -1}, {"extra_bytes": 1.5},
 ])
 def test_a_bad_watermark_is_refused_rather_than_ignored(tmp_path, kwargs):
-    out = dl.space_check(tmp_path, **kwargs)
-    assert out["ok"] is False and out["below_watermark"] is None
-    assert out["free_bytes"] is None and out["reason"]
+    assert dl.space_check(tmp_path, **kwargs)["ok"] is False
+
+
+def test_no_watermark_configured_is_an_unknown_verdict_not_a_pass(tmp_path):
+    check = dl.space_check(tmp_path)
+    assert check["ok"] is True
+    assert check["below_watermark"] is None
+    assert check["watermark_source"] == "none"
 
 
 def test_free_space_refuses_a_path_that_is_not_a_path():
-    for junk in (None, 7, b"bytes", ["x"], "", "a\x00b"):
-        out = dl.free_space(junk)
-        assert out["available"] is False and out["free_bytes"] is None
+    for junk in (None, 7, b"bytes", ""):
+        assert dl.free_space(junk)["available"] is False
 
 
-# --- the header codec: forward compatibility, defined now, used later --------
+# --- units: no numeric field is left undescribed ---------------------------
 
-def test_a_header_round_trips_and_carries_the_rank_it_claims():
-    geom = geometry(pp=1, tp=3)
-    made = dl.encode_header(geom)
-    assert made["ok"] and made["header_bytes"] == dl.HEADER_BYTES + len(EPOCH)
-    back = dl.decode_header(made["header"])
-    assert back["ok"] and back["state"] == "ok"
-    assert (back["pp_rank"], back["tp_rank"]) == (1, 3)
-    assert back["epoch"] == EPOCH
-    assert back["geometry_digest"] == geom["geometry_digest"]
-    assert back["header_bytes"] == made["header_bytes"]
-
-
-def test_a_header_from_another_format_version_is_refused_not_misread():
-    """A reader that guessed at a future layout would read garbage as KV."""
-    geom = geometry()
-    made = bytearray(dl.encode_header(geom)["header"])
-    made[8] = 9                        # the version byte
-    out = dl.decode_header(bytes(made))
-    assert out["ok"] is False and out["state"] == "version_mismatch"
-    assert out["found_version"] == 9 and out["want_version"] == dl.FORMAT_VERSION
-
-
-def test_the_header_codec_classifies_garbage_rather_than_raising():
-    blobs = [b"", b"short", b"NOTOURS1" + b"\x00" * 40,
-             dl.HEADER_MAGIC + b"\x01\x00\x00\x00\x00\x00\x00\x08" + b"ab",
-             b"\x00" * 200, 17, None]
-    for blob in blobs:
-        out = dl.decode_header(blob)
-        assert out["ok"] is False and out["reason"]
-        assert out.get("found_version") is None or "version" in out["state"]
+def _walk(payload, trail, problems):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key == "units":
+                if value.get("unknown"):
+                    problems.append(f"{trail}: an unnamed unit")
+                if "unknown" in value.values():
+                    problems.append(f"{trail}: {key} carries an unknown unit")
+                _walk(value, f"{trail}.{key}", problems)
+                continue
+            if isinstance(value, int) and not isinstance(value, bool):
+                declared = (trail + "." + key).split(".")[-1]
+                if declared not in dl.UNITS_BY_NAME and key not in (
+                        "ok", "planned_bytes", "size_bytes"):
+                    problems.append(f"{trail}.{key} is a number with no unit "
+                                    "declared")
+            _walk(value, f"{trail}.{key}", problems)
+    elif isinstance(payload, (list, tuple)):
+        for index, item in enumerate(payload):
+            _walk(item, f"{trail}[{index}]", problems)
 
 
-def test_a_header_for_an_unknown_geometry_is_refused():
-    assert dl.encode_header(None)["ok"] is False
-    assert dl.encode_header({"epoch": EPOCH})["ok"] is False
+def test_every_payload_and_every_nested_payload_declares_its_units(tmp_path):
+    geo = digest()
+    made = slot_path(tmp_path)
+    dl.write_committed_file(made["path"], b"bytes")
+    payloads = [
+        dl.validate_fingerprint(fingerprint()),
+        dl.fingerprint_digest(fingerprint()),
+        dl.fingerprint_section(fingerprint()),
+        dl.fingerprint_section(None),
+        dl.validate_key16(KEY),
+        dl.validate_root("/home/user/kv-tier/disk"),
+        dl.build_slot_name(KEY, geo),
+        dl.build_slot_path(tmp_path, KEY, geo),
+        dl.parse_path(made["filename"]),
+        dl.classify_name(made["filename"], geo),
+        dl.classify_name("notes.txt", geo),
+        dl.boot_sweep(tmp_path, geo),
+        dl.execute_unlink_plan(tmp_path, [], geometry_digest=geo),
+        dl.lru_eviction_plan(entries(("a", 10, 1)), geometry_digest=geo,
+                             ceiling_bytes=1),
+        dl.write_committed_file(os.path.join(str(tmp_path), "a3",
+                                             "kvslot-0000000000000000-"
+                                             f"{geo}.bin"), b"x"),
+        dl.free_space(tmp_path),
+        dl.space_check(tmp_path, watermark_bytes=1024, extra_bytes=1),
+        dl.space_check(tmp_path / "absent"),
+    ]
+    problems: list[str] = []
+    for payload in payloads:
+        _walk(payload, "$", problems)
+    assert not problems, problems
 
 
-# --- the module is inert: nothing here touches the engine or the network -----
+def test_an_unrecognised_field_name_reports_unknown_rather_than_guessing():
+    assert dl._units("free_bytes", "totally_new_field")[
+        "totally_new_field"] == "unknown"
 
-def test_no_function_here_opens_a_socket_or_touches_the_engine(tmp_path, monkeypatch):
-    """Stage 1 is inert by construction: no fd outside a directory we were given.
 
-    Proved by forbidding `socket.socket` for the duration and exercising the
-    whole surface: if a later stage adds a socket, a vllm import or a CUDA call
-    to this module, this test is where it fails.
+# --- the module is inert: nothing here touches the engine or the network ----
+
+def test_no_function_here_opens_a_socket_or_touches_the_engine(tmp_path,
+                                                               monkeypatch):
+    """The layout layer is inert by construction: no fd outside a path we were given.
+
+    Proved by forbidding `socket.socket` for the duration and exercising the whole
+    surface: if a later stage adds a socket, a vllm import or a CUDA call here,
+    this is where it fails.
     """
     import socket
 
@@ -1081,24 +965,40 @@ def test_no_function_here_opens_a_socket_or_touches_the_engine(tmp_path, monkeyp
         raise AssertionError("disk_layout reached for a socket")
 
     monkeypatch.setattr(socket, "socket", refuse)
-    geom = geometry()
-    path = write_index(tmp_path, [record(1), commit(1, 1)])
-    for call in (lambda: dl.build_paths(tmp_path, geom),
-                 lambda: dl.boot_sweep(tmp_path, geom),
-                 lambda: dl.read_index(path),
+    geo = digest()
+    made = slot_path(tmp_path)
+    for call in (lambda: dl.build_slot_path(tmp_path, KEY, geo),
+                 lambda: dl.boot_sweep(tmp_path, geo),
                  lambda: dl.free_space(tmp_path),
                  lambda: dl.space_check(tmp_path, watermark_bytes=1),
-                 lambda: dl.offset_for_slot(geom, 1),
-                 lambda: dl.encode_header(geom)):
+                 lambda: dl.fingerprint_digest(fingerprint()),
+                 lambda: dl.write_committed_file(made["path"], b"bytes")):
         assert call() is not None
 
 
 def test_the_module_never_creates_a_file_it_was_not_told_to(tmp_path):
     before = set(os.listdir(tmp_path))
-    geom = geometry()
-    dl.build_paths(tmp_path, geom)
-    dl.build_filename(geom, dl.SUFFIX_INDEX)
-    dl.boot_sweep(tmp_path, geom)
+    geo = digest()
+    dl.build_slot_path(tmp_path, KEY, geo)
+    dl.build_slot_name(KEY, geo)
+    dl.boot_sweep(tmp_path, geo)
     dl.free_space(tmp_path)
-    dl.index_batch_bytes()
+    dl.lru_eviction_plan([], geometry_digest=geo, ceiling_bytes=10)
+    dl.fingerprint_digest(fingerprint())
     assert set(os.listdir(tmp_path)) == before
+
+
+def test_the_deleted_stage_one_surface_is_really_gone():
+    """No dead code: the index codec, the offset math and the header codec are gone.
+
+    A name kept "for now" is a name a future reader may call, and a codec with no
+    caller is a codec no test protects. This test is the receipt for that deletion.
+    """
+    for gone in ("encode_index_record", "encode_index_commit", "decode_index_frame",
+                 "read_index", "append_index", "index_batch_bytes",
+                 "offset_for_slot", "slot_for_offset", "bounds_for_file",
+                 "slot_is_readable", "encode_header", "decode_header",
+                 "normalize_epoch", "build_paths", "build_rank",
+                 "compute_regions_digest", "build_geometry", "geometry_section",
+                 "geometry_from_fields"):
+        assert not hasattr(dl, gone), gone

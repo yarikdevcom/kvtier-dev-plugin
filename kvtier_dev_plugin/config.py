@@ -62,6 +62,18 @@ the file contract the proxy host's reader expects):
                                  writer.
   VLLM_E2_TIER_DIAG_RANK         pin the rank id (`PP<n>_TP<m>`) instead of
                                  deriving it from the process's distributed state.
+  VLLM_E2_TIER_MISS_LOG          a path to append one JSON line per tier lookup
+                                 to. Unset = no file, no open(), no I/O of any
+                                 kind (see miss_attribution.py).
+  VLLM_E2_TIER_DISK_ROOT         the SSD tier's store root, one file per KV
+                                 slot. UNSET = the tier cannot exist: no
+                                 directory is created, no thread starts, no byte
+                                 is written. tmpfs roots are refused.
+  VLLM_E2_TIER_DISK_BYTES        the tier's byte ceiling in bytes; above it files
+                                 are shed LRU by st_mtime. Unset = no ceiling,
+                                 NEVER zero. Neither variable ARMS the tier: the
+                                 arm is `disk_spill.arm()`, which expires by
+                                 itself, exactly like the raw-byte dump's.
 """
 
 from __future__ import annotations
@@ -111,6 +123,20 @@ ENV_DIAG_RANK = "VLLM_E2_TIER_DIAG_RANK"
 # guard mode: a launcher script must not be able to turn a facility that reads
 # real KV bytes on. With this directory unset the dump verb reports the honest
 # three-state marker as `not_deployed` and no worker hook is installed at all.
+# THE SSD TIER (`disk_spill.py`) -----------------------------------------------
+# Where the one-file-per-slot store lives, and how big it may get. BOTH are
+# required for the tier to exist at all, and neither ARMS it: the arm is the
+# in-process/arm-file gate in `disk_spill.arm()` (no env var arms a facility that
+# writes real KV bytes - the `guard_mode`/`blockdump` rule, pinned by a test).
+# Unset root = no directory is created, no thread starts, no byte is written.
+# `/tmp`, `/dev/shm` and `/run` are refused by `disk_layout.validate_root`: on the
+# box they are tmpfs, so a "disk" tier there spends the RAM the tier relieves.
+ENV_DISK_ROOT = "VLLM_E2_TIER_DISK_ROOT"
+# The ceiling in BYTES of stored slot files (a 64 GiB store is ~5,900 slots at
+# 11.4 MB). Unset or unparseable = no ceiling (never 0: a 0 ceiling would mean
+# "evict everything", which is a destructive reading of a typo).
+ENV_DISK_BYTES = "VLLM_E2_TIER_DISK_BYTES"
+
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
 # env-only on purpose: an HTTP argument naming a path the engine appends to would

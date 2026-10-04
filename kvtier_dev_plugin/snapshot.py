@@ -985,9 +985,9 @@ def backport_section(engine) -> dict:
 
 def dev_state_sections() -> dict:
     """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer,
-    the lookup ledger, the raw-byte dump.
+    the lookup ledger, the raw-byte dump, the SSD spill tier.
 
-    These are the five pieces of the plugin that CHANGE what the engine does (or
+    These are the pieces of the plugin that CHANGE what the engine does (or
     put a wrapper on its path), so every snapshot publishes them. Guard mode in
     particular must be impossible to miss: `snapshot_for_engine` also copies it to
     the top level as `guard_mode`, because a guarded dev engine mistaken for a
@@ -998,6 +998,7 @@ def dev_state_sections() -> dict:
     """
     from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
         blockdump,
+        disk_spill,
         guard_mode,
         step_trace,
         trace_ring,
@@ -1047,6 +1048,19 @@ def dev_state_sections() -> dict:
         _error(exc, "blockdump section")
         out["blockdump"] = {"error": f"{type(exc).__name__}"[:200]}
         out["blockdump_armed"] = None
+    try:
+        # THE SSD TIER's capability and counters: `not_configured` /
+        # `configured_disarmed` / `armed_and_ready`, plus `spilled`, `refused` PER
+        # REASON, `drops`, `bytes_written` and `evictions`. `disk_spill.section()`
+        # reads no files and walks no directory, so - like blockdump's - it is safe
+        # on this polled path; the store's size is deliberately NOT reported here
+        # for exactly that reason.
+        out["disk_spill"] = disk_spill.section()
+        out["disk_spill_armed"] = disk_spill.is_armed()
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk spill section")
+        out["disk_spill"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["disk_spill_armed"] = None
     return out
 
 

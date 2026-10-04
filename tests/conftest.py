@@ -21,6 +21,7 @@ import fakes_debug  # noqa: E402 - the shared fake engine structures
 from kvtier_dev_plugin import (  # noqa: E402
     blockdump,
     config,
+    disk_spill,
     evictions,
     guard_mode,
     lookup_ledger,
@@ -34,7 +35,7 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             config.ENV_ALLOW, config.ENV_DIAG_DIR, config.ENV_DIAG_EPOCH,
             config.ENV_DIAG_INTERVAL, config.ENV_DIAG_MIN_INTERVAL,
             config.ENV_DIAG_RANK, config.ENV_BOOT_INERT,
-            config.ENV_MISS_LOG)
+            config.ENV_MISS_LOG, config.ENV_DISK_ROOT, config.ENV_DISK_BYTES)
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +76,7 @@ def reset_dev_state():
              "worker": dict(worker_diag._state),
              "blockdump": dict(blockdump._state),
              "evictions": dict(evictions._state),
+             "disk_spill": dict(disk_spill._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -87,11 +89,15 @@ def reset_dev_state():
     blockdump.reset_state_for_tests()
     evictions.reset_state_for_tests()
     lookup_ledger.reset_state_for_tests()
+    # The SSD spill tier holds an arm, a queue and a THREAD. Dropping the queue
+    # reference is what keeps a spilled job from one test landing in the next.
+    disk_spill.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
            "blockdump": blockdump._state,
            "evictions": evictions._state,
+           "disk_spill": disk_spill._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -103,6 +109,7 @@ def reset_dev_state():
                        ("worker", worker_diag._state),
                        ("blockdump", blockdump._state),
                        ("evictions", evictions._state),
+                       ("disk_spill", disk_spill._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])
