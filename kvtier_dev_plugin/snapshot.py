@@ -796,6 +796,29 @@ def evictions_section(engine) -> dict:
         return evictions.empty_section(f"{type(exc).__name__}: {exc}")
 
 
+def gpu_census_section(engine) -> dict:
+    """The GPU pool's own census: matchable-but-unreferenced blocks, per group.
+
+    Why the gauge needs it: `BlockPool.get_usage()` counts every `ref_cnt == 0`
+    block as free, and a queued block that still carries a `block_hash` remains
+    matchable through `get_cached_block` (which checks no refcount) until
+    `_maybe_evict_cached_block` discards it - so "evicted" and "cached but idle"
+    were literally the same number. See gpu_census.py's header for the fork
+    references and for the one thing the pool CANNOT answer (per-group unhashed
+    counts, because all groups share one pool and an unhashed block has no group).
+
+    Contained the same way every other section is: a census that cannot run is a
+    `reason` with null counts, never a zero and never an exception into the engine.
+    Function-level import because `gpu_census` imports THIS module.
+    """
+    from . import gpu_census  # noqa: PLC0415 - cycle, see store_hook_section
+    try:
+        return gpu_census.section(engine)
+    except Exception as exc:  # noqa: BLE001 - the shape must survive regardless
+        _error(exc, "gpu census section")
+        return gpu_census.empty_section(f"{type(exc).__name__}: {exc}")
+
+
 def build_view(engine) -> dict:
     """One pass over the engine's scheduler-side state. Reads only."""
     scheduler = getattr(engine, "scheduler", None)
@@ -806,6 +829,10 @@ def build_view(engine) -> dict:
     # the one tier field that needs the ENGINE (for its corroboration), so it is
     # attached below tier_view(manager) rather than inside it.
     tier["evictions"] = evictions_section(engine)
+    # Same reason for the census: it resolves the pool through the engine (the
+    # scheduler's own `kv_cache_manager.block_pool`) so it survives a boot whose
+    # tier connector is absent, and its group labels come from `kv_cache_config`.
+    tier["gpu_pool_census"] = gpu_census_section(engine)
     return {
         "version": PROTOCOL_VERSION,
         "epoch": epoch(),
