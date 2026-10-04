@@ -24,23 +24,44 @@ bytes. Everything else in this module is about the discipline around that read:
 Stdlib + the plugin only; a fake worker with a fake pinned tensor, no engine, no
 torch, no vllm. The byte read runs on a REAL ctypes buffer, so the arithmetic
 under test is the arithmetic that will run on the box.
+
+ONE FAKE HERE IS DELIBERATELY UNCOOPERATIVE, and that is the lesson of the 0.2.7
+live failure: the first release keyed the request file by rank and had the HTTP
+route resolve the rank, which the EngineCore CANNOT do (`parallel_state` answers
+`AssertionError` in that role), so every `dump` refused on the box while 54 tests
+passed - because they pinned the rank through `VLLM_E2_TIER_DIAG_RANK` and never
+asked what the serving process would really answer. `a_serving_process()` below
+models a rank resolution that RAISES and `a_worker_rank()` one that answers, so the
+process split lives in the fixtures rather than in a comment. The same rule applies
+to the relay's per-process memory: switching "processes" clears the de-duplication
+set, because a fake that let the second rank inherit the first rank's memory would
+hide a fire-once bug exactly the way the pinned rank hid this one.
 """
 
 from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import ctypes
 import hashlib
 import json
 import pathlib
 import sys
 import time
+import types
 
 import fakes_debug as fake
 import pytest
 
-from kvtier_dev_plugin import blockdump, config, endpoint, snapshot, worker_diag
+from kvtier_dev_plugin import (
+    blockdump,
+    config,
+    cpu_capacity,
+    endpoint,
+    snapshot,
+    worker_diag,
+)
 
 # --- fixtures and fakes ------------------------------------------------------
 
@@ -181,6 +202,135 @@ def diag(tmp_path, monkeypatch):
     monkeypatch.setenv(config.ENV_DIAG_RANK, "PP0_TP0")
     monkeypatch.setenv(config.ENV_DIAG_MIN_INTERVAL, "0")
     return directory
+
+
+@pytest.fixture
+def diag_unpinned(tmp_path, monkeypatch):
+    """The channel WITHOUT `VLLM_E2_TIER_DIAG_RANK`, so rank resolution is the real
+    code path. The pinned rank is an operator escape hatch that bypasses
+    `parallel_state` entirely - and the bug this file exists to keep dead lived in
+    exactly that bypass, so the split-process tests must not use it.
+    """
+    directory = tmp_path / "kv-tier-diagnostics"
+    directory.mkdir()
+    monkeypatch.setenv(config.ENV_DIAG_DIR, str(directory))
+    monkeypatch.delenv(config.ENV_DIAG_RANK, raising=False)
+    monkeypatch.setenv(config.ENV_DIAG_MIN_INTERVAL, "0")
+    return directory
+
+
+def _parallel_state_module() -> dict:
+    """A `vllm.distributed.parallel_state` whose answers a test can set.
+
+    `pp=None` is the EngineCore/scheduler role: `get_pp_group()` raises
+    `AssertionError` there on the box, because that role never calls
+    `init_process_group`. Ints are a worker, which does have the state - the same two
+    expressions `gpu_worker.py:885-886` uses to key the handshake.
+    """
+    module = sys.modules.get("vllm.distributed.parallel_state")
+    holder = getattr(module, "KVTIER_TEST_STATE", None) if module else None
+    if holder is None:
+        module = types.ModuleType("vllm.distributed.parallel_state")
+        holder = {"pp": None, "tp": None}
+
+        def get_pp_group():
+            if holder["pp"] is None:
+                raise AssertionError(
+                    "DEFAULT_PG is not initialized; call init_process_group first")
+            return fake.Obj(name="ProcessGroup", rank_in_group=holder["pp"])
+
+        def get_tp_group():
+            if holder["tp"] is None:
+                raise AssertionError(
+                    "DEFAULT_PG is not initialized; call init_process_group first")
+            return fake.Obj(name="ProcessGroup", rank_in_group=holder["tp"])
+
+        module.get_pp_group = get_pp_group
+        module.get_tp_group = get_tp_group
+        module.KVTIER_TEST_STATE = holder
+        sys.modules["vllm.distributed.parallel_state"] = module
+    return holder
+
+
+@contextlib.contextmanager
+def a_serving_process():
+    """Become the EngineCore: a process whose `parallel_state` REFUSES to answer.
+
+    This is the role that serves the HTTP route. A fake that answered here would turn
+    the real bug into a passing test, which is precisely what happened once.
+    """
+    holder = _parallel_state_module()
+    saved = dict(holder)
+    holder.update({"pp": None, "tp": None})
+    try:
+        yield
+    finally:
+        holder.update(saved)
+
+
+@contextlib.contextmanager
+def a_worker_rank(pp: int, tp: int):
+    """Become a DIFFERENT worker process: its own rank AND its own memory.
+
+    Both halves matter. The rank comes from `parallel_state`, which answers here; the
+    de-duplication set and the poll budget are per-PROCESS state in the fork, so a
+    second simulated worker gets a fresh one - otherwise "worker B" would inherit
+    worker A's memory of a record it never saw, and a fire-once bug would be as
+    invisible here as the pinned rank made the rank bug. Restored on exit.
+    """
+    holder = _parallel_state_module()
+    saved_holder = dict(holder)
+    saved_state = {key: blockdump._state.get(key) for key in
+                   ("served", "pending_stat", "last_poll_mono", "polls",
+                    "poll_suppressed", "last_poll_reason")}
+    holder.update({"pp": pp, "tp": tp})
+    blockdump._state["served"] = {}
+    blockdump._state["pending_stat"] = None
+    blockdump._state["last_poll_mono"] = None
+    blockdump._state["polls"] = 0
+    blockdump._state["poll_suppressed"] = 0
+    try:
+        yield f"PP{pp}_TP{tp}"
+    finally:
+        holder.update(saved_holder)
+        blockdump._state.update(saved_state)
+
+
+@pytest.fixture(autouse=True)
+def no_forked_parallel_state():
+    """Never let the fake distributed state leak into another test's rank answer."""
+    yield
+    sys.modules.pop("vllm.distributed.parallel_state", None)
+
+
+def handshake_names_ranks(monkeypatch, *ranks):
+    """The rank SET, as the EngineCore learns it: the capacity handshake's
+    `(pp_rank, tp_rank)` keys, recorded scheduler-side by `cpu_capacity`. Setting that
+    dict is honest (the route process really does see it); wrapping the handshake
+    method is `test_cpu_capacity.py`'s business, not this file's.
+    """
+    monkeypatch.setitem(cpu_capacity._state, "reported",
+                        {f"{pp},{tp}": 100 for pp, tp in ranks})
+
+
+def pending_file(directory):
+    return directory / blockdump.PENDING_FILE
+
+
+def receipt_file(directory, rank="PP0_TP0"):
+    return directory / blockdump.RECEIPT_FILE.format(rank=rank)
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def relay_and_fulfil(worker) -> dict:
+    """One worker poll, as the next engine step would run it. The poll floor has its
+    own test; here it would only hide the relay behind "not due".
+    """
+    blockdump._state["last_poll_mono"] = None
+    return blockdump._tick(worker)
 
 
 def request_file(directory, rank="PP0_TP0"):
@@ -461,22 +611,36 @@ def test_dump_is_refused_while_disarmed_and_names_the_arm_verb(diag):
     assert list(diag.iterdir()) == []           # a refusal creates nothing
 
 
-def test_an_arm_writes_one_small_file_and_dump_arms_one_request(diag):
+def test_an_arm_writes_one_small_file_and_dump_arms_one_pending_record(diag):
+    """Arming a dump writes the RANK-AGNOSTIC pending record - no `PP<n>_TP<m>` in
+    the name, because this process cannot resolve one (see the relay tests)."""
     armed_engine(diag)
     assert (diag / blockdump.ARM_FILE).stat().st_size \
         <= blockdump.MAX_ARM_FILE_BYTES
     answer = blockdump.blockdump_for_engine(
         FakeEngine(), {"op": "dump", "group": "0", "block_id": 170, "length": 256})
     assert answer["request_armed"] is True, answer
-    armed = json.loads(request_file(diag).read_text(encoding="utf-8"))
+    armed = read_json(pending_file(diag))
     assert armed["block_ids"] == [170] and armed["group"] == "0"
     assert armed["length_bytes"] == 256 and armed["offset_bytes"] == 0
     assert armed["expires_ts"] > armed["armed_ts"]
+    assert armed["seq"] == answer["request_seq"] == 1
+    assert "PP" not in pending_file(diag).name
+    assert "PP" not in json.dumps(answer.get("request_file"))
     # The bytes never travel here: the utility-channel answer carries a PATH.
     assert "b64" not in json.dumps(answer)
-    assert response_file(diag).name in answer["response_file"]
+    assert response_file(diag).name in answer["response_files"]["pattern"].replace(
+        "<rank>", "PP0_TP0")
+    assert receipt_file(diag).name in answer["response_files"][
+        "receipt_pattern"].replace("<rank>", "PP0_TP0")
+    assert answer["response_file"] is None      # one file per rank, so not one
     assert "WORKER" in answer["bytes_source"]
     assert answer["answer_within_seconds"] == blockdump.POLL_INTERVAL_SECONDS
+    # A pending record is not a rank-keyed request file, and the engine process
+    # creates NO rank-keyed file of its own.
+    assert request_file(diag).exists() is False
+    assert {path.name for path in diag.iterdir()} == {blockdump.ARM_FILE,
+                                                      blockdump.PENDING_FILE}
 
 
 def test_the_geometry_of_the_named_group_travels_with_the_request(diag):
@@ -557,15 +721,20 @@ def test_the_window_refuses_past_its_cap_and_counts_it(diag):
             engine, {"op": "dump", "group": "0", "block_id": 1, "length": 64})
         if answer["request_armed"]:
             armed += 1
-            request_file(diag).unlink()      # the operator collected the answer
+            pending_file(diag).unlink()      # the operator collected the answers
     assert armed == blockdump.MAX_REQUESTS_PER_WINDOW
     assert "rate window" in answer["refused"]
     assert blockdump.counters()["window_refused"] == 3
     assert blockdump.counters()["requests_armed"] == armed
 
 
-def test_one_dump_is_in_flight_per_rank(diag):
-    """A second dump while one is pending is refused, and costs no window slot."""
+def test_one_pending_record_is_in_flight_for_every_rank(diag):
+    """A second dump while one is pending is refused, and costs no window slot.
+
+    One RECORD, not one per rank: the relay leaves the pending file on disk for the
+    other ranks, so the in-flight gate has to be the record itself - otherwise four
+    workers would be armed four times over by one operator asking once.
+    """
     armed_engine(diag)
     engine = FakeEngine()
     first = blockdump.blockdump_for_engine(
@@ -576,20 +745,23 @@ def test_one_dump_is_in_flight_per_rank(diag):
             engine, {"op": "dump", "group": "0", "block_id": 2, "length": 64})
         assert again["request_armed"] is False
         assert "already pending" in again["refused"]
+        assert again["pending_seq"] == 1        # names the record in flight
     assert blockdump.counters()["window_requests"] == 1
     assert blockdump.counters()["pending_refused"] == 3
 
 
 def test_a_stale_request_is_superseded_not_waited_behind(diag):
-    """A request left by a dead boot must not wedge the channel forever."""
+    """A record left by a dead boot must not wedge the channel forever."""
     armed_engine(diag)
-    request_file(diag).write_text(
-        json.dumps({"block_ids": [1], "group": "0",
+    pending_file(diag).write_text(
+        json.dumps({"version": blockdump.PROTOCOL_VERSION, "seq": 7,
+                    "group": "0", "block_ids": [1], "requested_ts": 1.0,
                     "expires_ts": time.time() - 1}), encoding="utf-8")
     answer = blockdump.blockdump_for_engine(
         FakeEngine(), {"op": "dump", "group": "0", "block_id": 5, "length": 64})
     assert answer["request_armed"] is True
-    assert "superseded_pending_request" in answer
+    assert answer["superseded_pending_request"] == str(pending_file(diag))
+    assert read_json(pending_file(diag))["seq"] == 1     # the stale 7 is gone
 
 
 # --- non-perturbation of the scheduler-side pool ------------------------------
@@ -624,27 +796,32 @@ def test_a_failing_region_does_not_escape_and_consumes_the_request(diag):
     Two layers are involved and both are exercised: a read that raises inside
     `read_block_bytes` is refused as data, and a region that breaks the probe ABOVE
     it (`__getattr__` itself raising) escapes `dump_blocks` and is caught by
-    `fulfil_request`. EITHER WAY the answer is one honest response file and a
-    consumed request - a broken region answered once, not retried every poll.
+    `fulfil_request`. EITHER WAY the answer is one honest response file, an honest
+    receipt, and a consumed request - a broken region answered once, not retried
+    every poll.
     """
     armed_engine(diag)
     armed = blockdump.blockdump_for_engine(
         FakeEngine(), {"op": "dump", "group": "0", "block_id": 1, "length": 64})
     assert armed["request_armed"] is True
-    report = blockdump.fulfil_request(worker_with({"0": RaisingTensor(blocks=2)}))
+    report = relay_and_fulfil(worker_with({"0": RaisingTensor(blocks=2)}))
     assert report["written"] is True                 # an ANSWER, not a silence
-    document = json.loads(response_file(diag).read_text(encoding="utf-8"))
+    assert report["relay"]["adopted"] is True        # it reached the worker at all
+    document = read_json(response_file(diag))
     assert document["refused"] is True
     assert "the host read failed: RuntimeError" in document["reason"]
+    assert document["request_seq"] == 1
     assert not request_file(diag).exists()           # consumed: no retry loop
+    assert read_json(receipt_file(diag))["refused"] is True
 
     blockdump.blockdump_for_engine(
         FakeEngine(), {"op": "dump", "group": "0", "block_id": 1, "length": 64})
-    report = blockdump.fulfil_request(worker_with({"0": ExplosiveRegion()}))
+    report = relay_and_fulfil(worker_with({"0": ExplosiveRegion()}))
     assert report["written"] is True
-    document = json.loads(response_file(diag).read_text(encoding="utf-8"))
+    document = read_json(response_file(diag))
     assert document["refused"] is True
     assert "the dump raised" in document["reason"]
+    assert document["request_seq"] == 2
     assert not request_file(diag).exists()
     assert blockdump.counters()["fulfil_errors"] >= 1
 
@@ -791,13 +968,16 @@ def test_a_fulfilled_request_writes_one_bounded_answer_file_with_units(diag):
         FakeEngine(), {"op": "dump", "group": "0", "block_id": 3,
                        "offset": 128, "length": 64})
     assert armed["request_armed"] is True
-    report = blockdump._tick(worker_with({"0": tensor}))
+    report = relay_and_fulfil(worker_with({"0": tensor}))
     assert report["written"] is True
-    document = json.loads(response_file(diag).read_text(encoding="utf-8"))
+    document = read_json(response_file(diag))
     assert document["refused"] is False
     assert document["rank"] == "PP0_TP0" and document["role"] == "blockdump"
+    # Which ask this answers: a rank-keyed file with no seq could be yesterday's.
+    assert document["request_seq"] == armed["request_seq"] == 1
+    assert document["request"]["seq"] == 1
     assert document["total_bytes"] == 64
-    assert document["request"] == {"group": "0", "block_ids": [3],
+    assert document["request"] == {"seq": 1, "group": "0", "block_ids": [3],
                                    "offset_bytes": 128, "length_bytes": 64}
     # The bytes are the bytes.
     assert base64.b64decode(document["blocks"][0]["b64"]) == tensor.block(3)[128:192]
@@ -807,20 +987,34 @@ def test_a_fulfilled_request_writes_one_bounded_answer_file_with_units(diag):
         assert field in json.dumps(document)
     assert set(document["units"]) >= {"total_bytes", "offset_bytes",
                                       "length_bytes", "bytes_per_block"}
-    assert not request_file(diag).exists()          # fire once
+    assert not request_file(diag).exists()          # fire once, for this rank
+    # The pending record SURVIVES its first answer: the other ranks have a turn.
+    assert pending_file(diag).exists()
+    # The receipt says the same verdict in a file small enough for the verb to read.
+    receipt = read_json(receipt_file(diag))
+    assert receipt["rank"] == "PP0_TP0" and receipt["seq"] == 1
+    assert receipt["refused"] is False and receipt["total_bytes"] == 64
+    assert receipt["blocks"] == 1 and receipt["response_written"] is True
+    assert (diag / blockdump.RECEIPT_FILE.format(rank="PP0_TP0")).stat().st_size \
+        <= blockdump.MAX_RECEIPT_FILE_BYTES
 
 
 def test_the_response_file_cap_refuses_rather_than_writing_a_huge_file(diag,
                                                                        monkeypatch):
-    """A multi-megabyte synchronous write inside a worker step is a stall."""
+    """A multi-megabyte synchronous write inside a worker step is a stall - but the
+    VERDICT still ships, because a rank that produced nothing is indistinguishable
+    from a rank that never polled."""
     monkeypatch.setattr(blockdump, "MAX_RESPONSE_BYTES", 64)
     armed_engine(diag)
     blockdump.blockdump_for_engine(FakeEngine(), {"op": "dump", "group": "0",
                                                   "block_id": 1, "length": 256})
-    report = blockdump.fulfil_request(worker_with({"0": FakeTensor(blocks=2)}))
+    report = relay_and_fulfil(worker_with({"0": FakeTensor(blocks=2)}))
     assert report["written"] is False and "cap" in report["reason"]
     assert response_file(diag).exists() is False
     assert not request_file(diag).exists()          # consumed, not retried
+    receipt = read_json(receipt_file(diag))
+    assert receipt["refused"] is True and "cap" in receipt["reason"]
+    assert receipt["response_written"] is False and receipt["seq"] == 1
 
 
 def test_an_expired_request_is_dropped_and_counted_not_served(diag):
@@ -832,7 +1026,6 @@ def test_an_expired_request_is_dropped_and_counted_not_served(diag):
     assert report["written"] is False and "expired" in report["reason"]
     assert blockdump.counters()["dropped"] == 1
     assert not request_file(diag).exists()
-
 
 # --- the three-state capability marker ---------------------------------------
 
