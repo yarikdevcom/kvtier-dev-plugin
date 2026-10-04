@@ -19,6 +19,7 @@ if str(TESTS) not in sys.path:
 import fakes_debug  # noqa: E402 - the shared fake engine structures
 
 from kvtier_dev_plugin import (  # noqa: E402
+    blockdump,
     config,
     evictions,
     guard_mode,
@@ -72,17 +73,24 @@ def reset_dev_state():
              "step": dict(step_trace._state),
              "guard": dict(guard_mode._state),
              "worker": dict(worker_diag._state),
+             "blockdump": dict(blockdump._state),
              "evictions": dict(evictions._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
     guard_mode.reset_state_for_tests()
     worker_diag.reset_state_for_tests()
+    # The raw-byte dump holds an ARM, and an armed dump is exactly the kind of
+    # development state this fixture exists to keep from leaking into the next
+    # test: without this, one test that armed it would leave every later test (and
+    # every later `section()`/`capability()` claim) reporting `armed_and_ready`.
+    blockdump.reset_state_for_tests()
     evictions.reset_state_for_tests()
     lookup_ledger.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
+           "blockdump": blockdump._state,
            "evictions": evictions._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
@@ -93,6 +101,7 @@ def reset_dev_state():
     for key, state in (("trace", trace_ring._state), ("step", step_trace._state),
                        ("guard", guard_mode._state),
                        ("worker", worker_diag._state),
+                       ("blockdump", blockdump._state),
                        ("evictions", evictions._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()

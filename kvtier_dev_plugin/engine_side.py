@@ -11,9 +11,14 @@ inside `EngineCore.__init__` (vllm/v1/engine/core.py:214-217), from
     is skipped with a warning instead of clobbered;
   * total: nothing it does can raise into the process that loaded it.
 
-What it installs: SEVEN methods on the `EngineCore` class, plus one wrapper on
+What it installs: NINE methods on the `EngineCore` class, plus one wrapper on
 `KVConnectorFactory.create_connector` (the connector-creation hook that lands the
-PR #56810 install when the tier connector is built). `EngineCoreProc`
+PR #56810 install when the tier connector is built), plus - in every process, on
+the connector's BASE class - the CPU capacity clamp, the per-rank diagnostics
+writer and the raw-byte dump hook (`worker_diag` and `blockdump`, both
+file-channel facilities that retry off the handshake hook, because a worker never
+imports `EngineCore` and nothing in a worker is reachable over the utility
+channel). `EngineCoreProc`
 (and `DPEngineCoreProc`, the actor classes) inherit them, and the UTILITY
 dispatch looks them up with `getattr(self, method_name)`
 (vllm/v1/engine/core.py:1669-1671), so a class-level method is exactly what
@@ -38,6 +43,7 @@ import threading
 
 from . import (
     backport,
+    blockdump,
     config,
     cpu_capacity,
     evictions,
@@ -275,6 +281,27 @@ def _make_tier_method():
     return kvtier_dev_tier
 
 
+def _make_blockdump_method():
+    def kvtier_dev_blockdump(self, args=None):  # noqa: ARG001 - bound method
+        """The bounded raw-KV-byte dump: status / arm / disarm / dump.
+
+        This half runs on the EngineCore loop thread and CANNOT see worker memory,
+        so it validates against the caps and writes the one small control file a
+        worker answers - it never returns bytes and never reads a KV byte itself.
+        Disarmed at load, because this is a diagnostic on a box serving real
+        traffic; no env var arms it, and an arm expires on its own.
+        """
+        return blockdump.blockdump_for_engine(self, args)
+
+    kvtier_dev_blockdump.__doc__ = (
+        "kvtier-dev-plugin: the bounded, read-only, ARM-GATED dump of parked KV "
+        "bytes (status/arm/disarm/dump). One region, one slot, an explicit byte "
+        "range; the bytes are delivered by a file a WORKER writes, never over "
+        "this channel. The read is host-memory arithmetic only: no CUDA, and no "
+        "refcount, free-queue or hash-state change.")
+    return kvtier_dev_blockdump
+
+
 _FACTORIES = {
     config.METHOD_SNAPSHOT: _make_snapshot_method,
     config.METHOD_RELOAD_POLICY: _make_reload_method,
@@ -284,6 +311,7 @@ _FACTORIES = {
     config.METHOD_GUARD: _make_guard_method,
     config.METHOD_TIER: _make_tier_method,
     config.METHOD_LOOKUPS: _make_lookups_method,
+    config.METHOD_BLOCKDUMP: _make_blockdump_method,
 }
 
 
@@ -321,6 +349,27 @@ def _engine_core_class():
     return getattr(module, "EngineCore", None)
 
 
+def _on_worker_report(connector) -> None:
+    """Both file-channel facilities, in the ONE order that matters.
+
+    The handshake hook is the only moment a worker process definitely has an
+    offload handler, so it drives BOTH file-channel installs - and `worker_diag`
+    must attempt first, because both wrap the SAME method
+    (`SimpleCPUOffloadWorker.get_finished`). Whichever lands second composes on
+    top of the other (the `guard_mode` sibling rule), so a later ordering change
+    cannot silently drop one; running the rank-file writer first is still the
+    order that keeps the proxy host's reader fed, which is the facility real
+    dashboards depend on. Each call is contained on its own, so a broken first
+    listener cannot cost the second one its install.
+    """
+    for hook in (worker_diag.ensure_installed, blockdump.ensure_installed):
+        name = getattr(hook, "__name__", "listener")
+        try:
+            hook(connector)
+        except Exception as exc:  # noqa: BLE001 - a listener never breaks a handshake
+            snapshot._error(exc, f"worker report hook ({name})")
+
+
 def register() -> None:
     """The `vllm.general_plugins` entry point. Inert unless gated on."""
     try:
@@ -341,9 +390,16 @@ def register() -> None:
         # connector has not imported its worker module yet; the retry is driven
         # by the handshake hook below, which fires once this rank really has an
         # offload handler. With VLLM_E2_TIER_DIAG unset both are inert.
-        cpu_capacity.set_worker_report_hook(worker_diag.ensure_installed)
+        cpu_capacity.set_worker_report_hook(_on_worker_report)
         capacity = cpu_capacity.install()
         worker_files = worker_diag.install()
+        # THE BLOCK DUMP'S WORKER HALF, fitted after the rank-file writer and for
+        # the same reason (a worker has no utility channel). Installing it is NOT
+        # arming it: with the facility disarmed - which is every fresh boot, and
+        # there is no env var that changes that - the wrapper's cost is one
+        # monotonic comparison per step plus one `os.stat` per poll interval, and
+        # no KV byte is read. `blockdump.py` owns the caps and the arm.
+        dump_hook = blockdump.install()
         # THE CONNECTOR-CREATION HOOK, and it comes before anything that could
         # refuse: this is what turns "patched before the first request" from an
         # operator habit into a property of the boot order. `create_connector` is
@@ -364,6 +420,9 @@ def register() -> None:
             logger.info("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
             logger.info("kvtier-dev-plugin: worker diagnostics writer %s",
                         worker_files)
+            logger.info("kvtier-dev-plugin: raw-byte dump hook %s (armed: %s)",
+                        blockdump.counters()["skip_reason"] or dump_hook,
+                        blockdump.is_armed())
             return
         report = attach_methods(cls)
         # Usually a no-op here: at this point in EngineCore.__init__ the
@@ -404,6 +463,10 @@ def register() -> None:
         level("kvtier-dev-plugin: connector-creation hook %s", connector_hook)
         level("kvtier-dev-plugin: CPU capacity clamp %s", capacity)
         level("kvtier-dev-plugin: worker diagnostics writer %s", worker_files)
+        level("kvtier-dev-plugin: raw-byte dump hook %s; DISARMED at boot by "
+              "design, armed only by POST %s {\"op\":\"arm\"} (it expires), and "
+              "while disarmed a worker reads no KV byte and opens no file",
+              dump_hook, config.ROUTE_PREFIX + config.ROUTE_BLOCKDUMP)
         # WHAT THE BOOT WILL DO, stated at plugin load, and what it DID stated at
         # connector creation. Guard mode has no env var of its own and never will
         # (arming a bug-masking facility from a launcher script is the thing the

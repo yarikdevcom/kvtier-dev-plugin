@@ -985,9 +985,9 @@ def backport_section(engine) -> dict:
 
 def dev_state_sections() -> dict:
     """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer,
-    the lookup ledger.
+    the lookup ledger, the raw-byte dump.
 
-    These are the four pieces of the plugin that CHANGE what the engine does (or
+    These are the five pieces of the plugin that CHANGE what the engine does (or
     put a wrapper on its path), so every snapshot publishes them. Guard mode in
     particular must be impossible to miss: `snapshot_for_engine` also copies it to
     the top level as `guard_mode`, because a guarded dev engine mistaken for a
@@ -996,7 +996,13 @@ def dev_state_sections() -> dict:
     Function-level imports again: `guard_mode` records into `trace_ring` and
     `kvconfig` reads `guard_mode`, so a module-level import here would be a cycle.
     """
-    from . import guard_mode, step_trace, trace_ring, worker_diag  # noqa: PLC0415
+    from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
+        blockdump,
+        guard_mode,
+        step_trace,
+        trace_ring,
+        worker_diag,
+    )
     out: dict = {}
     try:
         out["guard"] = guard_mode.section()
@@ -1028,6 +1034,19 @@ def dev_state_sections() -> dict:
         _error(exc, "lookup ledger section")
         out["lookup_ledger"] = {"error": f"{type(exc).__name__}"[:200]}
         out["lookup_ledger_armed"] = None
+    try:
+        # THE RAW-BYTE DUMP's capability: `not_deployed` / `deployed_disarmed` /
+        # `armed_and_ready`. It is a section and a top-level bool for the same
+        # reason guard mode is one: a reader of `/snapshot` (and the API process
+        # that mirrors these bools into `/status`) must be able to tell "the byte
+        # dump cannot exist here" from "it exists and is off" from "someone armed
+        # it". `section()` reads no files, so this stays safe on a polled path.
+        out["blockdump"] = blockdump.section()
+        out["blockdump_armed"] = blockdump.is_armed()
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "blockdump section")
+        out["blockdump"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["blockdump_armed"] = None
     return out
 
 

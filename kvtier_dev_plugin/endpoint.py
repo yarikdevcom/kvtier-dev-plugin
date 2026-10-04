@@ -17,6 +17,8 @@ it):
     POST /plugins/kvtier/guard           arm / disarm / fetch captures   [TOKEN]
     GET  /plugins/kvtier/lookups         the lookup/adopt ledger's newest records
     POST /plugins/kvtier/lookups         arm / disarm / clear / verdict    [TOKEN]
+    GET  /plugins/kvtier/blockdump       the raw-byte dump's capability state
+    POST /plugins/kvtier/blockdump       arm / disarm / dump bounded ranges [TOKEN]
     POST /plugins/kvtier/policy/reload   reload <package dir>/policy.py  [TOKEN]
 
 GET takes its arguments from query parameters, POST from a JSON object body.
@@ -369,6 +371,23 @@ ARG_SPECS: dict[str, dict] = {
                            "deep": {"kind": "bool"},
                            "sample_every": {"kind": "int", "min": 1,
                                             "max": 100000}},
+    # THE RAW-BYTE DUMP. `length` is deliberately bounded by the SAME cap the
+    # engine enforces (`blockdump.MAX_BYTES_PER_REQUEST`), pinned equal by
+    # test_blockdump_caps.py: a wire bound looser than the engine's would let a
+    # caller's over-long request through to be refused there instead of here, and
+    # a tighter one would be a lie about what the verb can do. There is no
+    # default for `length`: an over-long range must be asked for explicitly, and
+    # nothing here can ask for "the rest of the span".
+    config.ROUTE_BLOCKDUMP: {"op": {"kind": "enum", "values": ("status", "arm",
+                                                               "disarm", "dump")},
+                             "group": {"kind": "str",
+                                       "max_chars": MAX_ARG_STRING_CHARS},
+                             "block_id": {"kind": "int", "min": 0,
+                                          "max": 2 ** 31 - 1},
+                             "offset": {"kind": "int", "min": 0,
+                                        "max": 2 ** 31 - 1},
+                             "length": {"kind": "int", "min": 1, "max": 1048576},
+                             "seconds": {"kind": "int", "min": 1, "max": 7200}},
 }
 
 
@@ -481,14 +500,15 @@ def query_arguments(request: Request, route: str) -> dict:
 
 # --- the dev-state mirror ---------------------------------------------------
 
-DEV_STATE_KEYS = ("guard_mode", "trace_armed", "lookup_ledger_armed")
+DEV_STATE_KEYS = ("guard_mode", "trace_armed", "lookup_ledger_armed",
+                  "blockdump_armed")
 DEV_STATE_UNKNOWN_NOTE = (
     "no engine answer has been seen by this API process yet, so guard mode, the "
-    "trace ring and the lookup ledger are UNKNOWN here, not false. The engine's "
-    "own answer in any verb payload "
-    "(snapshot/kvconfig/block/request/trace/guard/lookups) is authoritative; the "
-    "default at every engine boot is guard_mode=false, trace_armed=false, "
-    "lookup_ledger_armed=false.")
+    "trace ring, the lookup ledger and the raw-byte dump are UNKNOWN here, not "
+    "false. The engine's own answer in any verb payload "
+    "(snapshot/kvconfig/block/request/trace/guard/lookups/blockdump) is "
+    "authoritative; the default at every engine boot is guard_mode=false, "
+    "trace_armed=false, lookup_ledger_armed=false, blockdump_armed=false.")
 
 
 def note_dev_state(request: Request, payload, source: str) -> None:
@@ -542,7 +562,8 @@ def dev_state_view(request: Request) -> dict:
     entry = state.get("dev_state") if isinstance(state, dict) else None
     if not isinstance(entry, dict) or not entry:
         return {"guard_mode": None, "trace_armed": None,
-                "lookup_ledger_armed": None, "source": None,
+                "lookup_ledger_armed": None, "blockdump_armed": None,
+                "source": None,
                 "epoch": None, "observed_at": None, "age_seconds": None,
                 "note": DEV_STATE_UNKNOWN_NOTE}
     observed = entry.get("observed_at")
@@ -552,6 +573,7 @@ def dev_state_view(request: Request) -> dict:
     return {"guard_mode": entry.get("guard_mode"),
             "trace_armed": entry.get("trace_armed"),
             "lookup_ledger_armed": entry.get("lookup_ledger_armed"),
+            "blockdump_armed": entry.get("blockdump_armed"),
             "source": entry.get("source"), "epoch": entry.get("epoch"),
             "observed_at": observed, "age_seconds": age,
             "note": ("mirrored from the engine's own answers in this API "
@@ -560,6 +582,25 @@ def dev_state_view(request: Request) -> dict:
 
 
 # --- payload helpers --------------------------------------------------------
+
+def blockdump_capability(deployed: bool, armed) -> str:
+    """The three-state marker, from what THIS process can actually know.
+
+    The same discipline the KV-tier reader on the proxy host uses for the probe
+    channel: "not deployed" and "deployed but not armed" and "armed" are three
+    different operational statements and must never collapse into one boolean.
+    The fourth value is the one this API process can produce and the ENGINE never
+    needs: `status` makes no engine call, so an arm it has never observed is
+    `..._unobserved`, never `disarmed` (the guard-mode rule).
+    """
+    if not deployed:
+        return "not_deployed"
+    if armed is True:
+        return "armed_and_ready"
+    if armed is False:
+        return "deployed_disarmed"
+    return "deployed_armed_state_unobserved"
+
 
 def status_payload(dev_state: dict | None = None) -> dict:
     try:
@@ -573,7 +614,7 @@ def status_payload(dev_state: dict | None = None) -> dict:
     allowed = config.allow_networks()
     mirrored = dev_state if isinstance(dev_state, dict) else {
         "guard_mode": None, "trace_armed": None, "lookup_ledger_armed": None,
-        "note": DEV_STATE_UNKNOWN_NOTE}
+        "blockdump_armed": None, "note": DEV_STATE_UNKNOWN_NOTE}
     return {
         "plugin": config.PLUGIN_NAME,
         "enabled": config.enabled(),
@@ -610,6 +651,7 @@ def status_payload(dev_state: dict | None = None) -> dict:
         "guard_mode": mirrored.get("guard_mode"),
         "trace_armed": mirrored.get("trace_armed"),
         "lookup_ledger_armed": mirrored.get("lookup_ledger_armed"),
+        "blockdump_armed": mirrored.get("blockdump_armed"),
         "dev_state": mirrored,
         "worker_diagnostics": {
             "env": config.ENV_DIAG_DIR,
@@ -624,6 +666,27 @@ def status_payload(dev_state: dict | None = None) -> dict:
             "note": "written by the WORKER processes, one file per rank; this "
                     "process only reports the configuration. The live per-rank "
                     "truth is in those files (the proxy host's reader reads them).",
+        },
+        # THE RAW-BYTE DUMP's capability, three states, never a bare bool. The
+        # engine's own answer (`GET/POST /blockdump`, or `snapshot.blockdump`) is
+        # authoritative for `armed`; what is here is the local deployment fact
+        # plus the last arm this API process OBSERVED, and `..._unobserved` when
+        # it has observed none - the guard-mode rule again.
+        "blockdump": {
+            "route": config.ROUTE_PREFIX + config.ROUTE_BLOCKDUMP,
+            "deployed": config.diagnostics_dir() is not None,
+            "armed": mirrored.get("blockdump_armed"),
+            "capability": blockdump_capability(
+                config.diagnostics_dir() is not None,
+                mirrored.get("blockdump_armed")),
+            "ops": ["status", "arm", "disarm", "dump"],
+            "note": ("a bounded, read-only dump of parked KV bytes: one region, "
+                     "one slot, an explicit byte range, base64 in a file a WORKER "
+                     "writes (the utility channel never carries bytes). DISARMED "
+                     "at every boot and there is no env var that arms it; only "
+                     "`POST {\"op\":\"arm\"}` does, and an arm expires on its own. "
+                     "Disarmed, a worker's cost is one stat per poll interval. "
+                     "`not_deployed` means no VLLM_E2_TIER_DIAG, so no channel."),
         },
         "tier": {
             "route": config.ROUTE_PREFIX + config.ROUTE_TIER,
@@ -984,6 +1047,49 @@ async def route_lookups_post(request: Request):
     args = await body_arguments(request, config.ROUTE_LOOKUPS)
     return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
                                      source="lookup ledger verb"))
+
+
+@router.get(config.ROUTE_BLOCKDUMP)
+async def route_blockdump(request: Request):
+    """The raw-byte dump's capability state. Token required even for this read,
+    as for `/trace` and `/guard`: the same door ARMS the facility."""
+    await _guard_dev_state_route(request)
+    args = dict(query_arguments(request, config.ROUTE_BLOCKDUMP))
+    args.setdefault("op", "status")
+    return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
+                                     source="blockdump status"))
+
+
+@router.post(config.ROUTE_BLOCKDUMP)
+async def route_blockdump_post(request: Request):
+    """THE BOUNDED RAW-KV-BYTE DUMP - read-only, arm-gated, and file-delivered.
+
+    `{op: status|arm|disarm|dump, group?, block_id?, offset?, length?, seconds?}`.
+    It exists to answer a byte-level question no counter can (whether a store on
+    behalf of one group also writes other regions' bytes at the same GPU index),
+    so the payload is bytes - which is exactly why this route is shaped the way it
+    is:
+
+      * TOKEN-GATED like `/guard`: the door that can read KV bytes is not a read.
+      * DISARMED at every boot, no env var that arms it, and an arm EXPIRES
+        (`seconds`, default 1800, max 7200). `op: dump` on a disarmed engine is a
+        refusal that names the arm verb, never a silent no-op.
+      * `length` is REQUIRED and capped (this module's spec, mirrored by the
+        engine's own `MAX_BYTES_PER_REQUEST`): a caller asks for N bytes of one
+        region at one slot, and nothing here can ask for a span.
+      * a rolling rate window (requests per window), one request in flight per
+        rank, a response-file size cap, and a `refused` reason for every one of
+        them. Nothing is ever truncated to fit.
+      * the BYTES NEVER CROSS THE UTILITY CHANNEL. This half writes one small
+        control file; the worker writes the base64 + per-block sha256 to
+        `blockdump-<rank>.json` in the diagnostics directory and the payload says
+        where. Reading a slot is host-memory arithmetic only: no CUDA, and no
+        refcount, free-queue or hash-state change (see `blockdump.py`).
+    """
+    await _guard_dev_state_route(request)
+    args = await body_arguments(request, config.ROUTE_BLOCKDUMP)
+    return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
+                                     source="blockdump verb"))
 
 
 @router.post(config.ROUTE_RELOAD)

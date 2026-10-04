@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 from test_routes import (
     BLOCK,
+    BLOCKDUMP,
     GUARD,
     KVCONFIG,
     LOOKUPS,
@@ -394,11 +395,12 @@ def test_status_advertises_the_surface_it_actually_serves(engine):
     assert status["routes"] == [prefix + route for route in config.ROUTES]
     assert sorted(status["routes"]) == sorted([
         STATUS, SNAPSHOT, KVCONFIG, BLOCK, REQUEST, TRACE, GUARD, TIER, LOOKUPS,
-        RELOAD])
+        BLOCKDUMP, RELOAD])
     assert status["dev_state_routes"] == [prefix + config.ROUTE_TRACE,
                                           prefix + config.ROUTE_GUARD,
                                           prefix + config.ROUTE_TIER,
-                                          prefix + config.ROUTE_LOOKUPS]
+                                          prefix + config.ROUTE_LOOKUPS,
+                                          prefix + config.ROUTE_BLOCKDUMP]
     assert status["engine_methods"] == list(config.METHODS)
     assert "DEVELOPMENT ONLY" in status["development_facilities"]["guard_mode"]
     assert "BaseException" in status["development_facilities"]["guard_mode"]
@@ -436,12 +438,14 @@ def test_the_validator_is_one_table_for_every_route():
     accident, so the table names every route the config declares."""
     for route in (config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG, config.ROUTE_BLOCK,
                   config.ROUTE_REQUEST, config.ROUTE_TRACE, config.ROUTE_GUARD,
-                  config.ROUTE_TIER, config.ROUTE_LOOKUPS):
+                  config.ROUTE_TIER, config.ROUTE_LOOKUPS,
+                  config.ROUTE_BLOCKDUMP):
         assert route in endpoint.ARG_SPECS, route
     assert set(endpoint.ARG_SPECS) == {config.ROUTE_SNAPSHOT, config.ROUTE_KVCONFIG,
                                        config.ROUTE_BLOCK, config.ROUTE_REQUEST,
                                        config.ROUTE_TRACE, config.ROUTE_GUARD,
-                                       config.ROUTE_TIER, config.ROUTE_LOOKUPS}
+                                       config.ROUTE_TIER, config.ROUTE_LOOKUPS,
+                                       config.ROUTE_BLOCKDUMP}
 
 
 @pytest.mark.parametrize("route,raw,expected", [

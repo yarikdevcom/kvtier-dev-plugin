@@ -556,17 +556,66 @@ def test_no_directory_configured_means_no_write_reason(writes_to, monkeypatch):
 
 def test_the_plugin_registers_the_handshake_retry_hook(monkeypatch, tmp_path):
     """`engine_side.register()` cannot install the worker writer itself (the class
-    does not exist yet), so it hands `worker_diag.ensure_installed` to the
-    capacity handshake, which fires exactly once this rank has a handler."""
-    from kvtier_dev_plugin import engine_side
+    does not exist yet), so it hands a LISTENER to the capacity handshake, which
+    fires exactly once this rank has a handler.
+
+    That listener drives BOTH file-channel facilities - the rank-file writer and
+    the raw-byte dump hook - because both wrap the worker's `get_finished`, and it
+    drives the writer FIRST because the rank files are the one input the proxy
+    host's reader has. So the assertion is no longer "is this function exactly
+    `worker_diag.ensure_installed`" (a composite is the right shape now) but "does
+    firing the hook install both, with the dump composed ON TOP of the writer".
+    """
+    from kvtier_dev_plugin import (  # noqa: PLC0415 - the modules under test
+        blockdump,
+        engine_side,
+    )
     saved = cpu_capacity._worker_report_hook
     monkeypatch.setenv(config.ENV_ENABLE, "1")
     monkeypatch.setenv(config.ENV_DIAG_DIR, str(tmp_path / "diag"))
+    monkeypatch.setenv(config.ENV_DIAG_RANK, "PP0_TP0")
     try:
         engine_side.register()
-        assert cpu_capacity._worker_report_hook is worker_diag.ensure_installed
+        assert cpu_capacity._worker_report_hook is engine_side._on_worker_report
+        # Nothing has been wrapped yet: at plugin load the worker class does not
+        # exist, which is the whole reason the retry exists.
+        assert worker_diag.counters()["installed"] is False
+        assert blockdump.counters()["installed"] is False
+        # Fire it the way the handshake does, with a connector naming a real
+        # worker class: both facilities land, one on top of the other.
+        cls, _module = fake.fork_class(worker_diag.TARGET_MODULE,
+                                       worker_diag.TARGET_CLASS,
+                                       fake.WORKER_SOURCE, register=True)
+        connector = fake.Obj(name="Connector", worker_handler=cls())
+        try:
+            cpu_capacity._call_worker_report_hook(connector)
+            assert worker_diag.counters()["installed"] is True
+            assert blockdump.counters()["installed"] is True
+            assert blockdump.counters()["nested"] == ["get_finished"]
+            assert worker_diag.counters()["nested"] == []
+        finally:
+            sys.modules.pop(worker_diag.TARGET_MODULE, None)
     finally:
         cpu_capacity.set_worker_report_hook(saved)
+
+
+def test_a_broken_first_listener_does_not_cost_the_second_one(monkeypatch,
+                                                               tmp_path):
+    """Two facilities share one hook, so the rank files must not depend on the dump
+    hook's health. The composite contains each call on its own."""
+    from kvtier_dev_plugin import blockdump, engine_side
+
+    def broken(connector):
+        raise RuntimeError("the writer is broken")
+
+    seen = []
+    monkeypatch.setattr(engine_side, "worker_diag",
+                        fake.Obj(name="wd", ensure_installed=broken))
+    monkeypatch.setattr(blockdump, "ensure_installed",
+                        lambda connector: seen.append(connector))
+    connector = fake.Obj(name="Connector")
+    engine_side._on_worker_report(connector)     # must not raise
+    assert seen == [connector]
 
 
 def test_a_broken_hook_never_breaks_a_handshake(monkeypatch):

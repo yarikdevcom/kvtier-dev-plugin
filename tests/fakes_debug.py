@@ -465,10 +465,19 @@ def unwrap_everything() -> int:
     test is still installed when the next one runs - the exact leak that would
     make a later test assert on a nested wrapper. A fixture calls this on teardown.
     """
-    from kvtier_dev_plugin import guard_mode, step_trace, worker_diag  # noqa: PLC0415
+    from kvtier_dev_plugin import (  # noqa: PLC0415 - unwrap, do not import at top
+        blockdump,
+        guard_mode,
+        step_trace,
+        worker_diag,
+    )
     restored = 0
     for cls in _NAMED_CLASSES.values():
-        for module in (guard_mode, step_trace, worker_diag):
+        # `blockdump` FIRST: it composes on TOP of `worker_diag`'s layer on the
+        # same method (`get_finished`), so removing the outer layer first is what
+        # puts the writer's layer back on the class for the writer's own unwrap to
+        # find. The reverse order would leave a wrapped method behind.
+        for module in (blockdump, guard_mode, step_trace, worker_diag):
             for name in getattr(module, "WRAPPED_METHODS", ()):
                 current = cls.__dict__.get(name)
                 if getattr(current, module.OWNER_ATTR, None) == module.OWNER_TAG:

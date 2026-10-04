@@ -125,6 +125,15 @@ OWNER_ATTR = "__kvtier_dev_workerdiag_owner__"
 OWNER_TAG = "kvtier-dev-plugin/workerdiag-1"
 ORIGINAL_ATTR = "__kvtier_dev_workerdiag_original__"
 
+# A function this package installed itself (another layer on the SAME method, e.g.
+# `blockdump`'s wrapper on `get_finished`) is composed with, never refused - the
+# `guard_mode.SIBLING_PACKAGE` rule. Refusing it would make the install ORDER a
+# silent data-loss switch: whichever facility landed second would report a refusal
+# and the rank files this writer produces would simply stop existing, which is the
+# one input the proxy host's reader has. A marker or definition owned by ANYONE
+# else is still refused outright.
+SIBLING_PACKAGE = (__package__ or "kvtier_dev_plugin") + "."
+
 SCHEMA_VERSION = 1          # the reader's KV_TIER_SNAPSHOT_VERSION
 ROLE = "worker"
 MAX_FILE_BYTES = 32 * 1024  # the reader's own cap is 256 KiB; we stay far below
@@ -140,6 +149,7 @@ _state: dict = {
     "skips": 0,
     "skip_reason": None,
     "skip_detail": [],
+    "nested": [],
     "class": None,
     "installed": False,
     "dir": None,
@@ -168,7 +178,7 @@ _state: dict = {
 def reset_state_for_tests() -> None:
     _state.update({"enabled": False, "installs": 0, "reinstalls": 0,
                    "uninstalls": 0, "skips": 0, "skip_reason": None,
-                   "skip_detail": [],
+                   "skip_detail": [], "nested": [],
                    "class": None, "installed": False, "dir": None, "rank": None,
                    "rank_source": None, "epoch_scope": None,
                    "interval_steps": None, "steps_since_write": 0, "steps": 0,
@@ -208,6 +218,7 @@ def section() -> dict:
         "skips": int(_state["skips"]),
         "skip_reason": _state["skip_reason"],
         "skip_detail": list(_state.get("skip_detail") or []),
+        "nested_in": list(_state.get("nested") or []),
         "rank": _state["rank"],
         "rank_source": _state["rank_source"],
         "epoch_scope": _state["epoch_scope"],
@@ -605,7 +616,7 @@ def install(cls=None) -> dict:
     plugin that is otherwise live still creates no files anywhere.
     """
     report = {"installed": False, "attached": [], "replaced": [], "skipped": [],
-              "skip_detail": [], "class": None, "reason": None}
+              "skip_detail": [], "nested": [], "class": None, "reason": None}
 
     def refuse(method_name: str, reason: str) -> None:
         """Record a refusal per method, the way `guard_mode.install` does.
@@ -650,11 +661,16 @@ def install(cls=None) -> dict:
             replaced = owner == OWNER_TAG
             if not replaced:
                 home = getattr(original, "__module__", None)
-                if home != TARGET_MODULE:
+                if home != TARGET_MODULE and not str(home or "").startswith(
+                        SIBLING_PACKAGE):
                     refuse(name, f"{report['class']}.{name} is neither ours nor "
                                  f"the fork's own: defined in {home!r}, not "
                                  f"{TARGET_MODULE!r}")
                     continue
+                if home != TARGET_MODULE:
+                    # A sibling layer of this package on the same method: go ON
+                    # TOP OF it so both facilities run, and say so in the report.
+                    report["nested"].append(name)
             if replaced:
                 original = getattr(original, ORIGINAL_ATTR, original)
                 report["replaced"].append(name)
@@ -676,6 +692,7 @@ def install(cls=None) -> dict:
             _state["class"] = report["class"]
             _state["installed"] = True
             _state["enabled"] = True
+            _state["nested"] = list(report["nested"])
             if not report["skipped"]:
                 _state["skip_reason"] = None
             _state["skip_detail"] = list(report["skip_detail"])

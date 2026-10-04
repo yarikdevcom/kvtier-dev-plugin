@@ -105,6 +105,12 @@ ENV_DIAG_MIN_INTERVAL = "VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS"
 # rather than written, because the reader classifies a file whose `rank` does not
 # match its file name as mislabeled.
 ENV_DIAG_RANK = "VLLM_E2_TIER_DIAG_RANK"
+# THE RAW-BYTE DUMP (`blockdump.py`) HAS NO ENV VAR OF ITS OWN, and never will.
+# Its channel is this directory; its arm is `POST /plugins/kvtier/blockdump
+# {"op":"arm"}` and it expires by itself. That is deliberate, the same posture as
+# guard mode: a launcher script must not be able to turn a facility that reads
+# real KV bytes on. With this directory unset the dump verb reports the honest
+# three-state marker as `not_deployed` and no worker hook is installed at all.
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
 # env-only on purpose: an HTTP argument naming a path the engine appends to would
@@ -126,11 +132,15 @@ METHOD_TRACE = "kvtier_dev_trace"
 METHOD_GUARD = "kvtier_dev_guard"
 METHOD_TIER = "kvtier_dev_tier"
 METHOD_LOOKUPS = "kvtier_dev_lookups"
+# The raw-byte dump verb. Read-only, bounded, and DISARMED until a human arms it
+# (there is no env var that arms it): see blockdump.py.
+METHOD_BLOCKDUMP = "kvtier_dev_blockdump"
 
 # Every engine method this plugin owns, in attach order. `attach_methods` walks
 # this, so a new verb cannot be attached in one place and forgotten elsewhere.
 METHODS = (METHOD_SNAPSHOT, METHOD_RELOAD_POLICY, METHOD_KVCONFIG, METHOD_INSPECT,
-           METHOD_TRACE, METHOD_GUARD, METHOD_TIER, METHOD_LOOKUPS)
+           METHOD_TRACE, METHOD_GUARD, METHOD_TIER, METHOD_LOOKUPS,
+           METHOD_BLOCKDUMP)
 
 # All HTTP surface lives here, never under /v1 (see docs/usage/security.md:349:
 # `--api-key` only protects the /v1, /v2, /inference, /cohere prefixes).
@@ -149,16 +159,21 @@ ROUTE_TRACE = "/trace"
 ROUTE_GUARD = "/guard"
 ROUTE_TIER = "/tier"
 ROUTE_LOOKUPS = "/lookups"
+# The bounded raw-KV-byte dump. It can ARM a diagnostic that reads real KV bytes,
+# so it is a dev-state route: token required in every shape, loopback included.
+ROUTE_BLOCKDUMP = "/blockdump"
 
 # The same routes as one tuple, in the order a reader wants them, so `status`
 # and the tests enumerate the surface from ONE place. Suffixes: the router
 # carries ROUTE_PREFIX itself.
 ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUEST,
-          ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS, ROUTE_RELOAD)
+          ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS, ROUTE_BLOCKDUMP,
+          ROUTE_RELOAD)
 
 # The routes that can change engine dev state. Token in every shape, loopback
 # included - see endpoint.require_dev_state_token.
-DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS)
+DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS,
+                    ROUTE_BLOCKDUMP)
 
 # Name used for logs, for `VLLM_PLUGINS` allowlisting and as the entry-point
 # name in both groups. One name allowlists both halves at once.

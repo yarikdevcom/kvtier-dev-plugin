@@ -167,10 +167,11 @@ from kvtier_dev_plugin.endpoint import KVTierDevEndpointPlugin
 app = FastAPI(); p = KVTierDevEndpointPlugin(); p.attach_router(app)
 print(sorted(r.path for r in app.routes if 'kvtier' in getattr(r, 'path', '')))
 "
-# ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+# ['/plugins/kvtier/block', '/plugins/kvtier/blockdump',
+#  '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
 #  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
 #  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
-#  '/plugins/kvtier/status', '/plugins/kvtier/trace']
+#  '/plugins/kvtier/status', '/plugins/kvtier/tier', '/plugins/kvtier/trace']
 ```
 
 Against the **running** server, the equivalent that does not depend on the
@@ -180,10 +181,11 @@ FastAPI route-tree shape (newer FastAPI nests included routers behind an
 ```bash
 curl -s http://127.0.0.1:8000/openapi.json | python3 -c \
   'import json,sys; print(sorted(p for p in json.load(sys.stdin)["paths"] if "kvtier" in p))'
-# ['/plugins/kvtier/block', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+# ['/plugins/kvtier/block', '/plugins/kvtier/blockdump',
+#  '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
 #  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
 #  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
-#  '/plugins/kvtier/status', '/plugins/kvtier/trace']
+#  '/plugins/kvtier/status', '/plugins/kvtier/tier', '/plugins/kvtier/trace']
 ```
 
 and confirm nothing under `/v1` came from us: `GET /v1/models` must behave
@@ -205,6 +207,9 @@ The whole surface, all under `/plugins/kvtier`:
 | `/request` | GET, POST | off-box only | one request by id: its blocks per group and what the tier could park |
 | `/trace` | GET, POST | **always** | the bounded event ring: read it, or arm / disarm / clear it |
 | `/guard` | GET, POST | **always** | guard mode: state, captured faults, arm, disarm |
+| `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
+| `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
+| `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -785,6 +790,131 @@ EngineCore-only. So a worker reports through a **file**: one per rank, into
   `counters.boundary_stored` are deliberately absent because they are scheduler-side
   (`BoundaryStoreStats`) - the reader notes an absent counter and adds zero, which
   keeps the aggregate honest instead of inventing a reading.
+
+## Dumping a few parked bytes to settle a byte-level question (`blockdump.py`)
+
+Some questions are not answerable from counters. "A parked 3,200-token span costs 5
+slots (one per prefix-cacheable group), yet `cuda_mem_ops.py:244-250` reads as
+though one store writes `bpb` bytes for EVERY region at ONE GPU index - so does a
+store made for group 0 also write the other groups' bytes there?" is a question
+about BYTES. Sibling slots demonstrably hold different GPU block ids, so the data
+is not simply duplicated; only real bytes settle it, and guessing risks silently
+corrupting resumed prefixes.
+
+So this capability reads a HANDFUL of real parked slots' bytes and nothing else.
+It is split like `worker_diag`, because the bytes live in the worker (as a slice of
+`SimpleCPUOffloadWorker.cpu_kv_caches[region]`, `worker.py:235-244`) and nothing in
+a worker is reachable over the utility channel:
+
+* the **EngineCore** half (`/blockdump`) validates against the caps and writes ONE
+  small control file (`blockdump-request-<rank>.json`); it never returns bytes and
+  never reads one;
+* the **worker** half, on a wrapped `get_finished`, performs the read and writes
+  ONE bounded response file (`blockdump-<rank>.json`) with base64 bytes and a
+  per-block `sha256`. The operator collects that file - it is on the ENGINE host,
+  in `$VLLM_E2_TIER_DIAG`.
+
+**The read mutates nothing.** A slot's bytes are addressed by host-memory
+arithmetic only - `data_ptr() + block_id * stride(0) * element_size + offset`,
+`ctypes.string_at`. No CUDA (a stray context at 0.96 utilisation is an outage), no
+GPU pool, and no `ref_cnt` / free-queue / hash-index change: the CPU block pool is
+scheduler-side state this path never even looks at, which
+`tests/test_blockdump.py::test_no_dump_path_even_looks_at_the_block_pool` proves
+with a pool that records every attribute read on itself (and records none).
+
+**DISARMED at every boot, and there is no env var that arms it** - the guard-mode
+rule, applied to the one facility that reads KV bytes. `POST {"op":"arm"}` arms it
+and the arm **expires** by itself (`seconds`, default 1800, max 7200). A worker
+cannot be told anything over the utility channel, so the arm crosses to it as one
+small file (`blockdump-arm.json`) that the worker re-reads at most once every
+`POLL_INTERVAL_SECONDS` (2 s). Disarmed, a worker's whole cost is one `os.stat` per
+poll: no open, no parse, no KV byte read, no response file. Deploy it, leave it
+disarmed indefinitely, and the box does no dump work.
+
+**The caps, and their units** (all reported in `caps` with a `units` map; every one
+REFUSES with the numbers named and is counted - nothing is ever truncated):
+
+| Cap | Value | Unit |
+|-----|-------|------|
+| `max_bytes_per_request` | 1 048 576 | bytes of raw KV bytes per request (pre-base64) |
+| `max_blocks` | 8 | blocks (slots) per request |
+| `max_response_bytes` | 4 194 304 | bytes of the response file (a worker step must not stall writing a giant file) |
+| `max_requests_per_window` / `request_window_seconds` | 20 / 300.0 | dumps per rolling window |
+| `arm_default_seconds` / `arm_max_seconds` | 1800 / 7200 | how long an arm lives |
+| `poll_interval_seconds` | 2.0 | the worker's poll floor |
+| one request per rank | - | a `dump` while one is pending is refused (and costs no window slot) |
+
+A `length` is REQUIRED by `op: dump` (no default, `endpoint.ARG_SPECS` bound pinned
+equal to the engine's own cap): the caller must ask for N bytes of one region at one
+slot, so there is no path that dumps "the arena" and no path that leaks a span. The
+`block_id` is a **slot index in that rank's arena tensor for that region**
+(`0 .. num_cpu_blocks-1`), not a GPU block id; a wrong `group` is answered with the
+region names this rank actually has.
+
+The three-state capability marker is in `/plugins/kvtier/status` (`blockdump:
+{deployed, armed, capability}`), in every `snapshot` (`snapshot.blockdump`) and in
+the verb's own `armed_state`: `not_deployed` (no `VLLM_E2_TIER_DIAG`, no channel, no
+hook) / `deployed_disarmed` / `armed_and_ready`. Because `status` makes no engine
+call, an arm it has never observed is `deployed_armed_state_unobserved` - never a
+guessed `false`, the same rule as `guard_mode`.
+
+**Both `worker_diag` and `blockdump` wrap `get_finished`.** Neither refuses the
+other: a sibling layer of this package is composed with, never clobbered (the
+`guard_mode.SIBLING_PACKAGE` rule), in either install order, and the reports say
+which methods are `nested`. `engine_side.register()` installs `worker_diag` first
+and `blockdump` on top of it, in EVERY process - and, because the worker class does
+not exist yet at plugin load, the real install in a worker is driven by the capacity
+handshake hook (`engine_side._on_worker_report`), which calls the writer's retry
+first and the dump's second, each contained on its own.
+
+### The dump sequence (after a restart, to settle D vs P)
+
+```bash
+T='<the VLLM_E2_TIER_DEV_TOKEN value>'      # /blockdump needs the token in EVERY shape
+H="x-kvtier-dev-token: $T"
+B=http://127.0.0.1:8000/plugins/kvtier
+D=/tmp/kv-tier-diagnostics                  # whatever VLLM_E2_TIER_DIAG is on the box
+
+# 1. is it deployed, and disarmed?  (expect "capability": "deployed_disarmed")
+ssh llm "curl -s -H '$H' $B/blockdump" | python3 -m json.tool
+
+# 2. arm it for 30 minutes (a fresh boot is disarmed; nothing works until this)
+ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"arm\",\"seconds\":1800}' $B/blockdump"
+
+# 2b. if you do not know the region names yet: arm a made-up group and read the
+#     refusal, which lists every region this rank has
+ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"dump\",\"group\":\"list\",\"block_id\":0,\"length\":16}' $B/blockdump"
+ssh llm "cat $D/blockdump-PP0_TP0.json" | python3 -m json.tool     # .reason names them
+
+# 3. one dump per region, at the SAME slot index - collecting the file in between
+#    (the response file is OVERWRITTEN by the next dump, and one is in flight/rank)
+for R in 0 1 2 3 5; do
+  ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"dump\",\"group\":\"$R\",\"block_id\":170,\"offset\":0,\"length\":4096}' $B/blockdump" >/dev/null
+  sleep 2
+  ssh llm "cat $D/blockdump-PP0_TP0.json" > dump-g$R-slot170.json
+  ssh llm "rm -f $D/blockdump-PP0_TP0.json"
+done
+
+# 4. compare: identical bytes across regions at one slot index => one store wrote
+#    every region there; different bytes => the regions are distinct
+python3 -c "
+import json,glob
+for f in sorted(glob.glob('dump-g*-slot170.json')):
+    d = json.load(open(f)); b = d['blocks'][0]
+    print(f, d['group'], b['sha256'][:16], b['length_bytes'], 'bytes',
+          'bpb', b['bytes_per_block'])"
+
+# 5. stand down (or let the arm expire on its own)
+ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"disarm\"}' $B/blockdump"
+```
+
+Two operational facts the payload states too: `get_finished` only runs while the
+engine is **stepping**, so an idle engine answers at its next step rather than on a
+timer; and the response file is overwritten by the next dump, so collect it (or
+remove it) before arming another. To compare the SIBLING slots of one span instead
+of one index across regions, read the per-group slot ids from
+`GET $B/request?request_id=...` (or the live block tables) and dump each region at
+its own slot id - same command, different `block_id`.
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
@@ -1715,7 +1845,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-1001 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+1218 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1730,12 +1860,35 @@ reload verb, holder-based reload actually changing behaviour (same-size/same-mti
 edit), rollback with the traceback as data, containment (a raising policy and a
 raising engine both come back as data, `BaseException` propagates), the 504/502/503
 answers, that every installed engine method takes exactly one optional argument and
-answers under both dispatch shapes, and that the mount point is exactly the ten
+answers under both dispatch shapes, and that the mount point is exactly the eleven
 `/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
 one from loopback with no token, two from a source-bound non-loopback client socket
 on this host's own LAN address (skipped on a box with no such address).
+
+The raw-byte dump (`tests/test_blockdump.py`) is the one that tests bytes rather
+than claims, because the question it serves is a byte-level one: a real `ctypes`
+buffer stands in for the pinned arena, so a known pattern written by the test must
+come back through the response file identical, at an offset, with a matching
+`sha256`. Around that it pins the discipline: every cap REFUSES with the numbers
+named (a range that crosses the slot, a length over the cap, eight 200 KiB ranges
+that would total 1.5 MiB, a whole-block read of a 2 MiB slot) and nothing is ever
+clipped; a fresh boot does no dump work even with `VLLM_E2_TIER_DIAG` set for the
+rank-file writer (a pending request file with no arm file is never opened, never
+consumed, and answered by no file); non-perturbation is proven by a fake CPU block
+pool that records every attribute read on itself and records NONE during a dump,
+with `ref_cnt`, the free-queue order and the hash index identical after; a region
+whose `data_ptr` raises and a region whose `__getattr__` raises are both contained
+and BOTH consume the request, so one bad region is answered once instead of retried
+every poll; the wrapper hands back the fork's object IDENTICALLY and does not
+consume a generator result (the class of bug that would make the engine free
+nothing); the arm expires on the EngineCore's monotonic clock and in the file a
+worker reads, and a garbage/oversized arm file fails closed to disarmed; the
+capability marker's three states are asserted in `section()`, in `snapshot` and in
+`/status`, including that `/status` says `..._unobserved` rather than inventing
+`armed: false`; and the wire bound on `length` is pinned equal to the engine's own
+`MAX_BYTES_PER_REQUEST` rather than to a second copy of the literal.
 
 The lookup ledger (`tests/test_lookup_ledger.py`) is the one that proves the
 composition rules instead of asserting them: the cap and the monotonic `dropped`,
