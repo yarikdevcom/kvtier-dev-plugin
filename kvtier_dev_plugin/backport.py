@@ -514,16 +514,38 @@ def _fingerprint_verdict(name, fn) -> tuple[bool, str | None, str | None]:
 def _layer_kinds():
     """(owner_attr, owner_tag, kind, original_attr) for every layer we own.
 
-    The guard's constants are read from `guard_mode` itself (lazy: same
-    package, no cycle - guard_mode imports neither backport nor engine_side),
-    so the tag values cannot drift from what the guard actually stamps.
+    The guard's and the restore layer's constants are read from their own
+    modules (lazy: same package, no cycle - neither imports backport at import
+    time), so the tag values cannot drift from what they actually stamp.
+
+    THE RESTORE LAYER MUST BE LISTED HERE, and its absence was a real bug, not a
+    cosmetic omission. A layer that `_layers_of()` does not know is reported as
+    the BOTTOM - the fork's own body - so with `disk_restore` fitted on
+    `get_num_new_matched_tokens` / `build_connector_meta`:
+      * the in-tree stand-down fingerprinted OUR wrapper and reported the fork as
+        drifted ("live <sha> is neither the v0.30.0 body nor the #56810 body"),
+        which is exactly the misattribution this function's comment above warns
+        about, and it auto-disarmed a healthy tier; and
+      * `install()` saw `layers == []` and took `_install_copy`, which REPLACES
+        the class attribute with backport's own copy - silently deleting the
+        restore layer while `disk_restore` still believed it was fitted. An
+        offer-less tier that reports `installed=YES` is the silent-failure shape
+        this whole file exists to prevent.
+    `_rewrap()` could already rebuild a restore layer and
+    `disk_restore._install_sched_method` already refused to double-stack one;
+    both branches were unreachable until this entry existed.
     """
-    from . import guard_mode  # noqa: PLC0415 - sibling layer, lazy by idiom
+    from . import (  # noqa: PLC0415 - sibling layers, lazy by idiom
+        disk_restore,
+        guard_mode,
+    )
     return (
         (SWITCH_ATTR, SWITCH_TAG, "switch", ORIGINAL_ATTR),
         (OWNER_ATTR, OWNER_TAG, "backport", ORIGINAL_ATTR),
         (guard_mode.OWNER_ATTR, guard_mode.OWNER_TAG, "guard",
          guard_mode.ORIGINAL_ATTR),
+        (disk_restore.OWNER_ATTR, disk_restore.OWNER_TAG,
+         disk_restore.LAYER_KIND, disk_restore.ORIGINAL_ATTR),
     )
 
 

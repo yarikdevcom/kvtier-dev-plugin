@@ -242,10 +242,11 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "no_worker_proof")
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
-                   "read_failed", "not_settled", "slot_plan_failed",
+                   "read_failed", "file_missing", "size_mismatch", "short_read",
+                   "read_error", "not_ours", "not_settled", "slot_plan_failed",
                    "copy_failed", "batch_cap", "queue_full", "buffer_cap",
                    "bad_batch", "bad_job", "bad_size", "incomplete",
-                   "deadline_expired", "thread_dead", "not_tracked")
+                   "deadline_expired", "thread_dead", "not_tracked", "abandoned")
 
 _state: dict = {
     # install / posture
@@ -365,6 +366,7 @@ def counters_view(out: dict) -> dict:
         "bytes_applied": "bytes", "dma_unsettled_entries": "load entries not DMA'd",
         "invalid_reports": "GPU block ids reported as load errors",
         "finished_released": "requests released without a DMA",
+        "witness_emissions": "witness lines logged in this boot",
         "worker_watchdog_fires": "worker-side load expiries",
         "phantom_guard_trips": "invariant violations (must stay 0)",
         "region_plan_errors": "slot address plans that failed",
@@ -1603,6 +1605,55 @@ def _apply_buffer(worker, job: dict, buffer, total_bytes: int) -> dict:
     return _ok(bytes=int(total_bytes))
 
 
+def abandon_disk_entries(worker, why: str) -> dict:
+    """FAIL CLOSED: prune every disk entry of this step and report all of them.
+
+    Called when OUR OWN prep raised. The disk entries in `load_cpu_blocks` were
+    allocated for bytes we have not verified, and the fork's `start_load_kv` runs
+    right after this hook returns - so leaving the lists alone means the fork DMAs
+    whatever those CPU slots happened to contain and reports the load as finished.
+    That is the one silent-corruption shape this module can produce by itself, and
+    it is exactly what the `except Exception` path used to do (a probe with
+    `batch_status` made to raise left `load_cpu_blocks == [0, 1, 2]`, the event
+    submitted, and no load error reported). Recompute is always correct, so on any
+    failure of our own the whole step's disk work is abandoned and reported.
+    """
+    metadata = getattr(worker, "_connector_metadata", None)
+    if metadata is None:
+        return _ok(abandoned=0, reason="no connector metadata on this step")
+    paths = _metadata_paths(metadata)
+    disk_indices = [index for index, path in enumerate(paths) if path]
+    if not disk_indices:
+        return _ok(abandoned=0, reason="no disk entries to abandon")
+    cpu_blocks = list(getattr(metadata, FIELD_LOAD_CPU, None) or [])
+    gpu_blocks = list(getattr(metadata, FIELD_LOAD_GPU, None) or [])
+    keep = [index for index in range(min(len(cpu_blocks), len(gpu_blocks)))
+            if index not in set(disk_indices)]
+    for index in disk_indices:
+        if index < len(gpu_blocks):
+            gpu_id = _int(gpu_blocks[index])
+            if gpu_id is not None:
+                _remember_invalid(gpu_id)
+        _state["reads_failed"]["abandoned"] += 1
+    _replace_load_lists(metadata, [cpu_blocks[i] for i in keep],
+                        [gpu_blocks[i] for i in keep])
+    event = _int(getattr(metadata, FIELD_LOAD_EVENT, None))
+    batch_id = _batch_id(event) if event is not None else None
+    batch = _wbatches.pop(batch_id, None) if batch_id else None
+    submitted = bool(list(getattr(metadata, FIELD_LOAD_CPU, None) or []))
+    released = 0
+    if not submitted:
+        released = release_event(worker, metadata, batch, why)
+    _phantom_guard(worker, metadata, submitted=submitted)
+    for request_id in (batch or {}).get("req_ids") or _event_req_ids(metadata,
+                                                                      event or -1):
+        _wloads.pop(request_id, None)
+    if batch_id is not None:
+        disk_read.cancel_batch(batch_id, why)
+    _note(f"abandoned {len(disk_indices)} disk entry/entries: {why}")
+    return _ok(abandoned=len(disk_indices), released=released)
+
+
 def worker_before_load(worker) -> dict:
     """Apply settled bytes, prune the rest, and never DMA a stale slot.
 
@@ -1626,6 +1677,12 @@ def worker_before_load(worker) -> dict:
     except Exception as exc:  # noqa: BLE001 - a load prep never breaks a forward
         _state["worker_errors"] += 1
         snapshot._error(exc, "disk_restore before_load")
+        try:
+            abandon_disk_entries(worker, f"the load prep raised "
+                                         f"{type(exc).__name__}")
+        except Exception as exc2:  # noqa: BLE001 - the fallback cannot be the fault
+            snapshot._error(exc2, "disk_restore abandon")
+            _state["worker_errors"] += 1
         return _fail(f"the load prep raised {type(exc).__name__}")
 
 
@@ -1655,6 +1712,21 @@ def _worker_before_load(worker) -> dict:
     else:
         status = disk_read.batch_status(batch_id)
         failed = dict(batch["failures"])
+        # `disk_read` classified the failure on its own ledger (`file_missing`,
+        # `size_mismatch`, `short_read`, `read_error`, `not_ours`). Carry the NAME
+        # through: "the LRU is evicting faster than we read" (file_missing) and
+        # "the file is a different geometry than this boot's" (size_mismatch) and
+        # "the disk returned half a slot" (short_read) are three different operator
+        # actions, and flattening them into `read_failed` made the counter that is
+        # supposed to explain the recomputes explain nothing. The report is capped
+        # (`disk_read.MAX_JOBS_REPORT`), so a job past the cap keeps the generic
+        # name - the fine grain is best-effort, the failure report is not.
+        classified = {}
+        for item in status.get("failures") or []:
+            try:
+                classified[int(item["job"])] = str(item["reason_kind"])
+            except (TypeError, ValueError, KeyError):
+                continue
         if len(paths) != len(cpu_blocks) or len(gpu_blocks) != len(cpu_blocks):
             # THE STEP IS UNATTRIBUTABLE. `load_paths`, `load_cpu_blocks` and
             # `load_gpu_blocks` are built together by the fork and always share a
@@ -1688,7 +1760,10 @@ def _worker_before_load(worker) -> dict:
                         failed[job_id] = "not_settled"
                         _state["dma_unsettled_entries"] += 1
                     else:
-                        failed[job_id] = "read_failed"
+                        reason_kind = classified.get(job_id)
+                        failed[job_id] = (reason_kind
+                                          if reason_kind in _state["reads_failed"]
+                                          else "read_failed")
                     continue
                 outcome = _apply_buffer(worker, job, buffer, int(job["bytes"]))
                 if not outcome["ok"]:
@@ -1740,6 +1815,25 @@ def _worker_before_load(worker) -> dict:
                                  "every load entry on this step came from disk and "
                                  "none had bytes to copy")
     _phantom_guard(worker, metadata, submitted=submitted)
+    for request_id in batch["req_ids"]:
+        record = _wloads.get(request_id)
+        if record is not None and record.get("batch") not in (None, batch_id):
+            # A NEWER bind for the same request owns the record now; this step may
+            # not retire another step's watchdog coverage.
+            continue
+        # THE WORKER WATCHDOG HAS NOTHING LEFT TO DO FOR THIS REQUEST, and keeping
+        # the record was a real bug, not untidiness. Its one job is a load whose
+        # step never reached `start_load_kv`; here the step DID reach it, so this
+        # request's outcome is already final: either the fork submitted what
+        # survived the pruning and will report the event itself, or
+        # `release_event` reported it just now. A record left behind fired ~45 s
+        # later and pushed `finished_recving` for a request the engine had long
+        # since moved on from - a release nobody asked for, a `finished_released`
+        # counter that lies, and (for a load still in flight on a stalled stream)
+        # a claim that bytes were loaded before the copy that carries them had
+        # finished. That last shape is the phantom this module exists to prevent,
+        # arriving from the watchdog instead of from the watermark.
+        _wloads.pop(request_id, None)
     applied = len([job_id for job_id in batch["jobs"] if job_id not in failed])
     kinds = sorted({str(failed.get(job_id)) for job_id in drop})[:3]
     _note(f"applied {applied} of {len(batch['jobs'])} disk read(s); dropped "
@@ -1802,6 +1896,24 @@ def _phantom_guard(worker, metadata, submitted: bool) -> dict:
 
 _deferred_finished: set = set()
 
+# KNOWN GAP, DELIBERATELY NOT CLOSED HERE (the single next action for this path).
+# `finished_recving` and `get_block_ids_with_load_errors` are produced by two
+# different engine calls in a step, and this module cannot choose their order: the
+# model runner reads the load errors at `v1/worker/gpu/kv_connector.py:116` and
+# mines `get_finished` separately. A release made INSIDE `get_finished` (this
+# watchdog's, which runs there) therefore has its GPU block ids drained by the
+# NEXT step's read, so the scheduler sees "the load finished" one step before it
+# sees "truncate these blocks and recompute them". Under
+# `kv_load_failure_policy=recompute` the truncation does arrive, but one step of
+# tokens is generated from KV that was about to be invalidated. The sound fix is a
+# per-request pairing: hold a release in `_deferred_finished` until the drain that
+# carries ITS OWN block ids has happened, with a bounded wait (never park a
+# request waiting for a report). It needs a new piece of state and a deadline, and
+# the release-vs-report ordering must be settled against the fork's real step
+# order before writing it - the hazard is recorded here, and pinned by
+# `test_a_watchdog_expiry_releases_exactly_once`, so the next change has a test to
+# extend rather than a mystery to rediscover.
+
 
 def _defer_finish(request_id: str) -> None:
     if len(_deferred_finished) >= MAX_TRACKED_LOADS:
@@ -1843,6 +1955,35 @@ def release_event(worker, metadata, batch, why: str) -> int:
     if batch_id is not None:
         disk_read.cancel_batch(batch_id, why)
         _wbatches.pop(batch_id, None)
+    # MAKE THE STEP SAFE, not just silent. `release_event` is usually called from
+    # `start_load_kv`, which has already pruned the entries it dropped and rewritten
+    # the lists; from the watchdog it has not, and the disk entries would still be
+    # sitting in `load_cpu_blocks` for the next `start_load_kv` of this metadata to
+    # DMA - stale bytes, reported as loaded. So every disk entry this release speaks
+    # for leaves the step's lists here, and its GPU block is reported if the caller
+    # has not already reported it. This also erases the disk identities (via
+    # `_replace_load_lists`), so no later pass can re-release the same load or report
+    # the same block ids twice - `_handle_invalid_blocks` attributes an id to
+    # whichever request holds that block NOW.
+    try:
+        paths = _metadata_paths(metadata)
+        if any(paths):
+            cpu_blocks = list(getattr(metadata, FIELD_LOAD_CPU, None) or [])
+            gpu_blocks = list(getattr(metadata, FIELD_LOAD_GPU, None) or [])
+            owned = set((batch or {}).get("jobs") or {})
+            keep: list = []
+            for index in range(min(len(cpu_blocks), len(gpu_blocks))):
+                if not paths[index]:
+                    keep.append(index)
+                    continue
+                if index not in owned:
+                    gpu_id = _int(gpu_blocks[index])
+                    if gpu_id is not None:
+                        _remember_invalid(gpu_id)
+            _replace_load_lists(metadata, [cpu_blocks[i] for i in keep],
+                                [gpu_blocks[i] for i in keep])
+    except Exception as exc:  # noqa: BLE001 - an immutable step is a no-op
+        snapshot._error(exc, "disk_restore release prune")
     _note(f"released load event {event} as a failure: {why}")
     return released
 
@@ -1913,19 +2054,41 @@ def sweep_watchdog(worker) -> dict:
             continue
         batch_id = record.get("batch")
         batch = _wbatches.pop(batch_id, None) if batch_id else None
+        metadata = getattr(worker, "_connector_metadata", None)
+        event = (batch or {}).get("event")
+        live_step = (metadata is not None and event is not None
+                     and _int(getattr(metadata, FIELD_LOAD_EVENT, None)) == event)
         if batch is not None:
+            # Every GPU block this load owned: without the report the scheduler keeps
+            # the blocks it allocated for bytes that are never coming. Entries that
+            # failed at submit are not in `jobs`; `release_event`'s prune picks those
+            # up from the step itself when the step is still live.
             for job in (batch.get("jobs") or {}).values():
                 gpu_id = _int((job or {}).get("gpu_block_id"))
                 if gpu_id is not None:
                     _remember_invalid(gpu_id)
-            disk_read.cancel_batch(batch_id,
-                                   "the restore watchdog expired the load")
+        if batch is not None and live_step:
+            # ONE RELEASE PATH. `release_event` removes the index, reports every
+            # request of the event, cancels the read batch AND prunes the step's
+            # disk entries - which matters here as much as in `start_load_kv`: the
+            # sweep decides the load failed, and a metadata still naming those files
+            # would be pruned and released a SECOND time by the next pass over the
+            # same step (a second `finished_recving` for one load, and a second
+            # report of the same GPU block ids, which the scheduler attributes to
+            # whichever request holds those blocks by then).
+            release_event(worker, metadata, batch,
+                          "the restore watchdog expired the load")
+        else:
+            if batch is not None:
+                disk_read.cancel_batch(batch_id,
+                                       "the restore watchdog expired the load")
+            _defer_finish(request_id)
+            _state["finished_released"] += 1
+        if batch is not None and not live_step:
             event = batch.get("event")
             if event is not None and isinstance(pending, set):
                 pending.discard(event)
-        _defer_finish(request_id)
         _state["worker_watchdog_fires"] += 1
-        _state["finished_released"] += 1
         _wloads.pop(request_id, None)
         fired += 1
     if fired:
@@ -2418,6 +2581,7 @@ def install() -> dict:
     report = {"installed": False, "reason": None, "class": None}
     global _reused_this_install
     _reused_this_install = False
+    worker_refusal = None
     try:
         sched_cls = _class_of(SCHED_MODULE, SCHED_CLASS)
         worker_cls = _class_of(WORKER_MODULE, WORKER_CLASS)
@@ -2447,11 +2611,12 @@ def install() -> dict:
                 # own only because `gate()` demands a worker's proof, and a worker
                 # whose layer refused cannot produce that proof.
                 _uninstall_worker_half()
-                report["reason"] = (f"the load-error report could not be fitted "
-                                    f"({error_refusal}): a failed read would have "
-                                    "no way to say so, so the worker half of the "
-                                    "restore layer is refused")
-                _state["skip_reason"] = report["reason"]
+                worker_refusal = (
+                    f"the load-error report could not be fitted ({error_refusal}): "
+                    "a failed read would have no way to say so, so the worker "
+                    "half of the restore layer is refused")
+                report["reason"] = worker_refusal
+                _state["skip_reason"] = worker_refusal
                 if not halves:
                     return report
             else:
@@ -2462,14 +2627,25 @@ def install() -> dict:
             _state["installs"] += 1
         _state["installed"] = True
         _state["class"] = "+".join(halves)
-        _state["skip_reason"] = None
+        # A REFUSED HALF MUST STAY VISIBLE. `skip_reason` is what `boot_line()`
+        # prints when the gate is open, so clearing it here used to erase the only
+        # record that the worker half was refused - and "the worker half was
+        # refused" is the one refusal an operator has to be able to see without a
+        # post-mortem, because it means a failed read in this process can never be
+        # reported. The scheduler half fitted is still reported as fitted (that is
+        # true, and it is inert without a worker's proof); the refusal rides along
+        # in the same sentence.
+        _state["skip_reason"] = worker_refusal
         register_contribution()
+        success = (f"{len(SCHED_METHODS)} scheduler and "
+                   f"{len(WORKER_METHODS)} worker methods consult the SSD tier "
+                   f"where this process has them ({'+'.join(halves)}); inert "
+                   "until a root is set AND the spill arm AND the tier arm are "
+                   "raised")
+        if worker_refusal:
+            success = f"{success}; {worker_refusal}"
         report.update({"installed": True, "class": _state["class"],
-                       "reason": (f"{len(SCHED_METHODS)} scheduler and "
-                                  f"{len(WORKER_METHODS)} worker methods consult "
-                                  f"the SSD tier where this process has them "
-                                  f"({'+'.join(halves)}); inert until a root is set "
-                                  "AND the spill arm AND the tier arm are raised")})
+                       "reason": success})
         return report
     except Exception as exc:  # noqa: BLE001 - installation never breaks a boot
         _state["errors"] += 1

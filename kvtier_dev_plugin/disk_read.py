@@ -674,18 +674,36 @@ def batch_bytes(batch_id, job_id) -> int:
 
 
 def finish_batch(batch_id) -> dict:
-    """Close a batch and return every buffer it held. Idempotent."""
+    """Close a batch and return the buffers nobody is writing into any more.
+
+    EXACTLY-ONE-OWNER IS THE RULE, and the owner of a QUEUED or RUNNING job's buffer
+    is the READER THREAD, not this function. Returning one of those to the pool is a
+    double return: the pool then holds the SAME buffer twice, hands it to two later
+    reads, and one request's file bytes are memmoved into another request's CPU KV
+    slot - the silent-corruption shape this module exists to make impossible. It was
+    reachable through the ordinary restore path (`start_load_kv` while a read is
+    still in flight, which is exactly what `dma_unsettled_entries` counts), and a
+    probe that closes a batch with a RUNNING job found the pool holding one buffer
+    twice. So the same discipline `cancel_batch` already kept: recycle QUEUED (the
+    thread skips a bufferless job), DONE and FAILED buffers, null them so no path
+    returns them twice, and leave RUNNING alone - `_settle` brings those back when
+    the thread finds its batch gone.
+    """
     with _state_lock:
         batch = _batches.pop(batch_id, None)
         if batch is None:
             return _ok(closed=False, reason="the batch was already closed")
         released = 0
         for entry in batch["jobs"].values():
-            buffer = entry.get("job", {}).get("buffer")
+            if entry["state"] == RUNNING:
+                continue
+            job = entry.get("job") or {}
+            buffer = job.get("buffer")
             if buffer is None:
                 continue
+            job["buffer"] = None
             released += 1
-            _give_buffer_locked(buffer, int(entry["job"]["expect_bytes"]))
+            _give_buffer_locked(buffer, int(job["expect_bytes"]))
         _state["batches_closed"] += 1
         return _ok(closed=True, buffers=released, reason=None)
 

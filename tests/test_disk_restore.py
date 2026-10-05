@@ -42,7 +42,9 @@ import ctypes
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 import types
 
@@ -59,6 +61,7 @@ from kvtier_dev_plugin import (
     disk_spill,
     disk_store,
     engine_side,
+    guard_mode,
     worker_diag,
 )
 
@@ -1585,3 +1588,936 @@ def test_closing_a_batch_never_deadlocks_on_the_buffer_pool(armed):
         "self-deadlock is back"
     )
     assert outcome["report"]["closed"] is True
+
+
+# --- i: the FORK'S OWN worker rules, so the release can be proven ------------
+
+# Everything above drives `disk_restore`'s functions directly. That is the right
+# shape for the arithmetic and the wrong shape for the one question that gates
+# deployment: does a request ever end up parked in `WAITING_FOR_REMOTE_KVS`?
+# `scheduler.py:3068-3084` releases that state only when the worker reports the id
+# in `finished_recving`, and there is NO engine timeout for it - so the proof has to
+# run through the installed wrappers, on a worker that submits and mines the way the
+# fork does, and it has to name the block ids the engine reads back.
+#
+# The two fork rules this double transcribes (`worker.py:330-352`, quoted in
+# `disk_restore`'s module docstring):
+#   * `start_load_kv` launches the copy and records `load_event` in
+#     `_pending_load_event_indices` ONLY when there is something to copy - so a step
+#     this module prunes to nothing submits nothing and its index must never sit in
+#     that set (that is the phantom);
+#   * `get_finished` reports an index once the copy stream's high-water mark has
+#     passed it, and the watermark only moves FORWARD - which is why a stale index
+#     is reported by a LATER completion, and why a fake without a watermark could
+#     never test the hazard.
+# `get_block_ids_with_load_errors` is inherited from the connector base and lives in
+# a `vllm.`-named module, because `disk_restore._install_load_errors` refuses to
+# overwrite a report whose home is not vLLM's own tree.
+
+FORK_BASE_MODULE = "vllm.distributed.kv_transfer.kv_connector.v1.base"
+
+FORK_SCHED_SOURCE = '''
+class SimpleCPUOffloadScheduler:
+    """The three tier entry points, with the fork's own answers."""
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        return 0, False
+
+    def build_connector_meta(self, scheduler_output=None):
+        return "METADATA"
+
+    def update_connector_output(self, connector_output):
+        return None
+'''
+
+FORK_WORKER_SOURCE = '''
+class SimpleCPUOffloadWorker:
+    def __init__(self):
+        self.cpu_kv_caches = {}
+        self._connector_metadata = None
+        self._pending_load_event_indices = set()
+        self._load_hwm = -1
+        self.completed = set()
+        self.submitted = []
+        self.copied = []
+
+    def complete(self, event):
+        """The copy stream reports this event's CUDA event as done."""
+        self.completed.add(int(event))
+
+    def bind_connector_metadata(self, metadata):
+        self._connector_metadata = metadata
+
+    def start_load_kv(self):
+        cpu = list(getattr(self._connector_metadata, "load_cpu_blocks", None)
+                   or [])
+        if not cpu:
+            return                      # nothing to copy: NO submission
+        event = int(getattr(self._connector_metadata, "load_event", -1))
+        self._pending_load_event_indices.add(event)
+        self.submitted.append(event)
+        self.copied.extend(cpu)
+
+    def get_finished(self, finished_req_ids):
+        for index in self.completed:
+            self._load_hwm = max(self._load_hwm, index)
+        recving = set()
+        for index in list(self._pending_load_event_indices):
+            if index <= self._load_hwm:
+                self._pending_load_event_indices.discard(index)
+                table = (getattr(self._connector_metadata,
+                                 "load_event_to_reqs", {}) or {})
+                recving |= set(table.get(index, ()))
+        return set(), (recving or None)
+'''
+
+FORK_BASE_SOURCE = '''
+class KVConnectorBase_V1:
+    def get_block_ids_with_load_errors(self):
+        return set()
+'''
+
+FORK_CONNECTOR_SOURCE = '''
+class SimpleCPUOffloadConnector(KVConnectorBase_V1):
+    pass
+'''
+
+FORK_MODULES = (disk_restore.SCHED_MODULE, disk_restore.WORKER_MODULE,
+                disk_restore.CONNECTOR_MODULE, FORK_BASE_MODULE)
+
+
+def register_fork(name: str, source: str, **pre):
+    """Exec `source` into a module NAMED `name`, registered in `sys.modules`.
+
+    The `fork_class` posture (see `fakes_debug`): the plugin resolves the fork's
+    names only against a module it can find already imported, and refuses anything
+    whose `__module__` is not the fork's. A class defined in this file would carry
+    `test_disk_restore` and be (correctly) refused - which is precisely the
+    silent-failure mode this fixture exists to avoid: a wrapper installed on a name
+    the fork does not have installs cleanly and never fires.
+    """
+    module = types.ModuleType(name)
+    module.__dict__.update(pre)
+    sys.modules[name] = module
+    try:
+        exec(source, module.__dict__)  # noqa: S102 - our own source, never input
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+@pytest.fixture
+def fork():
+    """The fork's scheduler, worker and connector classes, importably registered.
+
+    `sys.modules` is restored here rather than through `monkeypatch`, because
+    monkeypatch's undo runs AFTER this fixture's teardown: a `delitem` it owns
+    re-registers the module behind our back and leaks a wrapped fork class into the
+    next test, where a later `_layers_of()` sees a layer it was never supposed to
+    find. (That exact leak made an unrelated `test_auto_boot.py` test fail, and it
+    cost an hour to name.)
+    """
+    saved = {name: sys.modules.get(name) for name in FORK_MODULES}
+    base = register_fork(FORK_BASE_MODULE, FORK_BASE_SOURCE)
+    sched, _ = fakes_debug.fork_class(disk_restore.SCHED_MODULE,
+                                      disk_restore.SCHED_CLASS,
+                                      FORK_SCHED_SOURCE, register=True)
+    worker, _ = fakes_debug.fork_class(disk_restore.WORKER_MODULE,
+                                       disk_restore.WORKER_CLASS,
+                                       FORK_WORKER_SOURCE, register=True)
+    connector = register_fork(
+        disk_restore.CONNECTOR_MODULE, FORK_CONNECTOR_SOURCE,
+        KVConnectorBase_V1=base.KVConnectorBase_V1).SimpleCPUOffloadConnector
+    try:
+        yield {"sched": sched, "worker": worker, "connector": connector}
+    finally:
+        disk_restore.uninstall()
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+class Engine:
+    """The two objects a model runner touches, and the CPU region they share."""
+
+    def __init__(self, worker, connector):
+        self.worker = worker
+        self.connector = connector
+
+    @property
+    def region(self):
+        return self.worker.cpu_kv_caches["g0"]
+
+    def bind(self, metadata):
+        """The fork's bind, then our hook - exactly as the installed wrappers run."""
+        self.worker.bind_connector_metadata(metadata)
+
+    def step(self, wait_for_reads=True):
+        """One forward pass: load prep, the load-error drain, then the mining.
+
+        `wait_for_reads` gives the reads the one-forward-pass window the design
+        assumes (a ~11 MB NVMe read lands well inside a step). Without it every
+        entry would answer `not_settled`, which is a real mode but not the one
+        being measured: it would report five different hardware failures as one.
+        """
+        if wait_for_reads:
+            for batch_id in list(disk_restore._wbatches):
+                settle(batch_id)
+        self.worker.start_load_kv()
+        errors = self.connector.get_block_ids_with_load_errors()
+        for event in list(self.worker.submitted):
+            self.worker.complete(event)
+        sending, recving = self.worker.get_finished(set())
+        return {"errors": errors, "sending": sending,
+                "recving": recving or set(), "submitted": list(
+                    self.worker.submitted)}
+
+
+@pytest.fixture
+def engine(fork, armed):
+    """Both halves installed, a worker with a real region tensor, one boot."""
+    report = disk_restore.install()
+    assert report["installed"] is True, report
+    worker = fork["worker"]()
+    worker.cpu_kv_caches = {"g0": Region()}
+    return Engine(worker, fork["connector"]())
+
+
+def disk_only_meta(root, event, seeds=(1,), groups=CACHEABLE, ram=0,
+                   digest=DIGEST):
+    """A step whose load is entirely disk-sourced, with its own request id.
+
+    Disk-only is the shape that matters: with a host-RAM hit alongside, the fork
+    submits the RAM copy and reports the load itself, and a release from us would be
+    a DOUBLE report. Only when nothing survives the pruning does the engine have
+    nobody to report to - which is where a missing report becomes a parked request.
+    """
+    cpu, gpu, paths = [], [], []
+    for group in groups:
+        for seed in seeds:
+            made = disk_layout.build_slot_path(root, key_hex(seed, group), digest)
+            assert made["ok"], made["reason"]
+            cpu.append(len(cpu))
+            gpu.append(60_000 + len(cpu))
+            paths.append(made["path"])
+    for index in range(ram):
+        cpu.append(410 + index)
+        gpu.append(70_000 + index)
+        paths.append("")
+    return Meta(load_event=event, cpu=cpu, gpu=gpu, paths=paths,
+                reqs={event: [f"req-{event}"]})
+
+
+def expired_batches(event, seconds=1.0):
+    """Backdate a live load so the watchdog treats it as expired. BOUNDED: the test
+    never sleeps for a deadline, it moves the deadline."""
+    batch = disk_restore._wbatches.get(disk_restore._batch_id(event))
+    if batch is not None:
+        batch["deadline_mono"] = time.monotonic() - seconds
+    for record in disk_restore._wloads.values():
+        record["deadline_mono"] = time.monotonic() - seconds
+
+
+# --- j: BLOCKER 1 - every failure mode reaches a report ----------------------
+
+def failure_mode(mode, engine, armed, monkeypatch, event=11):
+    """Put one named failure in front of an otherwise-healthy restore.
+
+    Each mode is induced where the real fault happens (the filesystem, the rank's
+    own digest, the bounded queue, the thread, the clock, the process boundary),
+    never by substituting the code under test.
+    """
+    fill(armed, blocks=1)
+    metadata = disk_only_meta(armed, event,
+                              digest=("ffee00112233" if mode == "digest"
+                                      else DIGEST))
+    if mode in {"vanished", "size_mismatch", "digest"}:
+        if mode == "vanished":
+            # Deleted AFTER the journal published the identity and BEFORE the worker
+            # opened it: exactly the LRU-race the index has to survive. It is deleted
+            # by the identity the WORKER will name (its own digest), not the
+            # sentinel-digest path the scheduler sent - the published path is not a
+            # file this boot could ever open.
+            vanish(armed, seeds=(1,))
+        if mode == "size_mismatch":
+            for path in metadata.load_paths:
+                if path:
+                    with open(path, "ab") as handle:
+                        handle.write(b"x")     # another geometry's slot width
+        engine.bind(metadata)
+        return metadata
+    if mode == "short_read":
+        real_open = open
+
+        class Shortened:
+            """A handle that answers `readinto` with fewer bytes than it promised."""
+
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._handle.close()
+                return False
+
+            def readinto(self, view):
+                with self._handle:
+                    return self._handle.readinto(view[:1])
+
+        monkeypatch.setattr(
+            disk_read, "open",
+            lambda path, *a, **k: Shortened(real_open(path, *a, **k)),
+            raising=False)
+        engine.bind(metadata)
+        return metadata
+    if mode == "queue":
+        # The documented drop path: a bounded queue answers `put_nowait` with
+        # `queue.Full` and the read is DROPPED, not queued onto an unbounded pile.
+        stub = queue.Queue(maxsize=1)
+        stub.put_nowait("the only slot, held by someone else")
+        monkeypatch.setattr(disk_read, "_get_queue", lambda: stub)
+        engine.bind(metadata)
+        return metadata
+    if mode == "thread_dead":
+        monkeypatch.setattr(disk_read, "_ensure_thread", lambda: False)
+        engine.bind(metadata)
+        return metadata
+    if mode == "worker_restart":
+        engine.bind(metadata)
+        # A worker process that came back mid-load: the metadata survived (the
+        # scheduler sent it) and the batch tables did not.
+        disk_restore._wbatches.clear()
+        disk_restore._wloads.clear()
+        return metadata
+    if mode == "batch_deadline":
+        engine.bind(metadata)
+        settle(disk_restore._batch_id(event))
+        # The READER's own batch deadline (`disk_read.LOAD_DEADLINE_SECONDS`), not
+        # the watchdog's: bytes that arrive after it are not trusted even when they
+        # arrived intact. Moving a clock is not substituting the code under test.
+        disk_read._batches[disk_restore._batch_id(event)]["deadline_mono"] = \
+            time.monotonic() - 1
+        return metadata
+    engine.bind(metadata)
+    return metadata
+
+
+FAILURE_MODES = ("vanished", "size_mismatch", "short_read", "digest", "queue",
+                 "thread_dead", "worker_restart", "batch_deadline")
+
+# One named bucket per mode, so the counter says WHICH hardware answer we got
+# (`file_missing` = the LRU outran us; `size_mismatch` = a foreign geometry;
+# `short_read` = a disk that answers short). `disk_read` classifies them; carrying
+# the name through the restore layer is what makes the recomputes explainable.
+FAILURE_BUCKETS = {"vanished": "file_missing", "size_mismatch": "size_mismatch",
+                   "short_read": "short_read", "digest": "digest_disagreement",
+                   "queue": "queue_full", "thread_dead": "thread_dead",
+                   "worker_restart": "not_tracked",
+                   "batch_deadline": "deadline_expired"}
+
+
+@pytest.mark.parametrize("mode", FAILURE_MODES)
+def test_every_failure_mode_reports_the_request(engine, armed, monkeypatch, mode):
+    """BLOCKER 1, per mode: the GPU blocks AND the request are reported, in one step.
+
+    Asserted on the engine's own two reads, not on a return code:
+      * `get_block_ids_with_load_errors()` names every GPU block the load owned
+        (that is what `scheduler.py:2008-2015` truncates and recomputes under
+        `kv_load_failure_policy=recompute`);
+      * `finished_recving` names the request (that is what
+        `scheduler.py:3068-3084` releases `WAITING_FOR_REMOTE_KVS` on);
+      * `copied` is EMPTY: the fork's DMA never saw a slot whose bytes were not
+        there, which is the difference between a recompute and a wrong answer.
+    """
+    event = 11
+    failure_mode(mode, engine, armed, monkeypatch, event)
+    result = engine.step()
+    counters = disk_restore.counters()
+    assert result["recving"] == {f"req-{event}"}, \
+        f"{mode}: the request was never released: {result}"
+    assert result["errors"] == {60001, 60002, 60003}, \
+        f"{mode}: the GPU blocks were not reported: {result}"
+    assert engine.worker.copied == [], f"{mode}: a failed load was still DMA'd"
+    assert counters["reads_failed"][FAILURE_BUCKETS[mode]] == len(CACHEABLE) or \
+        counters["reads_failed"][FAILURE_BUCKETS[mode]] >= 1, \
+        f"{mode}: counted under the wrong name: {counters['reads_failed']}"
+    assert counters["phantom_guard_trips"] == 0
+    assert 11 not in engine.worker._pending_load_event_indices, \
+        f"{mode}: a never-submitted index was left pending (phantom)"
+
+
+def test_a_healthy_restore_is_reported_by_the_FORK_not_by_us(engine, armed):
+    """The control that gives the matrix its meaning.
+
+    With good bytes the fork submits the event, the watermark passes it, and
+    `finished_recving` arrives from the FORK with NO load errors and the CPU slots
+    actually holding the file's bytes. If this test passes for the wrong reason
+    (e.g. our own release firing anyway) the failure matrix above would be proving
+    nothing about releases at all.
+    """
+    event = 11
+    fill(armed, blocks=1)
+    metadata = disk_only_meta(armed, event)
+    engine.bind(metadata)
+    result = engine.step()
+    assert result["recving"] == {f"req-{event}"}
+    assert result["errors"] == set(), "a good restore reported load errors"
+    assert result["submitted"] == [event], "the fork never submitted the copy"
+    assert disk_restore.counters()["reads_applied"] == len(CACHEABLE)
+    for index, group in enumerate(CACHEABLE):
+        assert engine.region.slot_bytes(index) == bytes([(1 * 11 + group) % 251]
+                                                        * WIDTH)
+    assert disk_restore.counters()["finished_released"] == 0, \
+        "we released a load the fork had already reported"
+
+
+def test_the_watchdog_does_not_re_report_a_settled_load(engine, armed):
+    """REGRESSION: the watchdog used to fire 45 s LATER and release it AGAIN.
+
+    A record left in `_wloads` after `start_load_kv` settled the load expired on its
+    own deadline and pushed `finished_recving` for a request the engine had moved on
+    from - a release nobody asked for, a `finished_released` counter that lies, and
+    for a load still in flight a claim that bytes had loaded before the copy
+    carrying them was finished. The record is retired the moment the step's outcome
+    is final; the watchdog keeps the case it was built for, a load whose step never
+    happened (`test_the_watchdog_releases_a_load_nobody_reported`).
+    """
+    fill(armed, blocks=1)
+    engine.bind(disk_only_meta(armed, 11))
+    engine.step()
+    assert disk_restore._wloads == {}, "the settled load still owns a watchdog record"
+    before = disk_restore.counters()["worker_watchdog_fires"]
+    expired_batches(11)
+    engine.worker.get_finished(set())
+    assert disk_restore.counters()["worker_watchdog_fires"] == before
+    assert disk_restore.counters()["finished_released"] == 0
+
+
+def test_a_finished_batch_never_returns_a_buffer_twice(armed, monkeypatch):
+    """REGRESSION, and the worst bug found on this path: two owners, one buffer.
+
+    `finish_batch` returned the buffers of EVERY job it closed - including the ones
+    the reader thread had not finished with. The thread returns its own buffer when
+    it finds the batch gone, so the buffer went back to the pool TWICE, the pool
+    handed the same memory to two later reads, and one request's file bytes would be
+    memmoved into another request's CPU KV slot. Reachable through the ordinary
+    path (`start_load_kv` while a read is in flight is what
+    `dma_unsettled_entries` counts), and it is silent: no exception, no counter.
+
+    Detected by counting the pool's objects against the pool's identities.
+    """
+    gate = threading.Event()
+    real_read = disk_read._read_file
+    monkeypatch.setattr(disk_read, "_read_file",
+                        lambda path, buffer, size: (gate.wait(5.0),
+                                                    real_read(path, buffer, size))[1])
+    fill(armed, blocks=1)
+    metadata = disk_only_meta(armed, 11)
+    assert disk_read.begin_batch("race", len(CACHEABLE))["ok"] is True
+    for index, path in enumerate(metadata.load_paths):
+        assert disk_read.request_read("race", index, path, WIDTH)["ok"] is True
+    settled_running = False
+    for _ in range(400):
+        if disk_read.batch_status("race")["running"] >= 1:
+            settled_running = True
+            break
+        time.sleep(0.005)
+    assert settled_running, "the reader thread never started a read"
+    assert disk_read.finish_batch("race")["closed"] is True
+    gate.set()
+    for _ in range(400):
+        if disk_read.counters()["reads_completed"]:
+            break
+        time.sleep(0.005)
+    time.sleep(0.05)
+    pooled = [id(buffer) for buffer, _size in disk_read._buffers]
+    assert len(pooled) == len(set(pooled)), \
+        f"the buffer pool holds the SAME buffer twice: {pooled}"
+
+
+# --- k: BLOCKER 2 - a cancelled load is never reported as "loaded" -----------
+
+def test_a_stale_index_would_be_reported_by_the_fork(fork):
+    """THE HAZARD EXISTS, and this fake can see it: a control, not a tautology.
+
+    An index left in `_pending_load_event_indices` after its load was dropped is
+    reported as "loaded" by a LATER event's completion, because the watermark is
+    monotone. A test of the guard is worthless unless something proves the phantom
+    is real - so here the bug is introduced BY HAND and the fork's own mining is
+    shown swallowing it. `disk_restore`'s job is to make this unreachable, and
+    `test_a_never_submitted_index_is_removed_before_the_watermark_moves` is the
+    half that says it does.
+    """
+    worker = fork["worker"]()
+    worker.bind_connector_metadata(Meta(load_event=11, cpu=[0], gpu=[7],
+                                        paths=[""], reqs={11: ["req-11"]}))
+    worker._pending_load_event_indices.add(11)     # the bug, on purpose
+    worker.complete(22)                            # a LATER event completed
+    _sending, recving = worker.get_finished(set())
+    assert recving == {"req-11"}, \
+        "the fake no longer models the phantom, so the guard tests prove nothing"
+
+
+def test_a_never_submitted_index_is_removed_before_the_watermark_moves(engine,
+                                                                       armed):
+    """The invariant, through the installed wrappers: nothing is mined that was
+    never submitted.
+
+    The prune that empties a step's load lists also stops the fork from submitting,
+    so the index never enters `_pending_load_event_indices`; the guard re-checks the
+    pair anyway and would COUNT a trip. Because the guard runs inside
+    `start_load_kv` and the watermark only moves when the fork submits, every step
+    that could advance the watermark has already run the guard.
+    """
+    fill(armed, blocks=1)
+    metadata = disk_only_meta(armed, 11)
+    vanish(armed, seeds=(1,))
+    engine.bind(metadata)
+    result = engine.step()
+    assert engine.worker._pending_load_event_indices == set()
+    assert engine.worker.submitted == []
+    assert result["recving"] == {"req-11"} and result["errors"]
+    assert disk_restore.counters()["phantom_guard_trips"] == 0
+
+
+def test_phantom_guard_counts_and_closes_a_trip(armed):
+    """The guard's own trip path: remove the index, release the requests, COUNT it.
+
+    A trip means some path skipped a submission without releasing it. It must stay
+    0 in production, and it must never be silent: the counter is the only evidence
+    that the invariant was ever at risk.
+    """
+    worker = Worker()
+    metadata = Meta(load_event=21, cpu=[], gpu=[], paths=[""],
+                    reqs={21: ["late"]})
+    worker._pending_load_event_indices.add(21)     # the bug, on purpose
+    verdict = disk_restore._phantom_guard(worker, metadata, submitted=False)
+    assert verdict["ok"] is False and verdict.get("tripped") is True
+    assert worker._pending_load_event_indices == set(), "the trip stayed open"
+    assert disk_restore.counters()["phantom_guard_trips"] == 1
+    _sending, recving = disk_restore.worker_get_finished(worker, (set(), None))
+    assert recving == {"late"}, "closing the trip parked the request"
+
+
+def test_a_late_completion_writes_nothing_after_the_load_was_dropped(engine, armed,
+                                                                     monkeypatch):
+    """Cancel a load while its read is in flight, then let the reader finish.
+
+    The bounce buffer is the whole reason this is safe: the destination is a
+    scheduler-owned CPU slot, and the only writer is the engine thread at submit
+    time. So a read that arrives after its load was dropped has nowhere to go - its
+    bytes are thrown away, the slot keeps whatever stale block it held (which is why
+    its GPU id was reported), and no later step reports the request a second time.
+    """
+    gate = threading.Event()
+    real_read = disk_read._read_file
+    monkeypatch.setattr(disk_read, "_read_file",
+                        lambda path, buffer, size: (gate.wait(5.0),
+                                                    real_read(path, buffer, size))[1])
+    fill(armed, blocks=1)
+    engine.bind(disk_only_meta(armed, 11))
+    result = engine.step(wait_for_reads=False)     # nothing settled: all pruned
+    untouched = [engine.region.slot_bytes(i) for i in range(len(CACHEABLE))]
+    assert all(byte == 0 for slot in untouched for byte in slot), \
+        "a pruned slot was written"
+    assert result["recving"] == {"req-11"} and result["errors"]
+    gate.set()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if disk_read.counters()["reads_completed"]:
+            break
+        time.sleep(0.005)
+    after = [engine.region.slot_bytes(i) for i in range(len(CACHEABLE))]
+    assert after == untouched, "a late completion wrote into a CPU KV slot"
+    later = engine.step(wait_for_reads=False)
+    assert later["recving"] == set(), "the dropped load was reported a second time"
+
+
+def test_a_watchdog_expiry_releases_exactly_once(engine, armed):
+    """A load expired by the watchdog is reported ONCE, and its blocks are reported.
+
+    The engine has no timeout on `WAITING_FOR_REMOTE_KVS`, so the watchdog is the
+    last resort; reporting twice is as bad as not reporting (the second report is
+    attributed to whoever holds those blocks by then). The cross-step pairing of the
+    release with its block report is a KNOWN GAP recorded above
+    `disk_restore._defer_finish`; this test pins what the code guarantees today and
+    is the test the pairing fix has to extend.
+    """
+    fill(armed, blocks=1)
+    engine.bind(disk_only_meta(armed, 11))
+    expired_batches(11)
+    fired = disk_restore.sweep_watchdog(engine.worker)["fired"]
+    blocks = disk_restore.take_invalid_block_ids()
+    assert fired == 1
+    assert blocks == {60001, 60002, 60003}
+    assert disk_restore.counters()["worker_watchdog_fires"] == 1
+    assert disk_restore.counters()["finished_released"] == 1
+    settle(disk_restore._batch_id(11))
+    assert engine.worker.start_load_kv() is None
+    assert engine.worker.submitted == []
+    _sending, recving = engine.worker.get_finished(set())
+    assert recving == {"req-11"}, "the expired request was never released"
+    assert disk_restore.counters()["finished_released"] == 1, \
+        "the same load was released twice"
+
+
+def test_our_own_failure_fails_closed_and_never_dma_unverified_bytes(engine, armed,
+                                                                     monkeypatch):
+    """If OUR prep raises, the disk entries must still never reach the DMA.
+
+    The tempting reading of "our hook never raises" is that the except branch is
+    dead code and can return a failure dict and move on. It cannot: the fork's
+    `start_load_kv` runs immediately after the wrapper returns, and the entries we
+    failed to classify are still in `load_cpu_blocks` - so the fork DMAs whatever
+    the CPU slots happened to contain and reports the load as FINISHED. A probe with
+    `batch_status` made to raise found exactly that (`copied == [0, 1, 2]`, the event
+    submitted, no load error). The hook now abandons the step's disk work on any
+    failure of its own: prune, report every GPU block, release the request.
+    """
+    fill(armed, blocks=1)
+    metadata = disk_only_meta(armed, 11)
+    engine.bind(metadata)
+    settle(disk_restore._batch_id(11))
+
+    def explode(batch_id):
+        raise RuntimeError("the ledger is having a day")
+
+    monkeypatch.setattr(disk_read, "batch_status", explode)
+    assert engine.worker.start_load_kv() is None   # the engine sees no exception
+    assert metadata.load_cpu_blocks == [], "unverified entries were left to DMA"
+    assert engine.connector.get_block_ids_with_load_errors() == {60001, 60002,
+                                                                 60003}
+    _sending, recving = engine.worker.get_finished(set())
+    assert recving == {"req-11"}
+    assert engine.worker.copied == []
+    assert disk_restore.counters()["reads_failed"]["abandoned"] == len(CACHEABLE)
+
+
+# --- l: the install/composition group (restored, with the reasons inline) ----
+
+def test_install_wraps_both_halves_and_is_idempotent(fork):
+    """RESTORED. It went red on `reinstalls == 1` after a second `install()`.
+
+    Wrong expectation, not a changed signature: `install()` short-circuits on
+    `_state["installed"]` and answers "already installed", so a second call cannot
+    count a re-install at all. `reinstalls` counts the OTHER reuse path - a fresh
+    boot onto a class that still carries our layer - and that is the path worth
+    pinning, because stacking a second restore layer on the first would DOUBLE every
+    offer. Both are asserted below.
+    """
+    sched, worker_cls = fork["sched"], fork["worker"]
+    first = disk_restore.install()
+    assert first["installed"] is True
+    assert "SimpleCPUOffloadScheduler" in first["class"]
+    assert "SimpleCPUOffloadWorker" in first["class"]
+    for name in disk_restore.SCHED_METHODS:
+        assert getattr(getattr(sched, name), disk_restore.OWNER_ATTR) \
+            == disk_restore.OWNER_TAG, name
+    for name in disk_restore.WORKER_METHODS:
+        assert getattr(getattr(worker_cls, name), disk_restore.OWNER_ATTR) \
+            == disk_restore.OWNER_TAG, name
+    connector_report = disk_restore.counters()["load_error_installs"]
+    assert connector_report == 1
+
+    second = disk_restore.install()          # the short-circuit path
+    assert second["installed"] is True and "already" in second["reason"]
+    assert disk_restore.counters()["installs"] == 1
+    assert disk_restore.counters()["reinstalls"] == 0
+
+    disk_restore.reset_state_for_tests()     # a fresh boot, the layer still fitted
+    third = disk_restore.install()
+    assert third["installed"] is True
+    assert disk_restore.counters()["reinstalls"] == 1, \
+        "a class that already carries our layer must be REUSED, not re-wrapped"
+    assert disk_restore.counters()["load_error_installs"] == 1, \
+        "the load-error report was fitted twice"
+    # exactly one restore layer deep, both before and after
+    from kvtier_dev_plugin import backport
+
+    _layers, bottom = backport._layers_of(sched.get_num_new_matched_tokens)
+    assert getattr(bottom, disk_restore.OWNER_ATTR, None) is None, \
+        "the bottom is no longer the fork's own body: the layer was stacked"
+
+
+def test_installed_scheduler_keeps_the_forks_metadata(fork, armed):
+    """RESTORED. Red only because the fixture it needed (`fork`) had gone.
+
+    Through the REAL wrappers, with the module's `Manager` as `self` (which is what
+    the scheduler passes on the box): the object the fork returned comes back
+    IDENTICAL. The wrapper mutates it - it fills `load_paths` - but never substitutes
+    it, because the scheduler hands the same object to the worker and a substituted
+    one would silently drop every field the fork put on it.
+    """
+    disk_restore.install()
+    sched = fork["sched"]
+    fill(armed, blocks=1)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    request = Req(request_id="req-1", blocks=1)
+    assert sched.get_num_new_matched_tokens(manager, request, 0) == (BLOCK, True)
+    assert sched.build_connector_meta(manager, "output") == "METADATA"
+    assert sched.update_connector_output(manager, object()) is None
+
+
+def test_installed_worker_prunes_before_the_fork_copies(fork, armed):
+    """RESTORED. It went red with `FileNotFoundError`: it deleted the WRONG FILE.
+
+    The path the scheduler publishes carries the digest SENTINEL
+    (`IDENTITY_DIGEST_PLACEHOLDER`) because the scheduler cannot know a rank's slot
+    width; the file that exists - and the one that has to vanish - is the one named
+    by the WORKER's own digest. `vanish()` exists for exactly that, and a test that
+    removes the published path deletes a file that was never there.
+
+    The behaviour it pins is the ordering: our pass runs BEFORE the fork's
+    `start_load_kv`, so what the fork's copy sees is either a slot with bytes in it
+    or an entry that is no longer in the lists. After the fork, the ordering is worth
+    nothing and a stale slot has already been DMA'd.
+    """
+    disk_restore.install()
+    fill(armed, blocks=1)
+    vanish(armed, seeds=(1,))
+    worker = fork["worker"]()
+    worker.cpu_kv_caches = {"g0": Region()}
+    metadata = disk_only_meta(armed, 11)
+    worker.bind_connector_metadata(metadata)
+    settle(disk_restore._batch_id(11))
+    worker.start_load_kv()
+    assert worker.copied == [], "the fork copied something from a wholly-failed step"
+    assert worker.submitted == [], "a step with nothing to copy reported a submission"
+    assert worker._pending_load_event_indices == set()
+
+
+def test_install_refuses_a_foreign_owner_marker(fork, monkeypatch):
+    """RESTORED. Red only because the fixture it needed (`fork`) had gone.
+
+    A wrapper carrying ANOTHER package's marker is refused, not stacked on: we cannot
+    reason about a layer whose semantics we have not read, and composing over it
+    silently changes what that third party's callers get.
+    """
+    def foreign(self, request, num_computed_tokens):
+        return 0, False
+
+    foreign.__name__ = disk_restore.METHOD_MATCHED
+    foreign.__module__ = fork["sched"].__module__
+    setattr(foreign, disk_restore.OWNER_ATTR, "someone-else/1")
+    monkeypatch.setattr(fork["sched"], disk_restore.METHOD_MATCHED, foreign)
+    report = disk_restore.install()
+    assert report["installed"] is False
+    assert "foreign owner marker" in report["reason"]
+
+
+def test_the_load_error_report_refuses_a_third_party_body(fork, armed, monkeypatch):
+    """RESTORED, and it found a real hole: the refusal was reported, then erased.
+
+    It went red on `installed is False`. That expectation was wrong for this process
+    shape - this fixture gives ONE process BOTH halves, so the scheduler half fits
+    and `install()` honestly reports itself installed for the half it fitted (the
+    half-fitted tier is inert: `gate()` demands a worker's proof, and a refused
+    worker cannot write one). What WAS wrong is the code: the success `reason`
+    OVERWROTE the refusal and `_state["skip_reason"]` was cleared, so `boot_line()`
+    - the operator's only line - lost the fact that the worker half was refused.
+    Now the refusal rides in the same sentence and stays in `skip_reason`.
+    """
+    def theirs(self):
+        return set()
+
+    theirs.__module__ = "someone_elses_plugin"
+    monkeypatch.setattr(fork["connector"], disk_restore.METHOD_LOAD_ERRORS, theirs)
+    report = disk_restore.install()
+    assert "SimpleCPUOffloadWorker" not in (report["class"] or "")
+    assert "load-error report could not be fitted" in report["reason"], \
+        "the refusal vanished from the install report"
+    assert "load-error report could not be fitted" in \
+        disk_restore.counters()["skip_reason"]
+    assert "load-error report could not be fitted" in disk_restore.boot_line()
+    assert disk_restore.METHOD_LOAD_ERRORS not in fork["connector"].__dict__ \
+        or getattr(fork["connector"], disk_restore.METHOD_LOAD_ERRORS) is theirs, \
+        "a third party's load-error report was overwritten anyway"
+
+
+def test_a_worker_process_refuses_to_install_without_the_report(fork, monkeypatch):
+    """The same refusal, in the process shape the box actually runs.
+
+    A worker process has the worker and the connector and never the manager, so the
+    refusal is FATAL there and `installed` must be False: a worker that cannot say
+    "this read failed" is the one configuration that serves a request on KV that was
+    never restored.
+    """
+    def theirs(self):
+        return set()
+
+    theirs.__module__ = "someone_elses_plugin"
+    monkeypatch.setattr(fork["connector"], disk_restore.METHOD_LOAD_ERRORS, theirs)
+    del sys.modules[disk_restore.SCHED_MODULE]
+    report = disk_restore.install()
+    assert report["installed"] is False
+    assert "load-error report could not be fitted" in report["reason"]
+
+
+def test_install_fits_under_a_guard_layer_and_guard_stays_outermost(fork):
+    """RESTORED, and it found a real bug in `backport._layer_kinds()`.
+
+    It went red on `"restore" in kinds`. The layer walk could not report a restore
+    layer because `_layer_kinds()` never listed its marker - although the same
+    function's own docstring said it returned one, `_rewrap()` could already rebuild
+    one, and `disk_restore._install_sched_method` already refused to stack one. Both
+    branches were unreachable, and the consequences were not cosmetic: the in-tree
+    stand-down fingerprinted OUR wrapper and reported the FORK as drifted, and a
+    later `backport.install()` saw `layers == []` and replaced the class attribute
+    with its own copy - deleting the restore layer while this module still reported
+    `installed=YES`. Guard outermost, restore at the bottom, and the fork's body
+    still the thing that gets fingerprinted.
+    """
+    sched = fork["sched"]
+    for name in disk_restore.SCHED_METHODS:
+        setattr(sched, name, guard_mode._make_wrapper(name, getattr(sched, name)))
+    report = disk_restore.install()
+    assert report["installed"] is True
+    assert "under guard" in disk_restore.counters()["nested"][0]
+    layers, bottom = backport._layers_of(sched.get_num_new_matched_tokens)
+    kinds = [kind for kind, _wrapper in layers]
+    assert kinds[0] == "guard", f"the guard is no longer outermost: {kinds}"
+    assert disk_restore.LAYER_KIND in kinds, f"the walk cannot see us: {kinds}"
+    assert getattr(bottom, disk_restore.OWNER_ATTR, None) is None, \
+        "the body underneath our layers is not the fork's own function"
+    assert sched.build_connector_meta(object(), "output") == "METADATA"
+
+
+def test_uninstall_puts_the_fork_back(fork):
+    """RESTORED. Red only because the fixture it needed (`fork`) had gone.
+
+    Every wrapped method is put back, including the connector's inherited load-error
+    report - and `hasattr` is the test, because a wrapper left on a class attribute
+    outlives the module that installed it (the classes are process globals).
+    """
+    sched, worker_cls = fork["sched"], fork["worker"]
+    disk_restore.install()
+    report = disk_restore.uninstall()
+    assert report["uninstalled"] is True
+    assert len(report["restored"]) == (len(disk_restore.SCHED_METHODS)
+                                       + len(disk_restore.WORKER_METHODS) + 1)
+    for name in disk_restore.SCHED_METHODS:
+        assert not hasattr(getattr(sched, name), disk_restore.OWNER_ATTR), name
+    for name in disk_restore.WORKER_METHODS:
+        assert not hasattr(getattr(worker_cls, name),
+                           disk_restore.OWNER_ATTR), name
+    assert disk_restore.counters()["installed"] is False
+
+
+def test_install_tolerates_a_process_with_only_one_half(fork):
+    """RESTORED. Red only because the fixture it needed (`fork`) had gone.
+
+    An EngineCore has the manager and never imports the worker; a worker is the
+    other way round. Requiring both would mean the layer could never fit anywhere.
+    The cross-process risk that tolerance opens - an offer with nobody to fill it -
+    is closed by `worker_proof`, and the load-error report is NOT fitted here, which
+    is what the last assertion checks.
+    """
+    del sys.modules[disk_restore.WORKER_MODULE]
+    report = disk_restore.install()
+    assert report["installed"] is True
+    assert "SimpleCPUOffloadWorker" not in report["class"]
+    assert disk_restore.METHOD_LOAD_ERRORS not in fork["connector"].__dict__
+
+
+def test_unattributable_disk_entries_are_never_dmaed(armed):
+    """RESTORED. It went red on `released == 1`, and the test was the thing that
+    was wrong.
+
+    It stood up a step with three disk entries AND two host-RAM entries, pruned the
+    three disk ones, and then expected us to release the request. With RAM entries
+    surviving, the fork DOES submit the event and reports the load itself - a second
+    report from us would be a double release of the same request. `released == 0` is
+    correct here and the release path is pinned per mode in section j (where
+    nothing survives the pruning and we are the only reporter). The invariant that
+    does hold in both shapes is the one asserted below: unattributable bytes never
+    reach the DMA, and their GPU blocks are reported.
+    """
+    fill(armed, blocks=1)
+    worker = Worker()
+    metadata = disk_meta(armed, seeds=(1,), ram=2)
+    cpu, gpu = list(metadata.load_cpu_blocks), list(metadata.load_gpu_blocks)
+    worker._connector_metadata = metadata
+    report = disk_restore.worker_before_load(worker)
+    assert report["ok"] is True and report["dropped"] == len(CACHEABLE)
+    assert metadata.load_cpu_blocks == cpu[len(CACHEABLE):]
+    assert metadata.load_gpu_blocks == gpu[len(CACHEABLE):]
+    assert report["released"] == 0 and report["submitted"] is True
+    assert disk_restore.counters()["reads_failed"]["not_tracked"] == len(CACHEABLE)
+    assert disk_restore.take_invalid_block_ids() == set(gpu[:len(CACHEABLE)])
+
+
+def test_the_watchdog_releases_a_load_nobody_reported(armed):
+    """RESTORED. It went red on a DOUBLE DRAIN of `take_invalid_block_ids()`.
+
+    The sweep itself fired on its first call (`fired == 1`); the test then read the
+    invalid-block set a second time and compared the empty result with three. That
+    drain-onces property is deliberate and pinned by
+    `test_the_invalid_block_report_drains`: an id reported twice is attributed to
+    whichever request holds that block by then, so the read IS the report. The
+    earlier verdict "the worker-side sweep never fired" came from this assertion,
+    not from the sweep.
+    """
+    fill(armed, blocks=1)
+    worker = Worker()
+    metadata = disk_meta(armed, seeds=(1,), ram=0)
+    worker._pending_load_event_indices.add(11)
+    bind(worker, metadata)
+    assert disk_restore._wloads and disk_restore._wbatches
+    expired_batches(11)
+    assert disk_restore.sweep_watchdog(worker)["fired"] == 1
+    assert disk_restore.counters()["worker_watchdog_fires"] == 1
+    assert worker._pending_load_event_indices == set()
+    blocks = disk_restore.take_invalid_block_ids()
+    assert len(blocks) == len(CACHEABLE), blocks
+    assert disk_restore.take_invalid_block_ids() == set(), "the report drained twice"
+    _sending, recving = disk_restore.worker_get_finished(worker, (set(), None))
+    assert recving == {"req-1"}
+
+
+def test_a_hostile_worker_never_raises(armed):
+    """RESTORED. It went red because the fake was hostile about the WRONG FIELD.
+
+    It raised from `_connector_metadata` and then expected `worker_bind` to fail -
+    but bind reads `load_paths`, `load_cpu_blocks`, `load_event`, and the identity
+    seam; a missing `load_paths` is an ordinary step with no disk work and bind
+    correctly answers `ok=True, queued=0`. Expecting a failure there would have
+    pinned a bug, not caught one. The hostile attributes are now the ones each path
+    actually reads, which is what makes the containment real.
+    """
+    class Exploding:
+        @property
+        def _connector_metadata(self):
+            raise RuntimeError("no metadata for you")
+
+    class ExplodingStep:
+        @property
+        def load_paths(self):
+            raise RuntimeError("no paths for you")
+
+    class ExplodingIndex:
+        @property
+        def _pending_load_event_indices(self):
+            raise RuntimeError("no indices for you")
+
+    assert disk_restore.worker_before_load(Exploding())["ok"] is False
+    assert disk_restore.worker_bind(Exploding(), ExplodingStep())["ok"] is False
+    assert disk_restore.worker_get_finished(ExplodingIndex(), (set(), None)) \
+        == (set(), None)
+    assert disk_restore.worker_before_load(ExplodingIndex())["ok"] is True
+    assert disk_restore.counters()["worker_errors"] >= 2
+
+
+def test_every_counter_has_a_unit():
+    """RESTORED, and it caught a real (if small) gap: `witness_emissions` had no
+    unit, so the payload carried a bare number under a `units` map whose whole
+    purpose is that no number in it is ever bare."""
+    counters = disk_restore.counters()
+    units = disk_restore.counters_view(dict(counters))["units"]
+    for name, value in counters.items():
+        if isinstance(value, int) and not isinstance(value, bool):
+            assert name in units, name
