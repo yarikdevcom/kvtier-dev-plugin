@@ -1832,6 +1832,113 @@ Tests: `tests/test_disk_restore_ledger_reporting.py`.
 landed in the same uncommitted working tree (HEAD is 0.2.21 and 0.2.22-0.2.24 were never
 committed), and neither change touches the other's files.
 
+### The door that showed zeros: a cross-process rollup of the ranks' spill counters (0.2.26)
+
+The reclaim was real and the payload said nothing happened. On the night of 2026-10-06
+the store went **395.8 GiB / 34,896 files -> 161.5 GiB / 14,233 files** (234 GiB shed,
+`/home` free 61 -> 293 GiB), and `POST /plugins/kvtier/disk {"op":"status"}` answered:
+
+```json
+{"spill": {"evictions": 0, "evicted_bytes": 0, "estimated_bytes": 0,
+           "ceiling_checks": 0, "estimate_seed_walks": 0, "walk_basis": null,
+           "walk_sampled_files": 0, "thread_alive": false}}
+```
+
+The truth was already on disk, in `/tmp/kv-tier-diagnostics/rank-PP0_TP0.json`:
+`disk.evictions: 15237`, `disk.spill_queued: 79`, `disk.spill_errors: 0`,
+`disk.ceiling_bytes: 206158430208`. Nothing was miscounted and nothing was lost.
+`disk_spill._state` is **per process**; the spill writer thread and
+`disk_spill._enforce_ceiling()` run in the processes that commit writes - the WORKERS,
+four of them here (`PP0_TP0`, `PP0_TP1`, `PP1_TP0`, `PP1_TP1`) plus the scheduler - and
+the `/disk` door is answered by whichever process the utility call landed on. That
+process ran no walk, so every counter it published was honestly zero, and 0.2.25's
+whitelist of `ceiling_checks` / `walk_*` - correct as far as it went - was unreadable in
+practice because the publishing process was the wrong one. **A witness nobody can read
+is not a witness.**
+
+**What 0.2.26 adds: `spill_rollup`, a sibling of `spill`** (`disk_store.rank_rollup()`,
+published by `op:status`). It reads the per-rank files `worker_diag` already writes in
+`VLLM_E2_TIER_DIAG` and sums what each rank's own process counted. Read-only, no shared
+memory, no new IPC channel, no new file name, no new thread, no new env var, no new
+write. `spill` keeps its keys and its meanings exactly as they were (pinned by a
+byte-identical test), because this adds a view and changes no policy.
+
+```json
+{"spill": {"evictions": 0, "thread_alive": false},
+ "spill_rollup": {
+   "basis": "rank_files_fleet_unknown",
+   "totals": {"evictions": 30760, "spilled": 24474, "spill_queued": 143,
+              "spill_errors": 2, "bytes_written": 337686041600,
+              "queue_depth": 0},
+   "totals_reported_by": {"evictions": 4, "spilled": 4, "queue_depth": 4},
+   "totals_are_lower_bound": true,
+   "ranks_counted": ["PP0_TP0", "PP0_TP1", "PP1_TP0", "PP1_TP1"],
+   "ranks_expected": null,
+   "ranks_expected_source": "no capacity handshake has been recorded in this process",
+   "ranks_missing": null,
+   "complete": null,
+   "per_rank": [{"rank": "PP0_TP0", "age_seconds": 1.4, "evictions": 15237,
+                 "spilled": 11841, "queue_depth": 0, "ceiling_bytes": 206158430208,
+                 "writer_thread_alive": true, "epoch": "9f2c1a07"}],
+   "stale_ranks": [], "excluded_files": [], "excluded_total": 0,
+   "ceiling_bytes": {"values": [206158430208], "agree": true, "min": 206158430208,
+                     "max": 206158430208, "reported_by": 4},
+   "writer_threads": {"alive": 4, "not_alive": 0, "unknown": 0},
+   "this_process": {"rank": null, "rank_source": "...not imported here",
+                    "counted_in_rollup": null}}}
+```
+
+**The totals are a sum of four processes' counters, not one fleet-wide counter**, and
+they are labelled as one (`scope`, `kinds`: `evictions` is a `counter-since-boot`,
+`queue_depth` is a `gauge`). There is deliberately no attempt at shared memory or a new
+IPC channel: reading files the ranks already write is the same channel `disk_restore`'
+`worker_proof()` already depends on, and the alternative is far riskier than the gap.
+
+**`basis` says which files the numbers came from**, in the same spirit as
+`ceiling_measurement.basis` above: `rank_files` (every rank the boot has, fresh),
+`rank_files_partial` (something missing, stale, unreadable or over the read cap),
+`rank_files_fleet_unknown` (every file that exists was fresh and counted, but this
+process does not know the rank set), `rank_files_unusable`, `no_rank_files`,
+`no_diagnostics_dir`, `directory_unreadable`, `rollup_failed`.
+
+**A rank file that is missing or stale makes the rollup say so, never quietly agree.**
+`totals_are_lower_bound` with `lower_bound_reason` naming the ranks; `ranks_missing`
+lists an expected rank the directory holds **no file at all** for; `stale_ranks`
+publishes a stale rank's last-known counters *outside* the totals, with its
+`age_seconds`; `excluded_files` lists a file that exists and is unusable. A rank is
+named in **at most one** of the three, so a reader adding them up can neither
+double-count a gap nor miss one. A silent low total is the dangerous case: it is
+indistinguishable from "the ceiling is holding", which is the exact misreading that cost
+the 0.2.25 investigation, re-opened one level up. The freshness bar is
+`RANK_ROLLUP_FRESH_SECONDS` (900 s, the same heartbeat bar `disk_restore` uses for its
+proof) and a `ts` in the future is treated as *not* fresh, because these files cross a
+process boundary.
+
+**`ranks_expected` comes from the capacity handshake** (`cpu_capacity`, the one place
+rank ids arrive in this process - the same rule `blockdump._expected_ranks()` uses, and
+this calls it rather than writing a second one). When this process has recorded no
+handshake, `ranks_expected` and `ranks_missing` are `null` and `complete` is `null`:
+"I cannot say" is published as itself, never as an empty set, which would read as
+"nothing was missing". And `this_process` says whether THIS process's own `spill`
+numbers are *inside* the totals - the difference between "my process did nothing and
+four others did" and "you are looking at one of the four", and the reason nobody can add
+`spill` to `totals` and get a number wrong by exactly one rank.
+
+**A rank file is untrusted input.** Size-capped, type-checked, per-field bounded, and
+every rejection is *named*: `malformed`, `too_large`, `bad_version`, `mislabeled` (its
+`rank` disagrees with its file name), `no_ts`, `clock_ahead`, `no_disk_section`, plus
+per-field `fields_rejected` for a counter that is negative, non-integer or over
+`RANK_ROLLUP_COUNTER_MAX`. A bad file costs that field for that rank only, and the door
+still answers `ok: true` - never a 500 because a diagnostic file was truncated.
+
+Costs: `op:status` now opens at most `MAX_RANK_ROLLUP_FILES` (32) files of at most 256
+KiB each and writes nothing (pinned). There is no cache: the rollup is the truth about
+the last file write, and freshness is the point of it. **This needs an engine restart to
+take effect** - it is engine-side code reached through the utility call, so the running
+boot keeps answering with the 0.2.25 payload until it is restarted into 0.2.26.
+
+Tests: `tests/test_disk_spill_rank_rollup.py`.
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 

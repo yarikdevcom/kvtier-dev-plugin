@@ -242,6 +242,25 @@ MAX_RECEIPT_FILE_BYTES = 1024
 MAX_RANK_FILES = 32                 # receipt files one status read will open
 MAX_SERVED_RECORDS = 64             # per-process memory of answered requests
 
+# --- the cross-process spill ROLLUP: reading the ranks' own rank files --------
+# The counters in `disk_spill._state` are PER PROCESS, and the processes are many:
+# the spill writer thread and the ceiling enforcement run in every WORKER, while the
+# `/plugins/kvtier/disk` door is answered by whichever process the utility call
+# landed on. On a 4-rank boot there are four independent spill states, and the one
+# that answers the HTTP call may have done none of the work. So the door reads the
+# per-rank files the WORKER ALREADY WRITES (`worker_diag`) and sums what each rank
+# saw - no shared memory, no new IPC, no new file: an honest sum of separate
+# processes' counters, labelled as one. See `rank_rollup` and README *The door that
+# showed zeros*.
+RANK_FILE_PREFIX = "rank-"              # worker_diag's name; READ here, never written
+RANK_FILE_SUFFIX = ".json"              # `rank-PP<pp>_TP<tp>.json`
+MAX_RANK_ROLLUP_FILE_BYTES = 256 * 1024  # the reader's own ceiling, same rule as proof
+MAX_RANK_ROLLUP_FILES = 32              # rank files one status read will open
+MAX_RANK_ROLLUP_ROWS = 16               # per-rank rows in one rollup payload
+MAX_RANK_ROLLUP_EXCLUDED = 16           # excluded files NAMED in one rollup payload
+RANK_ROLLUP_COUNTER_MAX = 1_000_000_000_000  # 1 TiB: past this a counter is not a fact
+RANK_ROLLUP_FRESH_SECONDS = 900.0       # the same heartbeat bar as disk_restore's proof
+
 MAX_LS_FILES = 200                  # ENTRIES in an `ls` response
 MAX_LS_LIMIT_DEFAULT = 50
 MAX_FILENAME_DISPLAY = 200          # CHARS of a path shown in a response
@@ -1835,6 +1854,485 @@ def _op_contains(body: dict) -> dict:
     return answer
 
 
+# --- the cross-process rollup: what the RANKS' spill counters saw --------------
+#
+# WHY THIS EXISTS (the 2026-10-06 reclaim, read out of a payload that said 0).
+# `disk_spill._state` is per-process. The spill writer thread and `_enforce_ceiling()`
+# run in the process that COMMITS WRITES - a worker - and on this boot there are four
+# of them (PP0_TP0, PP0_TP1, PP1_TP0, PP1_TP1) plus the scheduler. The `/disk` door is
+# answered by whichever process the utility call landed on, and that process ran no
+# walk. So the live reclaim of 395.8 GiB / 34,896 files down to 161.5 GiB / 14,233
+# files - 234 GiB shed in one night - was reported by `op:status` as
+# `evictions: 0, evicted_bytes: 0, ceiling_checks: 0, thread_alive: false`, while
+# `rank-PP0_TP0.json` was carrying `disk.evictions: 15237`. The whitelist that
+# publishes `ceiling_checks` and the `walk_*` fields is correct and unreadable in
+# practice: the publishing process is the wrong one, and a witness nobody can read is
+# not a witness.
+#
+# WHAT THIS IS NOT. It is not a shared counter and it does not become one: four
+# processes with four `evictions` counters, summed, is FOUR FACTS, not one fact times
+# four. There is no shared memory and no new IPC channel here (both far riskier than
+# reading files the ranks already write), and `spill` above stays this process's
+# verbatim counters - this adds a VIEW and changes no policy.
+#
+# THE ONE RULE THAT MAKES IT SAFE TO READ. A rank file is UNTRUSTED INPUT: another
+# process wrote it, it can be half-written, truncated by a crash, or a leftover from a
+# boot that is gone. Every file is size-capped, type-checked and per-field bounded, and
+# anything that is not fresh-and-usable is NAMED and EXCLUDED rather than folded into a
+# total. A total that cannot account for every rank the boot has is published as a
+# LOWER BOUND with the ranks it is missing named - the same rule that stopped a
+# truncated ceiling walk reporting its floor as a measurement.
+
+# (published name, the key in the rank file's `disk` section, unit). `files_written`
+# is the worker's name for `disk_spill`'s `spilled` counter - see
+# `worker_report`, which is the writer of that key.
+RANK_ROLLUP_FIELDS = (("evictions", "evictions", "files"),
+                      ("spilled", "files_written", "files"),
+                      ("spill_queued", "spill_queued", "requests"),
+                      ("spill_errors", "spill_errors", "writes"),
+                      ("bytes_written", "bytes_written", "bytes"),
+                      ("queue_depth", "queue_depth", "requests waiting NOW"))
+
+RANK_ROLLUP_MEANINGS = {
+    "evictions": "files THIS RANK's ceiling pass removed from the store (monotonic "
+                 "since that rank's boot); the reclaim's real size is the sum here, "
+                 "not `spill.evictions` in the process answering the call",
+    "spilled": "files this rank wrote (the rank file's `files_written`, which is "
+               "disk_spill's `spilled` counter)",
+    "spill_queued": "requests this rank handed to its writer thread",
+    "spill_errors": "writes this rank's thread failed",
+    "bytes_written": "bytes this rank wrote since its boot - NOT the store's current "
+                     "size: an eviction removes bytes this counter never subtracts",
+    "queue_depth": "requests waiting in this rank's queue RIGHT NOW (a gauge, summed "
+                   "as a fleet-wide instantaneous depth)",
+}
+RANK_ROLLUP_GAUGES = ("queue_depth",)
+"""Fields that are INSTANTANEOUS, not monotonic-since-boot. Summing a gauge across
+ranks answers "how much is waiting across the fleet right now", which is a different
+kind of number from a counter, so it gets its own label rather than a footnote."""
+
+
+def _rank_rollup_int(value):
+    """A counter from another process, or None. Bounded, and never a guess."""
+    number = _int(value)
+    if number is None or number < 0 or number > RANK_ROLLUP_COUNTER_MAX:
+        return None
+    return number
+
+
+def _rank_file_rollup_row(path, name: str) -> tuple:
+    """What ONE rank's file says its process did: (row | None, status, detail).
+
+    `status` is the verdict a reader sees by name: `counted` (fresh and usable),
+    `stale`, `too_large`, `malformed`, `bad_version`, `mislabeled`, `no_ts`,
+    `clock_ahead`, `no_disk_section`, `unreadable`. Only `counted` reaches a total; a
+    `stale` row still carries its last-known numbers so a reader can see what the rank
+    was doing before it stopped writing - under its own name, never inside a total.
+    """
+    from . import worker_diag  # noqa: PLC0415 - one rank-shape rule, not two
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:  # noqa: BLE001 - it vanished between listing and read
+        return None, "unreadable", f"stat failed: {type(exc).__name__}"
+    if size > MAX_RANK_ROLLUP_FILE_BYTES:
+        return None, "too_large", (f"{size} bytes (cap "
+                                   f"{MAX_RANK_ROLLUP_FILE_BYTES}); not read")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RANK_ROLLUP_FILE_BYTES + 1)
+        document = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:  # noqa: BLE001 - a half-written file is not a fault
+        return None, "malformed", f"did not parse: {type(exc).__name__}"
+    if not isinstance(document, dict):
+        return None, "malformed", f"top level is {type(document).__name__}"
+    version = document.get("version")
+    if version != worker_diag.SCHEMA_VERSION:
+        return None, "bad_version", (f"schema {version!r}, this build reads "
+                                     f"{worker_diag.SCHEMA_VERSION}")
+    rank = document.get("rank")
+    claimed = name[len(RANK_FILE_PREFIX):-len(RANK_FILE_SUFFIX)]
+    if not isinstance(rank, str) or not worker_diag._valid_rank(rank):
+        return None, "mislabeled", f"its own `rank` field is {rank!r}"
+    if rank != claimed:
+        return None, "mislabeled", (f"the file says {rank!r} and the name says "
+                                    f"{claimed!r}")
+    stamp = document.get("ts")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None, "no_ts", "`ts` is absent or not numeric, so age is unknowable"
+    age = time.time() - float(stamp)
+    if age < 0.0:
+        # A CLOCK AHEAD OF OURS is not freshness (disk_restore applies the same
+        # one-sided rule to its proof): a file stamped an hour in the future would
+        # sail past the staleness test forever, and rank files cross a host boundary.
+        return None, "clock_ahead", f"stamped {-age:.1f}s in the future"
+    section = document.get("disk")
+    if not isinstance(section, dict):
+        return None, "no_disk_section", ("no `disk` section: that rank's worker never "
+                                         "registered the spill tier's report")
+    epoch = document.get("epoch")
+    row = {"rank": rank, "file": _clip(name, MAX_FILENAME_DISPLAY),
+           "age_seconds": round(age, 3),
+           "epoch": _clip(epoch, 40) if isinstance(epoch, str) else None}
+    rejected = []
+    for field, source, _unit in RANK_ROLLUP_FIELDS:
+        value = _rank_rollup_int(section.get(source))
+        row[field] = value
+        if value is None and section.get(source) is not None:
+            rejected.append(field)
+    alive = section.get("writer_thread_alive")
+    row["writer_thread_alive"] = alive if isinstance(alive, bool) else None
+    row["ceiling_bytes"] = _rank_rollup_int(section.get("ceiling_bytes"))
+    row["fields_rejected"] = rejected
+    if rejected:
+        row["fields_rejected_note"] = _clip(
+            f"{rejected} carried a value that is not a non-negative int under "
+            f"{RANK_ROLLUP_COUNTER_MAX}, so they are excluded from the totals")
+    if age > RANK_ROLLUP_FRESH_SECONDS:
+        return row, "stale", f"{age:.0f}s old (fresh within " \
+                             f"{RANK_ROLLUP_FRESH_SECONDS:.0f}s)"
+    return row, "counted", None
+
+
+def rank_rollup() -> dict:
+    """THE CROSS-PROCESS VIEW of the spill tier: what every rank's own counters saw.
+
+    The public entry point, and the only thing about it that is not a reading: it
+    cannot raise. `_rank_rollup_inner` builds the whole payload from ONE skeleton, so a
+    degraded rollup and a healthy one ship the same keys; the outer guard below exists
+    only for the case where even that skeleton fails, and answers the handful of keys a
+    reader must always have rather than a 500 on the door.
+
+    Published by `op:status` as `spill_rollup` (a SIBLING of `spill`, which stays
+    this process's counters byte-for-byte). It answers the question the door could not
+    answer on 2026-10-06: "this process enforced nothing" and "the enforcement happened
+    in a process whose counters I am not looking at" look IDENTICAL in the `spill`
+    block, and the second answer is the default on a multi-rank boot.
+
+    READ-ONLY. It writes nothing, starts nothing, reads nothing but the rank files
+    `worker_diag` already writes, bounded by `MAX_RANK_ROLLUP_FILES` opens of
+    `MAX_RANK_ROLLUP_FILE_BYTES` each.
+    """
+    try:
+        return _rank_rollup_inner()
+    except Exception as exc:  # noqa: BLE001 - the door answers 200, always
+        snapshot._error(exc, "disk_store rank rollup")
+        return {"basis": "rollup_failed", "degraded": True, "complete": None,
+                "totals": {}, "totals_reported_by": {},
+                "totals_are_lower_bound": True, "ranks_counted": [],
+                "ranks_expected": None, "ranks_missing": None,
+                "reason": _clip(f"the rollup could not be built: "
+                                f"{type(exc).__name__}", MAX_STRING_CHARS)}
+
+
+def _rank_rollup_inner() -> dict:
+    """Build and fill the rollup. ONE skeleton for every outcome, healthy or not, so a
+    degraded payload and a complete one can never disagree about which keys exist.
+    """
+    out: dict = {"basis": None,
+                 "totals": {field: None for field, _s, _u in RANK_ROLLUP_FIELDS},
+                 "totals_reported_by": {field: 0
+                                        for field, _s, _u in RANK_ROLLUP_FIELDS},
+                 "totals_are_lower_bound": True,
+                 "lower_bound_reason": None,
+                 "ranks_counted": [],
+                 "ranks_expected": None,
+                 "ranks_expected_source": None,
+                 "ranks_missing": None,
+                 "rank_files_found": 0,
+                 "listing_truncated": False,
+                 "per_rank": [],
+                 "per_rank_truncated": False,
+                 "stale_ranks": [],
+                 "excluded_files": [],
+                 "excluded_total": 0,
+                 "excluded_truncated": False,
+                 "reason": None,
+                 "complete": None,
+                 "ceiling_bytes": None,
+                 "writer_threads": None,
+                 "distinct_epochs": 0,
+                 "epoch_note": ("epochs are PER-PROCESS unless VLLM_E2_TIER_DIAG_EPOCH "
+                                "is set (worker_diag), so more than one here is normal "
+                                "on a multi-rank boot and is NOT evidence of two "
+                                "boots"),
+                 "this_process": {"rank": None, "rank_source": None,
+                                  "counted_in_rollup": None,
+                                  "note": ("this process could not resolve its own "
+                                           "rank id, so it cannot say whether its "
+                                           "`spill` counters are inside the totals or "
+                                           "describe a different process")},
+                 "fresh_seconds": RANK_ROLLUP_FRESH_SECONDS,
+                 "degraded": False,
+                 "kinds": {field: ("gauge" if field in RANK_ROLLUP_GAUGES
+                                   else "counter-since-boot")
+                           for field, _s, _u in RANK_ROLLUP_FIELDS},
+                 "units": {field: unit for field, _src, unit in RANK_ROLLUP_FIELDS},
+                 "meanings": dict(RANK_ROLLUP_MEANINGS),
+                 "scope": ("totals are the SUM of each rank's OWN per-process "
+                           "counters, read from its rank file; `spill` in this same "
+                           "payload is THIS process's counters and nothing else. A "
+                           "worker and the process answering this call are different "
+                           "processes, so the two disagreeing is the expected case, "
+                           "not a contradiction."),
+                 "note": ("A total here is an honest sum over the ranks whose files "
+                          "were fresh, never a fleet-wide counter: separate "
+                          "processes, separate counters, no shared memory and no new "
+                          "IPC. Where a rank is missing, stale or unreadable the "
+                          "totals are a LOWER BOUND and `ranks_missing`/"
+                          "`stale_ranks`/`excluded_files` name it, because a "
+                          "confidently low total is the failure this view exists to "
+                          "stop - it is the same claim a truncated ceiling walk used "
+                          "to make about its own floor.")}
+    try:
+        filled = _fill_rank_rollup(out)
+        _settle_local_overlap(filled)
+        return filled
+    except Exception as exc:  # noqa: BLE001 - a degraded rollup still answers 200
+        snapshot._error(exc, "disk_store rank rollup")
+        out["basis"] = "rollup_failed"
+        out["degraded"] = True
+        out["reason"] = _clip(f"the rollup raised {type(exc).__name__}",
+                              MAX_STRING_CHARS)
+        return out
+
+
+def _settle_local_overlap(out: dict) -> None:
+    """Say whether THIS process's own `spill` counters are inside the totals.
+
+    `spill` and `totals` are two views that may describe the SAME process or two
+    different ones, and a reader that adds them gets a number wrong by exactly one
+    rank. Every return path lands here, so the answer is never a `null` the caller has
+    to guess at - it is the difference between "my process did nothing and four others
+    did" and "you are looking at one of the four", which is the same question the whole
+    rollup exists to answer.
+    """
+    local = out.get("this_process")
+    if not isinstance(local, dict):
+        return
+    rank = local.get("rank")
+    if not isinstance(rank, str):
+        return
+    counted = rank in out["ranks_counted"]
+    local["counted_in_rollup"] = counted
+    local["note"] = (
+        f"this process IS {rank} and its file is in the totals: `spill` and `totals` "
+        "overlap, so never add them" if counted else
+        f"this process is {rank} and its file is NOT in the totals, so `spill` and "
+        "`totals` describe different processes and may legitimately differ")
+
+
+def _mark_rollup_gaps(out: dict, expected, counted_ranks: list,
+                      listed_ranks=None) -> None:
+    """Name the ranks this rollup did NOT read, and set `complete` from that.
+
+    THREE FACTS, kept apart on purpose, because collapsing them is how a gap becomes
+    invisible: `ranks_missing` lists an expected rank the directory holds NO FILE for;
+    `stale_ranks` lists a rank whose file exists but is too old to describe the present;
+    `excluded_files` lists a file that exists and is unusable. A rank appears in at most
+    one of the three, so a reader adding them up cannot double-count a gap or miss one.
+
+    `ranks_missing: null` means the rank SET is unknown (this process cannot say), and
+    `[]` means every rank the boot names has a file. The two must never be conflated: "I
+    do not know the fleet" and "the fleet is fully accounted for" are opposite claims,
+    and a reader can only tell them apart if both are spelled out.
+    """
+    missing = None
+    if isinstance(expected, (list, tuple)):
+        missing = sorted(set(expected) - set(listed_ranks or ()))
+    out["ranks_missing"] = missing
+    counted = set(counted_ranks)
+    out["complete"] = (None if missing is None else
+                       bool(counted) and set(expected) <= counted
+                       and not out["excluded_total"])
+
+
+def _rollup_gap_reason(out: dict, missing, expected) -> str:
+    """WHY these totals are a lower bound, naming every rank that is not in them."""
+    reasons = []
+    if missing:
+        reasons.append(f"no file at all from {', '.join(missing[:8])}")
+    if out["stale_ranks"]:
+        names = ", ".join(str(entry.get("rank"))
+                          for entry in out["stale_ranks"][:8])
+        reasons.append(f"stale, so excluded from the totals: {names}")
+    if out["excluded_files"]:
+        names = ", ".join(str(entry.get("file"))
+                          for entry in out["excluded_files"][:8])
+        reasons.append(f"unreadable or unusable: {names}")
+    if out["listing_truncated"]:
+        reasons.append(f"only {MAX_RANK_ROLLUP_FILES} of "
+                       f"{out['rank_files_found']} files were opened")
+    if expected is None:
+        reasons.append("the rank set is unknown here, so a rank that never wrote a "
+                       "file is invisible to this view as well")
+    return "; ".join(reasons)
+
+
+def _fill_rank_rollup(out: dict) -> dict:
+    """Read the directory and fill `rank_rollup`'s payload. Contained by its caller."""
+    from . import worker_diag  # noqa: PLC0415 - one rank rule, not two
+    local_rank, local_source = worker_diag.rank_id()
+    out["this_process"] = {"rank": local_rank, "rank_source": local_source,
+                           "counted_in_rollup": None,
+                           "note": ("this process resolved its rank to "
+                                    f"{local_rank!r}; whether that rank's file was "
+                                    "counted is decided below")}
+    # The rank SET is asked for BEFORE the directory is touched, so even a payload that
+    # can read nothing can still say which ranks it therefore cannot see.
+    expected, expected_source = _expected_ranks()
+    out["ranks_expected"] = expected
+    out["ranks_expected_source"] = expected_source
+    directory = config.diagnostics_dir()
+    if directory is None:
+        out["basis"] = "no_diagnostics_dir"
+        out["degraded"] = True
+        _mark_rollup_gaps(out, expected, [])
+        out["lower_bound_reason"] = _clip(_rollup_gap_reason(out, out["ranks_missing"],
+                                                             expected), 400)
+        out["reason"] = (f"{config.ENV_DIAG_DIR} is not set, so no rank writes a file "
+                         "and nothing can be rolled up: the zeros in `spill` are all "
+                         "this view can see, and they are NOT evidence that no rank "
+                         "evicted anything")
+        return out
+    try:
+        names = sorted(entry.name for entry in os.scandir(str(directory))
+                       if entry.is_file()
+                       and entry.name.startswith(RANK_FILE_PREFIX)
+                       and entry.name.endswith(RANK_FILE_SUFFIX))
+    except OSError as exc:  # noqa: BLE001 - unreadable directory is data, not a 500
+        out["basis"] = "directory_unreadable"
+        out["degraded"] = True
+        _mark_rollup_gaps(out, expected, [])
+        out["lower_bound_reason"] = _clip(_rollup_gap_reason(out, out["ranks_missing"],
+                                                             expected), 400)
+        out["reason"] = (f"the diagnostics directory could not be listed: "
+                         f"{type(exc).__name__}")
+        return out
+    out["rank_files_found"] = len(names)
+    if len(names) > MAX_RANK_ROLLUP_FILES:
+        out["listing_truncated"] = True
+        names = names[:MAX_RANK_ROLLUP_FILES]
+    if not names:
+        out["basis"] = "no_rank_files"
+        out["degraded"] = True
+        _mark_rollup_gaps(out, expected, [])
+        out["lower_bound_reason"] = _clip(_rollup_gap_reason(out, out["ranks_missing"],
+                                                             expected), 400)
+        out["reason"] = ("no rank file exists yet, so there is NO EVIDENCE of "
+                         "enforcement in any process - which is a different claim "
+                         "from `spill.evictions: 0` in this one")
+        return out
+    counted: list = []
+    listed: list = []
+    for name in names:
+        # The rank a FILE NAME claims, whether or not the file is readable: it decides
+        # "no file at all" (ranks_missing) versus "a file that told us nothing".
+        claimed = name[len(RANK_FILE_PREFIX):-len(RANK_FILE_SUFFIX)]
+        if worker_diag._valid_rank(claimed):
+            listed.append(claimed)
+        row, status, detail = _rank_file_rollup_row(
+            os.path.join(str(directory), name), name)
+        if status == "counted":
+            counted.append(row)
+            continue
+        record = {"file": _clip(name, MAX_FILENAME_DISPLAY), "status": status}
+        if detail is not None:
+            record["reason"] = _clip(detail, MAX_STRING_CHARS)
+        if row is not None:
+            record.update({key: row[key] for key in
+                           ("rank", "age_seconds", "evictions", "spilled",
+                            "spill_queued", "spill_errors", "bytes_written",
+                            "queue_depth", "ceiling_bytes",
+                            "writer_thread_alive")})
+        elif worker_diag._valid_rank(claimed):
+            # The CONTENT told us nothing, but the NAME still claims a rank, and a
+            # reader scanning "which of my ranks is unaccounted for" needs that name
+            # here rather than having to line file names up by hand. Labelled as the
+            # file's claim, because an unreadable body cannot vouch for it.
+            record["rank"] = claimed
+            record["rank_source"] = "the file name only; the body was unreadable"
+        if status == "stale":
+            out["stale_ranks"].append(record)
+        else:
+            out["excluded_files"].append(record)
+    out["excluded_total"] = len(out["excluded_files"]) + len(out["stale_ranks"])
+    out["excluded_files"] = out["excluded_files"][:MAX_RANK_ROLLUP_EXCLUDED]
+    out["stale_ranks"] = out["stale_ranks"][:MAX_RANK_ROLLUP_EXCLUDED]
+    out["excluded_truncated"] = out["excluded_total"] > (len(out["excluded_files"])
+                                                         + len(out["stale_ranks"]))
+    out["ranks_counted"] = sorted(row["rank"] for row in counted)
+    _mark_rollup_gaps(out, expected, out["ranks_counted"], listed)
+    if not counted:
+        out["basis"] = "rank_files_unusable"
+        out["degraded"] = True
+        out["lower_bound_reason"] = _clip(_rollup_gap_reason(out, out["ranks_missing"],
+                                                             expected), 400)
+        out["reason"] = (f"{len(names)} rank file(s) were read and NONE was fresh "
+                         "and usable: the totals are null rather than zero, and "
+                         "`excluded_files`/`stale_ranks` name why")
+        return out
+    rows = sorted(counted, key=lambda row: row["rank"])
+    out["per_rank"] = rows[:MAX_RANK_ROLLUP_ROWS]
+    out["per_rank_truncated"] = len(rows) > MAX_RANK_ROLLUP_ROWS
+    for field, _source, _unit in RANK_ROLLUP_FIELDS:
+        values = [row[field] for row in rows if row[field] is not None]
+        out["totals"][field] = sum(values) if values else None
+        out["totals_reported_by"][field] = len(values)
+    out["kinds"] = {field: ("gauge" if field in RANK_ROLLUP_GAUGES
+                            else "counter-since-boot")
+                    for field, _source, _unit in RANK_ROLLUP_FIELDS}
+    ceilings = [row["ceiling_bytes"] for row in rows
+                if row["ceiling_bytes"] is not None]
+    out["ceiling_bytes"] = {
+        "values": sorted(set(ceilings)),
+        "min": min(ceilings) if ceilings else None,
+        "max": max(ceilings) if ceilings else None,
+        "agree": len(set(ceilings)) <= 1,
+        "reported_by": len(ceilings),
+        "note": ("a CEILING is a configured LIMIT, not a counter: summing it would be "
+                 "a number about arithmetic, not about the box. Disagreement here "
+                 "means two ranks booted against different limits, which is exactly "
+                 "the state in which one rank keeps writing while another evicts")}
+    alive = [row["writer_thread_alive"] for row in rows]
+    out["writer_threads"] = {"alive": alive.count(True),
+                             "not_alive": alive.count(False),
+                             "unknown": alive.count(None),
+                             "note": ("this is the field tonight's payload could not "
+                                      "say: `spill.thread_alive: false` in the process "
+                                      "answering the call, while every rank's writer "
+                                      "thread was alive in its own")}
+    out["distinct_epochs"] = len({row["epoch"] for row in rows
+                                  if isinstance(row["epoch"], str)})
+    out["epoch_note"] = ("epochs are PER-PROCESS unless VLLM_E2_TIER_DIAG_EPOCH is "
+                         "set (worker_diag), so more than one here is normal on a "
+                         "multi-rank boot and is NOT evidence of two boots (a rank "
+                         "file from a PREVIOUS boot is caught by `ts`, not by this)")
+    if local_rank is not None:
+        out["this_process"]["rank"] = local_rank
+    has_gap = bool(out["ranks_missing"]) or bool(out["stale_ranks"]) \
+        or bool(out["excluded_files"]) or bool(out["listing_truncated"])
+    if out["complete"] is True:
+        out["basis"] = "rank_files"
+        out["totals_are_lower_bound"] = False
+    elif has_gap:
+        out["basis"] = "rank_files_partial"
+        out["degraded"] = True
+        out["lower_bound_reason"] = _clip(
+            _rollup_gap_reason(out, out["ranks_missing"], expected), 400)
+    else:
+        # Every file that EXISTS was counted and fresh; what is unknown is whether some
+        # rank never wrote one. That is not a defect in this reading, but it does make
+        # the totals a lower bound - and it must not be reported under the same word as
+        # "a rank file is stale", which is a fact about a rank rather than about this
+        # process's ignorance of the fleet.
+        out["basis"] = "rank_files_fleet_unknown"
+        out["lower_bound_reason"] = _clip(
+            f"the totals cover the {len(out['ranks_counted'])} rank file(s) that "
+            f"exist, but the rank set is unknown here ({expected_source}), so a rank "
+            "that never wrote a file is invisible to this view", 400)
+    return out
+
+
 def _op_status(_body: dict) -> dict:
     from . import worker_diag  # noqa: PLC0415 - one rank rule, not two
     rank, source = worker_diag.rank_id()
@@ -1874,6 +2372,16 @@ def _op_status(_body: dict) -> dict:
                        "walk_measured_bytes", "walk_entries_examined",
                        "walk_skipped_files", "walk_truncated",
                        "walk_count_truncated", "plan_truncated")},
+            # THE SAME MECHANISM, SEEN FROM OUTSIDE THIS PROCESS. Everything above -
+            # `spill.evictions`, `ceiling_checks`, the `walk_*` fields - is THIS
+            # process's `disk_spill._state`, and on a multi-rank boot the processes
+            # that RUN the ceiling pass and the writer thread are the WORKERS, not
+            # whoever is answering this call. That is why a boot that shed 234 GiB
+            # answered this door with every counter at zero: the fields were published
+            # correctly and read from the wrong process, which is the same thing as
+            # not publishing them. Additive by contract: `spill` keeps its keys and
+            # its meanings exactly as they were, and this block only ever adds a view.
+            "spill_rollup": rank_rollup(),
             # THE JOURNAL, SAYING IT OUT LOUD. `spill.journal_failures` is this
             # process's count of refusals it was handed; `journal.write_errors` is
             # the INDEX's count of lines it never got, and `journal.writable:
