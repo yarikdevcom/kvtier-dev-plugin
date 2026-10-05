@@ -401,7 +401,7 @@ ARG_SPECS: dict[str, dict] = {
     # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
     config.ROUTE_DISK: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm", "spill-one",
-                                          "ls", "offers")},
+                                          "ls", "contains", "offers")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         "fingerprint": {"kind": "str", "max_chars": 32},
@@ -412,7 +412,20 @@ ARG_SPECS: dict[str, dict] = {
                         # 400 rather than a silently ignored field.
                         "enabled": {"kind": "bool"},
                         "scope": {"kind": "enum",
-                                  "values": ("optin", "all")}},
+                                  "values": ("optin", "all")},
+                        # `ls` has always accepted a shard filter engine-side
+                        # (`disk_store._op_ls`); it was unreachable because it was not
+                        # in THIS table, so every attempt answered `unsupported request
+                        # keys: ['shard']`. A listing of one shard is how an operator
+                        # names the four rank files of one parked span without
+                        # listing the whole store, which is exactly what `contains`
+                        # sends them to do next - so the key is whitelisted at the
+                        # width of a wire string and its SHAPE stays the engine's
+                        # rule (`_validate_shard` demands exactly SHARD_CHARS hex and
+                        # says so; a bound here tighter than that would lie about what
+                        # the verb can do).
+                        "shard": {"kind": "str",
+                                  "max_chars": MAX_ARG_STRING_CHARS}},
 }
 
 
@@ -521,6 +534,54 @@ def query_arguments(request: Request, route: str) -> dict:
         return validate_arguments(route, _query_arguments(request))
     except _ArgumentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+def _conflict(key, query_value, body_value) -> HTTPException:
+    """The 400 for one key that disagrees between the query string and the body."""
+    return HTTPException(
+        status_code=400,
+        detail=f"{key} was given twice and disagrees: the query string says "
+               f"{str(query_value)[:60]!r} and the body says "
+               f"{str(body_value)[:60]!r}; send it once, or send the same value "
+               "in both places")
+
+
+async def post_arguments(request: Request, route: str) -> dict:
+    """A POST's arguments: the JSON body AND the query string, both honoured.
+
+    WHY THIS EXISTS (0.2.21). Every POST handler used to read the BODY ALONE, while
+    every GET read the query string - and the routes are documented for both forms, so
+    operators wrote things like `POST /plugins/kvtier/disk?op=arm&seconds=3600`. The
+    query string was never read, so the request ran `op=status`, and the answer said
+    `ok: true` with `"op": "status"` while the arm file kept its old mtime. An
+    UNEXECUTED OPERATION REPORTING SUCCESS is the worst shape this plugin can have: a
+    `true` that says a live-code path is open when it is closed (and the inverse for
+    `disarm`) is worse than an error, because the operator stops looking.
+
+    THE RULE, spelled out because "honour the query string" is not yet a rule:
+      * both halves are validated against the SAME spec as GET, so a query key outside
+        the table is a 400 here too instead of being ignored; a POST is no longer a
+        place where a typo costs nothing;
+      * a key present in BOTH must carry the SAME value once validated (`?seconds=3600`
+        and `{"seconds": 3600}` agree, because the int rule coerces the query string);
+        a disagreement is a 400 naming both values. There is deliberately NO precedence
+        rule that silently picks a winner: silent precedence is a smaller version of
+        the bug being fixed;
+      * the SAFE-method route is untouched. A mutating `op` still cannot run from a
+        method a browser may issue without a preflight (`route_disk`'s 405 and the
+        engine-side `safe_method` refusal are the two guards), and the token gate is
+        method-independent, so a query-string `op` is exactly as authenticated as a
+        body `op`.
+    """
+    body = await body_arguments(request, route)
+    query = query_arguments(request, route)
+    for key, value in query.items():
+        if key not in body:
+            body[key] = value
+            continue
+        if body[key] != value:
+            raise _conflict(key, value, body[key])
+    return body
 
 
 # --- the dev-state mirror ---------------------------------------------------
@@ -720,7 +781,8 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # "this boot has no disk tier", not "this verb is broken".
         "disk": {
             "route": config.ROUTE_PREFIX + config.ROUTE_DISK,
-            "ops": ["status", "arm", "disarm", "spill-one", "ls", "offers"],
+            "ops": ["status", "arm", "disarm", "spill-one", "ls", "contains",
+                    "offers"],
             "root_env": config.ENV_DISK_ROOT,
             "ceiling_env": config.ENV_DISK_BYTES,
             # The journal gets its own path because it is the one piece of state
@@ -891,7 +953,7 @@ async def route_snapshot_post(request: Request):
     except GuardDenied as denied:
         raise HTTPException(status_code=denied.status_code,
                             detail=denied.detail) from None
-    args = await body_arguments(request, config.ROUTE_SNAPSHOT)
+    args = await post_arguments(request, config.ROUTE_SNAPSHOT)
     return as_json(await engine_call(request, config.METHOD_SNAPSHOT, args,
                                      source="snapshot read"))
 
@@ -917,7 +979,7 @@ async def route_kvconfig_post(request: Request):
     except GuardDenied as denied:
         raise HTTPException(status_code=denied.status_code,
                             detail=denied.detail) from None
-    args = await body_arguments(request, config.ROUTE_KVCONFIG)
+    args = await post_arguments(request, config.ROUTE_KVCONFIG)
     return as_json(await engine_call(request, config.METHOD_KVCONFIG, args,
                                      source="kvconfig read"))
 
@@ -943,7 +1005,7 @@ async def route_block_post(request: Request):
     except GuardDenied as denied:
         raise HTTPException(status_code=denied.status_code,
                             detail=denied.detail) from None
-    args = await body_arguments(request, config.ROUTE_BLOCK)
+    args = await post_arguments(request, config.ROUTE_BLOCK)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="block inspect"))
 
@@ -969,7 +1031,7 @@ async def route_request_post(request: Request):
     except GuardDenied as denied:
         raise HTTPException(status_code=denied.status_code,
                             detail=denied.detail) from None
-    args = await body_arguments(request, config.ROUTE_REQUEST)
+    args = await post_arguments(request, config.ROUTE_REQUEST)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="request inspect"))
 
@@ -1012,7 +1074,7 @@ async def route_trace_post(request: Request):
     removes every wrapper this plugin owns outside the init-time ones.
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_TRACE)
+    args = await post_arguments(request, config.ROUTE_TRACE)
     return as_json(await engine_call(request, config.METHOD_TRACE, args,
                                      source="trace verb"))
 
@@ -1041,7 +1103,7 @@ async def route_guard_post(request: Request):
     KeyboardInterrupt always continue on their way.
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_GUARD)
+    args = await post_arguments(request, config.ROUTE_GUARD)
     return as_json(await engine_call(request, config.METHOD_GUARD, args,
                                      source="guard verb"))
 
@@ -1096,7 +1158,7 @@ async def route_tier_post(request: Request):
     arming such an engine is what `set_armed` refuses.
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_TIER)
+    args = await post_arguments(request, config.ROUTE_TIER)
     return as_json(await engine_call(request, config.METHOD_TIER, args,
                                      source="tier verb"))
 
@@ -1134,7 +1196,7 @@ async def route_lookups_post(request: Request):
     capacity, a monotonic `dropped` count, and records nothing while disarmed.
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_LOOKUPS)
+    args = await post_arguments(request, config.ROUTE_LOOKUPS)
     return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
                                      source="lookup ledger verb"))
 
@@ -1177,7 +1239,7 @@ async def route_blockdump_post(request: Request):
         refcount, free-queue or hash-state change (see `blockdump.py`).
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_BLOCKDUMP)
+    args = await post_arguments(request, config.ROUTE_BLOCKDUMP)
     return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
                                      source="blockdump verb"))
 
@@ -1208,6 +1270,13 @@ async def route_disk(request: Request):
                    f"POST {config.ROUTE_PREFIX + config.ROUTE_DISK} "
                    f"(this route's GET answers op=status only)")
     args.setdefault("op", "status")
+    if op == "contains":
+        # The same rule as the POST: "you asked badly" is a 400 here too, never a
+        # `present: false` - a GET is the form an operator reaches for when they are
+        # already unsure, so it must not answer their malformed key with a "not there".
+        problem = disk_store.contains_key_problem(args.get("key"))
+        if problem is not None:
+            raise HTTPException(status_code=400, detail=f"op=contains: {problem}")
     args["safe_method"] = True
     return as_json(await engine_call(request, config.METHOD_DISK, args,
                                      source="disk spill status"))
@@ -1217,9 +1286,9 @@ async def route_disk(request: Request):
 async def route_disk_post(request: Request):
     """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
-    `{op: status|arm|disarm|spill-one|ls|offers, slot?, key?, fingerprint?,
-    seconds?, limit?, enabled?, scope?}`. KV slots evicted from the RAM tier are
-    spilled to
+    `{op: status|arm|disarm|spill-one|ls|contains|offers, slot?, key?,
+    fingerprint?, seconds?, limit?, shard?, enabled?, scope?}`. KV slots evicted from
+    the RAM tier are spilled to
     `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin` on the engine's own
     disk, so the RAM tier can shrink - the group id is part of the identity, since
     two groups can hash the same token chain, and the digest half is rebuilt by
@@ -1281,13 +1350,35 @@ async def route_disk_post(request: Request):
         store to measure it.
       * A MUTATING `op` is refused with 405 on GET; the safe method answers
         `op=status` only.
+      * ON THIS POST EVERY ARGUMENT MAY ARRIVE IN THE QUERY STRING OR THE BODY, and
+        BOTH are read (`post_arguments`). `?op=arm&seconds=3600` with no body arms the
+        tier, and so does `?op=arm` beside `{"seconds": 3600}`. A key given in both
+        places must AGREE or the answer is a 400 naming the two values: there is no
+        silent precedence, because until 0.2.21 this route read the body only and a
+        query-string `op` was IGNORED WHILE ANSWERING `ok: true` - an unexecuted
+        operation reporting success, on a verb whose whole job is to open and close a
+        live path.
+      * `contains` answers one identity: is it in the disk index, for WHICH RANKS, and
+        whether the index is even able to answer (`present: null` with a `verdict` of
+        `index_never_refreshed` / `index_has_no_journal_directory` when it is not).
+        It reads the replayed journals in memory and NEVER walks the store - `ls` (with
+        `shard`) is the verb that walks. A key that cannot name an identity is a `400`
+        here, never a `present: false`.
       * `engine_fields` answers `present|absent|unknown` for this boot: whether
         `SimpleCPUOffloadMetadata` carries `store_keys` at all. On an unpatched
         engine the worker hook refuses and counts `no_key_for_slot` and writes
         nothing - which is the same build being correct on both engines.
     """
     await _guard_dev_state_route(request)
-    args = await body_arguments(request, config.ROUTE_DISK)
+    args = await post_arguments(request, config.ROUTE_DISK)
+    from . import disk_store  # noqa: PLC0415 - the key rule lives with the verb
+    # A malformed key is a `400`, answered HERE so that "you asked badly" can never
+    # reach the caller as a `present: false` from the engine. The ONE definition of a
+    # usable key is `disk_store.contains_key_problem`, shared with the verb itself.
+    if str(args.get("op") or "").strip().lower() == "contains":
+        problem = disk_store.contains_key_problem(args.get("key"))
+        if problem is not None:
+            raise HTTPException(status_code=400, detail=f"op=contains: {problem}")
     return as_json(await engine_call(request, config.METHOD_DISK, args,
                                      source="disk spill verb"))
 

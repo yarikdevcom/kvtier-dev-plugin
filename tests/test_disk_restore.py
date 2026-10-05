@@ -483,7 +483,16 @@ def test_worker_half_gate_needs_no_tier_arm(armed, monkeypatch):
 
 
 def test_nothing_fires_when_the_tier_arm_is_down(armed, monkeypatch):
-    """Pull the tier arm and no lookup can offer, allocate, or name a file."""
+    """Pull the tier arm and no lookup can offer, allocate, or name a file.
+
+    UPDATED FOR 0.2.21, and this is the one existing assertion the change made wrong.
+    BEFORE: `sum(refused.values()) == 0` - a gate-closed marked request left no counter
+    at all, only `last_reason`. That was the ambiguity that cost the 2026-10-05
+    investigation: an empty `refused` was read as "nothing refused us" when the gate had
+    refused the request. AFTER: the decline is counted under its own name, and the
+    nothing-fired claim is made STRONGER rather than weaker - no offer, no allocation,
+    no pending hit, the fork's own tuple back, and exactly one refusal, named.
+    """
     monkeypatch.setattr(backport, "is_armed", lambda: False)
     manager = Manager(reqs_to_load={"req-1": object()})
     fill(armed, blocks=2)
@@ -492,7 +501,9 @@ def test_nothing_fires_when_the_tier_arm_is_down(armed, monkeypatch):
     assert manager._pending_cpu_hits == {}
     counters = disk_restore.counters()
     assert counters["offers"] == 0
-    assert sum(counters["refused"].values()) == 0
+    moved = {name: count for name, count in counters["refused"].items() if count}
+    assert moved == {"tier_disarmed": 1}, \
+        "the gate's decline is counted, by the name the gate itself gave"
 
 
 def test_worker_proof_needs_a_fresh_rank_file_saying_installed_and_armed(tmp_path,

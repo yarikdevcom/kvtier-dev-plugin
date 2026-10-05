@@ -1460,9 +1460,22 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
             _refuse("workers_not_servicing", opened["reason"])
         elif kind == "no_worker_proof":
             _refuse("no_worker_proof", opened["reason"])
+        elif kind in ("not_configured", "disarmed", "tier_disarmed"):
+            # THE CLOSED GATE, COUNTED BY NAME (0.2.21). This branch used to call
+            # `_note()` and leave `refused` untouched, so `refused == {}` was ambiguous
+            # between "nothing refused us" and "the gate refused every request of the
+            # boot without a trace" - and that ambiguity cost the whole afternoon of
+            # 2026-10-05, which read an empty `refused` as evidence that the ALIGNMENT
+            # guard had declined the request when the gate had declined it. A closed
+            # gate is not a judgement about THIS request (the comment here used to say
+            # so) but it IS the reason no offer was made, and the `refused` dict has to
+            # be readable on its own. `_refuse` sets `last_reason` exactly as `_note`
+            # did, and the value returned to the scheduler is unchanged.
+            _refuse(kind, opened["reason"])
         else:
-            # The plain unarmed case, and the common one: not a refusal worth a
-            # counter, because "the tier is off" is not a fact about this request.
+            # A gate reason this module has no bucket for. Still `last_reason` only, so
+            # a gate that grows a fourth kind shows up as an absent counter rather than
+            # being filed under someone else's name.
             _note(opened["reason"])
         return ram_result
     request_id = str(getattr(request, "request_id", "") or "")
@@ -4069,6 +4082,17 @@ def scheduler_section() -> dict:
         "ranks_reads_applied": int(tally["ranks_reads_applied"]),
         "loads_released": int(tally["loads_released"]),
         "skipped_no_marker": int(tally["skipped_no_marker"]),
+        # THE MARKER'S OWN EVIDENCE (0.2.21). All three existed in `counters()` and in
+        # `counters_view`'s units but were never published here, so PROVING a marker
+        # reached the scheduler meant inventing a control experiment: send a PAIRED
+        # unflagged request and watch `skipped_no_marker` move for the control and not
+        # for the marked one - one extra request through a live engine to learn one
+        # bit. `flagged` rising with the marked request while `requests_seen` rises for
+        # both makes a marked request self-evident from one payload read, which is the
+        # whole purpose of this section.
+        "flagged": int(tally["flagged"]),
+        "requests_seen": int(tally["requests_seen"]),
+        "lookups": int(tally["lookups"]),
         "witness_verdict": tally["witness_verdict"],
         "witness_reason": tally["witness_reason"],
         "witness_kind": tally["witness_kind"],
@@ -4155,6 +4179,19 @@ def scheduler_section() -> dict:
                                  "restore (`optin` scope without the marker), from "
                                  "counters(): the nothing-was-offered-because-nobody-"
                                  "asked case, kept apart from a refusal",
+            "flagged": "requests that reached the offer path CARRYING the "
+                       "kvtier_disk_restore marker, from counters(): the evidence a "
+                       "marker survived the engine's own field-folding and arrived - "
+                       "without it a `flagged: 0` and a `skipped_no_marker` that never "
+                       "moved were the same observation twice",
+            "requests_seen": "lookups observed by the request-scoped gate, from "
+                             "counters(): the population `flagged` and "
+                             "`skipped_no_marker` are drawn from, so the two must sum "
+                             "to it while the scope is `optin`",
+            "lookups": "lookups reaching the restore path at all, from counters(): "
+                       "the entry count of the offer path, counted BEFORE the gate and "
+                       "the scope, so a `lookups` that rises while `offers` sits at 0 "
+                       "is the refusal vocabulary's job to explain",
             "witness_verdict": "the last restore-posture verdict this process spoke "
                                "(a verdict, not a count). Read it BESIDE "
                                "`reads_applied`, never instead of it: on 2026-10-05 "

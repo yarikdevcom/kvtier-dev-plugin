@@ -248,7 +248,7 @@ MAX_FILENAME_DISPLAY = 200          # CHARS of a path shown in a response
 MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
-DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "offers")
+DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers")
 """`offers` is mutating and POST-only: it raises or drops THIS BOOT's offer switch
 and (optionally) sets the scope. It is not the arm. Arming the spill tier says bytes
@@ -1774,6 +1774,67 @@ def _op_ls(body: dict) -> dict:
                                         "mtime_ns")}
 
 
+def contains_key_problem(key) -> str | None:
+    """Why this `key` cannot be asked about, or None when it can.
+
+    ONE definition, used by the ROUTE (to answer a bad key with a `400` before the
+    engine is touched) and by the VERB (to answer it as data when something calls the
+    engine-side function directly). "You asked badly" and "it is not there" must never
+    share a response: a caller that reads `present: false` for a malformed key goes
+    looking for a missing spill instead of a missing eight hex characters.
+
+    The parsing is `disk_layout.split_block_key`'s, so there is no second rule for what
+    a key is: 16 hex of digest plus 8 hex of big-endian group id, at least
+    `disk_layout.MIN_KEY_HEX_CHARS` characters.
+    """
+    if key is None or key == "":
+        return ('op=contains needs a "key": the engine\'s GROUP-QUALIFIED block hash '
+                f'(the {disk_layout.KEY_DIGEST_CHARS}-hex key16 plus the group id as '
+                f"{disk_layout.GROUP_SUFFIX_HEX_CHARS} hex chars, so at least "
+                f"{disk_layout.MIN_KEY_HEX_CHARS} hex characters)")
+    split = disk_layout.split_block_key(key)
+    if not split["ok"]:
+        return f"the key cannot name an identity: {split['reason']}"
+    return None
+
+
+def _op_contains(body: dict) -> dict:
+    """"Is this identity on the disk, and for which ranks?" - answered from the index.
+
+    THE QUESTION A STORE SIZE CANNOT ANSWER. Before this verb the only evidence that a
+    span had been parked was "the store grew engine-wide", which attributes nothing to
+    the span you asked about. `disk_index.membership()` answers it from the replayed
+    journals, in memory, per RANK.
+
+    It deliberately does NOT walk the store: `ls` already does that (and takes the walk
+    caps with it), and a membership test that scanned every file would turn a polled
+    endpoint into an I/O storm over a 2,720-file shard set. It also does not move the
+    witness's `hits`/`misses` - see the docstring there.
+
+    The one thing this CANNOT say is the geometry digest each rank named its file with:
+    the journal line is `<seq> <+|-> <key16> <bytes> <group>` and carries no digest.
+    Naming the actual files is `op=ls` with a `shard`, and the answer says so.
+    """
+    key = body.get("key")
+    problem = contains_key_problem(key)
+    if problem is not None:
+        return {"ok": False, "op": "contains", "read_only": True,
+                "reason": problem, "present": None,
+                "verdict": disk_index.VERDICT_KEY_REJECTED,
+                "key": str(key)[:MAX_STRING_CHARS] if key is not None else None}
+    answer = disk_index.membership(key)
+    answer["read_only"] = True
+    answer["key"] = str(key)[:MAX_STRING_CHARS]
+    answer["next_step"] = (
+        "the files this identity names are "
+        "kvslot-<key16>-g<group>-<geodigest12>.bin, ONE PER RANK; the journal "
+        "carries no digest, so name them with {\"op\":\"ls\","
+        "\"shard\":\"<shard>\"} (it walks the store, this verb does not). Compare "
+        "ranks_present with restore.digests_expected in this same answer: fewer "
+        "ranks than the boot has armed means a partially-written span.")
+    return answer
+
+
 def _op_status(_body: dict) -> dict:
     from . import worker_diag  # noqa: PLC0415 - one rank rule, not two
     rank, source = worker_diag.rank_id()
@@ -1869,7 +1930,8 @@ def _op_offers(body: dict) -> dict:
 
 
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
-             "spill-one": _op_spill_one, "ls": _op_ls, "offers": _op_offers}
+             "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
+             "offers": _op_offers}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

@@ -212,14 +212,19 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls` (see `disk_store.py`). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains` (see `disk_store.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
 both are validated against the SAME per-route table (`endpoint.ARG_SPECS`), so a
 bound cannot be evaded by changing the method. An unrecognised key is a `400` that
 never reaches the engine - including a stray `?cachebuster=1` on `/snapshot`. A
-validated body is forwarded to the engine as ONE dict argument
+**POST reads BOTH forms** (since 0.2.21): `POST /disk?op=arm&seconds=3600` with an empty
+body arms the tier, and a key given in the query string AND the body must carry the same
+value or the answer is a `400` naming both - there is no silent winner, because until
+0.2.21 the POST handlers read the body only and a query-string `op` was **ignored while
+answering `ok: true`** (`?op=arm` ran `status`, the arm file kept its mtime, and the
+response claimed success). A validated body is forwarded to the engine as ONE dict argument
 (`call_utility_async(method, args)` -> `getattr(self, name)(*args)`,
 `vllm/v1/engine/core.py:1669-1671`); a call with no arguments still sends none, so
 nothing that worked before arguments changed. Which engine method a request reaches
@@ -987,8 +992,30 @@ curl -s -H "$H" -X POST -d '{"op":"arm","seconds":600}' $B/disk
 # size (which is larger than the GPU pool's - the id is bounded per pool).
 curl -s -H "$H" -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f60700000003"}' $B/disk
 curl -s -H "$H" -X POST -d '{"op":"ls","limit":20}' $B/disk
+# ONE IDENTITY, NOT THE WHOLE STORE (since 0.2.21). "Did the span I park actually land,
+# and for WHICH RANKS?" - answered from the replayed journals in memory, never by
+# walking the store (that is `ls`). One park span is one file PER RANK, so the answer is
+# a set of ranks: `ranks_present: 2` on a boot with 4 armed ranks is a half-written span.
+curl -s -H "$H" -X POST -d '{"op":"contains","key":"a3f0b7c1d4e5f60700000003"}' $B/disk
+# the query-string form does the same thing (and since 0.2.21, so does every other op)
+curl -s -H "$H" -X POST "$B/disk?op=contains&key=a3f0b7c1d4e5f60700000003"
+# name the four rank FILES of one span without listing the whole store: `shard` is the
+# first two hex of the key16 (the filter has always existed; 0.2.21 whitelists the key)
+curl -s -H "$H" -X POST "$B/disk?op=ls&shard=a3f0&limit=20"
 ssh llm "curl -s -H '$H' -X POST -d '{"op":"disarm"}' $B/disk"
 ```
+
+**`contains` answers "I cannot answer" as its own verdict, with `present: null`.** Five
+of its verdicts are not a "no": a key that cannot name an identity (a `400` at the route,
+never a `present: false`), a process with no journal directory, an index that has replayed
+nothing since boot, a replay that named no file at all, and a check that raised. That
+distinction is the most valuable field on the verb: on 2026-10-05 `entries: 0` was read as
+"my span is not on disk" for a whole afternoon when the fact was that nothing had been
+replayed into that process yet. A present answer carries the entry's `bytes`, the journal
+file it came from, and one row per rank (`rank`, `bytes`, `journal`, `seq`) - which is how
+you tell a complete span from a partial one. What it cannot say is each rank's geometry
+digest: the journal line is `<seq> <+|-> <key16> <bytes> <group>` and names no digest, so
+naming the actual files is `op=ls` with a `shard`, and the answer says so.
 
 **No fsync, on purpose.** The spill writes are buffered: `write_committed_file`
 keeps the `.part` + `O_CREAT|O_EXCL` + `os.replace` commit ordering (so *a committed
@@ -1146,6 +1173,21 @@ that section as fields, not only as text in the boot line: `offers_enabled`, `sc
 `disk_restore.installed: true` describes a WORKER and cannot start a restore; only
 the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
 is that verdict at boot.
+
+**A marked request is self-evident, and a closed gate is counted (both 0.2.21).**
+`restore.flagged`, `restore.requests_seen` and `restore.lookups` are published beside
+`restore.skipped_no_marker`, so "did my marker survive the engine's field-folding?" is
+one payload read instead of a control experiment: `requests_seen` moves for every lookup,
+`flagged` only for a request carrying `kv_transfer_params.kvtier_disk_restore: true`,
+`skipped_no_marker` only for one that does not. And a marked request turned away by the
+**gate** now moves its own bucket - `refused.not_configured`, `refused.disarmed`,
+`refused.tier_disarmed` - in the same region that already counted `offers_disabled`,
+`workers_not_servicing` and `no_worker_proof`. Before, a gate decline wrote `last_reason`
+and no counter, so an empty `refused` could not be told apart from "nothing refused us":
+that ambiguity is what made an alignment-guard refusal look like the answer on
+2026-10-05 when the gate had refused the request. `last_reason` is written exactly as
+before (something may parse it), and the value handed back to the scheduler is the fork's
+own tuple, unchanged - the change is bookkeeping, not behaviour.
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 

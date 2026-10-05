@@ -127,6 +127,17 @@ MAX_JOURNAL_FILES = 64              # journal FILES one refresh will open
 MAX_LINES_PER_REFRESH = 8_192       # LINES applied per refresh (bounded work)
 MAX_READ_PER_REFRESH = 512 * 1024   # BYTES read across all journals per refresh
 MAX_JOURNAL_RANK_CHARS = 32         # CHARS of a rank id in a journal file name
+# HOW MANY RANKS one identity may be recorded as written by. A parked span is one
+# file PER RANK (each names it with its own geometry digest), so the honest answer to
+# "is this span on disk?" is a per-rank set, not a bool. This cap bounds that set for
+# one identity against a hostile or misconfigured journal directory; a real boot has
+# as many entries as it has ranks.
+MAX_RANKS_PER_IDENTITY = 32         # RANKS remembered per identity
+MAX_RANK_RECORDS = 262_144          # (identity, rank) PAIRS held in memory in total
+# The label for a journal whose file name carries no rank (`disk-spill-journal-.jsonl`).
+# A contribution we cannot attribute is still a contribution; naming it `None` would
+# make it indistinguishable from "no rank" in a payload.
+UNNAMED_RANK = "unnamed"
 MAX_STRING_CHARS = 160              # CHARS of a path/reason kept in state
 REFRESH_MIN_INTERVAL_SECONDS = 1.0  # SECONDS between journal refreshes
 
@@ -175,6 +186,31 @@ GROUP_PREFIX = "g"                  # `<key16>:g<group>` is an index key
 MAX_JOURNAL_SIZE_BYTES = 1 << 40    # BYTES one line may claim (a slot is 11.5 MB)
 SEQ_TAIL_READ_BYTES = 4096          # BYTES of the journal tail read to seed a seq
 
+# THE ANSWER `membership()` gives, a closed vocabulary. The distinction that matters
+# is between "I looked and it is not there" and "I have never looked" - on
+# 2026-10-05 `entries: 0` was read as "my span is not on disk" for an afternoon when
+# the real fact was that no journal had been replayed into this process yet.
+VERDICT_PRESENT = "present"
+VERDICT_NOT_PRESENT = "not_present"
+VERDICT_ENTRY_DROPPED = "entry_dropped_but_rank_lines_remain"
+VERDICT_NEVER_REFRESHED = "index_never_refreshed"
+VERDICT_NO_JOURNAL_DIR = "index_has_no_journal_directory"
+VERDICT_INDEX_EMPTY = "index_empty_no_spill_lines"
+VERDICT_KEY_REJECTED = "key_rejected"
+VERDICT_CHECK_FAILED = "membership_check_failed"
+MEMBERSHIP_VERDICTS = (VERDICT_PRESENT, VERDICT_NOT_PRESENT, VERDICT_ENTRY_DROPPED,
+                       VERDICT_NEVER_REFRESHED, VERDICT_NO_JOURNAL_DIR,
+                       VERDICT_INDEX_EMPTY, VERDICT_KEY_REJECTED,
+                       VERDICT_CHECK_FAILED)
+"""Every answer `membership()` may give. FIVE of them mean "I cannot answer", not
+"it is not there", and answer `present: null` for exactly that reason: a key that
+cannot name an identity, a journal directory this process was never pointed at, an
+index that has replayed nothing yet, an index whose replay named no file at all (an
+empty map over a store that may be full - the 2026-10-05 trap read directly), and a
+check that raised. On 2026-10-05 an `entries: 0` was read as "my span is not on disk"
+and cost an afternoon, when the fact was that nothing had been replayed into the
+process yet."""
+
 # Why a line was not applied. A closed vocabulary, one counter each.
 DROP_REASONS = ("malformed_line", "bad_op", "bad_key", "bad_size", "bad_seq",
                 "bad_group", "journal_shrank", "journal_capped", "line_cap",
@@ -182,6 +218,14 @@ DROP_REASONS = ("malformed_line", "bad_op", "bad_key", "bad_size", "bad_seq",
 
 _state: dict = {
     "entries": {},                    # identity -> entry dict (insertion ordered)
+    # identity -> {rank -> {bytes, journal, seq, seen_ts}}. `entries` is what the OFFER
+    # path asks (one claim per identity, the last journal applied wins); this is the
+    # SAME replay seen per rank, the only way to answer "is the whole span there, or
+    # two ranks of four?" without walking the store.
+    "rank_lines": {},
+    "rank_records": 0,                # (identity, rank) PAIRS held
+    "rank_records_dropped": 0,        # pairs refused by a cap
+    "membership_checks": 0,           # `op=contains` answers given here
     "cursors": {},                    # journal path -> byte offset
     "seq": {},                        # journal path -> last applied seq
     "stopped": {},                    # journal path -> reason it stopped
@@ -235,7 +279,9 @@ def reset_state_for_tests() -> None:
     needs; there is no thread and no open descriptor to stop.
     """
     _state.update({
-        "entries": {}, "cursors": {}, "seq": {}, "stopped": {},
+        "entries": {}, "rank_lines": {}, "rank_records": 0,
+        "rank_records_dropped": 0, "membership_checks": 0,
+        "cursors": {}, "seq": {}, "stopped": {},
         "applied": 0, "spills": 0, "removals": 0, "misses": 0, "hits": 0,
         "entries_dropped": 0,
         "dropped": {reason: 0 for reason in DROP_REASONS},
@@ -255,9 +301,15 @@ def reset_state_for_tests() -> None:
 
 
 def counters() -> dict:
-    """A copy for a payload. The ENTRIES are never included (only their count)."""
+    """A copy for a payload. The ENTRIES are never included (only their count).
+
+    Neither is the PER-RANK table, for the same reason and one more: it is a live nested
+    dict of the index's own memory, and a payload that hands one out can be mutated by
+    whoever receives it. Counts, always counts.
+    """
     out = dict(_state)
     out["entries"] = int(len(_state["entries"]))
+    out["rank_lines"] = int(len(_state["rank_lines"]))
     return out
 
 
@@ -1065,6 +1117,64 @@ def _forget_rank(path) -> None:
         entries.pop(key, None)
     _state["bytes_indexed"] = max(0, sum(int(entry["bytes"])
                                          for entry in entries.values()))
+    # The PER-RANK view loses exactly that rank's claims - and an identity whose last
+    # remaining claim came from the truncated journal goes with it, so the two views
+    # cannot disagree about whether a rank backs an entry.
+    rank_lines = _state["rank_lines"]
+    for identity in list(rank_lines):
+        rows = rank_lines[identity]
+        for name in [name for name, row in rows.items()
+                     if row.get("journal") == path]:
+            rows.pop(name, None)
+            _state["rank_records"] = max(0, int(_state["rank_records"]) - 1)
+        if not rows:
+            rank_lines.pop(identity, None)
+
+
+def _rank_label(path) -> str:
+    """The rank a journal line came from, from the ONE rule that names a journal."""
+    return _rank_of(path) or UNNAMED_RANK
+
+
+def _record_rank(identity, path, size, seq) -> None:
+    """Remember that THIS rank's journal claims this identity, bounded.
+
+    Called from the same place that inserts the entry, so the per-rank view and the
+    entry can never be built by different rules. Three caps: ranks per identity, pairs
+    in total, and the identity cap that `entries` already enforces (an identity evicted
+    from the entry table loses its rank rows here, so the two cannot drift apart).
+    """
+    rank_lines = _state["rank_lines"]
+    rows = rank_lines.get(identity)
+    if rows is None:
+        if int(_state["rank_records"]) >= MAX_RANK_RECORDS:
+            _state["rank_records_dropped"] += 1
+            return
+        rows = {}
+        rank_lines[identity] = rows
+    name = _rank_label(path)
+    if name not in rows and len(rows) >= MAX_RANKS_PER_IDENTITY:
+        _state["rank_records_dropped"] += 1
+        return
+    if name not in rows:
+        _state["rank_records"] = int(_state["rank_records"]) + 1
+    rows[name] = {"bytes": int(size), "journal": path, "seq": int(seq),
+                  "seen_ts": round(time.time(), 6)}
+
+
+def _drop_identity_ranks(identity) -> int:
+    """Drop every rank claim for one identity. Returns how many went."""
+    rows = _state["rank_lines"].pop(identity, None)
+    if not rows:
+        return 0
+    _state["rank_records"] = max(0, int(_state["rank_records"]) - len(rows))
+    return len(rows)
+
+
+def rank_claims(identity) -> dict:
+    """The per-rank claims for one identity, as a fresh dict. Never the live one."""
+    return {name: dict(row) for name, row in
+            _state["rank_lines"].get(identity, {}).items()}
 
 
 def _apply_line(text, path):
@@ -1119,12 +1229,19 @@ def _apply_line(text, path):
     if op == REMOVE_LINE:
         _state["removals"] += 1
         gone = _state["entries"].pop(identity, None)
+        # The per-rank view goes with the entry, deliberately WITHOUT the rank's
+        # identity being the deciding fact: one rank reporting the file unlinked drops
+        # the identity for the offer path today, and a per-rank table that still
+        # claimed all four would tell a truer-looking lie than the answer the offer
+        # path is actually going to give.
+        _drop_identity_ranks(identity)
         if gone is not None:
             _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
                                           - int(gone["bytes"]))
         return REMOVE_LINE
     _state["spills"] += 1
     _insert(identity, size, path, group)
+    _record_rank(identity, path, size, seq)
     return SPILL_LINE
 
 
@@ -1152,6 +1269,7 @@ def _insert(identity, size, path, group_id=None) -> None:
     while len(entries) >= MAX_INDEX_ENTRIES:
         oldest = next(iter(entries))
         dropped = entries.pop(oldest)
+        _drop_identity_ranks(oldest)
         _state["entries_dropped"] += 1
         _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
                                       - int(dropped["bytes"]))
@@ -1227,6 +1345,131 @@ def contains(key) -> bool:
         return False
 
 
+def membership(key) -> dict:
+    """The OPERATOR's answer to "is this span in the disk index?", per RANK.
+
+    WHY THIS EXISTS WHEN `lookup()` AND `contains()` EXISTED. Both of those answer the
+    OFFER path ("may I offer this identity?" - one claim, last journal wins). An
+    operator asking "did the span I parked actually land?" needs three things neither
+    gives: WHICH rank's claim it is reading (one parked span is one file per rank, so
+    a single answer can call a two-ranks-of-four span complete), whether the index is
+    even in a state to answer, and no side effect on the witness counters. So this
+    reads the SAME replayed journals, per rank, and:
+
+      * NEVER walks the store directory. `op=ls` does that; a `contains` that scanned
+        thousands of files under a polled endpoint is how you build an I/O storm.
+        Everything here is in-process memory plus one `journal_directory()` resolve.
+      * Does NOT move `hits`/`misses`. Those are the witness's ledger and an
+        experiment reads them as evidence of offer-path behaviour; an operator asking
+        a question twice must not change them. `membership_checks` counts this verb.
+      * Answers "I cannot answer" as its own verdict with `present: null`, never as
+        `present: false`. A key that cannot name an identity, a journal directory
+        that was never configured, an index that has replayed nothing, and an index
+        that replayed and holds nothing are four DIFFERENT statements from "the entry
+        is not here".
+
+    Never raises; the key parsing is `disk_layout.split_block_key`'s, so there is no
+    second spelling of an identity here.
+    """
+    try:
+        _state["membership_checks"] = int(_state["membership_checks"]) + 1
+        directory = journal_directory()
+        view = {"refreshes": int(_state["refreshes"]),
+                "entries": int(len(_state["entries"])),
+                "journals_tracked": int(len(_state["cursors"])),
+                # DID THE REPLAY EVER SEE A SPILL LINE? This is what separates "the
+                # journals name no file" (never any spill, or a journal stopped at its
+                # first line) from "the map holds nothing NOW" (all it learned has been
+                # removed or evicted). Both read as `entries: 0`; only one of
+                # them means the store was never described to this process.
+                "spill_lines_applied": int(_state["spills"]),
+                "removal_lines_applied": int(_state["removals"]),
+                "bytes_indexed": int(_state["bytes_indexed"]),
+                "journal_directory": directory,
+                "journal_write_errors": int(_state["journal_write_errors"]),
+                "rank_records": int(_state["rank_records"]),
+                "rank_records_dropped": int(_state["rank_records_dropped"])}
+        blank = {"key16": None, "group_id": None, "identity": None, "shard": None,
+                 "bytes": 0, "bytes_all_ranks": 0, "journal": None, "rank": None,
+                 "ranks": [], "ranks_present": 0, "index": view}
+        split = disk_layout.split_block_key(key)
+        if not split["ok"]:
+            return {**blank, "ok": False, "present": None,
+                    "verdict": VERDICT_KEY_REJECTED,
+                    "reason": (f"the key cannot name an identity: "
+                               f"{split['reason']}"),
+                    "answer": "the request cannot be answered: this key does not "
+                              "name a group-qualified identity"}
+        key16, group = split["key16"], split["group_id"]
+        identity = identity_of(key16, group)
+        located = {"key16": key16, "group_id": group, "identity": identity,
+                   "shard": key16[:disk_layout.SHARD_CHARS]}
+        if directory is None:
+            return {**blank, **located, "ok": True, "present": None,
+                    "verdict": VERDICT_NO_JOURNAL_DIR,
+                    "reason": (f"neither {config.ENV_DISK_JOURNAL_DIR} nor "
+                               f"{config.ENV_DIAG_DIR} is set, so no journal could "
+                               "ever be replayed into this index"),
+                    "answer": "cannot answer: this process has no journal directory"}
+        if view["refreshes"] == 0:
+            return {**blank, **located, "ok": True, "present": None,
+                    "verdict": VERDICT_NEVER_REFRESHED,
+                    "reason": (f"the index has replayed no journal since this "
+                               f"process started ({directory} is the journal "
+                               "directory); an answer of 'not present' here would "
+                               "be a claim about a map nobody read"),
+                    "answer": "cannot answer yet: nothing has refreshed the index"}
+        entry = _state["entries"].get(identity)
+        claims = rank_claims(identity)
+        rows = [{"rank": name, "bytes": int(row["bytes"]),
+                 "journal": str(row["journal"]), "seq": int(row["seq"]),
+                 "seen_ts": row["seen_ts"]}
+                for name, row in sorted(claims.items())]
+        total = sum(int(row["bytes"]) for row in rows)
+        found = {**blank, **located, "ok": True, "ranks": rows,
+                 "ranks_present": len(rows), "bytes_all_ranks": total}
+        if entry is not None:
+            return {**found, "present": True, "verdict": VERDICT_PRESENT,
+                    "bytes": int(entry["bytes"]),
+                    "journal": str(entry.get("journal") or ""),
+                    "rank": _rank_of(entry.get("journal")),
+                    "reason": None,
+                    "answer": (f"present for {len(rows)} rank(s) of this identity; "
+                               "one parked span is one file per rank, so compare "
+                               "this count with the ranks the boot has armed "
+                               "(`restore.ranks_armed` in the same answer)")}
+        if rows:
+            return {**found, "present": False, "verdict": VERDICT_ENTRY_DROPPED,
+                    "reason": (f"{len(rows)} rank journal line(s) name this "
+                               "identity, but no entry backs it: the identity was "
+                               "dropped (the entry cap, a journal that stopped, or a "
+                               "removal line), so the offer path will not see it "
+                               "either"),
+                    "answer": "not offered: rank lines remain but the entry is gone"}
+        if view["entries"] == 0 and view["spill_lines_applied"] == 0:
+            return {**found, "present": None, "verdict": VERDICT_INDEX_EMPTY,
+                    "reason": (f"the index holds no identities at all after "
+                               f"{view['refreshes']} refresh(es) of "
+                               f"{view['journals_tracked']} journal file(s): "
+                               f"nothing in this boot's journals names a spilled "
+                               f"file, so {identity} cannot be found in it"),
+                    "answer": "not in the index: the journal replay named no file"}
+        return {**found, "present": False, "verdict": VERDICT_NOT_PRESENT,
+                "reason": (f"this boot's replayed journals do not name {identity} "
+                           f"({view['entries']} other identities are indexed over "
+                           f"{view['journals_tracked']} journal file(s), "
+                           f"{view['removal_lines_applied']} removal line(s) "
+                           f"applied)"),
+                "answer": f"not in the index: no entry and no rank line for "
+                          f"{identity}"}
+    except Exception as exc:  # noqa: BLE001 - a verb never breaks a schedule
+        _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
+        snapshot._error(exc, "disk_index membership")
+        return _fail(f"the membership check raised {type(exc).__name__}",
+                     present=None, verdict=VERDICT_CHECK_FAILED, key16=None,
+                     group_id=None, ranks=[], ranks_present=0)
+
+
 def remove(key) -> dict:
     """Drop one entry, because its file is gone. Bounded and counted.
 
@@ -1240,6 +1483,7 @@ def remove(key) -> dict:
             return _fail(str(split["reason"]))
         identity = identity_of(split["key16"], split["group_id"])
         gone = _state["entries"].pop(identity, None)
+        _drop_identity_ranks(identity)
         if gone is None:
             return _ok(removed=False, reason="no entry for this identity")
         _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
@@ -1256,6 +1500,8 @@ def forget_all(reason: str | None = None) -> dict:
     """Empty the index. The honest answer to 'I can no longer trust this'."""
     count = len(_state["entries"])
     _state["entries"] = {}
+    _state["rank_lines"] = {}
+    _state["rank_records"] = 0
     _state["bytes_indexed"] = 0
     _note(reason or "the index was cleared")
     return {"cleared": count, "reason": reason}
@@ -1271,6 +1517,14 @@ def section() -> dict:
     return {
         "entries": int(len(_state["entries"])),
         "entry_cap": MAX_INDEX_ENTRIES,
+        # THE PER-RANK VIEW `op=contains` answers from: how many (identity, rank) pairs
+        # are held, and how many a cap refused to remember. A dropped pair is a span
+        # that reads as fewer ranks than it has - never a false presence, always a
+        # claim this index can no longer back.
+        "rank_records": int(_state["rank_records"]),
+        "rank_records_dropped": int(_state["rank_records_dropped"]),
+        "rank_cap_per_identity": MAX_RANKS_PER_IDENTITY,
+        "membership_checks": int(_state["membership_checks"]),
         "entries_dropped": int(_state["entries_dropped"]),
         "bytes_indexed": int(_state["bytes_indexed"]),
         "journals_tracked": int(len(_state["cursors"])),
@@ -1309,6 +1563,14 @@ def section() -> dict:
         "last_reason": _state["last_reason"],
         "last_error": _state["last_error"],
         "units": {"entries": "identities", "entry_cap": "identities",
+                  "rank_records": "(identity, rank) pairs: one parked span is one "
+                                  "file PER RANK, so an identity is backed by as many "
+                                  "records as it has ranks",
+                  "rank_records_dropped": "rank records a cap refused: the identity "
+                                          "may read as fewer ranks than it "
+                                          "has (never a false presence)",
+                  "rank_cap_per_identity": "ranks remembered per identity",
+                  "membership_checks": "answers `op=contains` has given here",
                   "entries_dropped": "identities", "bytes_indexed": "bytes",
                   "journals_tracked": "files", "journal_writes": "lines",
                   "journal_lines": "lines", "journal_write_errors": "writes",

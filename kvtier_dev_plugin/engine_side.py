@@ -337,12 +337,14 @@ def _make_disk_method():
 
     kvtier_dev_disk.__doc__ = (
         "kvtier-dev-plugin: the SSD spill tier's control verb "
-        "(status/arm/disarm/spill-one/ls). DISARMED at every boot, no env var arms "
-        "it, and an arm expires. `spill-one` is relayed to the workers by a file "
-        "because a worker has no utility channel; the write itself happens on the "
-        "spill thread. `engine_fields` in every answer says whether this boot's "
-        "metadata carries store_keys, i.e. whether the engine half of the wiring "
-        "is live.")
+        "(status/arm/disarm/spill-one/ls/contains/offers). DISARMED at every boot, no "
+        "env var arms it, and an arm expires. `spill-one` is relayed to the workers by "
+        "a file because a worker has no utility channel; the write itself happens on "
+        "the spill thread. `contains` answers ONE identity from the replayed "
+        "journals (per rank, and with a `present: null` verdict when the index "
+        "cannot answer) and never walks the store. `engine_fields` in every answer "
+        "says whether this boot's metadata carries store_keys, i.e. whether the "
+        "engine half of the wiring is live.")
     return kvtier_dev_disk
 
 
