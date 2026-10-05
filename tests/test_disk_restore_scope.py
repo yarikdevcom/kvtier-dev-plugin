@@ -280,7 +280,13 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     counters = disk_restore.counters()
     new_keys = ("offers_enabled", "scope", "marker_key", "offer_cap", "ranks_armed",
                 "ranks_seen", "suppressed_hits", "suppressed_spans",
-                "suppressed_requests", "suppressions")
+                "suppressed_requests", "suppressions",
+                # THE APPLIED-READ EVIDENCE. `restorations` is the counter that read
+                # as success through the 2026-10-05 livelock; these are the direct
+                # ones, and they existed in `_state` while the payload had none.
+                "reads_applied", "disk_reads_applied", "ranks_reads_applied",
+                "loads_released", "skipped_no_marker", "witness_verdict",
+                "witness_reason", "witness_kind")
     for key in new_keys:
         assert key in section, key
         assert str(section["units"].get(key, "")).strip(), \
@@ -295,6 +301,18 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     for key in ("suppressed_hits", "suppressed_spans", "suppressed_requests",
                 "suppressions"):
         assert section[key] == counters[key] == 0, key
+    # THE APPLIED-READ PASS-THROUGH, asserted AS `counters()`' value: this section
+    # recomputes nothing, so a payload and a verb can never disagree about whether a
+    # read was applied. `proof_reads` is deliberately NOT in this family - it counts
+    # rank files opened by `worker_proof()`, not KV reads - and its unit says so.
+    applied = ("reads_applied", "disk_reads_applied", "ranks_reads_applied",
+               "loads_released", "skipped_no_marker")
+    for key in applied:
+        assert section[key] == counters[key] == 0, key
+    for key in ("witness_verdict", "witness_reason", "witness_kind"):
+        assert section[key] == counters[key], key
+    assert "NOT KV reads" in section["units"]["proof_reads"], \
+        "proof_reads counts rank files, and must not be misread as a KV read"
 
     # THE OTHER SWITCH STATE. Same keys, different verdict: a payload that drops the
     # posture when the posture is off is a payload that cannot tell "off" from "gone".
@@ -302,6 +320,14 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     off = disk_restore.scheduler_section()
     assert off["offers_enabled"] is False
     assert set(off) == set(section), "the shape must not depend on the posture"
+    # The applied-read evidence is present in the OFF state too: a predicate that
+    # watches `reads_applied` must be able to read it before the switch is raised,
+    # and a key that appears only once traffic is allowed is a key that cannot
+    # distinguish "off" from "gone".
+    for key in ("reads_applied", "disk_reads_applied", "ranks_reads_applied",
+                "loads_released", "skipped_no_marker", "witness_verdict",
+                "witness_reason", "witness_kind"):
+        assert key in off, key
     # The scope is its own field, and it moves independently of the switch.
     disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
     scoped = disk_restore.scheduler_section()
@@ -699,3 +725,64 @@ def test_the_verb_documentation_names_the_opt_in_key():
     readme = (pathlib.Path(__file__).resolve().parent.parent
               / "README.md").read_text()
     assert '{"kv_transfer_params": {"kvtier_disk_restore": true}}' in readme
+
+
+# --- the applied-read evidence reaches the payload ---------------------------
+
+def test_the_applied_read_counters_reach_the_payload_as_a_pass_through(armed):
+    """A number that only exists in `_state` is a number no poller can use.
+
+    The 2026-10-05 livelock is the reason for this test's shape: `restorations` rose
+    and the witness said CONFIRMED while the applied-read counter sat at zero, and
+    the payload carried only the first of those two. So the split is asserted here in
+    BOTH directions - a read that really was applied moves the payload, and a
+    restoration with no read behind it is visible as exactly that.
+    """
+    before = disk_restore.scheduler_section()
+    assert before["reads_applied"] == 0
+
+    # A worker-side read applied: the DIRECT counter, not the reported-back one.
+    disk_restore._state["reads_applied"] = 7
+    disk_restore._state["disk_reads_applied"] = 3
+    disk_restore._state["ranks_reads_applied"] = 11
+    disk_restore._state["loads_released"] = 5
+    disk_restore._state["skipped_no_marker"] = 9
+    after = disk_restore.scheduler_section()
+    counters = disk_restore.counters()
+    for key, value in (("reads_applied", 7), ("disk_reads_applied", 3),
+                       ("ranks_reads_applied", 11), ("loads_released", 5),
+                       ("skipped_no_marker", 9)):
+        assert after[key] == value, key
+        # A PASS-THROUGH, not a recomputation: the section and the counters agree.
+        assert after[key] == counters[key], key
+
+    # THE COSTUME COUNTER, caught. A finished report with no read behind it is
+    # `no_read`, never a restoration; the payload shows both numbers so a predicate
+    # can tell "bytes came back" from "bytes were read".
+    disk_restore._state["restorations"] = 4
+    disk_restore._state["no_read"] = 4
+    split = disk_restore.scheduler_section()
+    assert split["restorations"] == 4
+    assert disk_restore.counters()["no_read"] == 4, (
+        "the refusal of the costume counter stays in counters()")
+    assert split["reads_applied"] == 7, "the direct counter is unaffected by either"
+    assert "reads memmoved" in split["units"]["reads_applied"]
+
+
+def test_the_witness_verdict_travels_with_the_counters_it_quotes(armed):
+    """`witness_verdict` is prose's number and must not be read instead of one.
+
+    Its unit says so, and the three `witness_*` fields ship together so a reader who
+    takes the verdict also has the stable kind and the sentence that explains it -
+    while `reads_applied` sits in the same payload, unlifted.
+    """
+    disk_restore._state["witness_verdict"] = "NO READ"
+    disk_restore._state["witness_kind"] = "no_read"
+    disk_restore._state["witness_reason"] = "no applied read behind any report"
+    section = disk_restore.scheduler_section()
+    assert section["witness_verdict"] == "NO READ"
+    assert section["witness_kind"] == "no_read"
+    assert section["witness_reason"] == "no applied read behind any report"
+    assert section["reads_applied"] == 0, "the verdict does not move the counter"
+    for key in ("witness_verdict", "witness_reason", "witness_kind"):
+        assert str(section["units"][key]).strip(), key

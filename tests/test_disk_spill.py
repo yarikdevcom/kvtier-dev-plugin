@@ -280,6 +280,167 @@ def test_the_arm_crosses_to_a_worker_as_a_bounded_file(tmp_path, monkeypatch):
     assert disk_spill.is_armed() is False                  # expired: disarmed
 
 
+# --- the arm dies at a reboot, by its own contents -------------------------
+# The arm file used to be checked for `armed` + `expires_ts` alone, so a file that
+# survived a reboot armed the NEW boot - a cold box with the restore path open to
+# live traffic and no operator having asked. The protection used to be "`/tmp` is
+# tmpfs", which is exactly what the journal move would have destroyed, so the fence
+# is in the FILE: a boot identity the reader compares against its own.
+
+def _arm_document(**overrides) -> dict:
+    """A well-formed arm document for THIS boot, with the test's edits applied."""
+    epoch, scope = config.diagnostics_epoch()
+    document = {"version": disk_spill.PROTOCOL_VERSION,
+                "writer": disk_spill.WRITER_TAG, "armed": True,
+                "armed_ts": time.time(), "expires_ts": time.time() + 600,
+                "seconds": 600.0, "root": str(disk_spill._state["root"]),
+                "epoch": epoch, "epoch_scope": scope, "pid": os.getpid(),
+                "boot_id": disk_spill._boot_id()}
+    document.update(overrides)
+    return document
+
+
+def _read_as_a_worker(document, tmp_path, monkeypatch):
+    """Write `document` as the arm file and ask the WORKER's question: armed?
+
+    The in-process arm is cleared and the file-verdict cache is dropped, which is
+    the state a worker process is in: it never saw the verb, it only has the file.
+    """
+    directory = tmp_path / "diag-as-a-worker"
+    directory.mkdir(exist_ok=True)
+    monkeypatch.setenv(config.ENV_DIAG_DIR, str(directory))
+    path = directory / disk_spill.ARM_FILE
+    path.write_bytes(json.dumps(document).encode())
+    disk_spill._state["armed"] = False
+    disk_spill._state["arm_expires_mono"] = None
+    disk_spill._state["arm_file_verdict"] = None
+    disk_spill._state["arm_file_checked_mono"] = None
+    return disk_spill.is_armed(), disk_spill._state["last_reason"], path
+
+
+def test_an_arm_file_with_a_foreign_epoch_does_not_arm_the_tier(tmp_path,
+                                                                monkeypatch):
+    """THE REQUESTED PROOF, and it does not depend on the directory being tmpfs.
+
+    The epoch here is the operator's per-boot one (`VLLM_E2_TIER_DIAG_EPOCH`), which
+    is the only kind of epoch that can name a boot - with `epoch_scope: "process"` two
+    workers of one boot legitimately disagree, and refusing that would disarm a
+    healthy tier. The reason NAMES the mismatch: "disarmed" with no reason is how an
+    armed-looking box quietly does nothing.
+    """
+    monkeypatch.setenv(config.ENV_DIAG_EPOCH, "boot-2026-10-05-a")
+    armed, reason, _path = _read_as_a_worker(
+        _arm_document(epoch="boot-of-the-previous-boot", epoch_scope="env"),
+        tmp_path, monkeypatch)
+    assert armed is False
+    assert "epoch mismatch" in reason, reason
+    assert "boot-of-the-previous-boot" in reason, reason
+    assert disk_spill._state["arm_file_boot_refusals"] == 1
+    assert disk_spill.arm_state()["arm_file_boot_refusals"] == 1
+    assert "epoch mismatch" in disk_spill.arm_state()["arm_file_reason"]
+    # And the tier really is closed: a spill is refused, not written.
+    refused = disk_spill.request_spill(caches(), 1, KEY)
+    assert refused["ok"] is False and refused["reason_kind"] == "disarmed"
+
+
+def test_an_arm_file_naming_another_boot_id_does_not_arm_the_tier(tmp_path,
+                                                                  monkeypatch):
+    """The fence that needs NO operator configuration: the kernel's own boot id.
+
+    This is the half that covers the default deployment, where the epoch is a
+    per-process token and therefore proves nothing about a boot.
+    """
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("11111111-2222-3333-4444-555555555555\n", encoding="utf-8")
+    monkeypatch.setattr(disk_spill, "BOOT_ID_PATH", str(boot_id))
+    armed, reason, _path = _read_as_a_worker(
+        _arm_document(boot_id="99999999-8888-7777-6666-555555555555"),
+        tmp_path, monkeypatch)
+    assert armed is False
+    assert "boot id mismatch" in reason, reason
+    assert "99999999-8888-7777-6666-555555555555" in reason, reason
+
+
+def test_an_arm_of_this_boot_still_arms_a_process_that_only_has_the_file(tmp_path,
+                                                                         monkeypatch):
+    """THE OTHER DIRECTION, which matters just as much: the fence must not become
+    "never armed". A worker sees only the file, so a file from THIS boot arms it.
+    """
+    monkeypatch.setenv(config.ENV_DIAG_EPOCH, "boot-2026-10-06-a")
+    armed, reason, path = _read_as_a_worker(_arm_document(), tmp_path, monkeypatch)
+    assert armed is True, reason
+    assert path.exists()
+    # A real arm, written by this process, is readable by a worker of the same boot:
+    # the document carries the identity it will be checked against.
+    disk_spill.arm()
+    written = json.loads(Path(disk_spill.arm()["arm_file"]).read_text(
+        encoding="utf-8"))
+    assert written["epoch"] == config.diagnostics_epoch()[0]
+    assert written["epoch_scope"] == config.diagnostics_epoch()[1]
+    assert written["boot_id"] == disk_spill._boot_id()
+    disk_spill._state["armed"] = False
+    disk_spill._state["arm_file_checked_mono"] = None
+    assert disk_spill.is_armed() is True, disk_spill._state["last_reason"]
+    assert disk_spill._state["arm_file_boot_refusals"] == 0
+
+
+def test_a_fellow_worker_of_this_boot_is_never_refused_by_its_own_epoch(tmp_path,
+                                                                        monkeypatch):
+    """`epoch_scope: "process"` means the epoch is NOT a boot identity.
+
+    With `VLLM_E2_TIER_DIAG_EPOCH` unset every process stamps its own token, so the
+    EngineCore's arm file and a worker's token differ WITHIN one boot. Refusing on
+    that would silently disarm every worker on the box, which is the failure mode to
+    avoid while closing the reboot hole; the boot id is what closes the reboot hole.
+    """
+    monkeypatch.delenv(config.ENV_DIAG_EPOCH, raising=False)
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("11111111-2222-3333-4444-555555555555\n", encoding="utf-8")
+    monkeypatch.setattr(disk_spill, "BOOT_ID_PATH", str(boot_id))
+    armed, reason, _path = _read_as_a_worker(
+        _arm_document(epoch="deadbeef", epoch_scope="process",
+                      boot_id="11111111-2222-3333-4444-555555555555"),
+        tmp_path, monkeypatch)
+    assert armed is True, reason
+    assert disk_spill._state["arm_file_boot_refusals"] == 0
+
+
+def test_an_arm_file_from_before_the_fence_is_believed_and_said_so(tmp_path,
+                                                                   monkeypatch):
+    """A file with no boot identity in it cannot be PROVEN stale, so it is believed.
+
+    Refusing it would break the documented "arm the tier, then restart the engine"-
+    workflow, which is a feature - a REBOOT is what the arm must not survive, and a
+    reboot moves the boot id. Files this version writes always carry the identity, so
+    the gap is one release wide at most (and the diagnostics directory is tmpfs
+    today, so no such file survives the upgrade reboot either).
+    """
+    armed, _reason, _path = _read_as_a_worker(
+        {"armed": True, "expires_ts": time.time() + 600, "epoch": "aabbccdd"},
+        tmp_path, monkeypatch)
+    assert armed is True
+    assert disk_spill._state["arm_file_boot_refusals"] == 0
+
+
+def test_the_boot_id_is_an_absence_and_never_a_guess(tmp_path, monkeypatch):
+    """No readable `/proc/sys/kernel/random/boot_id` = no boot-id evidence.
+
+    The fence must not become a way for a container without that file to disarm the
+    tier: an unreadable identity means the rule does not fire, and the epoch rule is
+    still there when the operator set a per-boot epoch.
+    """
+    monkeypatch.setattr(disk_spill, "BOOT_ID_PATH",
+                        str(tmp_path / "does-not-exist"))
+    assert disk_spill._boot_id() is None
+    armed, reason, _path = _read_as_a_worker(_arm_document(boot_id=None),
+                                             tmp_path, monkeypatch)
+    assert armed is True, reason
+    monkeypatch.setattr(disk_spill, "BOOT_ID_PATH", str(tmp_path / "huge"))
+    huge = tmp_path / "huge"
+    huge.write_text("x" * 4096, encoding="utf-8")
+    assert disk_spill._boot_id() is None
+
+
 # --- the round trip: real bytes, the name the fingerprint dictates ----------
 
 def test_a_slot_round_trips_to_the_file_the_fingerprint_names():
@@ -503,6 +664,49 @@ def test_a_sample_naming_an_unknown_region_names_the_regions_it_does_have():
 
 # --- the commit protocol, at the spill boundary ----------------------------
 
+def test_the_spill_path_calls_no_fsync_at_all(monkeypatch):
+    """NO FSYNC ON THE SPILL PATH, PROVEN BY A COUNT, on both write routes.
+
+    These are cache bytes: the price of a lost span is one recompute, and the
+    safety net is that a journaled-but-absent file is classified `file_missing` at
+    read time and pruned before any DMA (see `disk_layout.write_committed_file`).
+    A fsync of an 11.4 MB slot on the writer thread buys nothing against that and
+    costs latency, so the production caller passes `sync=False`.
+
+    The assertion is a COUNT of `os.fsync` calls, not a reading of the flag, so a
+    future edit that puts a sync back on this path fails HERE. The same test then
+    shows the `sync=` mechanism itself is intact - a caller that asks for
+    durability still gets it - because keeping the capability is part of the deal.
+    """
+    calls = []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+
+    direct = disk_spill.spill_slot(caches(), 1, KEY)
+    assert direct["ok"] is True, direct
+    assert direct["directory_synced"] is False, "the spill path does not sync"
+    assert calls == [], f"the synchronous spill fsynced {len(calls)}x"
+
+    # The writer thread goes through the same call site; prove it too.
+    queued = disk_spill.request_spill(caches(), 2,
+                                      "b" + KEY16[1:] + "1" * 48
+                                      + f"{GROUP:08x}")
+    assert queued["ok"] is True, queued
+    assert disk_spill.drain(timeout_seconds=5.0)["drained"] is True
+    assert calls == [], f"the spill thread fsynced {len(calls)}x"
+
+    # The bytes still landed: dropping durability must not change one byte.
+    assert Path(direct["path"]).read_bytes() == next(
+        iter(caches().values())).slot_bytes(1)
+
+    # AND THE MECHANISM IS STILL THERE: a caller that wants a durable file asks
+    # for it and gets real fsyncs (a test, or any future system-of-record user).
+    durable = disk_layout.write_committed_file(
+        str(Path(disk_spill._state["root"]) / "durable.bin"), b"bytes",
+        sync=True)
+    assert durable["ok"] is True and durable["directory_synced"] is True
+    assert len(calls) == 2, "sync=True must fsync the file AND the directory"
+
+
 def test_a_failed_rename_leaves_no_file_at_the_final_name(monkeypatch):
     def fail_replace(a, b, **kwargs):
         raise OSError("the rename blew up")
@@ -571,6 +775,40 @@ def test_a_key_that_is_not_the_engine_key_shape_is_refused():
         refused = disk_spill.spill_slot(caches(), 0, junk)
         assert refused["ok"] is False
         assert refused["reason_kind"] == "bad_key"
+
+
+def test_a_journal_on_tmpfs_still_spills_and_says_so_loudly(tmp_path, monkeypatch,
+                                                            caplog):
+    """A degraded-but-loud tier beats a silent one, in EITHER direction.
+
+    The journal's filesystem is a WARNING and a reported field, never a gate: a
+    tier that refused to write because its INDEX lives in `/tmp` would be a
+    diagnostic causing the outage it measures. So the spill lands, the warning
+    fires once, and the verb says `journal.fs.on_tmpfs: true`.
+    """
+    mounts = tmp_path / "mounts"
+    mounts.write_text("tmpfs /tmp tmpfs rw 0 0\n", encoding="utf-8")
+    monkeypatch.setattr(disk_layout, "PROC_MOUNTS_PATH", str(mounts))
+    monkeypatch.setenv(config.ENV_DIAG_RANK, "PP0_TP0")   # a rank names a journal
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR,
+                       str(tmp_path / "journal"))   # under /tmp -> tmpfs
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is True, result
+    assert result["journalled"] is True, result     # the write AND the index worked
+    section = disk_spill.section()
+    assert section["journal"]["fs"]["on_tmpfs"] is True
+    assert section["journal"]["fs"]["label"] == "tmpfs"
+    assert section["journal_failures"] == 0
+    assert sum(disk_spill._state["refused"].values()) == 0
+    warnings = [rec.getMessage() for rec in caplog.records
+                if "spill JOURNAL directory" in rec.getMessage()]
+    assert len(warnings) == 1, warnings
+    # Again, and nothing new is logged: the idiom is once per episode.
+    assert disk_spill.spill_slot(caches(), 2,
+                                 "c" + KEY16[1:] + "1" * 48
+                                 + f"{GROUP:08x}")["ok"] is True
+    assert len([rec for rec in caplog.records
+                if "spill JOURNAL directory" in rec.getMessage()]) == 1
 
 
 # --- the queue: bounded, dropping, and never blocking ----------------------

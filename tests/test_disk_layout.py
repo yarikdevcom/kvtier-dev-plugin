@@ -685,7 +685,32 @@ def test_a_tmpfs_root_is_refused_even_though_it_exists_and_is_writable(monkeypat
     assert dl.validate_root(None)["ok"] is False
 
 
-# --- the commit protocol: `.part`, fsync, replace, directory fsync ----------
+# --- the commit protocol: `.part`, replace, optional fsync -----------------
+
+def test_the_sync_flag_is_a_real_fsync_count(tmp_path, monkeypatch):
+    """`sync=` is the durability opt-in, measured as a count of `os.fsync`.
+
+    The spill tier runs with `sync=False` (a cache does not pay for durability -
+    `disk_read` catches a journaled-but-absent file as `file_missing` and the span
+    is recomputed), and this proves both halves: the flag really does skip every
+    fsync, and it really does not skip the commit ordering (the file lands).
+    """
+    calls = []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    quiet = dl.write_committed_file(slot_path(tmp_path)["path"], b"bytes",
+                                    sync=False)
+    assert quiet["ok"] is True and quiet["directory_synced"] is False
+    assert calls == []
+    loud_path = os.path.join(slot_path(tmp_path)["directory"], "loud.bin")
+    loud = dl.write_committed_file(loud_path, b"bytes", sync=True)
+    assert loud["ok"] is True and loud["directory_synced"] is True
+    assert len(calls) == 2, "the file and its directory"
+    # The commit ordering is NOT part of the flag: `O_CREAT|O_EXCL` on the part and
+    # the atomic `os.replace` run either way, so "a committed name means a complete
+    # file" survives the fsyncs being dropped.
+    source = Path(dl.__file__).read_text(encoding="utf-8")
+    body = source.split("def write_committed_file", 1)[1]
+    assert "O_CREAT | os.O_EXCL" in body and "os.replace(part, text)" in body
 
 def test_written_bytes_round_trip_through_the_committed_file(tmp_path):
     blob = bytes(range(256)) * 40

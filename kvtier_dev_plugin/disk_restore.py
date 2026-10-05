@@ -571,6 +571,13 @@ def counters_view(out: dict) -> dict:
         "witness_kind": "the stable name of the last verdict: the emission key is "
                        "(verdict, kind) and never the sentence, because the sentence "
                        "quotes counters",
+        "witness_verdict": "the last restore-posture verdict this process spoke "
+                           "(CONFIRMED / NO READ / ...): a verdict, never a count, "
+                           "and read beside `reads_applied` rather than instead of "
+                           "it - on 2026-10-05 a CONFIRMED verdict sat next to "
+                           "reads_applied=0",
+        "witness_reason": "the sentence the witness last gave for its verdict; "
+                          "prose for a human, never a number to aggregate",
         "suppressed_hits": "lookups refused because the REQUEST is suppressed after "
                            "a failed disk load (the loop that starved the box)",
         "suppressed_requests": "request ids currently black-holed for disk "
@@ -597,7 +604,8 @@ def counters_view(out: dict) -> dict:
         "index_refreshes": "journal refreshes",
         "index_refresh_errors": "raised refreshes",
         "ranks_proven": "rank files attesting a live worker half",
-        "proof_reads": "rank files read for that proof",
+        "proof_reads": "RANK FILES read for that proof - nothing to do with KV "
+                       "reads: see `reads_applied` for the applied disk reads",
         "loads_released": "loads removed from the ledger",
         "binds": "worker binds observed", "disk_binds": "binds carrying disk work",
         "reads_started": "file reads queued", "reads_applied": "reads memmoved",
@@ -4027,6 +4035,29 @@ def scheduler_section() -> dict:
         "restorations": int(state["restorations"]),
         "adopted": int(state["adopted"]),
         "adopted_tokens": int(state["adopted_tokens"]),
+        # THE DIRECT EVIDENCE THAT A READ HAPPENED, passed through from `counters()`
+        # with no recomputation here.
+        #
+        # WHY THESE ARE IN THE PAYLOAD AT ALL. `restorations` is the counter an
+        # experiment reads as success, and on 2026-10-05 it reported CONFIRMED while
+        # nothing was read. The honest applied-read counter that existed in memory
+        # (`reads_applied`) was never sent, so a predicate had to choose between the
+        # costume counter and the indirect `adopted_tokens`. `reads_applied` means
+        # literally "a read was memmoved into a slot", and it is now reachable from
+        # the same one call as everything else. `disk_reads_applied` /
+        # `ranks_reads_applied` are the scheduler-side per-offer verdict and the
+        # worker-attested total; the three `witness_*` are the verdict allowed to use
+        # them. `loads_released` and `skipped_no_marker` complete the ledger: the
+        # reads that finished and were let go, and the lookups that were left alone
+        # because nobody asked.
+        "reads_applied": int(tally["reads_applied"]),
+        "disk_reads_applied": int(tally["disk_reads_applied"]),
+        "ranks_reads_applied": int(tally["ranks_reads_applied"]),
+        "loads_released": int(tally["loads_released"]),
+        "skipped_no_marker": int(tally["skipped_no_marker"]),
+        "witness_verdict": tally["witness_verdict"],
+        "witness_reason": tally["witness_reason"],
+        "witness_kind": tally["witness_kind"],
         "refused": {name: int(state["refused"].get(name) or 0)
                     for name in OFFER_REFUSALS},
         "refusal_reasons": {name: OFFER_REFUSAL_WHY.get(
@@ -4074,7 +4105,35 @@ def scheduler_section() -> dict:
                                 "(one per proven rank: the WORKER names the file "
                                 "with its own digest, so four ranks are four names "
                                 "per identity, not one)",
-            "proof_reads": "rank files read for that proof",
+            "proof_reads": "RANK FILES read for that proof - NOT KV reads. "
+                           "`reads_applied` is the applied-disk-read counter; this "
+                           "one counts how many rank files `worker_proof()` opened, "
+                           "and the two must never be read as the same kind of "
+                           "number",
+            "reads_applied": "reads memmoved into a CPU slot (THE direct evidence "
+                             "that a disk read was applied; pass-through from "
+                             "counters()). In a scheduler-only process this stays 0 "
+                             "by construction - the worker reads - so read it "
+                             "beside `ranks_reads_applied` and `witness_verdict`",
+            "disk_reads_applied": "scheduler-side applied disk reads (0 in a "
+                                  "scheduler-only process by construction), from "
+                                  "counters()",
+            "ranks_reads_applied": "applied disk reads attested by live worker rank "
+                                   "files at the last proof read, from counters()",
+            "loads_released": "loads removed from the ledger, from counters()",
+            "skipped_no_marker": "requests left exactly as the fork would have "
+                                 "left them because they did not ask for a disk "
+                                 "restore (`optin` scope without the marker), from "
+                                 "counters(): the nothing-was-offered-because-nobody-"
+                                 "asked case, kept apart from a refusal",
+            "witness_verdict": "the last restore-posture verdict this process spoke "
+                               "(a verdict, not a count). Read it BESIDE "
+                               "`reads_applied`, never instead of it: on 2026-10-05 "
+                               "the witness said CONFIRMED while reads_applied was 0",
+            "witness_reason": "the sentence the witness last gave for its verdict: "
+                              "prose for a human, never a number to aggregate",
+            "witness_kind": "the stable name of the last verdict (the emission key is "
+                            "(verdict, kind), never the sentence), from counters()",
             "deadline_seconds": "SECONDS an unreported load may live before the "
                                 "watchdog reports it as a failure",
             "methods_here": "scheduler methods our layer is on in this process",

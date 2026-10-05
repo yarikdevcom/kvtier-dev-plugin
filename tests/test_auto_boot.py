@@ -40,7 +40,15 @@ import fixtures_pr56810 as PR  # noqa: F401 - imported for its module-level setu
 import pytest
 import test_backport as TB
 
-from kvtier_dev_plugin import backport, config, disk_spill, guard_mode, snapshot
+from kvtier_dev_plugin import (
+    backport,
+    config,
+    disk_index,
+    disk_layout,
+    disk_spill,
+    guard_mode,
+    snapshot,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -699,6 +707,50 @@ def test_the_boot_line_names_the_two_tiers_apart_without_losing_tier():
     assert "ram_tier=ARMED disk_tier=DISARMED tier=ARMED" in line, line
     assert "ram_tier=ARMED disk_tier=ARMED" not in line, \
         "they are ONE field each, not a merged verdict"
+
+
+def test_the_boot_line_carries_the_journal_directorys_filesystem(tmp_path,
+                                                                monkeypatch):
+    """`journal_dir=tmpfs` is the 2026-10-05 failure, greppable at the next boot.
+
+    The spill JOURNAL is the only map from a KV identity to a spilled file and it
+    cannot be rebuilt, and on the default configuration it still lives in `/tmp`.
+    A reboot then destroys the map while the KV files on the store root survive -
+    which is exactly what happened (107 GB spilled, an index at `entries: 0`) with
+    nothing in the log saying so. The warning fires once per episode; the boot line
+    is what stays readable afterwards, on the line the operator already greps.
+
+    It is INFORMATIONAL: a tmpfs journal degrades the tier and never stops it, and
+    the field must never become a refusal.
+    """
+    mounts = tmp_path / "mounts"
+    mounts.write_text("tmpfs /tmp tmpfs rw 0 0\n/dev/md0 /home/kv ext4 rw 0 0\n",
+                      encoding="utf-8")
+    monkeypatch.setattr(disk_layout, "PROC_MOUNTS_PATH", str(mounts))
+    monkeypatch.setattr(disk_layout, "FORBIDDEN_ROOT_PREFIXES", ())
+    disk_index.reset_state_for_tests()
+
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, "/tmp/kv-tier-diagnostics")
+    _report, up, _cls, _manager = boot()
+    line = up["line"]
+    assert "journal_dir=tmpfs" in line, line
+    names = [part.split("=")[0] for part in line.split(" ") if "=" in part]
+    assert names.count("journal_dir") == 1, line
+    # The field sits with the disk tier's own verdicts, and the restart verifier's
+    # `grep -oE "tier=[A-Za-z_]+" | tail -1` still lands on the bare `tier=`.
+    assert re.search(r"tier=ARMED.*journal_dir=", line), line
+    assert line.split("journal_dir=")[0].count("tier=") == 3, line
+
+    # A journal on platter says so and warns about nothing.
+    disk_index.reset_state_for_tests()
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, "/home/kv/diag")
+    _r2, on_disk, _c2, _m2 = boot()
+    assert "journal_dir=disk" in on_disk["line"], on_disk["line"]
+
+    # And neither setting has any effect on the ARM, which is the field that means
+    # "this boot writes KV to disk".
+    assert "disk_tier=" in on_disk["line"] and "disk_tier=" in line
+    disk_index.reset_state_for_tests()
 
 
 def test_the_tier_fields_are_independent_and_tier_stays_the_last_grep_match(

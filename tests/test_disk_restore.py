@@ -2861,12 +2861,27 @@ def test_every_counter_has_a_unit():
     its own - `offer_cap`, `ranks_armed`, `ranks_seen`, the three `suppressed_*` - and a
     number that reached the payload through a pass-through is exactly as bare as one
     that came from `_state`.
+
+    The applied-read evidence is pinned here by name (`reads_applied`,
+    `disk_reads_applied`, `ranks_reads_applied`, `loads_released`,
+    `skipped_no_marker`, and the three `witness_*`), because those keys are the reason
+    the payload exists for an experiment: `restorations` reported CONFIRMED through the
+    2026-10-05 livelock while `reads_applied` sat at 0, and the direct counter was not
+    in the payload at all. A pass-through that silently loses its unit is the first
+    step back to that.
     """
+    APPLIED_READ_KEYS = ("reads_applied", "disk_reads_applied",
+                         "ranks_reads_applied", "loads_released",
+                         "skipped_no_marker", "witness_verdict",
+                         "witness_reason", "witness_kind")
     counters = disk_restore.counters()
     units = disk_restore.counters_view(dict(counters))["units"]
     for name, value in counters.items():
         if isinstance(value, int) and not isinstance(value, bool):
             assert name in units, name
+    for name in APPLIED_READ_KEYS:
+        assert name in counters, name
+        assert name in units, f"{name} reaches counters() with no unit"
 
     view = disk_restore.scheduler_section()
     section_units = view["units"]
@@ -2877,6 +2892,9 @@ def test_every_counter_has_a_unit():
             for inner, field in value.items():
                 if isinstance(field, int) and not isinstance(field, bool):
                     assert f"index.{inner}" in section_units, inner
+    for name in APPLIED_READ_KEYS:
+        assert name in view, f"{name} is in counters() but not in the payload"
+        assert name in section_units, f"{name} reaches the payload with no unit"
 
 
 # --- n: THE SCHEDULER ROLE, the only role that can start a restore -----------

@@ -74,6 +74,18 @@ the file contract the proxy host's reader expects):
                                  NEVER zero. Neither variable ARMS the tier: the
                                  arm is `disk_spill.arm()`, which expires by
                                  itself, exactly like the raw-byte dump's.
+  VLLM_E2_TIER_DISK_JOURNAL_DIR  where the spill JOURNAL lives, apart from the rest
+                                 of the diagnostics directory. UNSET = fall back to
+                                 VLLM_E2_TIER_DIAG (the pre-0.2.19 behaviour).
+                                 Set it to a path on a filesystem that SURVIVES A
+                                 REBOOT: the journal is the only map from a KV
+                                 identity to a spilled file, and a reboot that eats
+                                 it while the files survive leaves the restore index
+                                 at `entries: 0`. Only the JOURNAL moves here - the
+                                 arm file stays in the diagnostics directory and
+                                 dies at boot, on purpose. A journal directory on
+                                 tmpfs is warned about once and reported as
+                                 `journal_dir=tmpfs` on the boot line.
   THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
   is installed in every worker whenever the plugin is on, and its per-step cost
   while unarmed is two `os.environ.get` calls; the two switches that make it do
@@ -143,6 +155,28 @@ ENV_DISK_ROOT = "VLLM_E2_TIER_DISK_ROOT"
 # 11.4 MB). Unset or unparseable = no ceiling (never 0: a 0 ceiling would mean
 # "evict everything", which is a destructive reading of a typo).
 ENV_DISK_BYTES = "VLLM_E2_TIER_DISK_BYTES"
+# WHERE THE SPILL JOURNAL LIVES, separately from everything else in the
+# diagnostics directory. UNSET = fall back to VLLM_E2_TIER_DIAG, which is the
+# pre-0.2.19 behaviour and changes nothing for an existing deployment.
+#
+# WHY THE JOURNAL GETS ITS OWN VARIABLE AND ITS OWN FILESYSTEM. The journal IS the
+# map from a KV identity to a file on the RAID array, and it is the one piece of
+# cross-process state in this tier that cannot be rebuilt: a reboot that destroys
+# it while the 107 GB of KV files it describes survives leaves the restore index at
+# `entries: 0` - a huge pile of real data with no map to it (observed 2026-10-05).
+# So an operator points this at persistent storage (e.g. `/home/user/kv-tier/diag`)
+# and keeps `VLLM_E2_TIER_DIAG` wherever the rank files belong.
+#
+# WHY THE SPLIT IS PER-CATEGORY AND NOT "MOVE THE DIRECTORY". The same diagnostics
+# directory holds the spill tier's ARM FILE, and an arm is supposed to die at
+# reboot: a cold box booting with the tier armed exposes the restore path to live
+# traffic with no operator having asked. Moving the whole directory to disk would
+# silently break that invariant, so only the journal moves here - and the arm is
+# separately made to fail closed across a boot by its own contents (see
+# `disk_spill._read_arm_file`). `GET /plugins/kvtier/disk` reports the journal
+# directory's filesystem under `journal.fs`, and the boot line carries
+# `journal_dir=tmpfs` when it lands on a filesystem that dies at reboot.
+ENV_DISK_JOURNAL_DIR = "VLLM_E2_TIER_DISK_JOURNAL_DIR"
 
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
@@ -340,6 +374,25 @@ def diagnostics_dir() -> Path | None:
     if not raw or "\x00" in raw:
         return None
     return Path(raw)
+
+
+def disk_journal_dir() -> Path | None:
+    """Where the spill JOURNAL lives, or None when nothing is configured at all.
+
+    ONE READ POINT, and the only one: `disk_index.journal_directory()` is its sole
+    caller, and every journal path (append, tail-seed, refresh glob) is composed
+    there, so there is no second place a journal filename could be built.
+
+    `VLLM_E2_TIER_DISK_JOURNAL_DIR` UNSET falls back to `diagnostics_dir()`, which
+    is the pre-0.2.19 behaviour: an existing deployment changes nothing until the
+    operator sets the new variable. The fallback is deliberate - the variable exists
+    so the journal can be moved to a filesystem that survives a reboot, not to make
+    the tier demand another knob.
+    """
+    raw = os.environ.get(ENV_DISK_JOURNAL_DIR, "").strip()
+    if raw and "\x00" not in raw:
+        return Path(raw)
+    return diagnostics_dir()
 
 
 def diagnostics_epoch() -> tuple[str, str]:

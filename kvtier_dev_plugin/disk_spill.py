@@ -9,12 +9,23 @@ and writes them to disk under a name that IS their identity
 `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin`).
 
 IT ALSO KEEPS THE RESTORE INDEX FROM BEING STARVED. Every file this module commits
-is journalled (`disk_index.record_spill`, called AFTER the `os.replace`, so a torn
-write is never recorded) and every file its ceiling plan deletes is journalled too
-(`record_removal`). Both happen on the writer thread and both are strictly
-subordinate to the write: the SPILL is the product and the journal is an index of
-it, so a journal that cannot be written costs a missed restore and never a failed
-spill. `journal_failures` counts those, and the spill still reports success.
+is journalled (`disk_index.record_spill`, called AFTER the `os.replace`, so a write
+that never even reached its final name is never recorded) and every file its
+ceiling plan deletes is journalled too (`record_removal`). Both happen on the
+writer thread and both are strictly subordinate to the write: the SPILL is the
+product and the journal is an index of it, so a journal that cannot be written costs
+a missed restore and never a failed spill. `journal_failures` counts those, and the
+spill still reports success.
+
+AND IT DOES NOT FSYNC, ON PURPOSE. `spill_slot` commits with `sync=False`: buffered
+writes, no fsync of the file and none of its directory, so the page cache owns
+device ordering. These bytes are a CACHE, and the cost of losing one to a crash is
+one recompute; `disk_read` classifies a journaled-but-absent file `file_missing`
+(and a short one `size_mismatch`/`short_read`) and `disk_restore` prunes it out of
+the DMA, so false presence costs a recompute and never wrong bytes. What is NOT
+touched is the commit ordering (`O_CREAT|O_EXCL` then `os.replace`), which protects
+against a TORN WRITE - a different property, and one this tier still guarantees.
+See `disk_layout.write_committed_file`.
 
 AND IT COUNTS GROUP COLLISIONS, because only a number settles how often two
 KV-cache groups hash the same token chain. Two groups over one chain share a
@@ -36,6 +47,27 @@ code that publishes into it is scheduler-side store-completion (the fork calls
 build, at `manager.py:988-992` at the fork HEAD 10b8e07 this suite's fixture is
 generated from; the method itself starts at `manager.py:1009` there and its
 `cpu_block_pool._insert_block_hash` calls are at `manager.py:1026-1043`).
+
+AN ARM MUST DIE AT A REBOOT, BY ITS OWN CONTENTS
+-------------------------------------------------
+The arm crosses the process boundary as one small file in the diagnostics directory
+(`ARM_FILE`), because the verb that arms runs in the EngineCore and the spill happens
+in a worker. That file used to be checked for `armed` + a wallclock `expires_ts`
+alone, so a file that survived a reboot armed the NEW boot for the rest of its life -
+and a cold box booting with the disk tier armed exposes the restore path to live
+traffic with no operator having asked, which is the precondition of the 2026-10-05
+load-failure livelock. What actually killed it was `/tmp` being tmpfs, and "move the
+diagnostics directory to disk so the journal survives" would have silently destroyed
+that protection while fixing the journal.
+
+So the arm fails closed on its own contents (`_arm_boot_fence`): the file records the
+kernel BOOT ID and its epoch with an `epoch_scope`, and a reader refuses a file whose
+boot identity provably differs from its own, with a reason that NAMES the mismatch.
+The epoch is only evidence when its scope is `env` (an operator-set per-boot id);
+with `epoch_scope: "process"` two workers of ONE boot legitimately disagree, and
+consulting it there would disarm a healthy tier. A surviving arm file is therefore
+harmless wherever it lives, and the journal can be moved to persistent storage
+without arming anything (`VLLM_E2_TIER_DISK_JOURNAL_DIR`, `disk_index`).
 
 WHAT CHANGED IN 0.2.14: a lookup does not have to hit for a restore to happen.
 `disk_restore` reads these files back WITHOUT touching that hash index, by extending
@@ -209,6 +241,13 @@ ARM_MAX_SECONDS = 7200.0
 ARM_FILE = "disk-spill-arm.json"
 MAX_ARM_FILE_BYTES = 4096
 ARM_FILE_POLL_SECONDS = 1.0          # SECONDS a cached file verdict is trusted
+# THE BOOT FENCE. `/proc/sys/kernel/random/boot_id` is one UUID per kernel boot, the
+# same string in every process on the box, so it is the boot identity an ARM FILE can
+# be checked against without the operator configuring anything. Bounded read, never
+# a raise; an unreadable one is an absence of knowledge, not a disarm.
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+MAX_BOOT_ID_CHARS = 64
+MAX_EPOCH_CHARS = 128
 
 WRITER_TAG = "kvtier-dev-plugin/disk-spill-1"
 PROTOCOL_VERSION = 1
@@ -233,6 +272,10 @@ _state: dict = {
     "arm_seconds": None,
     "arm_file_verdict": None,
     "arm_file_checked_mono": None,
+    # How often an arm file was refused for belonging to another boot: the number
+    # that says "the boot fence is working", and - if it ever climbs with no reboot
+    # - "the boot identity is not what I thought it was".
+    "arm_file_boot_refusals": 0,
     # the fingerprint this process writes under (boot-constant)
     "fingerprint": None,
     "geometry_digest": None,
@@ -297,7 +340,7 @@ def reset_state_for_tests() -> None:
         "configured": False, "root": None, "ceiling_bytes": None,
         "armed": False, "arm_expires_mono": None, "arm_expires_wall": None,
         "arm_seconds": None, "arm_file_verdict": None,
-        "arm_file_checked_mono": None,
+        "arm_file_checked_mono": None, "arm_file_boot_refusals": 0,
         "fingerprint": None, "geometry_digest": None,
         "thread_started": 0, "thread_alive": False,
         "queue_depth": 0, "queue_depth_peak": 0,
@@ -446,8 +489,84 @@ def is_armed() -> bool:
     return bool(verdict)
 
 
+def _boot_id() -> str | None:
+    """This boot's kernel boot id, or None. Bounded, and never raises.
+
+    The one boot identity that needs no operator configuration and is identical in
+    every process of the boot (unlike `snapshot.epoch()`, which is per-process unless
+    `VLLM_E2_TIER_DIAG_EPOCH` is set). A container that re-mints its boot id gets a
+    stricter fence, never a weaker one: the only direction a mismatch can move is
+    DISARMED.
+    """
+    try:
+        with open(BOOT_ID_PATH, "rb") as handle:
+            raw = handle.read(MAX_BOOT_ID_CHARS + 1)
+    except OSError:
+        return None
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text or len(text) > MAX_BOOT_ID_CHARS or "\n" in text:
+        return None
+    return text
+
+
+def _arm_boot_fence(document) -> str | None:
+    """Why this arm file belongs to a DIFFERENT BOOT, or None to believe it.
+
+    WHY THIS EXISTS. The arm file used to be checked for `armed` and `expires_ts`
+    only, so a surviving file armed a REBOOTED box for the rest of its 1800 s - and a
+    cold boot with the disk tier armed exposes the restore path to live traffic with
+    no operator having asked, which is the precondition of the 2026-10-05
+    load-failure livelock. Today the file survives because the diagnostics directory
+    is tmpfs; a fix that moved the whole directory to disk (to save the JOURNAL from
+    the same fate) would have silently destroyed that invariant. So the arm fails
+    closed ON ITS OWN CONTENTS, and the directory it lives in stops mattering.
+
+    Two fences, each applied only when it can actually PROVE something, because a
+    false refusal silently stops the tier from spilling:
+
+    * the BOOT EPOCH, when the file says its epoch was the operator's per-boot one
+      (`epoch_scope: "env"`). Then the epoch IS a boot identity and a disagreement is
+      proof. With `epoch_scope: "process"` the epoch is a per-process token - which
+      two processes of ONE boot legitimately disagree on - so it is not evidence of
+      anything and is not consulted; that is what the boot id below is for.
+    * the KERNEL BOOT ID, when both the file and this process have one.
+
+    An arm file written by a plugin older than this change carries neither field: no
+    comparison is possible, so it is believed (the same behaviour it had), and the
+    gap closes for every file this version writes. Refusing such a file would also
+    break the documented "arm an engine restart survives" workflow, which is a
+    feature - it is a REBOOT the arm must not survive, and a reboot moves the boot
+    id.
+    """
+    scope = document.get("epoch_scope")
+    if scope == "env":
+        documented = document.get("epoch")
+        if isinstance(documented, str) and documented:
+            ours, our_scope = config.diagnostics_epoch()
+            if documented != ours:
+                return (f"the arm file names a different boot: epoch mismatch "
+                        f"(the file says {documented[:MAX_EPOCH_CHARS]!r} with "
+                        f"scope env; this boot is {ours[:MAX_EPOCH_CHARS]!r} with "
+                        f"scope {our_scope})")
+    documented_boot = document.get("boot_id")
+    ours_boot = _boot_id()
+    if (isinstance(documented_boot, str) and documented_boot and ours_boot
+            and documented_boot != ours_boot):
+        return (f"the arm file is from a previous boot: boot id mismatch (the file "
+                f"says {documented_boot[:MAX_BOOT_ID_CHARS]!r}, this boot is "
+                f"{ours_boot[:MAX_BOOT_ID_CHARS]!r})")
+    return None
+
+
 def _read_arm_file(path):
-    """(armed, reason) from the arm file. Fail CLOSED: any doubt is disarmed."""
+    """(armed, reason) from the arm file. Fail CLOSED: any doubt is disarmed.
+
+    `armed` and `expires_ts` are the two checks the first versions had. THE THIRD IS
+    THE BOOT: `_arm_boot_fence` refuses an arm written by a boot that is not this one
+    (a reboot must not arm a cold box), and its reason NAMES the mismatch, because
+    "disarmed and I do not know why" is how an armed-looking box ends up quietly
+    doing nothing.
+    """
     if path is None:
         return False, (f"{config.ENV_DIAG_DIR} is not set, so no arm file can "
                        "reach a worker")
@@ -473,6 +592,10 @@ def _read_arm_file(path):
         return False, "the arm file has no numeric expires_ts"
     if time.time() >= float(expires):
         return False, "the arm expired"
+    stale = _arm_boot_fence(document)
+    if stale:
+        _state["arm_file_boot_refusals"] += 1
+        return False, stale
     return True, "armed by file"
 
 
@@ -539,21 +662,40 @@ def arm_state() -> dict:
                                      and armed else None),
             "default_seconds": ARM_DEFAULT_SECONDS,
             "max_seconds": ARM_MAX_SECONDS,
+            # THE BOOT FENCE, in the view an operator reads when the tier is quiet:
+            # how many arm files were refused for naming another boot, and the last
+            # reason the file verdict said no - which names the epoch or boot-id
+            # mismatch instead of only saying "disarmed".
+            "arm_file_boot_refusals": int(_state["arm_file_boot_refusals"]),
+            "arm_file_reason": _state["last_reason"],
+            "boot_id": _boot_id(),
             "units": disk_layout._units("seconds_left", "default_seconds",
-                                        "max_seconds", "expires_at_wallclock"),
+                                        "max_seconds", "expires_at_wallclock",
+                                        "arm_file_boot_refusals"),
             "note": ("an arm expires on its own; no env var arms this facility, "
-                     "and a fresh boot does zero disk work")}
+                     "and a fresh boot does zero disk work. An arm file must also "
+                     "name THIS boot (the kernel boot id, and the per-boot epoch "
+                     "when the operator sets one), so a reboot disarms a surviving "
+                     "file instead of arming a cold box with the restore path "
+                     "open to live traffic")}
 
 
 def _write_arm_file(now: float, seconds: float) -> dict:
     path = _arm_path()
     if path is None:
         return {"written": False, "reason": "no diagnostics directory"}
+    # The boot identity the reader will check itself against (`_arm_boot_fence`).
+    # `epoch` is the OPERATOR's per-boot value when they set one and this process's
+    # token otherwise, and `epoch_scope` says which - without the scope the reader
+    # cannot tell "a different boot" apart from "a different worker of this boot",
+    # and a false refusal would disarm a healthy tier.
+    epoch, scope = config.diagnostics_epoch()
     document = {"version": PROTOCOL_VERSION, "writer": WRITER_TAG,
                 "armed": True, "armed_ts": round(now, 6),
                 "expires_ts": round(now + seconds, 6),
                 "seconds": round(seconds, 3), "root": _state["root"],
-                "epoch": str(snapshot.epoch()), "pid": os.getpid()}
+                "epoch": str(epoch), "epoch_scope": scope, "pid": os.getpid(),
+                "boot_id": _boot_id()}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -1024,6 +1166,11 @@ def spill_slot(caches, slot, key, fingerprint=None) -> dict:
     is never recorded as having landed). A duplicate is not journalled: the file was
     already there, which means it was already recorded - possibly by a boot whose
     journal this one continues.
+
+    `directory_synced` in the answer is `False` on this path and that is the NORMAL
+    state, not an anomaly: the spill tier does not fsync (see the module docstring),
+    so it reports honestly that neither the file nor its directory was forced to the
+    device. A reader must never treat it as a failure.
     """
     started = time.monotonic()
     plan = plan_slot_write(caches, slot, key, fingerprint)
@@ -1039,8 +1186,19 @@ def spill_slot(caches, slot, key, fingerprint=None) -> dict:
                            f"{plan['bytes_per_file']}-byte write: "
                            f"{space['reason']}"),
                 "reason_kind": "no_free_space"}
+    # NO FSYNC ON THE SPILL PATH, ON PURPOSE. `sync=False` means buffered writes
+    # and no fsync of the file or its directory: the page cache owns device
+    # ordering. These are CACHE bytes, so the only cost of a lost write is one
+    # recompute, and the property that makes it free is that a journal entry whose
+    # bytes never reached the device is classified `file_missing` (or
+    # `size_mismatch`/`short_read`) at read time by `disk_read._read_file`,
+    # reported to the engine, and pruned out of the DMA by `disk_restore` before
+    # any stale byte is copied - so false presence costs a recompute and never
+    # wrong bytes. `O_CREAT|O_EXCL` and the `os.replace` commit ordering stay
+    # exactly as they were: those protect against TORN WRITES, which is a
+    # different property from durability and is not what this flag removes.
     written = disk_layout.write_committed_file(plan["path"], plan["blob"],
-                                               sync=True)
+                                               sync=False)
     elapsed = round(time.monotonic() - started, 6)
     if not written["ok"]:
         return {"ok": False, "final_exists": bool(written.get("final_exists")),
@@ -1535,6 +1693,14 @@ def section() -> dict:
         "journal_removals": int(_state["journal_removals"]),
         "journal_failures": int(_state["journal_failures"]),
         "journal_directory": disk_index.journal_directory(),
+        # THE JOURNAL'S FILESYSTEM, named where an operator reading this verb will
+        # look: `fs.on_tmpfs: true` means the map dies at reboot while the KV files
+        # it describes survive (2026-10-05: 107 GB spilled, `entries: 0`). The fix
+        # is `VLLM_E2_TIER_DISK_JOURNAL_DIR`; the arm file stays behind on purpose.
+        "journal": {"directory": disk_index.journal_directory(),
+                    "directory_env": config.ENV_DISK_JOURNAL_DIR,
+                    "fallback_env": config.ENV_DIAG_DIR,
+                    "fs": disk_index.journal_fs_state()},
         "thread_started": int(_state["thread_started"]),
         "thread_alive": bool(_state["thread_alive"]),
         "queue_depth": int(_state["queue_depth"]),

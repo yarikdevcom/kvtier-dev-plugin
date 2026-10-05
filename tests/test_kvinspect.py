@@ -455,3 +455,126 @@ def test_the_request_view_reports_groups_dropped_at_the_cap():
     payload = block(engine, request_id="cmpl-a")
     assert len(payload["groups"]) == kvinspect.MAX_GROUP_ENTRIES
     assert payload["groups_dropped"] == 3
+
+
+# --- THE TWO POOLS, AND THE BOUND THAT BELONGS TO EACH OF THEM --------------
+# Measured on the live box on 2026-10-05: the GPU pool holds 317 blocks and the
+# tier's CPU pool holds 1331 slots. `block_id` used to be validated against the GPU
+# pool and the answer returned early, so CPU slots 317..1330 - TWO THIRDS OF THE
+# HOST-RAM ARENA - could not be named through the documented verb, and it failed
+# SILENTLY: a 200 with `cpu_slot: no`, not an error. `spill-one` needs a CPU slot and
+# a key, and `/block` is how an operator finds one, so this is the shape of the live
+# numbers, pinned.
+
+GPU_BLOCKS = 317
+CPU_BLOCKS = 1331
+
+
+def live_pools():
+    """The live geometry: a 317-block GPU pool and a 1331-slot CPU pool."""
+    engine, info = fake.production_geometry()
+    gpu_blocks = ([fake.Block(i, block_hash=fake.hash_key(i, i % 6), ref_cnt=1,
+                              num_tokens=1024) for i in range(200)]
+                  + [fake.Block(i) for i in range(200, GPU_BLOCKS)])
+    info["pool"].blocks = gpu_blocks
+    info["pool"].num_gpu_blocks = GPU_BLOCKS
+    cpu_blocks = [fake.Block(i, block_hash=fake.hash_key(i, 2), ref_cnt=0)
+                  for i in range(CPU_BLOCKS)]
+    info["tier"].cpu_block_pool = fake.Pool(cpu_blocks,
+                                            num_gpu_blocks=CPU_BLOCKS,
+                                            free=CPU_BLOCKS - 100)
+    return engine, info
+
+
+def test_a_cpu_slot_above_the_gpu_pool_size_is_nameable():
+    """THE BUG, at the live numbers: slot 317 and slot 600 used to answer "no slot".
+
+    Each section is bounded by the pool it describes, so the CPU half resolves while
+    the GPU half honestly says the id is out of ITS range.
+    """
+    engine, _info = live_pools()
+    for slot in (317, 600, CPU_BLOCKS - 1):
+        payload = block(engine, block_id=slot)
+        assert payload["found"] is False, "the GPU pool has 317 blocks"
+        assert payload["reason_kind"] == "gpu_block_id_out_of_range", payload
+        assert "317 block objects" in payload["reason"], payload["reason"]
+        assert "block" not in payload
+        slot_view = payload["tier_cpu_slot"]
+        assert slot_view["present"] is True and slot_view["found"] is True, slot_view
+        assert slot_view["block"]["block_id"] == slot
+        # The parked block's `BlockHashWithGroupId` decodes here, which is the whole
+        # point: this is how an operator gets the KEY for `spill-one`.
+        assert slot_view["block"]["has_hash"] is True
+        assert slot_view["block"]["hash_group_id"] == 2
+        assert len(slot_view["block"]["hash_hex"]) == 32  # 16 bytes
+        assert payload["sections"] == {"gpu": False, "cpu": True,
+                                       "answered": True,
+                                       "gpu_pool_blocks": GPU_BLOCKS,
+                                       "cpu_pool_blocks": CPU_BLOCKS}
+
+
+def test_an_id_out_of_range_for_both_pools_names_both_pools():
+    """A named reason for each section - never a bare "no cpu slot"."""
+    engine, _info = live_pools()
+    payload = block(engine, block_id=CPU_BLOCKS + 69)
+    assert payload["found"] is False
+    assert payload["sections"]["answered"] is False
+    assert payload["sections"] == {"gpu": False, "cpu": False, "answered": False,
+                                   "gpu_pool_blocks": GPU_BLOCKS,
+                                   "cpu_pool_blocks": CPU_BLOCKS}
+    slot_view = payload["tier_cpu_slot"]
+    assert slot_view["found"] is False
+    assert slot_view["reason_kind"] == "cpu_block_id_out_of_range"
+    assert f"{CPU_BLOCKS} objects" in slot_view["reason"], slot_view["reason"]
+    # The top-level reason carries BOTH bounds, so a reader cannot take the GPU
+    # pool's size for the CPU pool's.
+    assert "GPU pool" in payload["reason"] and "CPU pool" in payload["reason"]
+    assert str(GPU_BLOCKS) in payload["reason"]
+    assert str(CPU_BLOCKS) in payload["reason"]
+
+
+@pytest.mark.parametrize("block_id", [-1, 0, 316, 317, 5000])
+def test_the_gpu_sections_own_bound_still_behaves_as_before(block_id):
+    """No tier at all: the GPU bound answers exactly as it always did.
+
+    `tier_cpu_slot` stays ABSENT (not "no cpu slot") when there is no connector -
+    that distinction is the only thing telling an operator the tier is missing
+    rather than the id being wrong.
+    """
+    engine = fake.engine(fake.scheduler(
+        pool=fake.Pool([fake.Block(i) for i in range(GPU_BLOCKS)])))
+    payload = block(engine, block_id=block_id)
+    assert ("block" in payload) is (0 <= block_id < GPU_BLOCKS), payload
+    assert payload["found"] is (0 <= block_id < GPU_BLOCKS)
+    assert payload["sections"] == {
+        "gpu": 0 <= block_id < GPU_BLOCKS, "cpu": False,
+        "answered": 0 <= block_id < GPU_BLOCKS,
+        "gpu_pool_blocks": GPU_BLOCKS, "cpu_pool_blocks": None}
+    assert "tier_cpu_slot" not in payload
+    if not payload["found"]:
+        assert "not nameable" in payload["reason"]
+        assert "317 block objects" in payload["reason"]
+
+
+def test_an_id_inside_the_gpu_pool_answers_both_halves_as_it_did():
+    """The healthy path is unchanged: GPU block AND the CPU slot of the same id."""
+    engine, _info = live_pools()
+    payload = block(engine, block_id=5, group=2)
+    assert payload["found"] is True and payload["block"]["block_id"] == 5
+    assert payload["tier_cpu_slot"]["found"] is True
+    assert payload["tier_cpu_slot"]["block"]["block_id"] == 5
+    assert payload["sections"]["answered"] is True
+    assert payload["sections"]["gpu"] is True and payload["sections"]["cpu"] is True
+    assert "reason" not in payload or payload["reason"] is None
+
+
+def test_a_cpu_pool_that_cannot_be_read_says_so_rather_than_out_of_range():
+    """`present: false` (no list to bound against) is NOT "the id is out of range"."""
+    engine, info = live_pools()
+    info["tier"].cpu_block_pool = fake.Pool([])
+    info["tier"].cpu_block_pool.blocks = "not a list"
+    payload = block(engine, block_id=600)
+    slot_view = payload["tier_cpu_slot"]
+    assert slot_view["present"] is False
+    assert slot_view["reason_kind"] == "no_cpu_block_list"
+    assert payload["sections"]["cpu"] is False

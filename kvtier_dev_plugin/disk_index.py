@@ -27,6 +27,28 @@ is an index of it. Every entry point a writer calls - `record_spill`,
 classified refusal, and none of them may raise into, block or fail the write that
 called them. A worker whose journal cannot be written keeps spilling.
 
+WHERE THE JOURNAL LIVES, AND WHY THAT IS A FILESYSTEM QUESTION
+--------------------------------------------------------------
+`journal_directory()` is the ONE read point for the path: the append, the tail-read
+that seeds a second boot's sequence, and `refresh()`'s glob all compose it there.
+It reads `VLLM_E2_TIER_DISK_JOURNAL_DIR` and falls back to `VLLM_E2_TIER_DIAG`
+(the pre-0.2.19 behaviour, so nothing changes for an existing deployment). The
+variable exists because the journal is the only map from a KV identity to a spilled
+file and it cannot be rebuilt: on 2026-10-05 a reboot destroyed the journal in
+`/tmp` while 107 GB of KV files survived on the RAID array, and the index came up at
+`entries: 0`. Only the JOURNAL follows the new variable - the spill tier's ARM FILE
+stays in the diagnostics directory and must keep dying at reboot, because a cold box
+booting with the restore path armed is the precondition of a livelock, not a
+convenience (see `disk_spill._read_arm_file`, which fails closed on its contents for
+the same reason).
+
+`journal_fs_state()` asks `disk_layout.tmpfs_verdict` - the same tmpfs logic the
+store root is refused by - whether that directory survives a reboot. On the DEFAULT
+configuration the journal still lands in `/tmp`, so this can only be a warning:
+logged once per episode (`notice_once`, the `miss_attribution` idiom), counted as
+`journal_tmpfs_warnings`, and published as `journal_on_tmpfs` / `journal_dir=tmpfs`
+on the boot line. It must never raise and must never refuse to spill.
+
 THE INDEX MAY ONLY EVER BE STALE IN THE SAFE DIRECTION
 ------------------------------------------------------
 A false ABSENCE costs a recompute. A false PRESENCE costs a load that fails -
@@ -71,6 +93,7 @@ path.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
@@ -86,6 +109,18 @@ MAX_READ_PER_REFRESH = 512 * 1024   # BYTES read across all journals per refresh
 MAX_JOURNAL_RANK_CHARS = 32         # CHARS of a rank id in a journal file name
 MAX_STRING_CHARS = 160              # CHARS of a path/reason kept in state
 REFRESH_MIN_INTERVAL_SECONDS = 1.0  # SECONDS between journal refreshes
+
+# How many distinct tmpfs notices one process may log. The idiom is
+# `miss_attribution.notice_once`: a dashboard polls the disk verb every few
+# seconds, so a per-poll warning would drown the log it is trying to write.
+MAX_FS_NOTICES = 32
+
+# The boot-line / snapshot token for the journal directory's filesystem. Fixed
+# vocabulary: a grep has to be able to match it.
+FS_TMPFS = "tmpfs"
+FS_DISK = "disk"
+FS_UNSET = "unset"
+FS_UNKNOWN = "unknown"
 
 JOURNAL_PREFIX = "disk-spill-journal-"
 JOURNAL_SUFFIX = ".jsonl"
@@ -129,7 +164,17 @@ _state: dict = {
     "last_journal": None,
     "last_refresh_mono": None,
     "bytes_indexed": 0,
+    # THE JOURNAL'S FILESYSTEM, cached per directory (a mount table does not move
+    # within a boot, and `journal_directory()` is read on the append path).
+    "journal_fs": None,
+    "journal_on_tmpfs": None,
+    "journal_tmpfs_warnings": 0,
+    "journal_fs_directory": None,
 }
+
+# Logged-once-per-episode keys, the `miss_attribution.notice_once` idiom.
+_notices: set = set()
+logger = logging.getLogger("kvtier_dev_plugin.disk_index")
 
 
 def reset_state_for_tests() -> None:
@@ -149,7 +194,10 @@ def reset_state_for_tests() -> None:
         "refreshes": 0, "refresh_skipped": 0,
         "last_reason": None, "last_error": None, "last_journal": None,
         "last_refresh_mono": None, "bytes_indexed": 0,
+        "journal_fs": None, "journal_on_tmpfs": None,
+        "journal_tmpfs_warnings": 0, "journal_fs_directory": None,
     })
+    _notices.clear()
 
 
 def counters() -> dict:
@@ -163,6 +211,112 @@ def counters() -> dict:
 
 def _note(reason) -> None:
     _state["last_reason"] = str(reason)[:MAX_STRING_CHARS]
+
+
+def notice_once(key: str, message: str) -> bool:
+    """Log `message` at most once per key per process. Bounded, never raises.
+
+    Returns True when it actually logged, so a caller can count the episode and
+    not the call. The repo's idiom (`miss_attribution.notice_once`): these views
+    are polled every few seconds by a dashboard, and a warning that repeats becomes
+    noise an operator stops reading - which is how tonight's silence stayed silent.
+    """
+    try:
+        if key in _notices:
+            return False
+        if len(_notices) >= MAX_FS_NOTICES:
+            _notices.clear()
+        _notices.add(key)
+        logger.warning("[KVTIER_DISK] %s", str(message)[:MAX_STRING_CHARS * 4])
+        return True
+    except Exception as exc:  # noqa: BLE001 - a log line is never worth a fault
+        snapshot._error(exc, "disk_index notice")
+        return False
+
+
+def journal_fs_state() -> dict:
+    """The journal directory's FILESYSTEM, and the loud part of a tmpfs answer.
+
+    WHY THIS IS A WARNING AND NOT A REFUSAL: a journal in `/tmp` works perfectly -
+    until the box reboots, when the map dies and the KV files it describes do not.
+    That is the 2026-10-05 failure: 107 GB of spilled KV on the RAID array and an
+    index that came up at `entries: 0`, with not one line in the log saying the map
+    was on a filesystem that dies at reboot. So: say it once, count it, publish it
+    (`journal_on_tmpfs` here, `journal_dir=tmpfs` on the boot line), and NEVER
+    refuse to spill. A degraded-but-loud tier beats a silent one in either
+    direction, and a tier that refuses to write because of where its INDEX lives
+    would be a diagnostic that causes the outage it is measuring.
+
+    The verdict itself is `disk_layout.tmpfs_verdict` - the same tmpfs logic the
+    store root is refused by - cached per directory, because a mount table does not
+    move within a boot and this is read by the snapshot, the verb and the boot
+    line. It cannot raise: an unreadable mount table is `on_tmpfs: None`, which is
+    reported as `journal_dir=unknown` and warned about never.
+    """
+    directory = journal_directory()
+    cached = _state.get("journal_fs")
+    if directory is None:
+        if _state["journal_fs_directory"] != "__unset__":
+            _state["journal_fs"] = None
+            _state["journal_on_tmpfs"] = None
+            _state["journal_fs_directory"] = "__unset__"
+        return {"directory": None, "on_tmpfs": None, "method": "unset",
+                "fstype": None, "mount_point": None, "warned": False,
+                "label": FS_UNSET,
+                "reason": f"{config.ENV_DISK_JOURNAL_DIR} is not set, and neither "
+                          f"is {config.ENV_DIAG_DIR}: there is no directory to "
+                          "write a spill journal into"}
+    if isinstance(cached, dict) and cached.get("directory") == directory:
+        verdict = cached
+    else:
+        verdict = disk_layout.tmpfs_verdict(directory)
+        verdict["directory"] = directory
+        _state["journal_fs"] = verdict
+        _state["journal_on_tmpfs"] = verdict.get("on_tmpfs")
+        _state["journal_fs_directory"] = directory
+    on_tmpfs = verdict.get("on_tmpfs")
+    label = (FS_TMPFS if on_tmpfs is True else
+             FS_UNKNOWN if on_tmpfs is None else FS_DISK)
+    warned = False
+    if on_tmpfs is True:
+        _note(f"the spill journal is on tmpfs ({verdict.get('mount_point')}), "
+              "so the restore index dies at reboot while the KV files it "
+              "describes survive")
+        if notice_once(
+                f"journal-tmpfs:{directory}",
+                f"the spill JOURNAL directory is on a filesystem that dies at "
+                f"reboot: {directory} sits on "
+                f"{verdict.get('fstype') or verdict.get('mount_point')} "
+                f"(method {verdict.get('method')}). The spilled KV files on the "
+                "store root survive a reboot; this journal does not, and it is "
+                "the only map from a KV identity to those files, so the restore "
+                "index will come up at entries: 0 after one. Set "
+                f"{config.ENV_DISK_JOURNAL_DIR} to a path on persistent storage "
+                "to keep the map (the arm file deliberately stays in the "
+                "diagnostics directory and dies at boot, as it must)."):
+            _state["journal_tmpfs_warnings"] += 1
+            warned = True
+    return {"directory": directory, "on_tmpfs": on_tmpfs,
+            "method": verdict.get("method"), "fstype": verdict.get("fstype"),
+            "mount_point": verdict.get("mount_point"),
+            "absolute": verdict.get("absolute"),
+            "warned": warned, "label": label,
+            "warnings": int(_state["journal_tmpfs_warnings"]),
+            "units": {"warnings": "warnings"},
+            "reason": verdict.get("reason")}
+
+
+def journal_fs_label() -> str:
+    """One token for the boot line: `tmpfs` / `disk` / `unset` / `unknown`.
+
+    Never raises: a boot line that cannot print a field prints the field's failure,
+    not no line at all.
+    """
+    try:
+        return str(journal_fs_state().get("label") or FS_UNKNOWN)
+    except Exception as exc:  # noqa: BLE001 - a boot line never fails on a field
+        snapshot._error(exc, "disk_index journal fs label")
+        return FS_UNKNOWN
 
 
 def _fail(reason, **extra) -> dict:
@@ -194,14 +348,25 @@ def identity_of(key16, group_id) -> str:
 # --- the journal: one rank's write/eviction stream ---------------------------
 
 def journal_directory():
-    """Where journals live: the diagnostics directory, or None.
+    """Where journals live: the journal directory, else the diagnostics one, else None.
 
-    The same directory the rank files, the arm file and the dump receipts use,
-    so the operator names ONE place and every cross-process channel of the
-    plugin goes there. Unset means the restore path has no way to learn what
-    the workers spilled, which is reported, not assumed.
+    THE ONE READ POINT FOR THAT PATH. `journal_path()` (the append), `_read_tail_seq`
+    (the sequence seed a second boot needs) and `refresh()` (the glob over every
+    rank's journal) all compose their path here, so the journal filename has exactly
+    one composition site - there is no second place to keep in sync, and a grep for
+    `JOURNAL_PREFIX` finds only name-handling, never a path build.
+
+    `VLLM_E2_TIER_DISK_JOURNAL_DIR` lets the journal be put on a filesystem that
+    survives a reboot while the rest of the diagnostics directory stays where it is.
+    UNSET means the diagnostics directory, exactly as before 0.2.19: the same
+    directory the rank files, the arm file and the dump receipts use, so the
+    operator can still name ONE place and every cross-process channel of the plugin
+    goes there. The arm file deliberately does NOT follow this variable - an arm has
+    to die at reboot, and `disk_spill._read_arm_file` fails closed on its own
+    contents as well. Unset both and the restore path has no way to learn what the
+    workers spilled, which is reported, not assumed.
     """
-    directory = config.diagnostics_dir()
+    directory = config.disk_journal_dir()
     return None if directory is None else str(directory)
 
 
@@ -215,7 +380,8 @@ def journal_path(rank=None) -> dict:
     """
     directory = journal_directory()
     if directory is None:
-        return _fail(f"{config.ENV_DIAG_DIR} is not set: there is no directory "
+        return _fail(f"{config.ENV_DISK_JOURNAL_DIR} is not set, and neither is "
+                     f"{config.ENV_DIAG_DIR}: there is no directory "
                      "for a spill journal to live in", path=None)
     if rank is None:
         from . import worker_diag  # noqa: PLC0415 - the one rank rule, not two
@@ -425,7 +591,8 @@ def refresh(*, force: bool = False) -> dict:
     try:
         directory = journal_directory()
         if directory is None:
-            out["reason"] = (f"{config.ENV_DIAG_DIR} is not set: no spill journal "
+            out["reason"] = (f"{config.ENV_DISK_JOURNAL_DIR} is not set, and "
+                             f"neither is {config.ENV_DIAG_DIR}: no spill journal "
                              "can be read, so the disk index stays empty")
             _note(out["reason"])
             return out
@@ -484,7 +651,7 @@ def _journal_names(directory) -> list:
                  and name.endswith(JOURNAL_SUFFIX)]
     except OSError as exc:
         _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
-        _note(f"the diagnostics directory could not be listed: "
+        _note(f"the journal directory could not be listed: "
               f"{type(exc).__name__}")
         return []
     names.sort()
@@ -800,6 +967,12 @@ def section() -> dict:
         "lookup_misses": int(_state["misses"]),
         "dropped": dict(_state["dropped"]),
         "journal_directory": journal_directory(),
+        # WHERE THAT DIRECTORY LIVES, filesystem-wise. `journal_on_tmpfs: true` is
+        # the 2026-10-05 failure made visible: the map survives nothing and the KV
+        # files survive everything. A warning, never a refusal.
+        "journal_fs": journal_fs_state(),
+        "journal_on_tmpfs": _state["journal_on_tmpfs"],
+        "journal_tmpfs_warnings": int(_state["journal_tmpfs_warnings"]),
         "last_reason": _state["last_reason"],
         "last_error": _state["last_error"],
         "units": {"entries": "identities", "entry_cap": "identities",
@@ -808,6 +981,7 @@ def section() -> dict:
                   "journal_lines": "lines", "journal_write_errors": "writes",
                   "journal_seq_seed": "lines", "journal_fields": "fields",
                   "journal_cap_bytes": "bytes",
+                  "journal_tmpfs_warnings": "warnings",
                   "refreshes": "refreshes", "applied_lines": "lines",
                   "spills_seen": "files", "removals_seen": "files",
                   "lookup_hits": "lookups", "lookup_misses": "lookups",

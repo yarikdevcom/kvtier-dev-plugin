@@ -2076,6 +2076,24 @@ def _disk_tier_field() -> str:
         return "UNKNOWN"
 
 
+def _journal_dir_field() -> str:
+    """`disk` / `tmpfs` / `unknown` / `unset`: the SPILL JOURNAL's filesystem.
+
+    A separate field from `disk_tier=` because it is a different fact about a
+    different thing: the arm says whether this boot writes KV to disk, this says
+    whether the INDEX that lets it be read back will still exist after a reboot.
+    Read through `disk_index.journal_fs_label()`, which cannot raise; the
+    try/except here only covers the import and is reported rather than swallowing
+    the field.
+    """
+    try:
+        from . import disk_index  # noqa: PLC0415 - sibling layer, lazy by idiom
+        return disk_index.journal_fs_label()
+    except Exception as exc:  # noqa: BLE001 - a boot line never fails because of a field
+        snapshot._error(exc, "boot line journal_dir")
+        return "unknown"
+
+
 def boot_line(boot: dict) -> str:
     """THE boot line: one line, fixed field order, bounded.
 
@@ -2113,6 +2131,14 @@ def boot_line(boot: dict) -> str:
     parts.append("disk_tier={}".format(_disk_tier_field()))
     parts.append("tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
     parts.append("faults={}".format(int(boot.get("faults_at_boot") or 0)))
+    # WHERE THE SPILL JOURNAL LIVES, in one token: `disk`, `tmpfs`, `unknown` or
+    # `unset`. A journal is the only map from a KV identity to a spilled file, and
+    # on the default configuration it still lands in `/tmp` - so a reboot eats the
+    # map while the 107 GB of KV files it describes survive, silently, which is
+    # exactly what happened on 2026-10-05. The warning is logged once (`disk_index
+    # .journal_fs_state`); this is the field that stays greppable afterwards. It is
+    # INFORMATIONAL: a tmpfs journal degrades the tier, it does not stop it.
+    parts.append("journal_dir={}".format(_journal_dir_field()))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))

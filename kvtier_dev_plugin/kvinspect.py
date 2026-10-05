@@ -175,7 +175,27 @@ def _pool_summary(pool) -> dict:
 
 
 def inspect_block(engine, group, block_id, ids_cap) -> dict:  # noqa: ARG001
-    """One GPU block by id, plus the CPU-pool slot of the same id if a tier runs."""
+    """One block by id, from BOTH pools that id could mean.
+
+    TWO POOLS, ONE NAME, AND THE BOUND BELONGS TO EACH OF THEM. A GPU block id and a
+    host-RAM (CPU-pool) slot id live in different `BlockPool`s and mean nothing to
+    each other - and on the live box they are not even the same SIZE (measured
+    2026-10-05: GPU pool 317, CPU pool 1331). This verb used to validate the id
+    against the GPU POOL and return early, which made two thirds of the host-RAM
+    arena unnameable through the documented route - and it failed SILENTLY: a 200
+    with no `tier_cpu_slot` block, not an error. `spill-one` needs a CPU slot plus a
+    key and `/block` is how an operator finds one, so that gap was operational.
+
+    Each section is now bounded by the pool it describes:
+      * `found` / `block` - the GPU pool's answer, bounded by ITS block list.
+      * `tier_cpu_slot` - the CPU pool's answer, bounded by ITS block list, emitted
+        whether or not the GPU half resolved.
+      * `sections` - which of the two answered, so a caller never has to guess what
+        a `found: false` that also carries a `tier_cpu_slot.block` was meant to say.
+    An id out of range for a section names THAT pool and its size (and a
+    `reason_kind`), instead of reporting "no cpu slot" - which is a different fact
+    (there is no tier at all).
+    """
     scheduler = getattr(engine, "scheduler", None)
     manager = getattr(scheduler, "kv_cache_manager", None)
     pool = getattr(manager, "block_pool", None)
@@ -187,18 +207,37 @@ def inspect_block(engine, group, block_id, ids_cap) -> dict:  # noqa: ARG001
         out["found"] = False
         out["reason"] = ("no kv_cache_manager.block_pool.blocks list on this "
                          "engine, or no block_id given")
+        out["reason_kind"] = "no_gpu_block_list"
+        out["sections"] = {"gpu": False, "cpu": False, "answered": False}
         return out
-    if block_id < 0 or block_id >= len(blocks):
-        out["found"] = False
-        out["reason"] = (f"block_id {block_id} is not nameable: the pool holds "
-                         f"{len(blocks)} block objects (ids 0..{len(blocks) - 1})")
-        return out
-    out["found"] = True
-    out["block"] = _block_state(pool, blocks[block_id], group)
+    gpu_count = len(blocks)
+    gpu_found = 0 <= block_id < gpu_count
+    out["found"] = gpu_found
+    if gpu_found:
+        out["block"] = _block_state(pool, blocks[block_id], group)
+    else:
+        out["reason"] = (f"block_id {block_id} is not nameable in the GPU pool: "
+                         f"it holds {gpu_count} block objects (ids "
+                         f"0..{max(gpu_count - 1, 0)})")
+        out["reason_kind"] = "gpu_block_id_out_of_range"
     out["group_geometry"] = _group_geometry(scheduler, group)
     tier_block = _tier_cpu_block(scheduler, block_id)
     if tier_block is not None:
         out["tier_cpu_slot"] = tier_block
+    cpu_found = bool(isinstance(tier_block, dict)
+                     and tier_block.get("found") is True)
+    out["sections"] = {"gpu": bool(gpu_found), "cpu": cpu_found,
+                       "answered": bool(gpu_found or cpu_found),
+                       "gpu_pool_blocks": gpu_count,
+                       "cpu_pool_blocks": (tier_block or {}).get(
+                           "cpu_pool_blocks")}
+    if not gpu_found and not cpu_found and isinstance(tier_block, dict) and (
+            tier_block.get("reason")):
+        # Out of range for BOTH pools: name the CPU bound too. "I asked for slot
+        # 1400 and got 'not nameable'" must not leave an operator reading the wrong
+        # pool's size off the answer.
+        out["reason"] = (f"{out['reason']}; and in the other pool, "
+                         f"{tier_block['reason']}")
     return out
 
 
@@ -245,8 +284,17 @@ def _tier_cpu_block(scheduler, block_id) -> dict | None:
     """The tier's CPU-pool slot with the same id, when a tier exists at all.
 
     A CPU block id and a GPU block id live in DIFFERENT pools and mean nothing to
-    each other; the pairing is reported anyway because "did the slot the tier
-    picked still hold a hash?" is a real question and the answer is cheap.
+    each other - and the CPU pool is usually the LARGER one, because host RAM holds
+    more slots than the GPU holds blocks. The pairing is reported because "did the
+    slot the tier picked still hold a hash?" is a real question and the answer is
+    cheap; the BOUND is the CPU pool's own, never the GPU pool's, so a slot above the
+    GPU pool's size resolves here instead of coming back "no cpu slot".
+
+    Three answers, never collapsed into one: no connector/manager at all (`None`, so
+    the key is absent: there is no tier), a tier whose pool cannot be read
+    (`present: false`), and an id outside this pool (`present: true, found: false`
+    with a reason naming THIS pool, its size and a `reason_kind`, plus the pool
+    summary so the bound is visible in the answer).
     """
     connector = getattr(scheduler, "connector", None)
     manager = getattr(connector, "scheduler_manager", None)
@@ -255,13 +303,18 @@ def _tier_cpu_block(scheduler, block_id) -> dict | None:
     pool = getattr(manager, "cpu_block_pool", None)
     blocks = getattr(pool, "blocks", None)
     if not isinstance(blocks, list):
-        return {"present": False, "reason": "no cpu_block_pool.blocks"}
-    if block_id is None or block_id < 0 or block_id >= len(blocks):
+        return {"present": False, "found": False,
+                "reason": "no cpu_block_pool.blocks",
+                "reason_kind": "no_cpu_block_list"}
+    count = len(blocks)
+    if block_id is None or block_id < 0 or block_id >= count:
         return {"present": True, "found": False,
                 "reason": f"id {block_id} is not nameable in the CPU pool "
-                          f"({len(blocks)} objects)"}
+                          f"({count} objects, ids 0..{max(count - 1, 0)})",
+                "reason_kind": "cpu_block_id_out_of_range",
+                "pool": _pool_summary(pool), "cpu_pool_blocks": count}
     return {"present": True, "found": True,
-            "pool": _pool_summary(pool),
+            "pool": _pool_summary(pool), "cpu_pool_blocks": count,
             "block": _block_state(pool, blocks[block_id], None)}
 
 
@@ -452,7 +505,13 @@ def usage_note() -> dict:
         "ids_cap_max": MAX_IDS_LIMIT,
         "note": ("the first call that names a block_id inspects a block; naming a "
                  "request_id inspects a request; naming both inspects the block "
-                 "and says so"),
+                 "and says so. A block_id is validated against EACH pool the id "
+                 "could mean: `found`/`block` is the GPU pool's answer bounded by "
+                 "its size, `tier_cpu_slot` is the host-RAM pool's answer bounded by "
+                 "ITS (usually larger) size, and `sections` says which answered. So "
+                 "a CPU slot above the GPU pool's block count is nameable here, "
+                 "which is how an operator finds a slot to hand to "
+                 "`disk {\"op\":\"spill-one\"}`."),
     }
 
 

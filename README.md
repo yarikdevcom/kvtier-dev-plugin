@@ -84,6 +84,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DEV_ALLOW` | extra peers beyond loopback: a comma-separated list of addresses or CIDRs. **Unset/empty = loopback only** (the pre-allowlist behaviour). A malformed entry is logged and skipped - never fatal, never an opening. See *Access model*. |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | seconds the HTTP layer waits for the engine before answering 504. Default `5.0`, clamped to `[0.05, 60]`. |
 | `VLLM_E2_TIER_DIAG` | the worker diagnostics directory (capability 5). **Unset = the worker writer is completely inert: no directory created, no file written, nothing wrapped in the worker.** Set it to a path both the worker ranks and the proxy host's reader can see. |
+| `VLLM_E2_TIER_DISK_JOURNAL_DIR` | where the SSD tier's spill **journal** lives, apart from the rest of the diagnostics directory. **Unset = fall back to `VLLM_E2_TIER_DIAG`** (the pre-0.2.19 behaviour). Set it to storage that survives a reboot: the journal is the only map from a KV identity to a spilled file and cannot be rebuilt, while the KV files it describes outlive it. **Only the journal follows this var** - the spill arm file stays in `VLLM_E2_TIER_DIAG` and dies at boot, because an arm must not survive a reboot. A journal on tmpfs is warned about once and reported (`journal_dir=tmpfs` on the boot line), never refused. |
 | `VLLM_E2_TIER_DIAG_INTERVAL` | how often a rank rewrites its file, in engine steps. Default `50`, clamped to `[1, 100000]`. A step that *changed* something writes immediately (subject to the floor below). |
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
@@ -355,6 +356,19 @@ curl -s "$B/block?block_id=412&group=5"      # ref_cnt, in_free_queue, prev/next
                                              # lookup the tier uses (manager.py:940),
                                              # the group's geometry, and the tier's
                                              # CPU slot of the same id
+                                             #
+                                             # THE ID IS BOUNDED PER POOL: `found`/
+                                             # `block` is the GPU pool's answer and
+                                             # `tier_cpu_slot` is the host-RAM pool's,
+                                             # each validated against ITS OWN block
+                                             # list (measured live: GPU 317 blocks,
+                                             # CPU pool 1331 slots - so a slot above
+                                             # the GPU count is nameable, and this is
+                                             # how you find a slot to hand to
+                                             # `spill-one`). `sections` says which
+                                             # half answered; an id out of range for
+                                             # a section names that pool and its size
+                                             # in `reason` / `reason_kind`.
 curl -s "$B/request?request_id=cmpl-a"       # the request's counters, then per group:
                                              # block_ids (capped), divisibility,
                                              # hash_scale_factor, coverable_blocks
@@ -965,10 +979,46 @@ H="Authorization: Bearer $VLLM_E2_TIER_DEV_TOKEN"; B=http://127.0.0.1:8000/plugi
 ssh llm "curl -s -H '$H' $B/disk" | python3 -m json.tool
 # arm for ten minutes, then prove the path writes real bytes for one slot
 curl -s -H "$H" -X POST -d '{"op":"arm","seconds":600}' $B/disk
-curl -s -H "$H" -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f607"}' $B/disk
+# `key` is the engine's GROUP-QUALIFIED block hash: the 16-hex `key16` plus the
+# group id as 8 hex chars (`key16 + f"{group:08x}"`, so 24 hex). A bare 16-hex key is
+# refused - it cannot say which group's bytes these are. Find both halves with
+# `GET /plugins/kvtier/block?block_id=<cpu slot>`: `tier_cpu_slot.block` carries
+# `hash_hex` and `hash_group_id`, and any CPU slot is nameable up to the CPU pool's
+# size (which is larger than the GPU pool's - the id is bounded per pool).
+curl -s -H "$H" -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f60700000003"}' $B/disk
 curl -s -H "$H" -X POST -d '{"op":"ls","limit":20}' $B/disk
 ssh llm "curl -s -H '$H' -X POST -d '{"op":"disarm"}' $B/disk"
 ```
+
+**No fsync, on purpose.** The spill writes are buffered: `write_committed_file`
+keeps the `.part` + `O_CREAT|O_EXCL` + `os.replace` commit ordering (so *a committed
+name means a complete file* against a torn write) but fsyncs nothing, so the page
+cache owns device ordering and the writer thread never stalls on a platter. These KV
+bytes are a cache, not a system of record, and the safety net is on the read side: a
+journal entry whose bytes never reached the device is classified `file_missing` (or
+`size_mismatch` / `short_read`) by `disk_read`, reported to the engine, and pruned out
+of the DMA before a stale byte is copied. **False presence costs a recompute, never
+wrong bytes.** `directory_synced: false` in a spill answer is therefore the normal
+state, not a fault. (`sync=` stays as a capability for any caller that genuinely
+wants a durable file; the spill tier does not use it.)
+
+**The journal's own filesystem: `VLLM_E2_TIER_DISK_JOURNAL_DIR`.** The spill journal
+(`disk-spill-journal-<rank>.jsonl`) is the only map from a KV identity to a file on
+the store, and it cannot be rebuilt. Unset, it lives in `VLLM_E2_TIER_DIAG` as before;
+set it to a path on storage that **survives a reboot** (e.g.
+`/home/user/kv-tier/diag`) if you want the restore index to come back with its
+entries. On 2026-10-05 a reboot destroyed a journal that lived in `/tmp` while 107 GB
+of KV files survived on the RAID array, and the index came up at `entries: 0`. The
+boot line prints `journal_dir=tmpfs|disk|unset|unknown`, `GET /plugins/kvtier/disk`
+answers `journal.fs`, and a tmpfs journal logs one warning per boot
+(`journal_tmpfs_warnings` counts them). It is a warning, never a refusal: a
+degraded-but-loud tier beats a silent one. **Only the journal moves** - the spill
+arm file stays in the diagnostics directory, because an arm must die at a reboot (a
+cold box booting with the tier armed exposes the restore path to live traffic with
+nobody having asked). The arm now fails closed on its own contents as well: it
+records the kernel boot id and its epoch with an `epoch_scope`, and a reader refuses a
+file naming a different boot, with a reason that says `epoch mismatch` or `boot id
+mismatch` (`arm_file_boot_refusals` in `arm_state`).
 
 `spill-one` is **relayed**: the EngineCore has no KV memory, so the ask becomes one
 small file under `VLLM_E2_TIER_DIAG` that every rank answers for its own slot on its

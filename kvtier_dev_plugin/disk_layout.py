@@ -91,9 +91,12 @@ mis-read. ``<geodigest12>`` carries the rank/stride/dtype half of that and
 
 A COMMIT IS A RENAME
 --------------------
-``write_committed_file`` writes ``<name>.part``, fsyncs it, ``os.replace``s it
-into place and fsyncs the directory. A file at the final name is ALWAYS complete:
-no torn tails, no index, no watermarks, no replay. A duplicate is benign -
+``write_committed_file`` writes ``<name>.part``, ``os.replace``s it into place,
+and does NOT fsync anything on the production path (``sync=`` is the opt-in and
+the spill tier deliberately does not take it - see the durability posture in
+``write_committed_file``'s own docstring).
+A file at the final name is ALWAYS complete AS SEEN BY THIS BOOT: no torn tails,
+no index, no watermarks, no replay. A duplicate is benign -
 identical content under an identical name - and is reported as one, not as an
 error. Every step is bounded, and a failed attempt leaves the final name absent,
 which is the whole point.
@@ -196,6 +199,15 @@ MAX_EVICTION_PLAN = 4096
 # the REFUSAL list, which is why S108 ("insecure temporary usage") reads them.
 FORBIDDEN_ROOT_PREFIXES = ("/tmp", "/dev/shm", "/run", "/var/run")  # noqa: S108
 
+# The journal's tmpfs check reads the kernel's own mount table rather than guessing
+# from a name, because the journal is not refused for living on tmpfs (a spill tier
+# whose journal is in /tmp still works - it just forgets its map at reboot) and a
+# warning that cried wolf on a bind-mounted `/tmp` would be ignored the way every
+# other noisy warning is. Bounded read, never a walk, never a raise.
+PROC_MOUNTS_PATH = "/proc/mounts"
+TMPFS_FSTYPES = ("tmpfs", "ramfs")
+MAX_MOUNTS_BYTES = 64 * 1024
+
 # Classifications of a name, and of a file in a sweep. Closed vocabularies: a
 # reader must be able to enumerate them from the payload.
 NAME_CURRENT = "current"
@@ -240,6 +252,7 @@ UNITS_BY_NAME = {
     "accepted": "requests",
     "arm_default_seconds": "seconds",
     "arm_seconds": "seconds",
+    "arm_file_boot_refusals": "refusals",
     "bad_call": "refusals",
     "bad_digest": "refusals",
     "bad_key": "refusals",
@@ -283,6 +296,13 @@ UNITS_BY_NAME = {
     "free_bytes": "bytes",
     "free_percent_of_total": "percent",
     "freed_bytes": "bytes",
+    # The tmpfs verdict for a directory (`tmpfs_verdict`): a bool/str triple, not
+    # numbers, but declared so no payload can carry an `"unknown"` unit.
+    "fstype": "filesystem type",
+    "mount_point": "paths",
+    "on_tmpfs": "verdict",
+    "journal_on_tmpfs": "verdict",
+    "journal_tmpfs_warnings": "warnings",
     "geometry_chars": "chars",
     "group_collisions": "events",
     "group_id": "groups",
@@ -901,6 +921,103 @@ def validate_root(path) -> dict:
     return {"ok": True, "reason": None, "value": text, "absolute": absolute}
 
 
+def _mount_table() -> list:
+    """`[(mount_point, fstype)]` from the kernel's own table. Bounded; [] on any
+    failure. A missing /proc is not an error, it is an absence of knowledge."""
+    try:
+        fd = os.open(PROC_MOUNTS_PATH, os.O_RDONLY)
+    except OSError:
+        return []
+    try:
+        raw = b""
+        while len(raw) < MAX_MOUNTS_BYTES:
+            chunk = os.read(fd, MAX_MOUNTS_BYTES - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return []
+    finally:
+        try:  # noqa: SIM105 - one descriptor, no contextlib import for it
+            os.close(fd)
+        except OSError:
+            pass
+    rows = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        fields = line.split(" ")
+        if len(fields) < 3:
+            continue
+        # /proc/mounts escapes a space in a mount point as octal `\040`.
+        rows.append((fields[1].replace("\\040", " "), fields[2]))
+    return rows
+
+
+def tmpfs_verdict(path) -> dict:
+    """Is ``path`` on a filesystem that dies at reboot? NEVER raises, never refuses.
+
+    THE SAME QUESTION ``validate_root`` ASKS THE STORE ROOT, for a path that is not
+    refused for the answer. The store root is refused by NAME (``/tmp``,
+    ``/dev/shm``, ``/run``, ``/var/run``) because a "disk" tier there spends the RAM
+    the tier exists to relieve. The spill JOURNAL is a different case: a journal in
+    ``/tmp`` works perfectly and simply forgets its map at reboot, so the answer
+    drives a WARNING and a reported field, never a refusal - which is why it is
+    worth reading the kernel's mount table instead of trusting a name (a bind
+    mounted ``/tmp`` on a real filesystem must not be warned about, or the warning
+    gets ignored the way every noisy one is).
+
+    ``on_tmpfs`` is ``True`` / ``False``, or ``None`` when nothing could be learned
+    (no readable mount table AND no name match): never a confident guess and never a
+    0-for-absence. ``method`` says how the answer was reached - ``mounts`` (the
+    longest mount-point prefix under ``path``, and its filesystem type), ``name``
+    (one of the forbidden runtime prefixes, believed because the table was
+    unreadable), or ``unknown``. A path that does not exist is answered by its
+    Mount table alone, which is correct: the question is about the FILESYSTEM, not
+    about the directory.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        return _fail(f"a directory must be a path, got {type(path).__name__}",
+                     on_tmpfs=None, method="unknown", fstype=None,
+                     mount_point=None)
+    try:
+        text = os.fspath(path)
+    except TypeError as exc:
+        return _fail(f"the directory is not a filesystem path: "
+                     f"{type(exc).__name__}", on_tmpfs=None, method="unknown",
+                     fstype=None, mount_point=None)
+    if not isinstance(text, str) or not text or "\x00" in text:
+        return _fail("the directory must be a non-empty str without a NUL byte",
+                     on_tmpfs=None, method="unknown", fstype=None,
+                     mount_point=None)
+    absolute = os.path.normpath(os.path.abspath(text))
+    name_match = None
+    for forbidden in FORBIDDEN_ROOT_PREFIXES:
+        if absolute == forbidden or absolute.startswith(forbidden + os.sep):
+            name_match = forbidden
+            break
+    # Longest matching mount point wins: `/home/user/kv` under a `/home` mount and a
+    # `/home/user` mount of a different type is answered by the more specific one.
+    best_point, best_type = None, None
+    for point, fstype in _mount_table():
+        if point == absolute or absolute.startswith(point.rstrip(os.sep) + os.sep):
+            if best_point is None or len(point) > len(best_point):
+                best_point, best_type = point, fstype
+        elif absolute == "/" and point == "/":
+            best_point, best_type = point, fstype
+    if best_type is not None:
+        return _ok(on_tmpfs=best_type in TMPFS_FSTYPES, method="mounts",
+                   fstype=best_type, mount_point=best_point,
+                   absolute=absolute, name_match=name_match,
+                   units=_units("on_tmpfs", "fstype", "mount_point"))
+    if name_match is not None:
+        return _ok(on_tmpfs=True, method="name", fstype=None,
+                   mount_point=name_match, absolute=absolute,
+                   name_match=name_match,
+                   units=_units("on_tmpfs", "fstype", "mount_point"))
+    return _ok(on_tmpfs=None, method="unknown", fstype=None, mount_point=None,
+               absolute=absolute, name_match=None,
+               units=_units("on_tmpfs", "fstype", "mount_point"))
+
+
 def validate_geometry_digest(digest) -> dict:
     """Is this a 12-hex-char geometry digest? Validates and lower-cases; derives
     nothing, ever.
@@ -1513,20 +1630,42 @@ def write_committed_file(path, blob, *, sync: bool = True) -> dict:
 
     The order is the whole design:
       1. make the containing directory (never through a symlink of ours);
-      2. write ``<path>.part`` with ``O_CREAT|O_EXCL`` and then ``fsync`` it;
+      2. write ``<path>.part`` with ``O_CREAT|O_EXCL`` (buffered: with
+         ``sync=False`` the page cache owns device ordering and nothing is
+         fsynced);
       3. ``os.replace`` the part onto the final name (atomic within a filesystem);
-      4. ``fsync`` the DIRECTORY, so the rename itself survives a crash.
+      4. with ``sync=True`` only, ``fsync`` the DIRECTORY, so the rename itself
+         survives a crash.
 
-    A file at the final name is therefore always a complete slot. Every failure
-    path removes the part and returns a classified refusal with no path, and
-    ``final_exists`` says whether the final name is still absent afterwards - the
-    property a test must be able to assert. ``FileExistsError`` is benign in both
-    places it can appear (a stale part from a dead attempt, and a duplicate whose
-    final name is already there): a duplicate is the SAME bytes under the SAME
-    name, which is a successful no-op, not an error.
+    A file at the final name is therefore always a complete slot AGAINST A TORN
+    WRITE - the property ``O_CREAT|O_EXCL`` plus the atomic rename give, and which
+    no durability primitive is needed for. That property stays whether or not
+    ``sync`` is set, and MUST NOT be removed together with the fsyncs.
 
-    ``sync=False`` is for tests that want the ordering without paying an fsync; the
-    production caller always syncs.
+    WHY THE SPILL TIER DOES NOT FSYNC (the posture the production caller uses).
+    These bytes are a CACHE, not a system of record: the cost of losing a span is
+    one recompute, and a fsync of an 11.4 MB file buys nothing against that. The
+    safety property that makes dropping durability FREE is that a journal entry
+    whose file never reached the device is caught at READ time and reported to the
+    engine, which truncates the span and recomputes it: ``disk_read._read_file``
+    classifies it ``file_missing`` (no file at the name the index claims) or
+    ``size_mismatch``/``short_read`` (a file that came up short), and
+    ``disk_restore.worker_before_load``/``abandon_disk_entries`` prune every failed
+    entry out of the DMA before a stale byte is copied. FALSE PRESENCE COSTS A
+    RECOMPUTE, NEVER WRONG BYTES. A crash can therefore only ever make this tier
+    slow for one request, never wrong.
+
+    Every failure path removes the part and returns a classified refusal with no
+    path, and ``final_exists`` says whether the final name is still absent
+    afterwards - the property a test must be able to assert. ``FileExistsError``
+    is benign in both places it can appear (a stale part from a dead attempt, and
+    a duplicate whose final name is already there): a duplicate is the SAME bytes
+    under the SAME name, which is a successful no-op, not an error.
+
+    ``sync=False`` is the PRODUCTION setting for the spill path (buffered writes,
+    no fsync, ``directory_synced: False`` reported honestly); the flag is kept
+    because a test - or any caller that genuinely wants a durable file - can still
+    ask for one.
     """
     if not isinstance(path, (str, os.PathLike)):
         return _fail(f"path must be a path, got {type(path).__name__}",
@@ -1652,6 +1791,12 @@ def write_committed_file(path, blob, *, sync: bool = True) -> dict:
             os.close(dir_fd)
     return _ok(units=_units("write_bytes", "elapsed_seconds"), duplicate=False,
                write_bytes=len(data), path=text, final_exists=True,
+               # `directory_synced: False` is the NORMAL state of the spill path,
+               # not an anomaly: the production caller passes `sync=False` on
+               # purpose (buffered writes, the page cache owns device ordering),
+               # and a lost file or short file is caught at read time as
+               # `file_missing`/`size_mismatch` and recomputed. Read it as "this
+               # tier does not pay for durability", never as a failure.
                directory_synced=bool(sync), reason=None,
                elapsed_seconds=round(time.monotonic() - started, 6))
 

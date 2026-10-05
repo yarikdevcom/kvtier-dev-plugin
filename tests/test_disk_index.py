@@ -495,3 +495,187 @@ def test_the_section_publishes_the_index_shape_and_its_units(journal_dir):
         section["note"]
     assert "identities" in section["units"]["entries"]
     assert section["journal_directory"] == str(journal_dir)
+
+
+# --- where the journal lives, and what filesystem that is -------------------
+# The journal is the ONLY map from a KV identity to a spilled file, and it cannot
+# be rebuilt. So its filesystem is a first-class fact: `VLLM_E2_TIER_DISK_JOURNAL_DIR`
+# puts it on storage that survives a reboot, and `journal_fs_state()` says out loud
+# when it is still sitting in `/tmp`.
+
+REAL_FORBIDDEN_ROOTS = disk_layout.FORBIDDEN_ROOT_PREFIXES
+
+MOUNTS_TMPFS = ("/dev/nvme0n1p1 / ext4 rw 0 0\n"
+                "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n")
+MOUNTS_DISK = ("/dev/nvme0n1p1 / ext4 rw 0 0\n"
+               "/dev/md0 /home/user/kv-tier ext4 rw 0 0\n")
+
+
+def fake_mounts(tmp_path, monkeypatch, text=None):
+    """A stand-in `/proc/mounts`, so the tmpfs answer is deterministic here."""
+    path = tmp_path / "mounts"
+    if text is None:
+        path.unlink(missing_ok=True)
+        monkeypatch.setattr(disk_layout, "PROC_MOUNTS_PATH", str(path))
+        return path
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(disk_layout, "PROC_MOUNTS_PATH", str(path))
+    return path
+
+
+def test_the_journal_directory_has_its_own_variable_and_a_diagnostics_fallback(
+        journal_dir, tmp_path, monkeypatch):
+    """Unset = exactly the pre-0.2.19 behaviour; set = the journal moves, alone."""
+    monkeypatch.delenv(config.ENV_DISK_JOURNAL_DIR, raising=False)
+    assert disk_index.journal_directory() == str(journal_dir)
+    for inert in ("", "   "):
+        monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, inert)
+        assert disk_index.journal_directory() == str(journal_dir)
+    elsewhere = tmp_path / "persistent"
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(elsewhere))
+    assert disk_index.journal_directory() == str(elsewhere)
+    # And the diagnostics directory itself did NOT move: the rank files, the arm
+    # file and the dump receipts still use it. Only the journal follows the new
+    # variable, because only the journal is rebuild-proof-by-necessity.
+    assert config.diagnostics_dir() == journal_dir
+    assert disk_index.journal_path()["path"].startswith(str(elsewhere))
+
+
+def test_every_journal_path_is_composed_at_the_one_read_point(journal_dir, tmp_path,
+                                                               monkeypatch):
+    """Append, tail-seed and the refresh glob all resolve through one function.
+
+    A second composition site is how a journal ends up written where the reader
+    will never look - which is indistinguishable from "nothing was spilled".
+    """
+    elsewhere = tmp_path / "persistent"
+    diag = journal_dir
+    monkeypatch.setenv(config.ENV_DIAG_DIR, str(diag))
+    monkeypatch.setenv(config.ENV_DIAG_RANK, RANK)
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(elsewhere))
+    # THE GREP, made executable: the journal file NAME is composed in exactly one
+    # place, and `config.disk_journal_dir()` has exactly one caller in the whole
+    # plugin. A second site is how a journal ends up written where no reader looks.
+    plugin_dir = os.path.dirname(os.path.abspath(disk_index.__file__))
+    with open(disk_index.__file__, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert source.count('{JOURNAL_PREFIX}{text}{JOURNAL_SUFFIX}') == 1
+    callers = []
+    for name in sorted(os.listdir(plugin_dir)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(plugin_dir, name), "r",
+                  encoding="utf-8") as handle:
+            text = handle.read()
+        if "disk_journal_dir" in text:
+            callers.append(name)
+    assert callers == ["config.py", "disk_index.py"], callers
+
+    store = tmp_path / "store"
+    made = write_slot(store)
+    assert disk_index.record_spill(made["path"], 11_468_800)["ok"] is True
+    path = disk_index.journal_path()["path"]
+    assert os.path.dirname(path) == str(elsewhere)
+    assert os.listdir(elsewhere) == [os.path.basename(path)]
+    assert list(diag.iterdir()) == [], "the diagnostics dir stays untouched"
+    # The refresh globs THE JOURNAL DIRECTORY, so it finds what the append wrote.
+    refreshed = disk_index.refresh(force=True)
+    assert refreshed["applied"] is True, refreshed
+    assert disk_index.lookup(KEY)["present"] is True
+    # The tail-seed reads the SAME file: a second boot continues the sequence.
+    disk_index.reset_state_for_tests()
+    assert disk_index.journal_append("+", "b" + KEY16[1:], 10, GROUP)["seq"] > 1
+
+
+def test_a_journal_on_tmpfs_is_warned_about_once_and_counted(tmp_path, monkeypatch,
+                                                             caplog):
+    """The 2026-10-05 failure made visible: a map on a filesystem that dies at boot.
+
+    Loud, once, and counted - a dashboard polls these views every few seconds, so a
+    per-poll warning would drown the log it is trying to write.
+    """
+    fake_mounts(tmp_path, monkeypatch, MOUNTS_TMPFS)
+    journal = tmp_path / "journal-on-tmpfs"
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(journal))
+    first = disk_index.journal_fs_state()
+    assert first["on_tmpfs"] is True, first
+    assert first["label"] == "tmpfs"
+    assert first["fstype"] == "tmpfs" and first["mount_point"] == "/tmp"
+    assert first["method"] == "mounts"
+    assert first["warned"] is True
+    warnings = [rec.getMessage() for rec in caplog.records
+                if "spill JOURNAL directory" in rec.getMessage()]
+    assert len(warnings) == 1, warnings
+    for _ in range(5):
+        again = disk_index.journal_fs_state()
+        assert again["warned"] is False, "once per episode, not once per poll"
+    assert disk_index.counters()["journal_tmpfs_warnings"] == 1
+    assert len([rec for rec in caplog.records
+                if "spill JOURNAL directory" in rec.getMessage()]) == 1
+    # And it reaches the surfaces an operator actually reads.
+    section = disk_index.section()
+    assert section["journal_on_tmpfs"] is True
+    assert section["journal_fs"]["label"] == "tmpfs"
+    assert section["journal_directory"] == str(journal)
+    assert disk_index.journal_fs_label() == "tmpfs"
+
+
+def test_a_journal_on_a_real_filesystem_says_disk_and_stays_quiet(tmp_path,
+                                                                  monkeypatch,
+                                                                  caplog):
+    fake_mounts(tmp_path, monkeypatch, MOUNTS_DISK)
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, "/home/user/kv-tier/diag")
+    verdict = disk_index.journal_fs_state()
+    assert verdict["on_tmpfs"] is False and verdict["label"] == "disk"
+    assert verdict["fstype"] == "ext4"
+    assert verdict["warned"] is False
+    assert disk_index.counters()["journal_tmpfs_warnings"] == 0
+    assert not [rec for rec in caplog.records if "JOURNAL" in rec.getMessage()]
+
+
+def test_a_more_specific_mount_beats_the_forbidden_name(tmp_path, monkeypatch):
+    """A bind-mounted `/tmp` on platter must NOT be warned about.
+
+    A warning that cries wolf is a warning that gets ignored, and this one has to
+    be believed: it is the only thing standing between a reboot and an empty index.
+    """
+    monkeypatch.setattr(disk_layout, "FORBIDDEN_ROOT_PREFIXES",
+                        REAL_FORBIDDEN_ROOTS)
+    fake_mounts(tmp_path, monkeypatch,
+                "tmpfs /tmp tmpfs rw 0 0\n/dev/md0 /tmp/kv-tier ext4 rw 0 0\n")
+    verdict = disk_layout.tmpfs_verdict("/tmp/kv-tier/diag")
+    assert verdict["ok"] is True
+    assert verdict["on_tmpfs"] is False and verdict["method"] == "mounts"
+    assert verdict["mount_point"] == "/tmp/kv-tier"
+
+
+def test_the_store_root_name_rule_still_answers_without_a_mount_table(tmp_path,
+                                                                      monkeypatch):
+    """No `/proc/mounts` (a container, a weird host): fall back to the NAME list."""
+    monkeypatch.setattr(disk_layout, "FORBIDDEN_ROOT_PREFIXES",
+                        REAL_FORBIDDEN_ROOTS)
+    fake_mounts(tmp_path, monkeypatch)              # the file does not exist
+    for path in ("/tmp/kv-tier", "/dev/shm/diag", "/var/run/x"):
+        verdict = disk_layout.tmpfs_verdict(path)
+        assert verdict["on_tmpfs"] is True, verdict
+        assert verdict["method"] == "name", verdict
+
+
+def test_an_unreadable_mount_table_is_an_unknown_and_never_a_guess(tmp_path,
+                                                                   monkeypatch):
+    monkeypatch.setattr(disk_layout, "FORBIDDEN_ROOT_PREFIXES", ())
+    fake_mounts(tmp_path, monkeypatch)
+    verdict = disk_layout.tmpfs_verdict(tmp_path / "somewhere")
+    assert verdict["ok"] is True
+    assert verdict["on_tmpfs"] is None and verdict["method"] == "unknown"
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(tmp_path / "somewhere"))
+    assert disk_index.journal_fs_label() == "unknown"
+    assert disk_index.journal_fs_state()["warned"] is False
+
+
+def test_the_tmpfs_verdict_refuses_junk_and_never_raises(tmp_path, monkeypatch):
+    fake_mounts(tmp_path, monkeypatch, MOUNTS_TMPFS)
+    for junk in (None, 7, b"bytes", "", "nul\x00"):
+        verdict = disk_layout.tmpfs_verdict(junk)
+        assert verdict["ok"] is False
+        assert verdict["on_tmpfs"] is None

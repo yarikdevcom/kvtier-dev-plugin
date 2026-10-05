@@ -9,7 +9,9 @@ it):
     POST /plugins/kvtier/snapshot        the same, body forwarded as one dict
     GET|POST /plugins/kvtier/kvconfig    the KV-cache geometry, including every
                                          group's divisibility verdict
-    GET|POST /plugins/kvtier/block       one block, by id (and group)
+    GET|POST /plugins/kvtier/block       one block, by id (and group): the GPU
+                                         pool's block AND the tier's CPU-pool slot of
+                                         that id, each bounded by its own pool
     GET|POST /plugins/kvtier/request     one request by id; no id = the id list
     GET  /plugins/kvtier/trace           the trace ring's newest events
     POST /plugins/kvtier/trace           arm / disarm / clear / read   [TOKEN]
@@ -721,6 +723,12 @@ def status_payload(dev_state: dict | None = None) -> dict:
             "ops": ["status", "arm", "disarm", "spill-one", "ls", "offers"],
             "root_env": config.ENV_DISK_ROOT,
             "ceiling_env": config.ENV_DISK_BYTES,
+            # The journal gets its own path because it is the one piece of state
+            # that cannot be rebuilt: unset it falls back to VLLM_E2_TIER_DIAG, and
+            # an operator who wants the index to survive a REBOOT points it at
+            # persistent storage. Only the journal follows it - the arm file stays
+            # in the diagnostics directory and dies at boot, on purpose.
+            "journal_dir_env": config.ENV_DISK_JOURNAL_DIR,
             "note": ("the SSD spill tier, both halves. WRITE: KV slots evicted "
                      "from the host-RAM tier are spilled to one file each on the "
                      "engine's own disk, named "
@@ -739,8 +747,16 @@ def status_payload(dev_state: dict | None = None) -> dict:
                      f"{config.ENV_DISK_ROOT} must name a real filesystem "
                      "(tmpfs roots are refused) AND the tier must be armed; no env "
                      "var arms it and an arm expires. `spill-one` is relayed to "
-                     "the workers through VLLM_E2_TIER_DIAG because a worker has "
-                     "no utility channel, and the write runs on the spill thread. "
+                     f"the workers through {config.ENV_DIAG_DIR} because a worker "
+                     "has no utility channel, and the write runs on the spill "
+                     "thread with NO fsync (buffered writes: the page cache owns "
+                     "device ordering, and a journaled file that never reached the "
+                     "device is reported as `file_missing` and recomputed). The "
+                     f"spill journal lives in {config.ENV_DISK_JOURNAL_DIR} when "
+                     f"set, else in {config.ENV_DIAG_DIR}; the journal directory's "
+                     "filesystem is reported under `journal.fs`, because a journal "
+                     "on tmpfs is a map that dies at reboot while the KV files it "
+                     "describes survive."
                      "READ BACK: a restore path HAS existed since 0.2.14, and every "
                      "answer from this verb carries it under `restore` - the "
                      "SCHEDULER's own verdict (layer fitted here, gate, index "
