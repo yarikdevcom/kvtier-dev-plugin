@@ -248,8 +248,12 @@ MAX_FILENAME_DISPLAY = 200          # CHARS of a path shown in a response
 MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
-DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls")
-MUTATING_DISK_OPS = ("arm", "disarm", "spill-one")
+DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "offers")
+MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers")
+"""`offers` is mutating and POST-only: it raises or drops THIS BOOT's offer switch
+and (optionally) sets the scope. It is not the arm. Arming the spill tier says bytes
+may be WRITTEN; this says requests may be SERVED from disk, which on 2026-10-05 was a
+difference of 123,474 un-requested 160,000-token offers."""
 
 # This module's own refusal vocabulary. `no_key_for_slot` and `bad_digest` share a
 # WORD with `disk_spill.REFUSAL_REASONS` because they are the same operational
@@ -1822,8 +1826,36 @@ def _op_disarm(_body: dict) -> dict:
     return disk_spill.disarm()
 
 
+def _op_offers(body: dict) -> dict:
+    """Raise/drop this boot's disk-OFFER switch, and optionally set the scope.
+
+    `{"op":"offers"}` alone reads the posture. `{"op":"offers","enabled":true}` raises
+    the switch. `{"op":"offers","scope":"optin"|"all"}` decides WHICH requests may be
+    offered once it is up; `optin` (the default) serves only a request carrying
+    `kv_transfer_params.kvtier_disk_restore = true`.
+
+    Two separate facts on purpose, and neither is the spill arm: the incident boot had
+    a healthy spill arm (raised for a spill measurement) and that alone was enough to
+    put disk offers in front of live traffic. A fresh boot answers `enabled: false` and
+    no restart, config file or environment variable changes that - only this verb does.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    out = {"ok": True, "posture": disk_restore.offer_posture()}
+    for field, apply in (("enabled", disk_restore.set_offer_switch),
+                         ("scope", disk_restore.set_scope)):
+        if field not in body or body[field] is None:
+            continue
+        verdict = apply(body[field])
+        if not verdict.get("ok"):
+            return {"ok": False, "reason": f"{field}: {verdict.get('reason')}",
+                    "posture": disk_restore.offer_posture()}
+        out[field] = verdict
+    out["posture"] = disk_restore.offer_posture()
+    return out
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
-             "spill-one": _op_spill_one, "ls": _op_ls}
+             "spill-one": _op_spill_one, "ls": _op_ls, "offers": _op_offers}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

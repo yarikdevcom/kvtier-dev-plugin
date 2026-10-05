@@ -991,6 +991,80 @@ the file again (~10 ms per 3,200-token span against ~3.2 s to recompute it). The
 worker rebuilds each name with its **own** digest, and a disagreement is a counted
 failure, not a guess.
 
+**A fresh boot offers nothing, and requests have to ask.** Two switches, both
+dev-verb only, both per boot, neither reachable by an environment variable:
+
+```bash
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"offers"}' $B/disk   # read
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
+     -d '{"op":"offers","enabled":true,"scope":"optin"}' $B/disk             # arm offers
+```
+
+`enabled` is this boot's offer switch and it starts **false**: arming the spill tier
+says bytes may be *written*, not that requests may be *served* from disk. `scope`
+decides which requests once it is up - `optin` (the default) serves only a request
+that asked for it, `all` is the whole-workload measurement posture. On 2026-10-05 a
+spill arm raised for a write experiment was enough to put 123,474 un-requested
+160,000-token offers in front of live traffic; these two switches are why an arm is no
+longer one of those things.
+
+`optin` rides a field the engine already has, so nothing new has to be plumbed. Send it
+at the TOP LEVEL of the chat-completions body:
+
+```json
+{"kv_transfer_params": {"kvtier_disk_restore": true}}
+```
+
+That is the shape this engine reads: `kv_transfer_params` is a declared field of the
+chat-completions request (`entrypoints/openai/chat_completion/protocol.py:143`), which
+the engine folds into `extra_args["kv_transfer_params"]` there at `:717-719`, and
+`vllm/v1/request.py:118-119` lifts it onto the `Request` our marker reads. Wrapping it
+in `extra_args` yourself is NOT the same thing on this build: chat-completions declares
+no `extra_args` body field and the request model ignores unknown fields, so
+`{"extra_args": {...}}` is dropped in silence rather than refused. Only
+`/v1/responses` and `/v1/completions` take `vllm_xargs`. The proxy passes either shape
+through untouched, so it is the engine leg that decides - checked against the deployed
+tree, not against upstream.
+
+Strictly the JSON boolean `true` - `"true"`, `1` or an absent field mean "not asked",
+and an unasked request is answered by the fork's own lookup with no journal refresh, no
+index query and no allocation. `restore.skipped_no_marker` counts those, so "nothing
+was offered because nobody asked" is readable and is never mixed up with a refusal.
+
+**A failed disk load is never offered twice.** The engine recovers from a KV load
+failure by resetting the request and rescheduling it, which asks
+`get_num_new_matched_tokens` again - and the journal has not changed, so an amnesiac
+restore answers with the same offer and the same failure. That loop is what starved
+the box. `suppress_load` fuses the **request** (named exactly by
+`connector_output.failed_recving`) and the **span** (its first block's key, so a
+replayed prompt under a fresh request id is refused too), on any of: a failed load,
+invalid block ids on a step that carried our slots, a load that outlived
+`RESTORE_DEADLINE_SECONDS`, or a request returning at or before the point where it was
+last offered. `suppressed_after_failure` is the refusal; `suppressed_hits` /
+`suppressed_spans` / `suppressions` say which half fired. The table is bounded
+(`MAX_SUPPRESSED_REQUESTS`, oldest-first), because a fuse that grows without limit is
+its own leak.
+
+**The scheduler refuses while any live rank refuses to serve.** A worker's rank file
+publishes `disk_restore.armed` = *will this rank service a disk load*, and
+`worker_proof()` is AND over the live ranks: one disarmed rank closes the whole
+scheduler, because the load event spans every rank and the blocks the refusing rank
+passes through stay un-filled while the fork has already committed to them. The
+refusal is `reason_kind=scheduler_armed_workers_disarmed` with `ranks_armed=0/4`, in
+`gate()`, in the boot line and in the counters. `installed` alone is not proof - that
+is the field that lied on 2026-10-05, when four ranks were fitted, none was armed, and
+the offers kept coming.
+
+**`restorations` cannot rise without a read.** The fork reports a load finished for its
+own host-RAM blocks too, so a finished report is not evidence of a restore. A
+completion counts as a restoration only when an applied disk read can be shown -
+this process's counter, or the sum the live worker rank files attest - and otherwise
+counts as `no_read`. `verdict=CONFIRMED` needs both, which is why the witness line
+carries `reads_applied=` and `no_read=`. The witness is emitted once per
+**(verdict, reason-kind)**, never once per step: keying it on the sentence re-issued
+it 1,048 times a second on the incident boot, and `witness_suppressed` counts the
+withheld lines so a quiet log is not mistaken for a dead module.
+
 **Why nothing was restored is one HTTP call.** `GET /plugins/kvtier/disk` (and the
 `disk_restore` section of `/snapshot`) reports the SCHEDULER's own verdict - the layer
 fitted in that process, the gate and its reason, the index size and its source, the

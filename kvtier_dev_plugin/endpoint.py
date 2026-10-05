@@ -399,12 +399,18 @@ ARG_SPECS: dict[str, dict] = {
     # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
     config.ROUTE_DISK: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm", "spill-one",
-                                          "ls")},
+                                          "ls", "offers")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         "fingerprint": {"kind": "str", "max_chars": 32},
                         "seconds": {"kind": "int", "min": 1, "max": 7200},
-                        "limit": {"kind": "int", "min": 1, "max": 200}},
+                        "limit": {"kind": "int", "min": 1, "max": 200},
+                        # `op=offers`: the boot's offer switch and the scope. A real
+                        # boolean and one of two names, validated here so a typo is a
+                        # 400 rather than a silently ignored field.
+                        "enabled": {"kind": "bool"},
+                        "scope": {"kind": "enum",
+                                  "values": ("optin", "all")}},
 }
 
 
@@ -712,7 +718,7 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # "this boot has no disk tier", not "this verb is broken".
         "disk": {
             "route": config.ROUTE_PREFIX + config.ROUTE_DISK,
-            "ops": ["status", "arm", "disarm", "spill-one", "ls"],
+            "ops": ["status", "arm", "disarm", "spill-one", "ls", "offers"],
             "root_env": config.ENV_DISK_ROOT,
             "ceiling_env": config.ENV_DISK_BYTES,
             "note": ("the SSD spill tier, both halves. WRITE: KV slots evicted "
@@ -1187,8 +1193,9 @@ async def route_disk(request: Request):
 async def route_disk_post(request: Request):
     """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
-    `{op: status|arm|disarm|spill-one|ls, slot?, key?, fingerprint?, seconds?,
-    limit?}`. KV slots evicted from the RAM tier are spilled to
+    `{op: status|arm|disarm|spill-one|ls|offers, slot?, key?, fingerprint?,
+    seconds?, limit?, enabled?, scope?}`. KV slots evicted from the RAM tier are
+    spilled to
     `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin` on the engine's own
     disk, so the RAM tier can shrink - the group id is part of the identity, since
     two groups can hash the same token chain, and the digest half is rebuilt by
@@ -1197,8 +1204,29 @@ async def route_disk_post(request: Request):
     THERE IS A RESTORE PATH (`disk_restore`, since 0.2.14): on a host-RAM shortfall
     the SCHEDULER offers the SSD's continuation as external tokens, extends the
     fork's own load tuple with the CPU slots it allocated, and the worker reads the
-    file back into them. It never publishes into `cached_block_hash_to_block`, which
-    is why a restored block helps only the request that paid for it. Every answer
+    file back into them.
+
+    IT DOES NOT OFFER UNTIL YOU TELL IT TO, TWICE OVER. `op=offers` is that switch:
+    `{"op":"offers"}` reads the posture, `{"op":"offers","enabled":true}` lets this
+    boot offer at all, and `scope` decides which requests - `optin` (default) serves
+    only a request that asked, `all` serves every request. A fresh boot is
+    `enabled:false`, and no env var, config file or spill arm changes that: the
+    incident of 2026-10-05 was a spill arm raised for a WRITE measurement being
+    enough to put 123,474 un-requested 160,000-token offers in front of live traffic.
+
+      REQUESTS OPT IN THROUGH THE ENGINE'S OWN FIELD - no new channel, no env var.
+      TOP LEVEL of the chat/completions body (NOT wrapped in `extra_args`, which this
+      build's chat-completions does not declare and ignores without a word):
+
+        {"kv_transfer_params": {"kvtier_disk_restore": true}}
+
+      The engine folds that field into `extra_args["kv_transfer_params"]` and
+      `vllm/v1/request.py:118-119` lifts it onto the Request this plugin reads.
+      Strictly the JSON boolean `true`: `"true"`, `1` or a missing field mean "not
+      asked", and an unasked request is answered by the fork's own lookup with no
+      journal refresh, no index query and no allocation. The restore never publishes
+    into `cached_block_hash_to_block`, which is why a restored block helps only the
+    request that paid for it. Every answer
     from this verb carries the scheduler's own verdict under `restore`, and
     `restore.why_no_restore` names the first link that is missing (layer not fitted
     here / gate closed / index empty / no worker proof / no offer made).

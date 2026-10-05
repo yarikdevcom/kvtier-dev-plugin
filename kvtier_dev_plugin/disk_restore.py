@@ -230,6 +230,15 @@ would otherwise be permanent, because the fork has no timeout for
 WAITING_FOR_REMOTE_KVS."""
 
 MAX_RESTORE_BLOCKS_PER_OFFER = 64    # SCHEDULER BLOCKS offered per request
+# THE OFFER'S REAL CEILING, IN TOKENS. 64 blocks of a 3,200-token scheduler block is
+# 204,800 tokens, and the block/slot caps alone let one request ask for the whole
+# prompt: on 2026-10-05 a live boot offered EXACTLY 160,000 tokens (50 blocks) on
+# every one of 123,474 offers, the engine could not place them, and every one of
+# them came back as a load failure that rescheduled the request. A cap that the
+# request's own length can reach is not a cap. 32,000 tokens is 10 scheduler blocks,
+# ~144 MB at the measured 14,416,000 B per 3,200-token span, ~13 ms of streaming
+# against a 45 s deadline: enough to be worth doing, small enough to be placeable.
+MAX_OFFER_TOKENS_PER_OFFER = 32_000  # TOKENS offered per request (10 spans)
 MAX_SLOTS_PER_OFFER = 256            # CPU slots allocated per request
 MAX_TRACKED_LOADS = 64               # REQUESTS with an outstanding disk load
 MAX_TRACKED_SLOTS = 4096             # cpu-slot -> identity entries
@@ -240,6 +249,33 @@ MAX_BOOT_LINE_CHARS = 160
 CPU_SLOT_RESERVE = 64                # CPU slots the offer must leave free
 MAX_PATHS_PER_STEP = 512             # load_paths entries one step may carry
 MIN_WITNESS_LOG_SECONDS = 30.0       # SECONDS between witness re-emissions
+MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
+MAX_RANK_COUNTER = 1_000_000_000     # ceiling on a counter read from a rank file
+
+# --- the request-scoped gate --------------------------------------------------
+
+RESTORE_MARKER_KEY = "kvtier_disk_restore"
+"""THE opt-in key, read out of `request.kv_transfer_params`.
+
+The channel is the engine's own: `vllm/v1/request.py:103` declares
+`self.kv_transfer_params: dict[str, Any] | None` and `:118-119` fills it from
+`sampling_params.extra_args.get("kv_transfer_params")`, and
+`get_num_new_matched_tokens(self, request, num_computed_tokens)` receives the
+request object - so the opt-in is readable at exactly the decision point, with no
+new socket, file, env var or side table. The fork's own connector reads nothing
+from it (`grep -rn kv_transfer_params vllm/v1/simple_kv_offload/` is empty on the
+box), so taking it over does not collide with fork behaviour.
+
+STRICTNESS, spelled out because a client can send anything here: a request is
+flagged when `kv_transfer_params` is a real `dict` AND its value under this key is
+the boolean `True`. Not `"true"`, not `1`, not a nested object - a caller who means
+it sends JSON `true`. Everything else is "not flagged", counted, never raised.
+"""
+
+RESTORE_SCOPE_OPTIN = "optin"
+RESTORE_SCOPE_ALL = "all"
+RESTORE_SCOPES = (RESTORE_SCOPE_OPTIN, RESTORE_SCOPE_ALL)
+RESTORE_SCOPE_DEFAULT = RESTORE_SCOPE_OPTIN
 
 OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "bad_result", "unaligned_local_prefix", "skip_read_requested",
@@ -248,7 +284,8 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "disk_run_below_one_block", "no_cpu_slots", "alloc_refused",
                   "no_channel", "path_build_failed", "index_refresh_failed",
                   "too_many_loads", "ram_hit_not_block_aligned",
-                  "no_worker_proof")
+                  "no_worker_proof", "offers_disabled", "workers_not_servicing",
+                  "skipped_no_marker", "suppressed_after_failure")
 
 # EVERY REFUSAL SPELLED OUT. `refused` says WHICH counter moved; this says what the
 # counter MEANS, so "why is there no restore?" is answerable from one payload read
@@ -305,6 +342,30 @@ OFFER_REFUSAL_WHY = {
     "no_worker_proof": "no fresh rank file attests a fitted worker half, so the "
                        "CPU slots an offer allocates might never be filled - the "
                        "one refusal that exists to prevent serving stale KV",
+    "offers_disabled": "the operator has not raised this boot's offer switch "
+                       "(`POST /plugins/kvtier/disk {\"op\":\"enable\"}`): the "
+                       "restore path stays out of the scheduling decision until "
+                       "someone chooses that in this boot, because arming the "
+                       "spill tier for a different experiment once put an "
+                       "un-requested disk offer in front of live traffic",
+    "workers_not_servicing": "the scheduler is armed but at least one live rank "
+                             "file says its worker half will NOT service a disk "
+                             "load (disarmed in its own process, or a boot the "
+                             "arm file outlived): offering would allocate slots "
+                             "nobody fills, the fork would report the load failed "
+                             "and the request would be rescheduled - the exact "
+                             "loop that starved the box on 2026-10-05",
+    "skipped_no_marker": "scope is `optin` and this request did not ask for a "
+                         f"disk restore (`extra_args.kv_transfer_params."
+                         f"{RESTORE_MARKER_KEY} = true` in the request body): the "
+                         "fork's own answer is returned untouched, which is the "
+                         "default posture for every request that does not ask",
+    "suppressed_after_failure": "a disk load already failed for THIS request (or "
+                                "for the span its offer was built from), and a "
+                                "failed load must never be re-offered: the "
+                                "reschedule that follows calls "
+                                "get_num_new_matched_tokens again, and re-offering "
+                                "the same span is an infinite loop, not a retry",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -323,33 +384,62 @@ _state: dict = {
     "fallbacks": 0, "boot_line": None,
     "sched_fitted": False, "worker_fitted": False, "methods_fitted": [],
     "install_refusals": 0, "install_deferrals": 0, "missing_methods": [],
-    "install_refusal_line": None,
+    "install_refusal_line": None, "install_deferral_line": None,
+    # THE OFFER POSTURE, per boot, dev-verb only. `offers_enabled` is False at every
+    # boot: arming the SPILL tier must not be enough to put a disk offer in front of
+    # live traffic (on 2026-10-05 an arm raised for a different experiment offered
+    # 19.7 BILLION tokens and starved the harness). `scope` then decides which
+    # requests may be offered at all once the switch is up.
+    "offers_enabled": False, "scope": RESTORE_SCOPE_DEFAULT,
+    "scope_changes": 0, "offer_switch_changes": 0, "ranks_seen": 0,
+    # scheduler-side request ledger (the request-scoped gate)
+    "requests_seen": 0, "flagged": 0, "skipped_no_marker": 0,
+    "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
     # scheduler-side ledger
     "lookups": 0, "offers": 0, "offered_tokens": 0, "blocks_offered": 0,
-    "adopted": 0,
-    "adopted_tokens": 0, "restorations": 0, "refused": {r: 0
-                                                        for r in OFFER_REFUSALS},
+    "adopted": 0, "adopted_tokens": 0, "restorations": 0,
+    "refused": {r: 0 for r in OFFER_REFUSALS},
     "refusals_total": 0, "last_refusal": None, "last_reason": None,
     "paths_emitted_steps": 0, "path_entries": 0, "path_entries_empty": 0,
     "path_length_violations": 0, "slots_allocated": 0, "stale_slots_dropped": 0,
     "watchdog_fires": 0, "index_refreshes": 0, "index_refresh_errors": 0,
     "loads_released": 0, "ranks_proven": 0, "proof_reads": 0,
+    # scheduler-side honesty: a completion is a RESTORATION only when this process
+    # or a proven rank can show an applied disk read for it; a completion with no
+    # read behind it is `no_read` and is never counted as a restoration.
+    "no_read": 0, "disk_reads_applied": 0, "ranks_reads_applied": 0,
+    "offer_clamped": 0,
     # worker-side ledger
     "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
-    "bytes_applied": 0, "dma_unsettled_entries": 0, "reads_failed": {r: 0
-                                                                     for r
-                                                                     in
-                                                                     WORKER_FAILURES},
+    "bytes_applied": 0, "dma_unsettled_entries": 0,
+    "reads_failed": {r: 0 for r in WORKER_FAILURES},
     "invalid_reports": 0, "finished_released": 0, "worker_watchdog_fires": 0,
     "phantom_guard_trips": 0, "region_plan_errors": 0, "worker_errors": 0,
     "load_error_installs": 0,
-    "witness_verdict": None, "witness_reason": None, "witness_emissions": 0,
+    "witness_verdict": None, "witness_reason": None, "witness_kind": None,
+    "witness_emissions": 0,
+    "witness_suppressed": 0,
 }
+"""`reads_failed` is the WORKER's per-entry ledger; the scheduler-side `no_read`
+and `disk_reads_applied` are the per-OFFER verdicts the witness is allowed to use:
+an offer is a restoration only if a read was applied for it."""
 
 # Scheduler side: request id -> load record. Bounded by MAX_TRACKED_LOADS.
 _loads: dict = {}
 # Scheduler side: cpu block id -> (request id, path). Bounded by MAX_TRACKED_SLOTS.
 _slot_paths: dict = {}
+# Scheduler side: request id -> why it will get no further disk offer, for the life
+# of the request. A load that failed and is re-offered is an infinite loop (see
+# `suppress_load`), so the answer has to be remembered, not re-derived.
+_suppressed: dict = {}
+# Scheduler side: the same for a disk SPAN (first block's key:group of the offered
+# run), because a request the engine reset comes back with the same hashes and a
+# span that failed once will fail for whoever asks for it next.
+_suppressed_spans: dict = {}
+# Scheduler side: request id -> computed tokens at the moment we last offered it disk
+# tokens. A request that returns at or before that point made no progress, which is
+# what a failed load looks like from the scheduler's seat.
+_offered_at: dict = {}
 
 # Worker side: request id -> in-flight record (the watchdog's table), and the
 # batches those records share. Both bounded; `_invalid` is drained once per step.
@@ -357,22 +447,26 @@ _wloads: dict = {}
 _wbatches: dict = {}
 _invalid: dict = {}
 _logged_lines: list = []
-_witness_state: dict = {"line": None, "emitted_mono": None}
+_witness_state: dict = {"line": None, "emitted_mono": None, "key": None}
 
 
 def reset_state_for_tests() -> None:
     """Back to a fresh boot: no ledgers, no counters, no installed layer."""
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
-    global _install_refusal_lines, _sched_cls_seen
+    global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
+    global _offered_at
     _loads = {}
     _slot_paths = {}
     _wloads = {}
     _wbatches = {}
     _invalid = {}
+    _suppressed = {}
+    _suppressed_spans = {}
+    _offered_at = {}
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
-    _witness_state.update({"line": None, "emitted_mono": None})
+    _witness_state.update({"line": None, "emitted_mono": None, "key": None})
     _proof_cache.update({"mono": None, "result": None})
     _deferred_finished.clear()
     for key, value in {
@@ -381,7 +475,7 @@ def reset_state_for_tests() -> None:
             "fallbacks": 0, "boot_line": None, "sched_fitted": False,
             "worker_fitted": False, "methods_fitted": [], "install_refusals": 0,
             "install_deferrals": 0, "missing_methods": [],
-            "install_refusal_line": None,
+            "install_refusal_line": None, "install_deferral_line": None,
             "lookups": 0, "offers": 0, "offered_tokens": 0,
             "blocks_offered": 0, "adopted": 0, "adopted_tokens": 0,
             "restorations": 0, "refusals_total": 0, "last_refusal": None,
@@ -389,14 +483,21 @@ def reset_state_for_tests() -> None:
             "path_entries_empty": 0, "path_length_violations": 0,
             "slots_allocated": 0, "stale_slots_dropped": 0, "watchdog_fires": 0,
             "index_refreshes": 0, "index_refresh_errors": 0, "loads_released": 0,
-            "ranks_proven": 0, "proof_reads": 0,
+            "ranks_proven": 0, "proof_reads": 0, "no_read": 0,
+            "disk_reads_applied": 0, "ranks_reads_applied": 0, "offer_clamped": 0,
             "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
             "bytes_applied": 0, "dma_unsettled_entries": 0, "invalid_reports": 0,
             "finished_released": 0, "worker_watchdog_fires": 0,
             "phantom_guard_trips": 0, "region_plan_errors": 0,
             "worker_errors": 0, "load_error_installs": 0,
             "witness_verdict": None, "witness_reason": None,
-            "witness_emissions": 0}.items():
+            "witness_kind": None, "witness_emissions": 0,
+            "witness_suppressed": 0,
+            "offers_enabled": False, "scope": RESTORE_SCOPE_DEFAULT,
+            "scope_changes": 0, "offer_switch_changes": 0, "ranks_seen": 0,
+            "requests_seen": 0,
+            "flagged": 0, "skipped_no_marker": 0, "suppressed_hits": 0,
+            "suppressed_spans": 0, "suppressions": 0}.items():
         _state[key] = value
     _state["refused"] = {name: 0 for name in OFFER_REFUSALS}
     _state["reads_failed"] = {name: 0 for name in WORKER_FAILURES}
@@ -411,6 +512,7 @@ def counters() -> dict:
     out["tracked_slots"] = len(_slot_paths)
     out["tracked_worker_loads"] = len(_wloads)
     out["pending_invalid_blocks"] = len(_invalid)
+    out["suppressed_requests"] = len(_suppressed)
     out["methods_fitted"] = list(_state["methods_fitted"])
     out["missing_methods"] = list(_state["missing_methods"])
     out["role_here"] = role_here()
@@ -426,6 +528,8 @@ def counters_view(out: dict) -> dict:
         "install_refusals": "install passes refused in this process because a "
                             "class was there and a method was not (or was "
                             "refused): each one has a line in the log",
+        "install_deferral_line": "the last deferral line: what this process said "
+                                 "when it had nothing to hook yet",
         "install_deferrals": "install attempts that found no tier class imported "
                              "in this process yet: the EXPECTED state at plugin "
                              "load, counted separately so a healthy boot never "
@@ -438,7 +542,51 @@ def counters_view(out: dict) -> dict:
         "load_error_installs": "times the load-error report was fitted on a class",
         "adopted": "requests whose disk slots reached the worker",
         "adopted_tokens": "tokens the scheduler adopted from disk",
-        "restorations": "loads with disk bytes reported finished",
+        "restorations": "loads with a DISK READ APPLIED behind them: a finished "
+                        "report with no read is counted as `no_read` instead, so "
+                        "this counter cannot rise on a boot where nothing was "
+                        "actually read from disk",
+        "no_read": "finished load reports with NO applied disk read behind them "
+                   "(an adopted offer that no worker filled): refusals of the "
+                   "counter, never restorations",
+        "disk_reads_applied": "scheduler-side applied disk reads (0 in a "
+                              "scheduler-only process by construction)",
+        "ranks_reads_applied": "applied disk reads attested by live worker rank "
+                               "files at the last proof read",
+        "offers_enabled": "this boot's offer switch: False until the dev verb "
+                          "raises it, so an armed spill tier alone cannot put a "
+                          "disk offer in front of live traffic",
+        "scope": "which requests may be offered at all: `optin` (only a request "
+                 "carrying the kvtier_disk_restore marker) or `all`",
+        "scope_changes": "times the scope was changed in this boot: a knob that "
+                         "moves once per experiment, so anything above 1-2 in a "
+                         "production log means someone was deciding mid-flight",
+        "offer_switch_changes": "times this boot's offer switch was raised or "
+                                "dropped: a boot that never offered and never "
+                                "changed hands says OFF and 0",
+        "requests_seen": "lookups observed by the request-scoped gate",
+        "flagged": "requests carrying the kvtier_disk_restore marker",
+        "skipped_no_marker": "requests left exactly as the fork would have left "
+                             "them because they did not ask for a disk restore",
+        "witness_kind": "the stable name of the last verdict: the emission key is "
+                       "(verdict, kind) and never the sentence, because the sentence "
+                       "quotes counters",
+        "suppressed_hits": "lookups refused because the REQUEST is suppressed after "
+                           "a failed disk load (the loop that starved the box)",
+        "suppressed_requests": "request ids currently black-holed for disk "
+                               "service in this boot (the fuse table's live "
+                               "size, not a counter)",
+        "suppressed_spans": "offers refused because the disk SPAN was implicated in "
+                            "a failed load, whichever request asked for it",
+        "ranks_seen": "live rank files that spoke about disk service at all, "
+                      "armed or not: ranks below this means a partial fleet, and a "
+                      "partial fleet refuses every offer",
+        "ranks_armed": "rank files that will SERVICE a disk load: the proof is AND "
+                       "over these, so one disarmed rank closes the whole scheduler",
+        "offer_clamped": "offers shortened to MAX_OFFER_TOKENS_PER_OFFER: an offer "
+                         "that would have been bigger than one request may put at "
+                         "once (the 160,000-token offers of 2026-10-05 clamp here)",
+        "suppressions": "requests black-holed for disk service in this boot",
         "refusals_total": "refusals", "paths_emitted_steps": "steps",
         "path_entries": "load_paths entries naming a file",
         "path_entries_empty": "load_paths entries naming nothing",
@@ -457,6 +605,9 @@ def counters_view(out: dict) -> dict:
         "invalid_reports": "GPU block ids reported as load errors",
         "finished_released": "requests released without a DMA",
         "witness_emissions": "witness lines logged in this boot",
+        "witness_suppressed": "witness emissions withheld because the verdict and "
+                              "reason had already been said (the flood fix: "
+                              "counters move every step, the verdict does not)",
         "worker_watchdog_fires": "worker-side load expiries",
         "phantom_guard_trips": "invariant violations (must stay 0)",
         "region_plan_errors": "slot address plans that failed",
@@ -622,6 +773,93 @@ def _worker_fail(kind: str, reason: str) -> dict:
 
 # --- the gate -----------------------------------------------------------------
 
+def offer_posture() -> dict:
+    """This boot's offer posture: the switch and the scope. Read-only, never raises.
+
+    Two independent facts, both per-boot, both set only by the dev verb:
+
+    `enabled` - may this boot offer disk restores AT ALL. False at every fresh boot.
+      Arming the spill tier is not this: on 2026-10-05 an arm raised for a spill
+      measurement was enough to put an un-requested 160,000-token disk offer in front
+      of live traffic 123,474 times, because the restore path keyed off the spill
+      arm. It is its own decision now.
+
+    `scope` - WHICH requests, once the switch is up. `optin` (the default) offers to
+      a request only if it carries `kv_transfer_params.kvtier_disk_restore = true`;
+      `all` offers to every request, which is what a measurement of the whole
+      workload wants and what no production boot should be left in.
+    """
+    return {"enabled": bool(_state["offers_enabled"]),
+            "scope": _state["scope"],
+            "marker_key": RESTORE_MARKER_KEY,
+            "flagged": _state["flagged"], "requests_seen": _state["requests_seen"],
+            "skipped_no_marker": _state["skipped_no_marker"],
+            "suppressed_requests": len(_suppressed)}
+
+
+def set_offer_switch(enabled) -> dict:
+    """Raise or drop THIS BOOT's offer switch. The dev verb's doing, never a file.
+
+    Deliberately not an environment variable and not the spill arm: the whole point
+    is that a boot that nobody asked to serve disk restores does not serve them.
+    Accepts a real boolean only - a payload that says `"true"` or `1` is refused
+    rather than obeyed, because a typo in a curl should not change engine behaviour.
+    """
+    if not isinstance(enabled, bool):
+        return _fail(f"the offer switch wants a JSON true or false, got "
+                     f"{type(enabled).__name__}")
+    changed = bool(_state["offers_enabled"]) != enabled
+    _state["offers_enabled"] = enabled
+    if changed:
+        _state["offer_switch_changes"] += 1
+    _logger.warning("kvtier-dev-plugin: DISK[restore] offers %s for this boot "
+                   "(scope=%s) - a fresh boot starts with them OFF and only this "
+                   "verb changes it", "ENABLED" if enabled else "disabled",
+                   _state["scope"])
+    return _ok(posture=offer_posture(), changed=changed)
+
+
+def set_scope(scope) -> dict:
+    """Which requests may be offered at all: `optin` (default) or `all`.
+
+    A misspelled scope is refused, not defaulted: silently falling back to `optin`
+    when someone typed `"all"` with a typo would leave a measurement measuring
+    nothing, and the operator would only see it in the results.
+    """
+    if not isinstance(scope, str) or scope not in RESTORE_SCOPES:
+        return _fail(f"scope must be one of {list(RESTORE_SCOPES)}, got {scope!r}")
+    changed = _state["scope"] != scope
+    _state["scope"] = scope
+    if changed:
+        _state["scope_changes"] += 1
+    _logger.warning("kvtier-dev-plugin: DISK[restore] scope=%s - %s", scope,
+                   "only a request carrying "
+                   f"kv_transfer_params.{RESTORE_MARKER_KEY}=true is offered" if
+                   scope == RESTORE_SCOPE_OPTIN else
+                   "EVERY request is a candidate, which is a measurement posture")
+    return _ok(posture=offer_posture(), changed=changed)
+
+
+def request_flagged(request) -> bool:
+    """Did THIS request ask for a disk restore? One attribute read; never raises.
+
+    Strict on purpose: a real `dict` carrying the marker key with the boolean `True`.
+    `"true"`, `1`, `1.0`, a nested object and a `kv_transfer_params` that is not a
+    dict are all "not asked". A client controls this field, and the cost of being
+    loose about it is disk work on a request that never asked for it.
+
+    This is the first thing the offer path looks at, before the gate and before any
+    file or index access, so an unflagged request in `optin` scope costs the fork's
+    own lookup plus this one attribute read. `tests` pin that with a lookup spy.
+    """
+    try:
+        params = getattr(request, "kv_transfer_params", None)
+        return isinstance(params, dict) and params.get(RESTORE_MARKER_KEY) is True
+    except Exception as exc:  # noqa: BLE001 - a hostile request is not a reason to raise
+        snapshot._error(exc, "disk_restore request marker")
+        return False
+
+
 def gate() -> dict:
     """May THIS process make/serve a disk restore? Configured AND armed AND armed.
 
@@ -651,8 +889,24 @@ def gate() -> dict:
         return _fail("the KV tier itself is disarmed, so the connector schedules "
                      "no load for a disk offer to ride on",
                      reason_kind="tier_disarmed")
+    if not _state["offers_enabled"]:
+        # The boot default. Reaching here means the spill tier is armed AND the RAM
+        # tier is armed, which is a state a *different* experiment puts up - and on
+        # 2026-10-05 that state was enough to put an un-requested 160,000-token disk
+        # offer in front of live traffic 123,474 times. Offering is its own decision,
+        # made per boot with the dev verb, and nothing else can make it.
+        return _fail("this boot has not been told to offer disk restores: arm it "
+                     "with POST /plugins/kvtier/d {\"op\":\"offers\","
+                     "\"enabled\":true} when a measurement actually wants them",
+                     reason_kind="offers_disabled")
     proof = worker_proof()
     if not proof["ok"]:
+        kind = proof.get("reason_kind")
+        if kind == "scheduler_armed_workers_disarmed":
+            return _fail(proof["reason"],
+                         reason_kind="scheduler_armed_workers_disarmed",
+                         ranks_armed=f"{proof.get('ranks_armed', 0)}/"
+                                     f"{proof.get('ranks_seen', 0)}")
         return _fail(proof["reason"], reason_kind="no_worker_proof")
     return _ok(root=root, ranks=proof["ranks"])
 
@@ -686,68 +940,8 @@ def worker_proof(force: bool = False) -> dict:
     _proof_cache["mono"] = now
     _proof_cache["result"] = result
     _state["ranks_proven"] = int(result["count"])
+    _state["ranks_seen"] = int(result.get("ranks_seen") or 0)
     return result
-
-
-def _read_worker_proof() -> dict:
-    directory = config.diagnostics_dir()
-    if directory is None:
-        return {"ok": False, "count": 0, "ranks": [],
-                "reason": f"{config.ENV_DIAG_DIR} is not set, so no worker's rank "
-                          "file can be read to prove the worker half of this path "
-                          "is fitted"}
-    try:
-        names = sorted(name for name in os.listdir(directory)
-                       if name.startswith(RANK_FILE_PREFIX)
-                       and name.endswith(RANK_FILE_SUFFIX))
-    except OSError as exc:
-        return {"ok": False, "count": 0, "ranks": [],
-                "reason": f"the diagnostics directory could not be listed: "
-                          f"{type(exc).__name__}"}
-    if not names:
-        return {"ok": False, "count": 0, "ranks": [],
-                "reason": "no worker has written a rank file yet, so nothing proves "
-                          "the worker half of this path is fitted"}
-    proven = []
-    for name in names[:MAX_RANK_FILES_PROBED]:
-        verdict = _rank_file_proves_restore(directory / name)
-        if verdict is not None:
-            proven.append(verdict)
-    _state["proof_reads"] += min(len(names), MAX_RANK_FILES_PROBED)
-    if proven:
-        return {"ok": True, "count": len(proven), "ranks": proven[:8],
-                "reason": None}
-    return {"ok": False, "count": 0, "ranks": [],
-            "reason": (f"{min(len(names), MAX_RANK_FILES_PROBED)} rank file(s) were "
-                       "read and none reports a fitted disk restore layer "
-                       "(disk_restore.installed) - so the worker half of this path "
-                       "is not live, and offering disk tokens would DMA slots "
-                       "nobody filled")}
-
-
-def _rank_file_proves_restore(path) -> str | None:
-    """One rank file: the rank it attests, or None. Never raises, never over-reads."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            raw = handle.read(MAX_RANK_FILE_BYTES + 1)
-        if len(raw) > MAX_RANK_FILE_BYTES:
-            return None  # unreadable by the reader too, so not evidence of anything
-        document = json.loads(raw)
-        if not isinstance(document, dict):
-            return None
-        stamp = document.get("ts")
-        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-            return None
-        if abs(time.time() - float(stamp)) > RANK_FILE_FRESH_SECONDS:
-            return None  # a heartbeat from a worker that may be gone
-        section = document.get("disk_restore")
-        if not isinstance(section, dict) or section.get("installed") is not True:
-            return None
-        rank = document.get("rank")
-        return str(rank)[:32] if rank is not None else str(path.name)[:64]
-    except Exception as exc:  # noqa: BLE001 - one bad file is not evidence, that's all
-        snapshot._error(exc, "disk_restore rank file")
-        return None
 
 
 def _may_restore_worker() -> dict:
@@ -759,6 +953,175 @@ def _may_restore_worker() -> dict:
     if not disk_spill.is_armed():
         return _fail("the disk tier is disarmed", reason_kind="disarmed")
     return _ok(root=root)
+
+
+def worker_service_verdict() -> dict:
+    """Will THIS process, as a worker, service a disk load? The rank file's answer.
+
+    This is deliberately NOT `gate()`. `gate()` is the SCHEDULER's question (is the
+    tier armed here, do the ranks prove a worker?) and a worker process fails it for
+    reasons that have nothing to do with filling a slot - the RAM tier's arm is
+    per-process and the arm verb reaches the EngineCore, so a worker that would serve
+    every read perfectly would answer `armed:false` forever, and a worker would be
+    judging itself against files it did not write. What `bind()` checks before it
+    touches a slot is `_may_restore_worker()` plus this process having fitted the
+    layer, so that is what a rank file reports.
+
+    On 2026-10-05 the scheduler offered 160,000 tokens 123,474 times to workers that
+    would not bind. The rank file was the only place that could have said so, and the
+    proof read looked at `installed` and ignored `armed`.
+    """
+    verdict = _may_restore_worker()
+    if not verdict["ok"]:
+        return verdict
+    if not _state["worker_fitted"]:
+        return _fail("the restore layer is not fitted in this worker process, so "
+                     "nothing would bind the paths an offer allocates slots for",
+                     reason_kind="worker_half_not_fitted")
+    return _ok(root=verdict["root"])
+
+
+def _rank_file_proves_restore(path) -> dict | None:
+    """What one rank file says about ITS worker: a verdict dict, or None.
+
+    None means "this file is not evidence of anything" (unreadable, too big, no
+    stamp, stale, wrong shape) - it neither proves nor vetoes. A readable file always
+    yields a verdict with `installed`/`armed`, because "fitted but will not serve" is
+    a DIFFERENT and much more important answer than "nothing here": a rank that is
+    fitted and disarmed passes every disk entry through as though it had none, and
+    the blocks the fork already committed to stay stale.
+
+    Absent or non-boolean `armed` reads as NO. A file from a plugin that predates the
+    field cannot vouch for a fact it never measured - fail closed, which is also what
+    makes a mixed-version fleet safe.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read(MAX_RANK_FILE_BYTES + 1)
+        if len(raw) > MAX_RANK_FILE_BYTES:
+            return None  # unreadable by the reader too, so not evidence of anything
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            return None
+        stamp = document.get("ts")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            return None
+        age = time.time() - float(stamp)
+        if age < 0.0:
+            # A CLOCK AHEAD OF OURS is not freshness: a file stamped an hour in the
+            # future would sail past the staleness test forever and vouch for a worker
+            # that died with it. Rank files live on a directory shared with another
+            # host's clock, so the skew is real and has to be one-sided.
+            return None
+        if age > RANK_FILE_FRESH_SECONDS:
+            return None  # a heartbeat from a worker that may be gone
+        section = document.get("disk_restore")
+        if not isinstance(section, dict):
+            return None
+        rank = document.get("rank")
+        name = str(rank)[:32] if rank is not None else str(path.name)[:64]
+        installed = section.get("installed") is True
+        armed = section.get("armed") is True
+        # `reads_applied` is a worker's own counter, published for the honesty check.
+        # It arrives from another process, so it is clamped before it is summed: a
+        # hostile or broken writer must not be able to put a fake total in front of the
+        # witness. `disk_store` has a `_bounded_int` with a floor of 1 (it validates
+        # operator knobs); this one wants 0-as-valid, so it uses this module's `_int`.
+        reads = _int(section.get("reads_applied"))
+        if reads is None or reads < 0:
+            reads = 0
+        return {"rank": name, "installed": installed, "armed": installed and armed,
+                "reads_applied": min(reads, MAX_RANK_COUNTER),
+                "reason": _clip(section.get("reason"), 160)}
+    except Exception as exc:  # noqa: BLE001 - one bad file is not evidence, that's all
+        snapshot._error(exc, "disk_restore rank file")
+        return None
+
+
+def _read_worker_proof() -> dict:
+    """Read the rank files NOW (no cache). See `worker_proof`.
+
+    The verdict is AND over the ranks that are live. A rank that is fitted but says it
+    will not serve disk VETOES the offer even when other ranks are ready: the fork's
+    load event spans every rank, so the ready ones cannot make the refusing one's
+    blocks valid - that is precisely the shape of the 2026-10-05 incident (4 ranks,
+    0 of them servicing, 123,474 offers).
+    """
+    directory = config.diagnostics_dir()
+    if directory is None:
+        return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+                "ranks_seen": 0, "reads_applied": 0,
+                "reason_kind": "no_worker_proof",
+                "reason": f"{config.ENV_DIAG_DIR} is not set, so no worker's rank "
+                          "file can be read to prove the worker half of this path "
+                          "is fitted"}
+    try:
+        names = sorted(name for name in os.listdir(directory)
+                       if name.startswith(RANK_FILE_PREFIX)
+                       and name.endswith(RANK_FILE_SUFFIX))
+    except OSError as exc:
+        return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+                "ranks_seen": 0, "reads_applied": 0,
+                "reason_kind": "no_worker_proof",
+                "reason": "the diagnostics directory could not be listed: "
+                          f"{type(exc).__name__}"}
+    if not names:
+        return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+                "ranks_seen": 0, "reads_applied": 0,
+                "reason_kind": "no_worker_proof",
+                "reason": "no worker has written a rank file yet, so nothing proves "
+                          "the worker half of this path is fitted"}
+    armed, silent = [], []
+    reads = 0
+    probed = names[:MAX_RANK_FILES_PROBED]
+    for name in probed:
+        said = _rank_file_proves_restore(directory / name)
+        if said is None:
+            continue
+        if not said["installed"]:
+            silent.append(f"{said['rank']}: not fitted")
+            continue
+        if not said["armed"]:
+            silent.append(f"{said['rank']}: {said['reason'] or 'will not serve'}")
+            continue
+        reads += said["reads_applied"] or 0
+        armed.append(said["rank"])
+    _state["proof_reads"] += len(probed)
+    armed.sort()
+    seen = len(armed) + len(silent)
+    _state["ranks_seen"] = seen
+    _state["ranks_reads_applied"] = reads
+    if armed and not silent:
+        return {"ok": True, "count": len(armed), "ranks": armed[:8],
+                "ranks_armed": len(armed), "ranks_seen": seen,
+                "reads_applied": reads, "reason_kind": None, "reason": None}
+    if silent and armed:
+        return {"ok": False, "count": len(armed), "ranks": armed[:8],
+                "ranks_armed": len(armed), "ranks_seen": seen,
+                "reads_applied": reads,
+                "reason_kind": "scheduler_armed_workers_disarmed",
+                "reason": f"{len(armed)} of {seen} live rank file(s) serve disk and "
+                          f"{len(silent)} do not ({'; '.join(silent)[:160]}): the "
+                          "load event spans every rank, so the ones that serve would "
+                          "still leave blocks the fork committed to "
+                          f"(ranks_armed={len(armed)}/{seen})"}
+    if silent:
+        return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+                "ranks_seen": seen, "reads_applied": reads,
+                "reason_kind": "scheduler_armed_workers_disarmed",
+                "reason": f"the scheduler is armed and {len(silent)} live rank "
+                          f"file(s) refuse disk service "
+                          f"({'; '.join(silent)[:160]}): an offer would allocate CPU "
+                          "slots nothing fills, the fork would report the load failed "
+                          "and reschedule the request - ranks_armed="
+                          f"0/{seen}, the exact shape of the 2026-10-05 loop"}
+    return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+            "ranks_seen": 0, "reads_applied": reads,
+            "reason_kind": "no_worker_proof",
+            "reason": f"{len(probed)} rank file(s) were read and none reports a "
+                      "fitted disk restore layer (disk_restore.installed) - so the "
+                      "worker half of this path is not live, and offering disk "
+                      "tokens would DMA slots nobody filled"}
 
 
 # --- the identity: which file holds the next span? ----------------------------
@@ -971,6 +1334,7 @@ def offer(manager, request, num_computed_tokens, ram_result):
     refcounting, pairing and state creation stays the fork's.
     """
     _state["lookups"] += 1
+    _state["requests_seen"] += 1
     try:
         return _offer(manager, request, num_computed_tokens, ram_result)
     except Exception as exc:  # noqa: BLE001 - a restore never breaks a schedule
@@ -980,12 +1344,127 @@ def offer(manager, request, num_computed_tokens, ram_result):
         return ram_result
 
 
+def _skip_unless_flagged(request) -> bool:
+    """True when this request must be handed straight back to the fork, at no cost.
+
+    THE CHEAPEST CHECK IN THE PATH, and it has to be first: an unflagged request in
+    `optin` scope must cost the fork's own lookup plus one attribute read - no gate,
+    no arm file, no rank directory, no journal, no allocation. Reading the gate first
+    would put a cached `open()` and a `listdir()` in front of every request the plugin
+    has no business touching, which is the opposite of what a scope switch is for.
+
+    It reports itself only when this boot is actually offering (`offers_enabled`), so
+    a disarmed boot does not fill its counters with `skipped_no_marker` for requests
+    that would have been refused anyway, and `why_no_restore()` keeps answering the
+    gate's question first for anyone who asks it directly.
+    """
+    if not _state["offers_enabled"] or _state["scope"] != RESTORE_SCOPE_OPTIN:
+        return False
+    if request_flagged(request):
+        _state["flagged"] += 1
+        return False
+    _state["skipped_no_marker"] += 1
+    return True
+
+
+def suppression_lookups() -> int:
+    """How many requests are black-holed for disk service right now. For a test."""
+    return len(_suppressed)
+
+
+def suppress_load(request_id: str, reason: str, span=None) -> bool:
+    """Never offer disk service to this request (and, if named, this span) again.
+
+    THE LOOP KILLER. A failed load is not a reason to try again on the next step: the
+    engine's recovery from a KV load failure resets the request's computed tokens and
+    reschedules it, which calls `get_num_new_matched_tokens` again, which asks us the
+    same question - and the index has not changed, so we would answer the same way.
+    On 2026-10-05 that loop ran 123,474 times in 3.9 minutes (520 offers a second) and
+    starved the harness into a watchdog reset. Nothing in the fork bounds it, so the
+    bound has to live here.
+
+    Two keys, because the failure has two reachable attributions:
+      * the REQUEST id, which `connector_output.failed_recving` names exactly;
+      * the SPAN (the first block's key16:group of the run we offered), which is what
+        a request that returns with no progress can be matched against when the fork
+        reports only invalid block ids and those ids are GPU-side.
+
+    Bounded and never raising: this table is a fuse, not a database.
+    """
+    try:
+        key = str(request_id or "")[:256]
+        if not key:
+            return False
+        if key not in _suppressed and len(_suppressed) >= MAX_SUPPRESSED_REQUESTS:
+            # Oldest-first eviction: a fuse that grows without bound in a long boot is
+            # its own leak, and forgetting the oldest suppression costs one more offer.
+            _suppressed.pop(next(iter(_suppressed)), None)
+        fresh = key not in _suppressed
+        _suppressed[key] = _clip(reason, 200)
+        if fresh:
+            _state["suppressions"] += 1
+        if span:
+            _suppressed_spans[str(span)[:80]] = _clip(reason, 200)
+        _logger.warning("kvtier-dev-plugin: DISK[restore] no further disk offer for "
+                       "request %s (span %s): %s", key or "?",
+                       str(span)[:40] or "-", _clip(reason, 160))
+        return True
+    except Exception as exc:  # noqa: BLE001 - a fuse must not break the scheduler
+        _state["errors"] += 1
+        snapshot._error(exc, "disk_restore suppress_load")
+        return False
+
+
+def _suppressed_span(run) -> str | None:
+    """The span key of a run offered by `_disk_run`: its first block's first group.
+
+    The FIRST block identifies the span well enough to be useful: a run that starts
+    at the same scheduler block for the same groups is the same offer, and the fused
+    span is exactly the offer that failed. Keying on the first block rather than the
+    whole list means a shorter or longer run that overlaps it is also refused, which
+    is the safe direction: a missed restore costs a recompute, a re-offered failure
+    costs the whole engine.
+    """
+    try:
+        first = (run.get("keys") or [None])[0]
+        if not first:
+            return None
+        group, key_hex = first[0][0], first[0][1]
+        return f"{str(key_hex)[:16]}:{int(group)}"
+    except Exception as exc:  # noqa: BLE001 - a key we cannot read is no key
+        snapshot._error(exc, "disk_restore span key")
+        return None
+
+
 def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
+    if _skip_unless_flagged(request):
+        # `optin` scope and this request never asked: not a refusal worth a counter
+        # beyond `skipped_no_marker`, and not one byte of the fork's answer changed.
+        return ram_result
     opened = gate()
     if not opened["ok"]:
-        # The unarmed case, and the common one: not a refusal worth a counter,
-        # because "the tier is off" is not a fact about this request.
-        _note(opened["reason"])
+        kind = opened.get("reason_kind")
+        if kind == "offers_disabled":
+            # Counted, because a boot that is armed everywhere but here is exactly the
+            # state an operator needs to see from the counters.
+            _refuse("offers_disabled", opened["reason"])
+        elif kind == "scheduler_armed_workers_disarmed":
+            _refuse("workers_not_servicing", opened["reason"])
+        elif kind == "no_worker_proof":
+            _refuse("no_worker_proof", opened["reason"])
+        else:
+            # The plain unarmed case, and the common one: not a refusal worth a
+            # counter, because "the tier is off" is not a fact about this request.
+            _note(opened["reason"])
+        return ram_result
+    request_id = str(getattr(request, "request_id", "") or "")
+    if request_id in _suppressed:
+        _state["suppressed_hits"] += 1
+        _refuse("suppressed_after_failure",
+                f"a disk load already failed for this request "
+                f"({_clip(_suppressed.get(request_id), 120)}) and re-offering the "
+                "same span to a request the engine just rescheduled is a loop, not "
+                "a retry")
         return ram_result
     if not isinstance(ram_result, tuple) or len(ram_result) < 2:
         _refuse("bad_result", f"the fork returned {type(ram_result).__name__} "
@@ -1009,6 +1488,23 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         # prefix for the same reason: an external suffix cannot start mid-block.
         _refuse("unaligned_local_prefix", f"{computed} local tokens is not a whole "
                                           f"number of {block_size}-token blocks")
+        return ram_result
+    if request_id in _offered_at and computed <= int(_offered_at[request_id]):
+        # THE LOOP FUSE, second half, and it needs `computed` to say anything. The
+        # engine's recovery from a KV load failure puts the request back at the door
+        # with its computed tokens RESET, so a request we already offered comes back
+        # at the same place or earlier having made no progress - and the index has
+        # not changed, so the honest answer to the second asking is the first answer
+        # plus a failure. Only a request that has moved FORWARD gets a second offer.
+        _state["suppressed_hits"] += 1
+        suppress_load(request_id, f"it came back for a second disk offer at "
+                                  f"{computed} computed tokens having reached "
+                                  f"{_offered_at[request_id]} on the first one")
+        _refuse("suppressed_after_failure",
+                f"{request_id[:48]} was already offered disk tokens at "
+                f"{_offered_at[request_id]} computed tokens and is asking again at "
+                f"{computed}: the engine rescheduled it, so the first load did not "
+                "land, and a second offer is the loop that starved the box")
         return ram_result
     if ram_tokens % block_size != 0:
         # A fine-grained (hash-aligned) RAM hit would interleave with our blocks
@@ -1050,7 +1546,6 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if not refreshed["ok"]:
         _refuse("index_refresh_failed", refreshed["reason"])
         return ram_result
-    request_id = str(getattr(request, "request_id", "") or "")
     if not request_id or len(request_id) > 256:
         _refuse("bad_call", "the request id is unusable")
         return ram_result
@@ -1066,12 +1561,28 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                f"block {start_block} for all of groups "
                                f"{groups['groups']}")
         return ram_result
+    # The SPAN half of the loop fuse: this exact span already failed for somebody.
+    span = _suppressed_span(run)
+    if span and span in _suppressed_spans:
+        _state["suppressed_spans"] += 1
+        _refuse("suppressed_after_failure",
+                f"the span starting at block {start_block} already failed a disk "
+                f"load ({_clip(_suppressed_spans.get(span), 120)}): offering it to "
+                "this request would fail the same way and cost it its RAM hit too")
+        return ram_result
     matched = min(run["blocks"] * block_size, max_hit_len)
     floored = whole_block_tokens(matched, block_size)
     if not floored["ok"]:
         _refuse("bad_call", floored["reason"])
         return ram_result
     disk_tokens = int(floored["tokens"])
+    if disk_tokens > MAX_OFFER_TOKENS_PER_OFFER:
+        # Clamped, not truncated mid-span: whole spans only, so the fork's own
+        # "one whole block per entry" rule still holds after the clamp. This is the
+        # ceiling that 160,000-token offers blew straight through.
+        _state["offer_clamped"] += 1
+        disk_tokens = whole_block_tokens(MAX_OFFER_TOKENS_PER_OFFER,
+                                         block_size)["tokens"]
     if disk_tokens <= 0:
         _refuse("disk_run_below_one_block", f"{matched} matched tokens is below one "
                                             f"{block_size}-token scheduler block "
@@ -1142,7 +1653,12 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         _refuse("ram_shape", f"_pending_cpu_hits could not be written: "
                              f"{type(exc).__name__}")
         return ram_result
-    _register_load(request_id, merged, disk_tokens)
+    _register_load(request_id, merged, disk_tokens, span=span)
+    # Remember where this offer left the request, so a re-ask at the SAME point can
+    # be recognised as a reschedule rather than progress (see the loop fuse below).
+    _offered_at[request_id] = computed
+    if len(_offered_at) > MAX_SUPPRESSED_REQUESTS:
+        _offered_at.pop(next(iter(_offered_at)), None)
     _state["offers"] += 1
     _state["offered_tokens"] += disk_tokens
     _state["blocks_offered"] += blocks
@@ -1304,7 +1820,8 @@ def _merge_into_pending(manager, request_id, ram_tokens, ram_computed, block_siz
                identities=identities, hit_length=hit_length)
 
 
-def _register_load(request_id: str, merged: dict, disk_tokens: int) -> None:
+def _register_load(request_id: str, merged: dict, disk_tokens: int,
+                   span: str | None = None) -> None:
     """Remember the load until the worker reports it, or the ledger expires it.
 
     The mapping `cpu_block_id -> path` is what later fills `load_paths`, and its
@@ -1324,6 +1841,9 @@ def _register_load(request_id: str, merged: dict, disk_tokens: int) -> None:
                           for item in merged["identities"]],
         "identities": list(merged["identities"]),
         "offered_mono": round(time.monotonic(), 6),
+        # The span this offer was built from, so a failure later can fuse the SPAN
+        # and not only the request that happened to ask for it.
+        "span": str(span)[:80] if span else None,
         "deadline_mono": round(time.monotonic()
                                + RESTORE_DEADLINE_SECONDS, 6),
         "adopted": False,
@@ -1384,6 +1904,12 @@ def _sweep_loads(manager) -> int:
             dropped += 1
         elif now >= float(record["deadline_mono"]):
             _state["watchdog_fires"] += 1
+            # A load that never reported inside its deadline is a failed load: the
+            # fork has no timeout of its own for WAITING_FOR_REMOTE_KVS, so the only
+            # thing standing between this request and another offer is this fuse.
+            suppress_load(request_id, "its load outlived the restore deadline "
+                                      "without a report",
+                          span=_span_key_of(record))
             _drop_load(request_id, "its ledger deadline expired without a report")
             dropped += 1
     if dropped:
@@ -1492,28 +2018,125 @@ def note_reported(manager, connector_output) -> dict:
     were beyond the GPU hit (the scheduler computed it and came up short) and beyond
     the host-RAM hit (this module only extends a hit that ran out) - so a
     restoration is a recompute that did not happen.
+
+    TWO THINGS IT ALSO DOES, both learned the hard way on 2026-10-05:
+
+    * It reads the FAILURE halves of the same report (`failed_recving`, and
+      `invalid_block_ids` when the fork names blocks but no request) and burns the
+      request and the span. A report that says "this load did not land" has to cost
+      the next offer, or the reschedule re-offers the same span forever.
+    * It will not call a finished load a restoration without a read behind it. The
+      fork reports a load finished for its OWN host-RAM blocks too, so
+      `finished_recving` on a request whose disk slots nobody filled looked exactly
+      like success: the live box counted 123,161 "restorations" with
+      `reads_applied=0` in the same line.
     """
-    out = {"released": 0, "restorations": 0}
+    out = {"released": 0, "restorations": 0, "failures": 0, "no_read": 0}
     try:
         reported = {str(item) for item in
                     (getattr(connector_output, "finished_recving", None) or ())}
-        for request_id in reported:
+        failed = {str(item) for item in
+                  (getattr(connector_output, "failed_recving", None) or ())}
+        invalid = _invalid_block_ids(connector_output)
+        for request_id in sorted(failed):
+            # EXACT attribution: the fork names the request whose load failed.
+            record = _loads.get(request_id)
+            suppress_load(request_id, "the engine reported this request's KV load "
+                                      "failed",
+                          span=_span_key_of(record))
+            _loads.pop(request_id, None)
+            out["failures"] += 1
+        if invalid and not failed:
+            # The block-id-only shape: we own the load-error report, so on a step
+            # where a disk load was in flight these are ours. Deliberately
+            # over-broad - a missed restore costs a recompute, a missed failure
+            # feeds the loop that starved the box.
+            for request_id in list(_loads):
+                if _loads[request_id].get("adopted"):
+                    suppress_load(request_id, f"{invalid} GPU block id(s) came "
+                                              "back as load errors on a step that "
+                                              "carried this request's disk slots",
+                                  span=_span_key_of(_loads.get(request_id)))
+                    _loads.pop(request_id, None)
+                    out["failures"] += 1
+        for request_id in sorted(reported):
             record = _loads.get(request_id)
             if record is None:
                 continue
-            if record["adopted"]:
-                _state["restorations"] += 1
-                out["restorations"] += 1
+            if request_id in failed:
+                _drop_load(request_id, "the worker reported it failed")
+                out["released"] += 1
+                continue
+            if not record["adopted"]:
+                _drop_load(request_id, "the worker reported it finished without the "
+                                       "slots ever reaching a step")
+                out["released"] += 1
+                continue
+            if not _a_read_was_applied():
+                # The honest version of what the live box called a restoration.
+                _state["no_read"] += 1
+                out["no_read"] += 1
+                suppress_load(request_id, "the load was reported finished with no "
+                                          "applied disk read behind it",
+                              span=_span_key_of(record))
+                _drop_load(request_id, "reported finished with NO applied disk "
+                                       "read: counted as no_read, not as a "
+                                       "restoration")
+                out["released"] += 1
+                continue
+            _state["restorations"] += 1
+            out["restorations"] += 1
             _drop_load(request_id, "the worker reported its load finished")
             out["released"] += 1
         _sweep_loads(manager)
-        if out["restorations"]:
+        if out["restorations"] or out["failures"]:
             emit_witness()
         return out
     except Exception as exc:  # noqa: BLE001 - a completion never breaks a step
         _state["errors"] += 1
         snapshot._error(exc, "disk_restore note_reported")
         return _fail(f"the completion report raised {type(exc).__name__}")
+
+
+def _invalid_block_ids(connector_output) -> int:
+    """How many GPU blocks this step reported as load errors. -1 if unreadable."""
+    try:
+        ids = getattr(connector_output, "invalid_block_ids", None)
+        return len(ids) if ids else 0
+    except Exception as exc:  # noqa: BLE001 - an unreadable report says nothing
+        snapshot._error(exc, "disk_restore invalid_block_ids")
+        return -1
+
+
+def _span_key_of(record) -> str | None:
+    """The span an in-flight load was built from, for the span half of the fuse."""
+    if not record:
+        return None
+    try:
+        span = record.get("span")
+        return str(span)[:80] if span else None
+    except Exception as exc:  # noqa: BLE001 - no key is only a weaker fuse
+        snapshot._error(exc, "disk_restore load span")
+        return None
+
+
+def _a_read_was_applied() -> bool:
+    """Was there any evidence at all that a disk byte reached a CPU slot for this?
+
+    Two sources, because the scheduler process and the worker process are different
+    processes and the scheduler NEVER reads a file itself: its own `reads_applied`
+    stays 0 by construction, and the worker publishes its count in its rank file.
+    So the scheduler-side evidence is (this process's counter) OR (the sum the live
+    rank files reported at the last proof read). Neither is per-request - there is no
+    channel that could make it per-request - so this is the weakest statement that
+    still separates "disk reads are happening on this box" from "nothing has ever
+    been read", which is precisely the distinction a witness line has to get right.
+
+    A boot where workers serve reads normally keeps this true; a boot where the
+    scheduler offers and the workers refuse (2026-10-05) keeps it false forever, and
+    `restorations` stays 0 and the witness says REFUTED instead of CONFIRMED.
+    """
+    return applied_reads_evidence()["reads_applied"] >= 1
 
 
 # --- the worker's doors -------------------------------------------------------
@@ -2306,34 +2929,75 @@ def _evict_oldest_worker_load() -> None:
 def witness_verdict() -> dict:
     """Can this boot PROVE a disk restore served a request? One verdict, one line.
 
-    CONFIRMED requires `restorations >= 1`: a request whose disk-sourced CPU slots
-    reached the worker's `load_cpu_blocks` AND whose load was reported
-    `finished_recving`. That is the only chain of facts that means "these tokens
-    were restored instead of recomputed" - offers, reads and bytes each have ways to
-    be true without a single request being served.
+    CONFIRMED needs TWO facts, not one:
+
+    * `restorations >= 1` - a request whose disk-sourced CPU slots reached the
+      worker's `load_cpu_blocks` and whose load was reported `finished_recving`; and
+    * `reads_applied >= 1` somewhere in this boot (here, or attested by a live worker
+      rank file) - because the fork reports a load finished for its OWN host-RAM
+      blocks too, so a finished report on a request whose disk slots nobody filled
+      is indistinguishable from success.
+
+    The live box on 2026-10-05 printed `verdict=CONFIRMED reads_applied=0`
+    8,244 times while serving zero disk bytes. One of those two facts was missing and
+    nothing checked the other.
 
     REFUTED names why it never happened, in the order a reader should check: the
     gate never opened, nothing was offered, offers were not adopted (the
-    3,200-token floor or a clamp), or an adopted load never reported.
+    3,200-token floor or a clamp), an adopted load never reported, or it reported
+    without a single disk byte behind it.
     """
     refused = {name: int(count) for name, count in _state["refused"].items()
                if count}
-    verdict = "CONFIRMED" if _state["restorations"] >= 1 else "REFUTED"
+    reads = applied_reads_evidence()
+    restorations = int(_state["restorations"])
+    verdict = "CONFIRMED" if restorations >= 1 and reads["reads_applied"] >= 1 \
+        else "REFUTED"
     reason = "-"
     if verdict == "REFUTED":
-        reason = _refuted_reason(refused)
+        reason = _refuted_reason(refused, reads)
+    # The stable NAME of a verdict is everything before the first colon:
+    # `offers_not_adopted: 3 offer(s) ...` and `... 4 offer(s) ...` are the same thing
+    # to say. Keying an emission on the sentence is exactly the 1,048-lines-a-second
+    # flood - the sentence quotes counters, and counters move every step.
+    kind = "CONFIRMED" if verdict == "CONFIRMED" else reason.split(":", 1)[0]
     _state["witness_verdict"] = verdict
     _state["witness_reason"] = reason
-    return {"verdict": verdict, "reason": reason,
-            "restorations": int(_state["restorations"]),
+    _state["witness_kind"] = kind
+    return {"verdict": verdict, "reason": reason, "kind": kind,
+            "restorations": restorations,
+            "reads_applied": int(reads["reads_applied"]),
+            "reads_from": reads["source"],
             "offers": int(_state["offers"]),
             "offered_tokens": int(_state["offered_tokens"]),
             "adopted": int(_state["adopted"]),
             "adopted_tokens": int(_state["adopted_tokens"]),
+            "no_read": int(_state["no_read"]),
             "refused": refused}
 
 
-def _refuted_reason(refused: dict) -> str:
+def applied_reads_evidence() -> dict:
+    """Applied disk reads this boot, from either process, with the source named.
+
+    The scheduler never reads a file itself - the worker does - so its own counter is
+    0 by construction and the worker's number only crosses the process boundary
+    through the rank file. Naming WHICH source answered is the point: `reads=0`
+    because the scheduler has no fingers is a different fact from `reads=0` because
+    nothing was ever read, and only the second one is news.
+    """
+    local = int(_state["reads_applied"] or 0) + int(_state["disk_reads_applied"] or 0)
+    ranks = int(_state["ranks_reads_applied"] or 0)
+    if local > 0:
+        return {"reads_applied": local, "source": "this process"}
+    if ranks > 0:
+        return {"reads_applied": ranks, "source": "worker rank file"}
+    return {"reads_applied": 0,
+            "source": ("nothing has applied a disk read in this boot"
+                       if _state["sched_fitted"] else
+                       "this process runs neither half")}
+
+
+def _refuted_reason(refused: dict, reads: dict) -> str:
     """The first link in the chain that did not hold, named."""
     if _state["offers"] == 0:
         if refused:
@@ -2346,10 +3010,29 @@ def _refuted_reason(refused: dict) -> str:
         return (f"offers_not_adopted: {_state['offers']} offer(s) reached the "
                 "scheduler and none reached a worker (below the whole-scheduler-"
                 "block adoption floor, or clamped to zero)")
-    return ("adopted_never_reported: disk slots reached the worker but no load was "
-            f"reported finished (watchdog fires: "
-            f"{int(_state['worker_watchdog_fires'])}, phantom trips: "
-            f"{int(_state['phantom_guard_trips'])})")
+    if not _state["restorations"] and not _state["no_read"]:
+        # Nothing has been REPORTED yet for an adopted load: that is a different
+        # failure from "reported, but with no read behind it", and the order matters
+        # because a scheduler process always has reads_applied == 0 by construction.
+        return ("adopted_never_reported: disk slots reached the worker but no load "
+                "was reported finished (watchdog fires: "
+                f"{int(_state['worker_watchdog_fires'])}, phantom trips: "
+                f"{int(_state['phantom_guard_trips'])})")
+    if _state["no_read"] and not _state["restorations"]:
+        return (f"no_disk_read_behind_the_report: {_state['no_read']} load(s) came "
+                "back finished with no applied disk read at all, which is the "
+                "signature of slots that were allocated and never filled ("
+                f"{_clip(reads['source'], 60)})")
+    if not reads["reads_applied"]:
+        return (f"adopted_without_a_read: {_state['adopted']} load(s) reached the "
+                "worker with no applied disk read anywhere in this boot "
+                f"({_clip(reads['source'], 60)}) - the reports the fork makes for "
+                "its own host-RAM blocks are not evidence of a restore")
+    # Reached only when a partial restoration happened and something else is still
+    # short of the bar; say what the numbers are rather than invent a category.
+    return (f"partial: {int(_state['restorations'])} restoration(s) with "
+            f"{int(reads['reads_applied'])} applied read(s) and "
+            f"{int(_state['no_read'])} report(s) with no read behind them")
 
 
 def witness_line() -> str:
@@ -2360,6 +3043,7 @@ def witness_line() -> str:
     """
     try:
         view = witness_verdict()
+        reads = {"reads_applied": view["reads_applied"], "source": view["reads_from"]}
         parts = ["DISK[restore-witness]",
                  f"verdict={view['verdict']}",
                  f"restorations={view['restorations']}",
@@ -2367,7 +3051,11 @@ def witness_line() -> str:
                  f"offered_tokens={view['offered_tokens']}",
                  f"adopted={view['adopted']}",
                  f"adopted_tokens={view['adopted_tokens']}",
-                 f"reads_applied={int(_state['reads_applied'])}",
+                 f"reads_applied={int(reads['reads_applied'])}",
+                 f"no_read={int(_state['no_read'])}",
+                 f"suppressed={int(_state['suppressions'])}",
+                 f"scope={_state['scope']}",
+                 f"offers_switch={'on' if _state['offers_enabled'] else 'off'}",
                  f"watchdog_fires={int(_state['worker_watchdog_fires'])}",
                  f"phantom_trips={int(_state['phantom_guard_trips'])}"]
         refused = view["refused"]
@@ -2386,24 +3074,31 @@ def witness_line() -> str:
 
 
 def emit_witness(force: bool = False) -> dict:
-    """Log the witness when its verdict CHANGED, and never more than once a window.
+    """Log the witness when its VERDICT OR REASON changes, and never more than a
+    stated rate.
 
-    Once per distinct verdict is what makes it readable in a boot log; `force` is
-    for a caller that wants the line right now. Re-issuing the same line every step
-    would be noise, and a witness nobody can grep because it scrolled away is a
-    witness that does not exist.
+    The dedupe key is `(verdict, reason)`, NOT the whole line. Keying on the line is
+    what put this module in the log 1,048 times a second on the incident boot:
+    `offered_tokens` and `adopted_tokens` move on every single step, so the "changed
+    verdict" test fired forever and the flood itself became the second outage. The
+    verdict and its reason are what an operator reads; the counters are readable from
+    the payload whenever they want numbers.
+
+    A verdict change is logged immediately even mid-window (that is the event worth
+    reading); a REPEAT of a verdict already out is what the window suppresses.
     """
     try:
         line = witness_line()
+        key = (_state["witness_verdict"], _state["witness_kind"])
         now = time.monotonic()
-        unchanged = _witness_state["line"] == line
         fired = _witness_state["emitted_mono"]
-        if unchanged and not force:
-            if isinstance(fired, (int, float)) \
-                    and (now - fired) < MIN_WITNESS_LOG_SECONDS:
-                return {"logged": False, "reason": "this verdict is already out",
+        if _witness_state["key"] == key and not force:
+            _state["witness_suppressed"] += 1
+            if not isinstance(fired, (int, float)) \
+                    or (now - fired) < MIN_WITNESS_LOG_SECONDS:
+                return {"logged": False, "reason": "unchanged verdict",
                         "line": line}
-            return {"logged": False, "reason": "unchanged verdict", "line": line}
+        _witness_state["key"] = key
         _witness_state["line"] = line
         _witness_state["emitted_mono"] = now
         _state["witness_emissions"] += 1
@@ -2433,7 +3128,16 @@ def boot_line() -> str:
     METHODS wrapped in the process that printed the line.
     """
     try:
-        opened = gate()
+        # ROLE-ARMEDED `armed`. On 2026-10-05 four worker ranks printed `armed=NO` in
+        # this line while the scheduler printed `armed=YES`, and the field meant two
+        # different things in the same log: for a scheduler it answers "may I offer",
+        # for a worker it must answer "will I serve" (worker_service_verdict). A
+        # worker fails the SCHEDULER gate for reasons that have nothing to do with
+        # serving - its process never received the tier arm - so printing the
+        # scheduler's answer from a worker made an honest worker look broken and let
+        # a genuinely broken pairing look like ordinary idleness.
+        service = worker_service_verdict()
+        opened = gate() if role_here() != "worker" else service
         parts = ["DISK[restore]"]
         parts.append("installed={}".format("YES" if _state["installed"] else "NO"))
         parts.append("class={}".format(_state["class"] or "none"))
@@ -2444,10 +3148,22 @@ def boot_line() -> str:
         parts.append("index={}".format(int(disk_index.counters()["entries"])))
         parts.append("digest={}".format(_clip(disk_spill.geometry_digest(), 16)
                                         or "none"))
+        # THE POSTURE, on the line, because it is the first thing to ask about when
+        # the counters say nothing happened: this boot's offer switch, the scope it
+        # offers under, and the marker an opt-in request has to carry.
+        parts.append(f"offers_switch={'ON' if _state['offers_enabled'] else 'OFF'}")
+        parts.append(f"scope={_state['scope']}")
+        parts.append(f"marker={RESTORE_MARKER_KEY}")
+        parts.append(f"offer_cap={int(MAX_OFFER_TOKENS_PER_OFFER)}")
+        parts.append("flagged={}".format(int(_state["flagged"])))
+        parts.append("skipped_no_marker={}".format(int(_state["skipped_no_marker"])))
+        parts.append("suppressed={}".format(int(_state["suppressions"])))
         parts.append("offers={}".format(int(_state["offers"])))
         parts.append("offered_tokens={}".format(int(_state["offered_tokens"])))
         parts.append("reads_applied={}".format(int(_state["reads_applied"])))
-        parts.append("ranks_proven={}".format(int(_state["ranks_proven"])))
+        parts.append("ranks_armed={}/{}".format(int(_state["ranks_proven"]),
+                                                 int(_state["ranks_seen"]
+                                                     or _state["ranks_proven"])))
         parts.append("deadline={}s".format(RESTORE_DEADLINE_SECONDS))
         refused = {name: int(count) for name, count in _state["refused"].items()
                    if count}
@@ -2520,10 +3236,18 @@ def worker_report() -> dict:
     """This module's worker verdict for the rank file, degraded to fit if needed."""
     from . import worker_diag  # noqa: PLC0415 - the seam owns its own cap
     try:
+        # `armed` here is what the SCHEDULER reads to decide whether to offer at all,
+        # so it must be the worker's own service verdict and never `gate()`: the
+        # scheduler's gate asks for a tier arm and a rank proof that a worker process
+        # cannot satisfy, so `gate()` would have every honest rank publish
+        # `armed:false` forever, and the incident boot's `armed:NO` was this same
+        # field meaning the wrong question. See `worker_service_verdict`.
+        service = worker_service_verdict()
         report = {"section": "disk_restore", "writer": OWNER_TAG,
                   "installed": bool(_state["installed"]),
                   "class": _clip(_state["class"], 60),
-                  "armed": bool(gate()["ok"]),
+                  "armed": bool(service["ok"]),
+                  "armed_reason": _clip(service.get("reason"), 100),
                   "binds": int(_state["binds"]),
                   "disk_binds": int(_state["disk_binds"]),
                   "reads_started": int(_state["reads_started"]),
@@ -2540,17 +3264,19 @@ def worker_report() -> dict:
                   "read_seconds_avg": read_latency()[0],
                   "read_seconds_max": read_latency()[1],
                   "reason": _clip(_state["last_reason"], 100),
-                  "note": ("restores READ the SSD tier. reads_applied counts slots "
-                           "whose bytes reached a CPU slot; dma_unsettled counts "
-                           "those that arrived too late and were recomputed. "
-                           "phantom_trips must stay 0: a trip means a load event "
-                           "that was never submitted was about to be reported as "
-                           "loaded.")}
+                  "note": ("restores READ the SSD tier. armed is this rank's own "
+                           "answer to 'will I service a disk load' and the scheduler "
+                           "refuses every offer while any live rank says no; "
+                           "reads_applied counts slots whose bytes reached a CPU "
+                           "slot; dma_unsettled counts those that arrived too late "
+                           "and were recomputed. phantom_trips must stay 0: a trip "
+                           "means a load event that was never submitted was about to "
+                           "be reported as loaded.")}
         if len(json.dumps(report, default=str)) > worker_diag.MAX_CONTRIBUTION_BYTES:
             return {"section": "disk_restore", "writer": OWNER_TAG,
                     "truncated": True,
                     "installed": bool(_state["installed"]),
-                    "armed": bool(gate()["ok"]),
+                    "armed": bool(service["ok"]),
                     "reads_applied": int(_state["reads_applied"]),
                     "bytes_applied": int(_state["bytes_applied"]),
                     "phantom_trips": int(_state["phantom_guard_trips"])}
@@ -2793,30 +3519,55 @@ _reused_this_install = False
 _install_refusal_lines: list = []
 
 
-def emit_install_refusal(reason: str) -> dict:
-    """ONE WARNING per distinct install-refusal reason, per process.
+def _emit_install_line(reason: str, *, deferred: bool) -> dict:
+    """ONE line per distinct install outcome per process; deferrals at INFO.
 
-    Distinct from `emit_boot_line()`: the boot line reports the POSTURE (armed or
-    not, with the gate's reason) and can therefore read normally while nothing is
-    wrapped; an install refusal cannot be carried by the posture at all. A fork
-    rename, a half-imported process, a wrapper we refuse to stack on: each prints
-    exactly once, at the level the engine's log carries.
+    THE WORDING SPLIT, and it matters more than it looks. At plugin load the tier
+    classes are legitimately not imported yet - that is the ORDER of the engine, not a
+    fault - and printing that at WARNING as `installed=NO reason=...` made the first
+    line of every healthy boot look like a failure, so the real refusals (a fork that
+    renamed a method, a wrapper we refuse to stack on) were indistinguishable from
+    routine startup noise. Two shapes now:
+
+      `deferred=YES refused=NO` at INFO    - nothing to hook YET. The boot is fine and
+                                             `install()` will be called again by the
+                                             process that can see the class.
+      `deferred=NO refused=YES` at WARNING - the class was there and we could not fit
+                                             it. This is the line to read.
     """
     try:
-        line = (f"DISK[restore-install] installed=NO role={role_here()} "
+        flag = ("deferred=YES refused=NO" if deferred
+                else "deferred=NO refused=YES")
+        line = (f"DISK[restore-install] installed=NO role={role_here()} {flag} "
                 f"reason={_clip(reason, MAX_BOOT_LINE_CHARS)}")
-        _state["install_refusal_line"] = line
+        if deferred:
+            _state["install_deferral_line"] = line
+        else:
+            _state["install_refusal_line"] = line
         if line in _install_refusal_lines:
-            return {"logged": False, "reason": "this refusal is already logged",
+            return {"logged": False, "reason": "this line is already logged",
                     "line": line}
         _install_refusal_lines.append(line)
         del _install_refusal_lines[:-4]
-        _logger.warning("kvtier-dev-plugin: %s", line)
+        if deferred:
+            _logger.info("kvtier-dev-plugin: %s", line)
+        else:
+            _logger.warning("kvtier-dev-plugin: %s", line)
         return {"logged": True, "reason": None, "line": line}
     except Exception as exc:  # noqa: BLE001 - a log line never breaks an install
         snapshot._error(exc, "disk_restore install refusal line")
         return {"logged": False, "reason": f"logging raised {type(exc).__name__}",
                 "line": None}
+
+
+def emit_install_refusal(reason: str) -> dict:
+    """A real install refusal: the class was there and the method was not. WARNING."""
+    return _emit_install_line(reason, deferred=False)
+
+
+def emit_install_deferral(reason: str) -> dict:
+    """Nothing to hook in this process YET. INFO, and worded as a deferral."""
+    return _emit_install_line(reason, deferred=True)
 
 
 def install(refit: bool = False, sched_cls=None) -> dict:
@@ -2882,7 +3633,7 @@ def install(refit: bool = False, sched_cls=None) -> dict:
             # never came back: the line prints once, and `install_deferrals` says
             # how many times this process asked and found nothing.
             _state["install_deferrals"] += 1
-            emit_install_refusal(report["reason"])
+            emit_install_deferral(report["reason"])
             return report
         halves = []
         if sched_cls is not None:

@@ -181,10 +181,16 @@ class Manager:
 
 
 class Req:
-    """`Request`: the fields the offer path reads, and nothing else."""
+    """`Request`: the fields the offer path reads, and nothing else.
+
+    `restore=True` carries the opt-in marker the way a real client does - inside
+    `kv_transfer_params`, which the engine fills from `extra_args`. The default is
+    flagged because these tests are about the offer path; an unflagged request is the
+    subject of its own tests, and the plugin's default scope offers it nothing.
+    """
 
     def __init__(self, request_id="req-1", blocks=4, seed=1, num_tokens=None,
-                 skip_reading_prefix_cache=False):
+                 skip_reading_prefix_cache=False, restore=True):
         self.request_id = request_id
         # The digest at the END of each STEP-run is what the engine's view keeps for
         # that scheduler block, so block ordinal b (0-based) carries view_digest(b+1)
@@ -194,6 +200,8 @@ class Req:
         self.num_tokens = (num_tokens if num_tokens is not None
                            else blocks * BLOCK + 1200)
         self.skip_reading_prefix_cache = skip_reading_prefix_cache
+        self.kv_transfer_params = ({disk_restore.RESTORE_MARKER_KEY: True}
+                                   if restore else {})
 
 
 class Meta:
@@ -295,12 +303,17 @@ def allow_tmp_root(monkeypatch):
 
 @pytest.fixture
 def armed(monkeypatch, tmp_path):
-    """The gate open: root set, spill armed, tier armed, a worker proven.
+    """The gate open AND this boot told to offer: five switches, not four.
 
-    The four switches are replaced with the value under test rather than driven
+    The four fork switches are replaced with the value under test rather than driven
     through their own files, because arm-file and root-validation behaviour belongs
     to `disk_spill`/`config` and is pinned there. What this suite pins is the GATE'S
-    OWN composition: all four, or nothing.
+    OWN composition: all of them, or nothing.
+
+    The fifth is this module's own switch, and a fresh boot leaves it DOWN: arming the
+    spill tier is not consent to put a disk offer in front of a request. Every test
+    that uses this fixture is a test ABOUT offering, so it says so here explicitly -
+    `test_the_default_boot_offers_nothing_and_touches_no_index` pins the other side.
     """
     root = tmp_path / "spill"
     root.mkdir()
@@ -314,7 +327,10 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setattr(backport, "is_armed", lambda: True)
     monkeypatch.setattr(disk_restore, "worker_proof",
                         lambda force=False: {"ok": True, "count": 1,
-                                             "ranks": ["PP0_TP0"], "reason": None})
+                                             "ranks": ["PP0_TP0"], "reason": None,
+                                             "ranks_armed": 1, "ranks_seen": 1,
+                                             "reads_applied": 0,
+                                             "reason_kind": None})
     monkeypatch.setattr(disk_store, "counters", lambda: {
         "geometry_digest": DIGEST, "fingerprint": {"total_bytes_per_block": WIDTH},
         "rank": "PP0_TP0"})
@@ -322,6 +338,12 @@ def armed(monkeypatch, tmp_path):
     utils.make_block_hash_with_group_id = pack
     utils.resolve_block_hashes = resolve
     monkeypatch.setitem(sys.modules, disk_restore.KV_UTILS_MODULE, utils)
+    # THE SWITCH, raised on purpose: see the docstring. `scope` stays at its default
+    # `optin`, and the suite's `Req` asks for a restore because a real opt-in request
+    # does - `test_the_default_boot_offers_nothing_and_touches_no_index` covers the
+    # request that does not.
+    disk_restore.set_offer_switch(True)
+    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_OPTIN)
     return str(root)
 
 
@@ -361,10 +383,10 @@ def settle(batch_id, limit=400):
                          f"{disk_read.batch_status(batch_id)}")
 
 
-def merged_cpu(manager):
+def merged_cpu(manager, request_id="req-1"):
     """The CPU ids the merged tuple handed the fork, in the fork's group order."""
     return [int(block.block_id)
-            for group in manager._pending_cpu_hits["req-1"][0] for block in group]
+            for group in manager._pending_cpu_hits[request_id][0] for block in group]
 
 
 def disk_meta(root, seeds=(1,), groups=CACHEABLE, ram=1, event=11,
@@ -473,13 +495,18 @@ def test_nothing_fires_when_the_tier_arm_is_down(armed, monkeypatch):
     assert sum(counters["refused"].values()) == 0
 
 
-def test_worker_proof_needs_a_fresh_rank_file_saying_installed(tmp_path,
-                                                               monkeypatch):
-    """The rank file IS the proof: fresh, and `disk_restore.installed: true`.
+def test_worker_proof_needs_a_fresh_rank_file_saying_installed_and_armed(tmp_path,
+                                                                         monkeypatch):
+    """The rank file IS the proof, and it is proof of TWO things.
 
-    Without it the scheduler would offer CPU slots no worker fills, and the fork's
-    `start_load_kv` would DMA whatever those slots happened to contain. That is the
-    one silent failure in this design, so it costs a positive proof, not a hope.
+    `installed` says a worker fitted the layer; `armed` says it will SERVICE a load.
+    The 2026-10-05 incident needed the second one and only had the first: the
+    scheduler offered 160,000 tokens 123,474 times to workers that would not bind, so
+    every disk block came back invalid and the request was rescheduled into the same
+    offer. A proof that reads only `installed` cannot see that state at all.
+
+    Covers the three shapes, in this order: fitted-but-unarmed (refused), fitted and
+    armed (accepted), and the freshness/unreadability edges.
     """
     directory = tmp_path / "diag"
     directory.mkdir()
@@ -497,20 +524,84 @@ def test_worker_proof_needs_a_fresh_rank_file_saying_installed(tmp_path,
 
     write(None)
     assert disk_restore.worker_proof(force=True)["ok"] is False
-    write({"installed": False})
+    write({"installed": False, "armed": True})
     assert disk_restore.worker_proof(force=True)["ok"] is False
+
+    # CASE 1 - installed but NOT armed: refused, and named as the incident, not as
+    # "no worker exists". This is the state the old proof walked straight past.
+    write({"installed": True, "armed": False, "reason": "the disk tier is disarmed"})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is False, "a rank that will not serve cannot vouch for a load"
+    assert verdict["reason_kind"] == "scheduler_armed_workers_disarmed"
+    assert verdict["ranks_armed"] == 0 and verdict["ranks_seen"] == 1
+    assert "ranks_armed=0/1" in verdict["reason"]
+
+    # An `armed` field that is absent or the wrong type is NOT armed either: a rank
+    # file written by a plugin that never measured the fact cannot vouch for it.
     write({"installed": True})
+    assert disk_restore.worker_proof(force=True)["ok"] is False
+    write({"installed": True, "armed": "true"})
+    assert disk_restore.worker_proof(force=True)["ok"] is False, \
+        "the string 'true' is a client's idea of armed, not a rank's"
+
+    # CASE 2 - installed AND armed: the proof, with the rank named.
+    write({"installed": True, "armed": True, "reads_applied": 3})
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is True and verdict["ranks"] == ["PP0_TP0"]
-    write({"installed": True}, ts=time.time() - 3600.0)
+    assert verdict["ranks_armed"] == 1 and verdict["reads_applied"] == 3, \
+        "the worker's own applied-read count is the scheduler's only evidence"
+
+    # Freshness and unreadable files, unchanged in meaning.
+    write({"installed": True, "armed": True}, ts=time.time() - 3600.0)
     assert disk_restore.worker_proof(force=True)["ok"] is False, \
         "a heartbeat from a worker that may be gone proves nothing"
-    write({"installed": True})
+    write({"installed": True, "armed": True})
     (directory / "rank-huge.json").write_text(
         "x" * (disk_restore.MAX_RANK_FILE_BYTES + 10))
     (directory / "rank-broken.json").write_text("{ not json")
     assert disk_restore.worker_proof(force=True)["ok"] is True, \
         "one unreadable file is not evidence against the readable one"
+
+
+def test_one_disarmed_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
+    """THE INCIDENT, as a test: 1 rank armed, 1 rank not, 0 offers.
+
+    The load event spans every rank, so a rank that passes disk entries through "as
+    though it had none" leaves blocks the fork already committed to - which the
+    engine reports as invalid ids, truncates to 0 tokens and reschedules. A proof
+    that accepted "some of my ranks serve" would have authorised every one of the
+    123,474 offers. The bar is AND over the live ranks, and the refusal names the
+    split so a reader sees a partial fleet instead of inferring one.
+    """
+    directory = tmp_path / "diag"
+    directory.mkdir()
+    monkeypatch.setattr(config, "diagnostics_dir", lambda: directory)
+
+    def write(rank, section):
+        document = {"version": 1, "epoch": "aabbccdd",
+                    "ts": round(time.time(), 6), "role": "worker", "rank": rank,
+                    "arena": {}, "counters": {},
+                    "writer": {"epoch_scope": "process"},
+                    "disk_restore": section}
+        (directory / f"rank-{rank}.json").write_text(json.dumps(document))
+
+    write("PP0_TP0", {"installed": True, "armed": True, "reads_applied": 7})
+    write("PP1_TP0", {"installed": True, "armed": False,
+                      "reason": "the disk tier is disarmed"})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is False, "a partial fleet is a refusal, not a partial offer"
+    assert verdict["reason_kind"] == "scheduler_armed_workers_disarmed"
+    assert verdict["ranks_armed"] == 1 and verdict["ranks_seen"] == 2
+    assert "ranks_armed=1/2" in verdict["reason"]
+    # The armed rank's reads are still reported - the veto is about offering, not
+    # about pretending the other rank is doing nothing.
+    assert verdict["reads_applied"] == 7
+
+    # Pull the veto and the same two files prove the fleet.
+    write("PP1_TP0", {"installed": True, "armed": True, "reads_applied": 2})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is True and verdict["ranks_armed"] == 2
+    assert verdict["reads_applied"] == 9
 
 
 def test_worker_proof_is_cached_and_never_read_when_closed(tmp_path, monkeypatch):
@@ -534,6 +625,7 @@ def test_worker_proof_is_cached_and_never_read_when_closed(tmp_path, monkeypatch
         return {"ok": True, "count": 1, "ranks": ["r"], "reason": None}
 
     monkeypatch.setattr(disk_restore, "_read_worker_proof", probe)
+    disk_restore.set_offer_switch(True)
     assert disk_restore.gate()["ok"] is False
     assert probes == [], "a closed gate must not read the diagnostics directory"
     monkeypatch.setattr(disk_spill, "is_armed", lambda: True)
@@ -638,7 +730,10 @@ def test_the_run_is_contiguous_a_gap_ends_it(armed):
                                             key_hex(3, group), WIDTH)
         assert removed["ok"], removed["reason"]
     disk_index.refresh(force=True)
-    assert offer(Manager(), Req(blocks=4)) == (2 * BLOCK, True)
+    # A FRESH request id: the same id asked again at the same computed tokens is a
+    # reschedule after a failed load and is refused by the loop fuse, which is what
+    # `test_a_failed_load_is_never_offered_again_on_the_same_request` pins.
+    assert offer(Manager(), Req(request_id="req-2", blocks=4)) == (2 * BLOCK, True)
 
 
 def test_run_refuses_a_hash_that_is_not_bytes(armed):
@@ -1009,32 +1104,158 @@ def test_adoption_is_measured_from_emission(armed):
     assert counters["paths_emitted_steps"] == 1
 
 
-def test_completion_counts_a_restoration_only_when_adopted(armed):
-    """The counter the witness needs: a disk load the worker REPORTED finished.
+def test_an_unadopted_completion_releases_the_ledger_and_restores_nothing(armed):
+    """The counter the witness needs is not "the worker said finished".
 
-    That is the only chain of facts meaning "these tokens were restored instead of
-    recomputed": offers, reads and bytes are each true in boots where no request was
-    ever served from disk.
+    A request whose slots never reached a step restored nothing, whatever the report
+    says. The ledger still has to let it go.
     """
     fill(armed, blocks=1)
     output = fakes_debug.Obj(name="KVConnectorOutput", finished_recving={"req-1"},
                              finished_sending=set())
-    first = Manager(reqs_to_load={"req-1": object()})
-    offer(first, Req(request_id="req-1", blocks=1))
-    unadopted = disk_restore.note_reported(first, output)
-    assert unadopted["restorations"] == 0
-    assert unadopted["released"] == 1, "the ledger still lets it go"
+    manager = Manager(reqs_to_load={"req-1": object()})
+    offer(manager, Req(request_id="req-1", blocks=1))
+    report = disk_restore.note_reported(manager, output)
+    assert report["restorations"] == 0
+    assert report["released"] == 1, "the ledger still lets it go"
 
+
+def test_a_reported_load_with_no_applied_read_is_no_read_not_a_restoration(armed):
+    """THE LIE, pinned: a finished report with no disk read behind it.
+
+    The fork reports a load finished for its OWN host-RAM blocks too, so a request
+    whose disk slots nobody filled produces a report indistinguishable from success.
+    That is how a live boot counted 123,161 `restorations` with `reads_applied=0` in
+    the same log line. `no_read` is what it is, and it is never a restoration.
+    """
+    fill(armed, blocks=1)
     manager = Manager(reqs_to_load={"req-1": object()})
     offer(manager, Req(request_id="req-1", blocks=1))
     slots = merged_cpu(manager)
     disk_restore.build_load_paths(manager, Meta(load_event=4, cpu=slots,
                                                 gpu=list(range(len(slots))),
                                                 reqs={4: ["req-1"]}))
-    report = disk_restore.note_reported(manager, output)
+    reported = fakes_debug.Obj(name="KVConnectorOutput", finished_recving={"req-1"},
+                               finished_sending=set())
+    report = disk_restore.note_reported(manager, reported)
+    assert report["restorations"] == 0, "a finished report with no read is not a " \
+                                        "restoration"
+    assert report["no_read"] == 1
+    assert disk_restore.counters()["no_read"] == 1
+    assert disk_restore.counters()["restorations"] == 0
+    assert disk_restore._loads == {} and disk_restore._slot_paths == {}
+
+
+def test_a_reported_load_with_an_applied_read_is_a_restoration(armed):
+    """The restoration the witness is allowed to count: adopted, reported, READ.
+
+    The scheduler never reads a file itself, so `reads_applied` here stands for the
+    worker's attestation (its own counter in a worker process, its rank file in a
+    scheduler process); `applied_reads_evidence()` names which source answered.
+    """
+    fill(armed, blocks=1)
+    disk_restore._state["reads_applied"] = 1
+    manager = Manager(reqs_to_load={"req-1": object()})
+    offer(manager, Req(request_id="req-1", blocks=1))
+    slots = merged_cpu(manager)
+    disk_restore.build_load_paths(manager, Meta(load_event=5, cpu=slots,
+                                                gpu=list(range(len(slots))),
+                                                reqs={5: ["req-1"]}))
+    done = fakes_debug.Obj(name="KVConnectorOutput", finished_recving={"req-1"},
+                           finished_sending=set())
+    report = disk_restore.note_reported(manager, done)
     assert report["restorations"] == 1
     assert disk_restore._loads == {}
     assert disk_restore._slot_paths == {}, "a finished load frees its mappings"
+
+
+def test_a_failed_load_is_never_offered_again_on_the_same_request(armed):
+    """THE LOOP TEST: offer, fail, asked again on the same id => no second offer.
+
+    The engine's recovery from a KV load failure resets the request and reschedules
+    it, which asks `get_num_new_matched_tokens` again; the index has not changed, so
+    without a fuse the answer is the same 160,000 tokens and the same failure. On the
+    live box that loop ran 123,474 times in 3.9 minutes and starved the harness into
+    a watchdog reset.
+
+    Driven through the real path: offer, then the fork's failure report, then the
+    same request id coming back at the SAME computed tokens (what a reset looks
+    like). The second answer must be the fork's own value, the suppression counter
+    must move, and no new slots may be allocated.
+    """
+    fill(armed, blocks=2)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    request = Req(request_id="req-1", blocks=2)
+    assert offer(manager, request) == (2 * BLOCK, True)
+    allocated = disk_restore.counters()["slots_allocated"]
+    assert allocated > 0, "the first offer must really have allocated"
+
+    # The fork reports the load as FAILED for this request id, then reschedules it.
+    failed = fakes_debug.Obj(name="KVConnectorOutput", finished_recving=set(),
+                             finished_sending=set(), failed_recving={"req-1"},
+                             invalid_block_ids=set())
+    report = disk_restore.note_reported(manager, failed)
+    assert report["failures"] == 1
+    assert disk_restore.counters()["suppressions"] == 1
+
+    # The same request, back at the door at the same place. The fork's answer stands.
+    again = offer(Manager(reqs_to_load={"req-1": object()}), request)
+    assert again == (0, False), "a failed load re-offered is the loop itself"
+    counters = disk_restore.counters()
+    assert counters["refused"]["suppressed_after_failure"] == 1
+    assert counters["suppressed_hits"] == 1
+    assert counters["slots_allocated"] == allocated, \
+        "a suppressed request must not allocate a single slot"
+    assert counters["offers"] == 1, "exactly one offer happened, for two askings"
+
+
+def test_a_failed_span_is_refused_for_every_request(armed):
+    """The span half of the fuse: a DIFFERENT request wanting the same span is refused.
+
+    The harness that caused the incident replayed the same prompts, so the failing
+    span was re-requested by fresh request ids over and over. Fusing only the id
+    would have let every one of those through.
+    """
+    fill(armed, blocks=2)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    assert offer(manager, Req(request_id="req-1", blocks=2)) == (2 * BLOCK, True)
+    failed = fakes_debug.Obj(name="KVConnectorOutput", finished_recving=set(),
+                             finished_sending=set(), failed_recving={"req-1"},
+                             invalid_block_ids=set())
+    disk_restore.note_reported(manager, failed)
+
+    counters = disk_restore.counters()
+    before = counters["refused"]["suppressed_after_failure"]
+    other = offer(Manager(reqs_to_load={"req-9": object()}),
+                  Req(request_id="req-9", blocks=2))
+    assert other == (0, False)
+    assert disk_restore.counters()["suppressed_spans"] == 1
+    assert disk_restore.counters()["refused"]["suppressed_after_failure"] == before + 1
+
+
+def test_invalid_block_ids_without_a_request_name_still_burn_the_load(armed):
+    """The block-id-only failure shape is not allowed to keep offering.
+
+    `get_block_ids_with_load_errors` is OURS (the base connector returns an empty
+    set), so invalid ids on a step that carried our slots are ours even when
+    `failed_recving` stays empty. Over-broad on purpose: a wrongly-fused request loses
+    one restore, an unfused failure feeds the loop.
+    """
+    fill(armed, blocks=1)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    assert offer(manager, Req(request_id="req-1", blocks=1)) == (BLOCK, True)
+    slots = merged_cpu(manager)
+    disk_restore.build_load_paths(manager, Meta(load_event=3, cpu=slots,
+                                                gpu=list(range(len(slots))),
+                                                reqs={3: ["req-1"]}))
+    out = fakes_debug.Obj(name="KVConnectorOutput", finished_recving=set(),
+                          finished_sending=set(), failed_recving=set(),
+                          invalid_block_ids={700 + n for n in range(len(slots))})
+    report = disk_restore.note_reported(manager, out)
+    assert report.get("failures") == 1, report
+    assert disk_restore.counters()["suppressions"] == 1
+    assert offer(Manager(reqs_to_load={"req-1": object()}),
+                 Req(request_id="req-1", blocks=1)) == (0, False)
 
 
 def test_completion_of_an_unknown_request_is_ignored(armed):
@@ -1358,7 +1579,8 @@ def test_boot_line_names_the_verdict_and_the_counters():
     line = disk_restore.boot_line()
     assert line.startswith("DISK[restore] ")
     for field in ("installed=", "class=", "armed=", "root=", "index=", "digest=",
-                  "offers=", "reads_applied=", "ranks_proven=", "deadline=",
+                  "offers=", "reads_applied=", "ranks_armed=", "deadline=",
+                  "offers_switch=", "scope=", "marker=", "offer_cap=",
                   "refused="):
         assert field in line, field
     assert len(line) <= disk_restore.MAX_BOOT_LINE_CHARS * 4
@@ -1399,29 +1621,58 @@ def test_witness_names_where_the_chain_broke(armed):
     open.
     """
     fill(armed, blocks=1)
-    offer(Manager(), Req(blocks=1))
+    offer(Manager(), Req(request_id="req-a", blocks=1))
     assert disk_restore.witness_verdict()["reason"].startswith(
         "offers_not_adopted")
 
+    manager = Manager(reqs_to_load={"req-b": object()})
+    offer(manager, Req(request_id="req-b", blocks=1))
+    slots = merged_cpu(manager, "req-b")
+    disk_restore.build_load_paths(manager, Meta(load_event=1, cpu=slots,
+                                                gpu=list(range(len(slots))),
+                                                reqs={1: ["req-b"]}))
+    verdict = disk_restore.witness_verdict()
+    assert verdict["adopted"] == 1
+    assert verdict["reason"].startswith("adopted_never_reported")
+
+
+def test_a_reported_restoration_without_a_read_refutes_the_witness(armed):
+    """The incident's log line, reproduced: a boot that CONFIRMED itself while
+    restoring nothing. `restorations` now stays 0 without a read, so the witness says
+    REFUTED and names why.
+
+    This is the single highest-value assertion in the suite: a witness that can be
+    satisfied by a finished report is not evidence of anything.
+    """
+    fill(armed, blocks=1)
     manager = Manager(reqs_to_load={"req-1": object()})
     offer(manager, Req(request_id="req-1", blocks=1))
     slots = merged_cpu(manager)
     disk_restore.build_load_paths(manager, Meta(load_event=1, cpu=slots,
                                                 gpu=list(range(len(slots))),
                                                 reqs={1: ["req-1"]}))
+    output = fakes_debug.Obj(name="KVConnectorOutput", finished_recving={"req-1"},
+                             finished_sending=set())
+    assert disk_restore.note_reported(manager, output)["restorations"] == 0
     verdict = disk_restore.witness_verdict()
-    assert verdict["adopted"] == 1
-    assert verdict["reason"].startswith("adopted_never_reported")
+    assert verdict["verdict"] == "REFUTED"
+    assert "no_disk_read_behind_the_report" in verdict["reason"]
+    assert "verdict=REFUTED" in disk_restore.witness_line()
+    assert "reads_applied=0" in disk_restore.witness_line()
 
 
-def test_witness_is_confirmed_by_a_reported_restoration(armed):
-    """CONFIRMED needs a load that reached a worker AND was reported finished.
+def test_witness_is_confirmed_by_a_reported_restoration_and_a_read(armed):
+    """CONFIRMED needs a load that reached a worker, was reported finished, AND had a
+    disk read applied somewhere in the boot.
 
     That single greppable line is the answer to "does the restore serve requests, or
-    did it never run" - and it can only be reached by the real chain, not by an offer
-    or a byte count.
+    did it never run" - reachable only by the real chain, not by an offer or a byte
+    count. The second condition is what was missing on 2026-10-05, where the same line
+    printed `verdict=CONFIRMED reads_applied=0` 8,244 times in a boot that had
+    restored nothing.
     """
     fill(armed, blocks=1)
+    disk_restore._state["reads_applied"] = 1
     manager = Manager(reqs_to_load={"req-1": object()})
     offer(manager, Req(request_id="req-1", blocks=1))
     slots = merged_cpu(manager)
@@ -1433,12 +1684,52 @@ def test_witness_is_confirmed_by_a_reported_restoration(armed):
     assert disk_restore.note_reported(manager, output)["restorations"] == 1
     verdict = disk_restore.witness_verdict()
     assert verdict["verdict"] == "CONFIRMED" and verdict["reason"] == "-"
+    assert verdict["reads_applied"] >= 1
     assert "verdict=CONFIRMED" in disk_restore.witness_line()
     assert "DISK[restore-witness]" in disk_restore.witness_line()
 
 
+def test_a_worker_attested_read_counts_even_with_the_scheduler_at_zero(armed):
+    """The scheduler's own read counter is 0 BY CONSTRUCTION - it never reads a file.
+
+    So the worker's rank file is the only evidence that can cross the process
+    boundary, and a witness that demanded the scheduler's local counter would say
+    REFUTED on a healthy boot forever. `applied_reads_evidence()` names which source
+    answered so the two kinds of zero stay distinguishable.
+    """
+    assert disk_restore.applied_reads_evidence()["reads_applied"] == 0
+    disk_restore._state["ranks_reads_applied"] = 5
+    evidence = disk_restore.applied_reads_evidence()
+    assert evidence["reads_applied"] == 5
+    assert evidence["source"] == "worker rank file"
+
+
+def test_the_witness_is_not_re_emitted_while_the_verdict_is_unchanged(armed, caplog):
+    """THE FLOOD FIX: the dedupe key is (verdict, reason), not the whole line.
+
+    Keyed on the line, every step re-issued a "changed" witness because
+    `offered_tokens` moves constantly - 1,048 lines a second on the incident boot,
+    and the log volume was the second outage. Counters may move all they like; one
+    verdict gets one line.
+    """
+    fill(armed, blocks=4)
+    with caplog.at_level(logging.WARNING, logger="kvtier_dev_plugin.disk_restore"):
+        for ordinal in range(20):
+            # Distinct ids: the loop fuse would (correctly) refuse a repeat of one.
+            offer(Manager(), Req(request_id=f"flood-{ordinal}", blocks=4))
+        lines = [record.getMessage() for record in caplog.records
+                 if "restore-witness" in record.getMessage()]
+    assert len(lines) == 1, \
+        f"20 lookups emitted {len(lines)} witness lines; the verdict never changed"
+    assert disk_restore.counters()["witness_emissions"] == 1
+    assert disk_restore.counters()["witness_suppressed"] >= 18, \
+        "the suppressions have to be counted, or a quiet log looks like a dead module"
+
+
 def test_the_witness_line_is_logged_once_per_verdict(armed, caplog):
+    """One line per VERDICT, not one per step and not one per counter movement."""
     fill(armed, blocks=1)
+    disk_restore._state["reads_applied"] = 1
     manager = Manager(reqs_to_load={"req-1": object()})
     offer(manager, Req(request_id="req-1", blocks=1))
     slots = merged_cpu(manager)
@@ -1449,7 +1740,10 @@ def test_the_witness_line_is_logged_once_per_verdict(armed, caplog):
                              finished_sending=set())
     with caplog.at_level(logging.WARNING):
         disk_restore.note_reported(manager, output)
+        # A second report on an empty ledger: the counters move, the verdict does not.
         disk_restore.note_reported(Manager(), output)
+        disk_restore.emit_witness()
+        disk_restore.emit_witness()
     lines = [rec.getMessage() for rec in caplog.records
              if "verdict=CONFIRMED" in rec.getMessage()]
     assert len(lines) == 1
@@ -1548,7 +1842,7 @@ def test_the_plugin_load_install_cannot_be_the_scheduler_fit(monkeypatch,
     saved = sys.modules.pop(disk_restore.SCHED_MODULE, None)
     saved_worker = sys.modules.pop(disk_restore.WORKER_MODULE, None)
     try:
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO, logger="kvtier_dev_plugin.disk_restore"):
             engine_side.register()
         counters = disk_restore.counters()
         assert counters["sched_fitted"] is False
@@ -1559,7 +1853,14 @@ def test_the_plugin_load_install_cannot_be_the_scheduler_fit(monkeypatch,
         assert counters["install_refusals"] == 0
         loud = "\n".join(rec.getMessage() for rec in caplog.records
                          if rec.levelno >= logging.WARNING)
-        assert "DISK[restore-install]" in loud
+        # The install line is a DEFERRAL here (nothing to hook yet), so it belongs to
+        # INFO, not to the WARNING-level noise the boot line still makes. A deferral
+        # printed at WARNING is what made every healthy boot look broken.
+        deferred = [rec.getMessage() for rec in caplog.records
+                    if "restore-install" in rec.getMessage()]
+        assert deferred, "the deferral has to be said"
+        assert all("deferred=YES" in text for text in deferred), deferred
+        assert not any("refused=YES" in text for text in deferred), deferred
         assert "DISK[restore] installed=NO" in loud
     finally:
         for name, previous in ((disk_restore.SCHED_MODULE, saved),
@@ -2680,10 +2981,31 @@ def test_the_restore_wrapper_is_on_the_method_the_live_scheduler_calls(
     assert "restore" in sched_layer_kinds(cls, disk_restore.METHOD_MATCHED)
 
     assert disk_restore.gate()["ok"] is True
-    before = disk_restore.counters()["refusals_total"]
-    # The fork's own answer, unchanged, and the refusal counted by name: the wrapper
-    # is on the call path and refuses in the open.
+    # The fork's own answer, unchanged, and NO work done: `object()` carries no
+    # opt-in marker, so in the default `optin` scope the request goes straight back to
+    # the fork. The wrapper is provably on the call path (it returned the fork's
+    # 4096 through the fitted method) without the restore path having to touch a file.
+    skipped_before = disk_restore.counters()["skipped_no_marker"]
     assert manager.get_num_new_matched_tokens(object(), 0) == (4096, True)
+    counters = disk_restore.counters()
+    assert counters["skipped_no_marker"] == skipped_before + 1
+    assert counters["refusals_total"] == 0, \
+        "an unflagged request is a skip, not a refusal: a refusal says we could not, " \
+        "a skip says it never asked"
+    assert counters["offers"] == 0
+
+    # A FLAGGED request with a manager the path cannot read is refused IN THE OPEN,
+    # counted by name. Same wrapper, other side of the scope switch.
+    class Hostile:
+        block_size = None
+        hash_block_size = None
+        block_hashes = []
+        num_tokens = 9999
+        kv_transfer_params = {disk_restore.RESTORE_MARKER_KEY: True}
+        request_id = "req-hostile"
+
+    before = disk_restore.counters()["refusals_total"]
+    assert manager.get_num_new_matched_tokens(Hostile(), 0) == (4096, True)
     counters = disk_restore.counters()
     assert counters["refusals_total"] == before + 1
     assert counters["last_refusal"]
