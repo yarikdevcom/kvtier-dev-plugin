@@ -175,7 +175,8 @@ def test_an_unknown_field_is_refused_rather_than_ignored():
 @pytest.mark.parametrize(("field", "junk"), [
     ("model_id", ""),
     ("model_id", 7),
-    ("model_revision", "has/slash"),
+    ("model_id", "nul\x00byte"),                # a NUL is refused wherever it lands
+    ("model_id", "a" * 300),
     ("dtype", "line\nbreak"),
     ("total_bytes_per_block", 512),              # a unit mix-up, not a geometry
     ("total_bytes_per_block", 2 * 1024 ** 3),    # a pool-wide total
@@ -207,6 +208,44 @@ def test_a_fingerprint_that_could_not_come_from_a_real_boot_is_refused(field, ju
     refused = dl.validate_fingerprint(fingerprint(**{field: junk}))
     assert refused["ok"] is False
     assert refused["reason"]
+
+
+def test_a_local_model_path_is_a_legal_identity_and_moves_the_digest():
+    """THE 2026-10-05 OUTAGE, PINNED. The box boots `vllm serve
+    /home/user/Qwen3.8-Flash-Next-W4A16-Merlin`, so `model_config.model` - the FIRST
+    candidate `disk_store` reads `model_id` from - is an absolute path, and
+    `_validate_string` refused any value containing a separator. Every step on every
+    rank was therefore refused as `fingerprint_incomplete`, the tier wrote zero
+    files, and no field any reader looked at was wrong: the engine patch was live,
+    the arm was fresh, the root was set, the rank was resolved. Zero files, zero
+    clues.
+
+    Two properties, both needed:
+      * a path-shaped identity is ACCEPTED, because a fingerprint field is digested
+        text and never a path component (the name is built from `key16`, its shard
+        and the digest - all hex, all validated separately);
+      * two different directories still produce two different digests. Refusing the
+        path was wrong, but so would be "helpfully" keeping the basename: two model
+        directories sharing a leaf name would then share a digest, and old bytes
+        would be findable under a new engine's name - the one failure this layer
+        exists to make impossible.
+    """
+    box = "/home/user/Qwen3.8-Flash-Next-W4A16-Merlin"
+    checked = dl.validate_fingerprint(fingerprint(model_id=box))
+    assert checked["ok"] is True, checked["reason"]
+    assert checked["fingerprint"]["model_id"] == box
+    other = dl.validate_fingerprint(fingerprint(
+        model_id="/home/user/other/Qwen3.8-Flash-Next-W4A16-Merlin"))
+    assert other["ok"] is True
+    assert dl.compute_geometry_digest(other["fingerprint"]) != \
+        dl.compute_geometry_digest(checked["fingerprint"])
+    # And the values that DO become path components stay path-separator strict.
+    assert dl.validate_key16("aa/bb/cc/dd/ee/ff")["ok"] is False
+    assert dl.validate_geometry_digest("ab/cd/ef/01/23/45")["ok"] is False
+    # A control character or a NUL is still refused in an identity field: that is a
+    # writer bug, not a spelling of a model directory.
+    assert dl.validate_fingerprint(
+        fingerprint(model_id="tab\there"))["ok"] is False
 
 
 @pytest.mark.parametrize("seed", [

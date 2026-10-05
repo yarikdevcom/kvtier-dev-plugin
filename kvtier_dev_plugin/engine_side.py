@@ -390,15 +390,44 @@ def _on_worker_report(connector) -> None:
     and being outermost is what guarantees that.
 
     Each call is contained on its own, so a broken first listener cannot cost the
-    second one its install.
+    second one its install - and each report is LOGGED, once per process, at
+    WARNING. Dropping the three reports on the floor is how a worker that never
+    wired its spill hook looked identical to one that did: the plugin-load line in
+    `register()` has already been written by then (and at a level the engine's log
+    does not even carry), so the handshake verdict was the only place the truth
+    existed and it was discarded.
     """
+    outcomes = []
     for hook in (worker_diag.ensure_installed, blockdump.ensure_installed,
                  disk_store.ensure_installed):
         name = getattr(hook, "__name__", "listener")
         try:
-            hook(connector)
+            outcomes.append(f"{name}={_brief_report(hook(connector))}")
         except Exception as exc:  # noqa: BLE001 - a listener never breaks a handshake
             snapshot._error(exc, f"worker report hook ({name})")
+            outcomes.append(f"{name}=raised:{type(exc).__name__}")
+    line = "kvtier-dev-plugin: worker hook install " + " ".join(outcomes)
+    if line not in _worker_report_lines:
+        _worker_report_lines.append(line)
+        del _worker_report_lines[:-4]
+        logger.warning(line)
+
+
+def _brief_report(report) -> str:
+    """One install report, in the space of a log field. Never raises."""
+    try:
+        if not isinstance(report, dict):
+            return str(report)[:48]
+        if report.get("installed"):
+            return "YES"
+        return "NO({})".format(str(report.get("reason")
+                                  or report.get("skip_reason")
+                                  or "refused")[:64].replace("\n", " "))
+    except Exception as exc:  # noqa: BLE001 - a log field cannot break a handshake
+        return f"unreadable:{type(exc).__name__}"
+
+
+_worker_report_lines: list = []
 
 
 def register() -> None:

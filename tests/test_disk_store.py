@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -1643,8 +1644,13 @@ def test_disk_store_imports_only_the_standard_library_and_its_own_package():
                 local.add(node.module or "")
             elif node.module:
                 external.add(node.module.split(".")[0])
-    assert external <= {"__future__", "contextlib", "dataclasses", "json", "os",
-                        "sys", "time"}, sorted(external)
+    # `logging` is stdlib and earns its place the hard way: the worker's disk
+    # verdict has to reach the engine log, and the engine's logging posture drops
+    # this logger's INFO lines entirely (measured on the box: every `logger.warning`
+    # this plugin emits is in /tmp/vllm-serve.log, no INFO line is). A verdict that
+    # cannot be logged is a verdict nobody can act on.
+    assert external <= {"__future__", "contextlib", "dataclasses", "json",
+                        "logging", "os", "sys", "time"}, sorted(external)
     package = disk_store.__name__.rpartition(".")[0]
     assert local == {"", package} or local <= {"", package}
     # And the engine is reached by NAME only: no vllm, no torch, at any nesting.
@@ -1728,3 +1734,217 @@ def test_the_status_route_advertises_the_ops_the_verb_actually_accepts(enabled):
     assert block["ops"] == list(disk_store._DISK_OPS)
     assert block["route"] == config.ROUTE_PREFIX + config.ROUTE_DISK
     assert block["root_env"] == config.ENV_DISK_ROOT
+
+
+# --- 14. what a WORKER can finally see: the rank-file contribution -----------
+#
+# On 2026-10-05 the SSD tier was configured, armed, and given traffic on a patched
+# engine, and it wrote nothing while all four ranks parked KV. There was no log
+# line, no counter and no file that reported what `disk_store` had done inside a
+# worker, so "the plugin never tried" and "it tried and refused" were the same
+# observable state. These tests pin the two things that end that: the report this
+# module contributes to the one rank file, and the one line it puts in the log.
+
+BOX_MODEL_PATH = "/home/user/Qwen3.8-Flash-Next-W4A16-Merlin"
+
+
+def test_a_local_model_path_spills_instead_of_refusing(tier, worker_class):
+    """THE regression test for the outage, and the one that would have caught it.
+
+    The box boots `vllm serve /home/user/<model>`, so `model_config.model` - the
+    first candidate for `model_id` - is an absolute path. `_validate_string` refused
+    any value containing a separator, so the fingerprint could never be built, every
+    step was refused as `fingerprint_incomplete`, and zero files were written while
+    the counters that every reader DID look at said "engine patch present, arm
+    fresh, root configured, rank resolved". All true; none of them the reason.
+
+    A fingerprint field is digested text and never a path component, so the path is
+    legal - and this test drives the whole round trip through the fork's two methods
+    to prove the bytes actually land.
+    """
+    role = handler({"g0": FakeRegion(8, SLOT_BYTES)})
+    role.vllm_config.model_config.model = BOX_MODEL_PATH
+    assert disk_store.install()["installed"] is True
+    caches = {"g0": FakeRegion(8, SLOT_BYTES)}
+    worker = fork_worker_instance(worker_class, caches)
+    worker.vllm_config = role.vllm_config
+    with metadata_shape(True):
+        step = metadata(store_cpu_blocks=[5], store_keys=[LONG_KEY])
+        worker.bind_connector_metadata(step)
+        assert disk_store.retained_view()["events"] == 1, \
+            disk_store.counters()["last_reason"]
+        worker.delivered = [step.store_event]
+        worker.get_finished(set())
+    assert disk_store.counters()["refused"] == {
+        name: 0 for name in disk_store.REFUSAL_REASONS}, \
+        disk_store.counters()["last_reason"]
+    assert disk_spill.drain()["drained"] is True
+    files = store_files(tier)
+    assert len(files) == 1, files
+    ((relative, payload),) = files.items()
+    assert payload == caches["g0"].slot_bytes(5)
+
+
+def test_the_worker_report_names_the_gate_the_identity_and_the_refusals(tier,
+                                                                       worker_class):
+    """Every field an operator needs to answer "why nothing", in one small object.
+
+    `engine_fields.observed_on_a_step` is the one the class probe cannot supply: "the
+    metadata TYPE declares store_keys" and "a metadata object this worker actually
+    bound carried it" are different claims, and only the second means a spill can be
+    named. That distinction is why the 2026-10-05 snapshot looked healthy.
+    """
+    assert disk_store.install()["installed"] is True
+    with metadata_shape(True):
+        step = metadata(store_cpu_blocks=[5], store_keys=[LONG_KEY])
+        disk_store.observe_bind(handler({"g0": FakeRegion(8, SLOT_BYTES)}), step)
+    report = disk_store.worker_report()
+    assert report["section"] == "disk"
+    assert report["installed"] is True
+    assert report["class"] == "SimpleCPUOffloadWorker"
+    assert report["configured"] is True and report["armed"] is True
+    assert report["root"] == str(tier)
+    assert report["fingerprint_ready"] is True and report["digest"]
+    assert report["engine_fields"]["observed_on_a_step"] is True
+    assert report["engine_fields"]["fingerprint_observed_on_a_step"] is True
+    assert report["binds"] == 1 and report["retained_events"] == 1
+    # The counters a reader must not have to re-derive from another module.
+    for key in ("files_written", "bytes_written", "drops", "refusals_total",
+                "last_refusal", "queue_depth", "writer_thread_alive"):
+        assert key in report, key
+
+
+def test_a_refusal_names_its_reason_and_its_count(tier):
+    """`refused` was always a fifteen-key table; the outage needed the non-zero part
+    and the running total to be readable in one glance."""
+    disk_store.resolve_store_keys(None)           # the worst argument this door takes
+    counters = disk_store.counters()
+    assert counters["refusals_total"] == 1
+    assert counters["last_refusal"]["reason"] == "bad_call"
+    assert counters["last_refusal"]["count"] == 1
+    report = disk_store.worker_report()
+    assert report["refused"] == {"bad_call": 1}   # only what happened
+    assert report["refusals_total"] == 1
+
+
+def test_the_worker_report_fits_the_seam_and_survives_a_lying_internals(tier,
+                                                                        monkeypatch):
+    """Two guarantees at once: the section is never so big that `worker_diag` drops
+    it for no reason, and a broken internal never raises into the write path.
+
+    The size case is the realistic worst one - sixteen unreadable fingerprint fields,
+    each with the paths it tried - and the report degrades itself (detail first)
+    rather than handing the writer a section it must refuse.
+    """
+    disk_store._state["fingerprint_missing"] = [
+        {"field": f"field_{index}",
+         "tried": [f"vllm_config.{path}" for path in
+                   ("model_config.model", "cache_config.block_size",
+                    "parallel_config.world_size")]}
+        for index in range(16)]
+    disk_store._state["last_reason"] = "x" * 4000
+    report = disk_store.worker_report()
+    assert len(json.dumps(report, default=str)) <= worker_diag.MAX_CONTRIBUTION_BYTES
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("the counters exploded")
+
+    monkeypatch.setattr(disk_spill, "counters", explode)
+    report = disk_store.worker_report()
+    assert isinstance(report, dict) and report["section"] == "disk"
+    assert report["report_error"] == "RuntimeError"
+    assert disk_store.counters()["fallbacks"] + snapshot.error_counters()["errors"] \
+        >= 1
+
+
+def test_install_offers_the_section_only_where_a_worker_class_exists(tier,
+                                                                    worker_class):
+    """An EngineCore or an API server has no spill hook and nothing to report, so it
+    registers NOTHING and the rank file carries no `disk` key at all - rather than an
+    empty object claiming a facility this process does not have."""
+    saved = sys.modules.pop(disk_store.TARGET_MODULE, None)
+    try:
+        assert disk_store.install()["installed"] is False
+        assert worker_diag.contributions()["registered"] == []
+    finally:
+        if saved is not None:
+            sys.modules[disk_store.TARGET_MODULE] = saved
+    assert disk_store.install()["installed"] is True
+    assert worker_diag.contributions()["registered"] == ["disk"]
+    assert worker_diag.contributions()["owners"] == {
+        "disk": "kvtier-dev-plugin/disk-store"}
+
+
+def test_the_rank_file_carries_the_disks_own_verdict(tier, worker_class,
+                                                     monkeypatch):
+    """THE thing that was missing, end to end: `worker_diag` is the only writer, and
+    the disk tier's verdict arrives THROUGH it. A completed store on a worker whose
+    fingerprint could not be built must be readable as a refusal, not as silence."""
+    monkeypatch.setenv(config.ENV_DIAG_MIN_INTERVAL, "0")
+    assert worker_diag.install(worker_class)["installed"] is True
+    assert disk_store.install()["installed"] is True
+    caches = {"g0": FakeRegion(8, SLOT_BYTES)}
+    worker = fork_worker_instance(worker_class, caches)
+    disk_spill.disarm()                           # the gate says no: refuse, visibly
+    with metadata_shape(True):
+        step = metadata(store_cpu_blocks=[5], store_keys=[LONG_KEY])
+        worker.bind_connector_metadata(step)
+        worker.delivered = [step.store_event]
+        worker.get_finished(set())                # also the rank file's write trigger
+    document = json.loads((tier.parent / "diag" / "rank-PP0_TP0.json").read_text())
+    # The required fields are intact - a contribution may never cost the reader a
+    # field whose absence makes the whole file `malformed`.
+    assert document["version"] == 1 and document["role"] == "worker"
+    assert document["rank"] == "PP0_TP0"
+    assert document["arena"]["bytes_total"] > 0
+    disk_section = document["disk"]
+    assert disk_section["installed"] is True
+    assert disk_section["armed"] is False         # and the file says so
+    assert disk_section["root"] == str(tier)
+    assert disk_section["files_written"] == 0
+    assert disk_section["note"].startswith("THE DISK TIER'S OWN VERDICT")
+    assert document["writer"]["contributions"]["written"] == ["disk"]
+
+
+def test_the_boot_line_states_the_verdict_and_is_logged_once(tier, worker_class,
+                                                             caplog):
+    """`BOOT[auto]` says nothing about the disk tier, so a worker's boot log could
+    not distinguish "never tried" from "tried and refused". `DISK[spill]` does, and
+    it is logged at WARNING because the engine's logging posture drops this logger's
+    INFO lines (measured: zero INFO plugin lines in the live engine log)."""
+    with caplog.at_level(logging.INFO, logger="kvtier_dev_plugin.disk_store"):
+        assert disk_store.install()["installed"] is True
+    lines = [row.message for row in caplog.records if "DISK[spill]" in row.message]
+    assert len(lines) == 1, lines                 # install from the hook: one line
+    line = lines[0]
+    assert "installed=YES" in line and "class=SimpleCPUOffloadWorker" in line
+    assert f"root={tier}" in line and "tier=ARMED" in line
+    assert "engine_fields=" in line and "refused=none" in line
+    assert caplog.records[0].levelname == "WARNING"
+    # The same verdict again is not a second line: install runs at plugin load AND
+    # off the handshake, and a repeated line is noise that buries the one that counts.
+    with caplog.at_level(logging.WARNING,
+                         logger="kvtier_dev_plugin.disk_store"):
+        disk_store.install()
+        disk_store.emit_boot_line()
+    assert len([row for row in caplog.records if "DISK[spill]" in row.message]) == 1
+    # A CHANGED verdict is a new line: the arm is the fact that moves at runtime.
+    disk_spill.disarm()
+    with caplog.at_level(logging.WARNING,
+                         logger="kvtier_dev_plugin.disk_store"):
+        assert disk_store.emit_boot_line()["logged"] is True
+    assert "tier=DISARMED" in caplog.records[-1].message
+
+
+def test_the_boot_line_and_the_report_survive_a_broken_everything(monkeypatch):
+    """The two new doors follow the same rule as every other one in this module: a
+    dict out, an exception never, even when the modules they read are lying."""
+    def explode(*args, **kwargs):
+        raise RuntimeError("the tier exploded")
+
+    monkeypatch.setattr(disk_spill, "disk_root", explode)
+    monkeypatch.setattr(disk_spill, "is_armed", explode)
+    assert isinstance(disk_store.boot_line(), str)
+    assert isinstance(disk_store.emit_boot_line(), dict)
+    assert isinstance(disk_store.worker_report(), dict)
+    assert isinstance(disk_store.hook_section(), dict)

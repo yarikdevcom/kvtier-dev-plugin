@@ -663,3 +663,187 @@ def test_the_writer_writes_only_into_the_directory_it_was_given(writes_to,
     worker_class().get_finished(set())
     assert written_files(writes_to) == ["rank-PP0_TP0.json"]
     assert list(other.iterdir()) == []
+
+
+# --- the contribution seam: one writer, several contributors ------------------
+#
+# `disk_store` (the SSD spill tier) has worker-side facts nobody else can see, and
+# the ONLY legal way to publish them is through this seam: a second writer of
+# `rank-<rank>.json` would race the atomic rename, and a second file name would be a
+# second contract the proxy host's reader has never been told about. So the seam is
+# judged by four properties, one test each: a contributor APPEARS, a contributor that
+# RAISES costs only itself, a contributor that is TOO LARGE is refused without
+# corrupting a required field, and NO contributor leaves the file byte-for-byte the
+# shape it had before the seam existed.
+
+# The keys the proxy host's reader REQUIRES, plus the writer's own optional halves.
+# A contribution must never displace one of these.
+REQUIRED_TOP_LEVEL = {"version", "epoch", "ts", "role", "rank", "arena",
+                      "counters"}
+
+
+def rank_document(directory):
+    return json.loads((directory / "rank-PP0_TP0.json").read_text())
+
+
+def test_a_contributed_section_appears_beside_the_required_fields(worker_class,
+                                                                  writes_to):
+    worker_diag.register_contribution("disk", lambda: {"installed": True,
+                                                       "files_written": 3})
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    document = rank_document(writes_to)
+    assert document["disk"] == {"installed": True, "files_written": 3}
+    # ...as a SIBLING of the required fields, never nested inside one of them.
+    assert set(document) >= REQUIRED_TOP_LEVEL
+    assert document["arena"]["bytes_total"] == 4096
+    assert document["writer"]["contributions"]["written"] == ["disk"]
+
+
+def test_no_contributor_leaves_the_file_the_shape_it_had(worker_class, writes_to):
+    """The absent case is INVISIBLE: no `disk` key, no empty object, no `error`
+    placeholder. A rank file that announced a disk tier on a boot that has none is
+    a payload that is confidently wrong."""
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    document = rank_document(writes_to)
+    assert "disk" not in document
+    assert set(document) == REQUIRED_TOP_LEVEL | {"writer", "error"}
+
+
+def test_a_contributor_that_raises_costs_only_its_own_section(worker_class,
+                                                              writes_to):
+    def explode():
+        raise RuntimeError("the contributor blew up")
+
+    worker_diag.register_contribution("disk", explode)
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())                    # the step never sees the raise
+    document = rank_document(writes_to)
+    assert set(document) >= REQUIRED_TOP_LEVEL
+    assert document["error"] is None
+    assert "disk" not in document
+    assert worker_diag.contributions()["errors"] == {"disk": 1}
+    assert worker_diag.counters()["write_errors"] == 0
+    assert worker_diag.counters()["writes"] == 1
+
+
+def test_a_contributor_that_lies_about_its_shape_is_counted(worker_class,
+                                                            writes_to):
+    worker_diag.register_contribution("disk", lambda: "not a dict")
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    document = rank_document(writes_to)
+    assert "disk" not in document
+    assert set(document) >= REQUIRED_TOP_LEVEL
+    assert worker_diag.contributions()["errors"] == {"disk": 1}
+
+
+def test_an_oversized_contribution_is_refused_not_truncated(worker_class,
+                                                            writes_to):
+    """Half a section reads as a fact with something missing, so an over-cap section
+    is dropped whole and counted - and the file the reader parses stays a file the
+    reader parses."""
+    worker_diag.register_contribution("disk", lambda: {"blob": "x" * 9000})
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    document = rank_document(writes_to)
+    assert "disk" not in document
+    assert set(document) >= REQUIRED_TOP_LEVEL
+    assert worker_diag.contributions()["refusals"] == {"disk": 1}
+
+
+def test_a_contribution_never_overwrites_a_field_the_reader_requires(writes_to):
+    """The allow-list is the whole trust: `"disk"` is a section, `arena`/`counters`/
+    `version` are not, so a guest cannot evict a host."""
+    for stolen in sorted(REQUIRED_TOP_LEVEL) + ["writer", "counters"]:
+        report = worker_diag.register_contribution(stolen, lambda: {})
+        assert report["registered"] is False, stolen
+        assert "allow-list" in report["reason"]
+
+
+def test_a_second_owner_of_one_section_is_refused(writes_to):
+    first = lambda: {"who": "first"}                    # noqa: E731 - a fixture
+    second = lambda: {"who": "second"}                  # noqa: E731 - a fixture
+    assert worker_diag.register_contribution("disk", first,
+                                             owner="a")["registered"] is True
+    refused = worker_diag.register_contribution("disk", second, owner="b")
+    assert refused["registered"] is False
+    assert "already belongs to 'a'" in refused["reason"]
+    # The same producer again is a reinstall, not a second owner: `install()` runs at
+    # plugin load AND again off the handshake hook.
+    assert worker_diag.register_contribution("disk", first,
+                                             owner="a")["registered"] is True
+
+
+def test_a_plain_dict_is_a_legal_contribution_and_unregister_takes_it_back(
+        worker_class, writes_to):
+    producer = {"installed": False, "reason": "no worker class here"}
+    assert worker_diag.register_contribution("disk", producer)["registered"]
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    assert rank_document(writes_to)["disk"] == producer
+    assert worker_diag.unregister_contribution("disk")["unregistered"] is True
+    worker_diag._state["last_signature"] = None
+    worker.get_finished(set())
+    assert "disk" not in rank_document(writes_to)
+
+
+def test_a_producer_that_is_neither_a_callable_nor_a_dict_is_refused(writes_to):
+    report = worker_diag.register_contribution("disk", 7)
+    assert report["registered"] is False and "callable or a dict" in report["reason"]
+
+
+def test_the_seam_bounds_how_many_sections_exist(writes_to, monkeypatch):
+    monkeypatch.setattr(worker_diag, "MAX_CONTRIBUTIONS", 1)
+    assert worker_diag.register_contribution("disk", lambda: {})["registered"]
+    second = worker_diag.register_contribution("disk", lambda: {"a": 1})
+    # Same section, same owner rule already refuses it; the cap is proved with a
+    # second ALLOW-LISTED name, which today does not exist - so the refusal here is
+    # the allow-list's, and the cap stays the backstop for the day one is added.
+    assert second["registered"] is False
+
+
+def test_contributions_are_dropped_before_any_required_field(writes_to, monkeypatch,
+                                                             worker_class):
+    """The byte ceiling is the reader's `malformed` trigger, so the triage sheds the
+    guest first and the host's required fields last."""
+    worker_diag.register_contribution("disk", lambda: {"small": 1})
+    worker_diag.install(worker_class)
+    full = len(worker_diag._dump(worker_diag.build_document(handler(), "PP0_TP0",
+                                                            "env")))
+    # A ceiling just under the untrimmed document: the FIRST thing the triage can
+    # shed is the contribution, and that alone fits - so this test measures the
+    # ORDER of the triage, not whether a tiny file is achievable.
+    monkeypatch.setattr(worker_diag, "MAX_FILE_BYTES", full - 5)
+    report = worker_diag.write_snapshot(handler(), "PP0_TP0", "env")
+    assert report["written"] is True
+    document = rank_document(writes_to)
+    assert "disk" not in document
+    assert set(document) >= REQUIRED_TOP_LEVEL
+    assert worker_diag.contributions()["dropped"] >= 1
+    assert len((writes_to / "rank-PP0_TP0.json").read_bytes()) <= full - 5
+
+
+def test_the_seam_is_visible_in_the_snapshot_section(writes_to):
+    worker_diag.register_contribution("disk", lambda: {}, owner="kvtier/2")
+    section = worker_diag.section()
+    seam = section["contributions"]
+    assert seam["registered"] == ["disk"]
+    assert seam["owners"] == {"disk": "kvtier/2"}
+    assert seam["allow_list"] == list(worker_diag.CONTRIBUTION_SECTIONS)
+    assert seam["max_section_bytes"] == worker_diag.MAX_CONTRIBUTION_BYTES
+    assert "only writer" in seam["note"]
+
+
+def test_a_contributors_base_exception_still_escapes(worker_class, writes_to):
+    """The rule the whole package follows: `except Exception`, never wider. A
+    KeyboardInterrupt from a diagnostic has to reach the engine, even though it
+    costs this rank file."""
+    def interrupt():
+        raise KeyboardInterrupt("the operator pressed ctrl-c")
+
+    worker_diag.register_contribution("disk", interrupt)
+    worker = installed_worker(worker_class, writes_to)
+    with pytest.raises(KeyboardInterrupt):
+        worker_diag.write_snapshot(worker, "PP0_TP0", "env")

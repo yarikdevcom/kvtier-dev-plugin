@@ -38,6 +38,15 @@ SCHEMA (version 1; the reader's `KV_TIER_SNAPSHOT_VERSION`)
      "writer": {"plugin": "kvtier-dev-plugin/1", "writes": int, ...},
      "error": null}
 
+    Optionally, a sibling per CONTRIBUTING worker module: today
+    `"disk": {...}` from `disk_store`. That is the contribution seam - another
+    module hands `worker_diag` a producer and `worker_diag` validates and writes,
+    so ONE process still has ONE writer per file. The reader ignores a top-level
+    key it does not read (its own `gpu_census` precedent), so an extra sibling
+    cannot make a file malformed; the byte ceiling and the allow-list are what
+    keep that true, and a contributor that raises or overruns costs its own
+    section only.
+
 Which fields the reader REQUIRES, and what this writer can honestly supply:
 
   `version`, `ts`, `role`, `rank`       always, exactly as above.
@@ -135,11 +144,49 @@ ORIGINAL_ATTR = "__kvtier_dev_workerdiag_original__"
 SIBLING_PACKAGE = (__package__ or "kvtier_dev_plugin") + "."
 
 SCHEMA_VERSION = 1          # the reader's KV_TIER_SNAPSHOT_VERSION
+# The keys `_clip_document` may never drop. The first seven are what the proxy
+# host's reader REQUIRES (a file missing one is `malformed`); the rest are the
+# writer's own optional halves, which the triage sheds in a fixed order. Anything
+# NOT listed - a contributed section, or a field a future writer adds - is what
+# gets dropped first, so a byte ceiling can never cost a required field.
+KEEP_KEYS = ("version", "epoch", "ts", "role", "rank", "arena", "counters",
+             "writer", "error", "parked", "equality_sample")
 ROLE = "worker"
 MAX_FILE_BYTES = 32 * 1024  # the reader's own cap is 256 KiB; we stay far below
 MAX_STRING_CHARS = 200
 MAX_GROUPS = 32
 WRITER_TAG = "kvtier-dev-plugin/1"
+
+# --- the contribution seam: ONE writer, several contributors -----------------
+# A worker-side module that has facts for the operator (today `disk_store`: the
+# SSD tier's own verdict) must NOT write a file. A second writer of
+# `rank-<rank>.json` would race the atomic `os.replace`, and a second file name
+# would be a second contract the proxy host's reader has never heard of. So other
+# modules hand this one a producer and stay silent; `worker_diag` validates and
+# writes, and it is the only code that opens the file.
+#
+# THREE LIMITS, because a contribution is a guest in someone else's file:
+#   * `CONTRIBUTION_SECTIONS` is a HARD allow-list of the top-level keys a
+#     contributor may add. It is the whole shape of the trust: `"disk"` is listed,
+#     `"arena"`/`"counters"`/`"version"` are not, so a contributor cannot overwrite
+#     a field the reader REQUIRES. An unknown section name is refused at register
+#     time, not at write time.
+#   * `MAX_CONTRIBUTIONS` bounds how many sections exist at all.
+#   * `MAX_CONTRIBUTION_BYTES` bounds ONE section, serialized; a section over it is
+#     REFUSED (and counted), never truncated - half a section reads as a fact with
+#     something missing.
+# Compatibility with the reader (`llm-api/kv_tier_diagnostics.py`) is not a hope,
+# it is the file's own design: it reads a fixed set of top-level keys and ignores
+# any other (`gpu_census` at :210 and `parked` are the existing optional
+# precedents), so an extra sibling key cannot make a file `malformed`. What CAN
+# make a file malformed is the 256 KiB read cap, a missing required field, or a
+# `rank`/filename mismatch - so the byte ceiling and the required-field rule are
+# enforced here, and `epoch`/`version`/`writer` stay exactly as they were:
+# a contribution never touches them.
+CONTRIBUTION_SECTIONS = ("disk",)
+MAX_CONTRIBUTIONS = 4
+MAX_CONTRIBUTION_BYTES = 4096
+MAX_CONTRIBUTION_NOTES = 4
 
 _state: dict = {
     "enabled": False,        # VLLM_E2_TIER_DIAG set at install time
@@ -174,6 +221,20 @@ _state: dict = {
     "fallbacks": 0,
 }
 
+# The registered producers and the seam's own accounting. Module-level for the
+# same reason `_state` is: it is per-process state that outlives one call.
+_contributors: dict = {}
+_contrib_state: dict = {
+    "registered": [],          # section names currently registered, in order
+    "refused": [],             # (name, reason) at REGISTER time, bounded
+    "errors": {},              # name -> times the producer raised or lied
+    "refusals": {},            # name -> times its section was too large
+    "notes": [],               # last bounded reasons, for `writer` in the file
+    "bytes": 0,                # bytes the last write spent on contributions
+    "sections": 0,             # sections in the last document written
+    "dropped": 0,              # sections dropped to keep the file under its cap
+}
+
 
 def reset_state_for_tests() -> None:
     _state.update({"enabled": False, "installs": 0, "reinstalls": 0,
@@ -187,11 +248,169 @@ def reset_state_for_tests() -> None:
                    "completion_reported": 0, "last_write_mono": None,
                    "last_signature": None, "last_error": None,
                    "last_path": None, "bytes_written": 0, "fallbacks": 0})
+    _reset_contributions_for_tests()
 
 
 def counters() -> dict:
     """A copy for the status/snapshot surface. Nothing big, nothing secret."""
     return dict(_state)
+
+
+# --- the contribution seam ---------------------------------------------------
+
+def _reset_contributions_for_tests() -> None:
+    """No contributors, no history. A leaked contributor makes the next test's
+    rank file carry a section it never asked for."""
+    _contributors.clear()
+    _contrib_state.update({"registered": [], "refused": [], "errors": {},
+                           "refusals": {}, "notes": [], "bytes": 0,
+                           "sections": 0, "dropped": 0})
+
+
+def register_contribution(name, produce, owner: str | None = None) -> dict:
+    """Offer a section for the rank file. Contained; returns a dict; never raises.
+
+    `produce` is a zero-argument callable returning a plain JSON-serialisable
+    dict, or a dict to publish verbatim. A callable is the honest form for a
+    module with live counters (it is asked at write time, so the file carries the
+    numbers of the step it was written on); a dict suits a module with boot-
+    constant facts.
+
+    Refused - always with a reason, never silently - when the section name is not
+    on `CONTRIBUTION_SECTIONS`, when the name is already held by a different
+    producer, when there is nothing sensible to produce, or when the seam already
+    holds `MAX_CONTRIBUTIONS` sections. Re-registering the SAME producer is
+    idempotent, because `install()` runs at plugin load AND again off the
+    handshake hook.
+    """
+    report = {"registered": False, "section": name, "reason": None}
+    try:
+        if not isinstance(name, str) or name not in CONTRIBUTION_SECTIONS:
+            report["reason"] = (f"{name!r} is not an allow-listed section; the "
+                                f"allow-list is {list(CONTRIBUTION_SECTIONS)}")
+            _note_refusal(str(name), report["reason"])
+            return report
+        held = _contributors.get(name)
+        if held is not None and held["produce"] is not produce:
+            report["reason"] = (f"the {name!r} section already belongs to "
+                                f"{held['owner']!r}; one owner per section, so a "
+                                f"second module cannot overwrite it")
+            _note_refusal(name, report["reason"])
+            return report
+        if not callable(produce) and not isinstance(produce, dict):
+            report["reason"] = (f"a contribution must be a callable or a dict, "
+                                f"got {type(produce).__name__}")
+            _note_refusal(name, report["reason"])
+            return report
+        if held is None and len(_contributors) >= MAX_CONTRIBUTIONS:
+            report["reason"] = (f"the seam holds {MAX_CONTRIBUTIONS} sections; "
+                                f"refusing a {MAX_CONTRIBUTIONS + 1}th")
+            _note_refusal(name, report["reason"])
+            return report
+        _contributors[name] = {"produce": produce,
+                               "owner": owner or "unknown"}
+        if name not in _contrib_state["registered"]:
+            _contrib_state["registered"] = list(
+                _contrib_state["registered"]) + [name]
+        report["registered"] = True
+        report["reason"] = ("re-registered the same producer" if held
+                            else "this section is now written by worker_diag")
+        return report
+    except Exception as exc:  # noqa: BLE001 - a seam refusal never breaks a boot
+        snapshot._error(exc, "worker diag register_contribution")
+        report["reason"] = f"registering raised {type(exc).__name__}"
+        return report
+
+
+def unregister_contribution(name) -> dict:
+    """Take a section back off. Test teardown, and a module standing down."""
+    removed = _contributors.pop(str(name), None) is not None
+    _contrib_state["registered"] = [row for row in _contrib_state["registered"]
+                                    if row != str(name)]
+    return {"unregistered": removed, "section": name,
+            "reason": None if removed else "no such contribution"}
+
+
+def contributions() -> dict:
+    """The seam's state for a verb or a snapshot: who contributes, what failed."""
+    return {"allow_list": list(CONTRIBUTION_SECTIONS),
+            "registered": list(_contrib_state["registered"]),
+            "owners": {name: row["owner"] for name, row in _contributors.items()},
+            "max_sections": MAX_CONTRIBUTIONS,
+            "max_section_bytes": MAX_CONTRIBUTION_BYTES,
+            "errors": dict(_contrib_state["errors"]),
+            "refusals": dict(_contrib_state["refusals"]),
+            "register_refused": [dict(row) for row
+                                 in _contrib_state["refused"]],
+            "bytes": int(_contrib_state["bytes"]),
+            "sections": int(_contrib_state["sections"]),
+            "dropped": int(_contrib_state["dropped"]),
+            "note": ("other worker-side modules contribute sections to THIS file "
+                     "through this seam; it stays the only writer of "
+                     "rank-<rank>.json, and a contributor that raises, lies or "
+                     "overruns its byte cap costs its own section only.")}
+
+
+def _note_refusal(name: str, reason: str) -> None:
+    """Remember a register-time refusal, bounded, so a boot can be read later."""
+    rows = list(_contrib_state["refused"])
+    rows.append({"section": _clip(str(name), 32), "reason": _clip(reason, 160)})
+    _contrib_state["refused"] = rows[-MAX_CONTRIBUTION_NOTES:]
+
+
+def _count_contribution(name: str, bucket: str, reason: str) -> None:
+    counts = dict(_contrib_state[bucket])
+    counts[name] = int(counts.get(name, 0)) + 1
+    _contrib_state[bucket] = counts
+    notes = list(_contrib_state["notes"])
+    notes.append(f"{name}: {_clip(reason, 120)}")
+    _contrib_state["notes"] = notes[-MAX_CONTRIBUTION_NOTES:]
+
+
+def _contribution_sections() -> tuple:
+    """(sections, notes) for this write. Every failure costs one section only.
+
+    A contributor that is absent is INVISIBLE: no key, no empty object, no
+    `{"error": ...}` placeholder. An empty-error object for a module that was never
+    relevant would make every rank file on every boot claim a facility it does not
+    have, and a reader would have to guess which of the two it is looking at.
+    """
+    sections: dict = {}
+    notes: list = []
+    for name in list(_contributors):
+        row = _contributors.get(name)
+        if row is None:
+            continue
+        produce = row["produce"]
+        try:
+            payload = produce() if callable(produce) else produce
+            if not isinstance(payload, dict):
+                _count_contribution(name, "errors",
+                                    f"produced {type(payload).__name__}, not a dict")
+                notes.append(f"{name}: not contributed (produced "
+                             f"{type(payload).__name__})")
+                continue
+            if not all(isinstance(key, str) for key in payload):
+                _count_contribution(name, "errors",
+                                    "carries a non-string key")
+                notes.append(f"{name}: not contributed (non-string key)")
+                continue
+            raw = _dump(payload)
+            if len(raw) > MAX_CONTRIBUTION_BYTES:
+                _count_contribution(name, "refusals",
+                                    f"{len(raw)} bytes, cap "
+                                    f"{MAX_CONTRIBUTION_BYTES}")
+                notes.append(f"{name}: refused at {len(raw)} bytes (cap "
+                             f"{MAX_CONTRIBUTION_BYTES})")
+                continue
+            sections[name] = payload
+        except Exception as exc:  # noqa: BLE001 - a contributor is never a step fault
+            _count_contribution(name, "errors",
+                                f"raised {type(exc).__name__}")
+            snapshot._error(exc, f"worker diag contribution ({name})")
+            notes.append(f"{name}: not contributed (raised "
+                         f"{type(exc).__name__})")
+    return sections, notes
 
 
 def section() -> dict:
@@ -226,6 +445,7 @@ def section() -> dict:
         "write_errors": int(_state["write_errors"]),
         "budget_skips": int(_state["budget_skips"]),
         "bytes_written": int(_state["bytes_written"]),
+        "contributions": contributions(),
         "last_path": _clip(_state["last_path"], 200),
         "last_error": _state["last_error"],
         "fallbacks": int(_state["fallbacks"]),
@@ -391,7 +611,12 @@ def _signature(handler, arena_bytes) -> tuple:
 
 
 def build_document(handler, rank, rank_source) -> dict:
-    """The file's content. Every number is a real reading or the key is absent."""
+    """The file's content. Every number is a real reading or the key is absent.
+
+    The contributed sections are appended LAST, as siblings of `version`/`arena`
+    (the reader's own `gpu_census` precedent), and a contributor that produced
+    nothing contributes NO key - see `_contribution_sections`.
+    """
     arena_bytes, bytes_source = _arena_bytes(handler)
     block_bytes, block_bytes_note = _block_bytes_by_group(handler)
     metadata = getattr(handler, "_connector_metadata", None)
@@ -415,7 +640,8 @@ def build_document(handler, rank, rank_source) -> dict:
                     getattr(handler, "_pending_store_event_indices", None)) or 0,
                 "load_events_pending": _len_or_none(
                     getattr(handler, "_pending_load_event_indices", None)) or 0}
-    return {
+    sections, contribution_notes = _contribution_sections()
+    document = {
         "version": SCHEMA_VERSION,
         "epoch": epoch,
         "ts": round(time.time(), 6),
@@ -451,26 +677,40 @@ def build_document(handler, rank, rank_source) -> dict:
             "completed_store_events": _len_or_none(
                 getattr(handler, "_completed_store_events", None)),
             "notes": [note for note in (block_bytes_note,) if note],
+            "contributions": {"registered": list(_contrib_state["registered"]),
+                              "written": sorted(sections),
+                              "notes": list(contribution_notes)},
         },
         "error": _state["last_error"],
     }
+    document.update(sections)
+    return document
 
 
 def _clip_document(document: dict) -> dict:
-    """Shrink to under MAX_FILE_BYTES without breaking a required field."""
+    """Shrink to under MAX_FILE_BYTES without breaking a required field.
+
+    The order is a triage, not a scramble. A contributed section goes first: it is
+    the newest guest in this file and the least load-bearing for the reader, which
+    reads a fixed set of keys and ignores an absent one. Then the optional prose
+    (`writer`), then the optional group list. The keys the reader REQUIRES -
+    `version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters` - are never touched, so
+    a trimmed file is a smaller file, never a `malformed` one.
+    """
     raw = _dump(document)
     if len(raw) <= MAX_FILE_BYTES:
         return document
-    # Drop the optional prose first (the reader never requires `writer`), then the
-    # optional group list. `version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters`
-    # stay: the reader calls a file missing one of those malformed.
-    trimmed = dict(document)
-    trimmed["writer"] = {"plugin": WRITER_TAG, "trimmed": True,
-                         "trimmed_reason": f"document exceeded "
-                                           f"{MAX_FILE_BYTES} bytes"}
+    trimmed = {key: value for key, value in document.items()
+               if key in KEEP_KEYS}
+    if len(_dump(trimmed)) > MAX_FILE_BYTES:
+        trimmed["writer"] = {"plugin": WRITER_TAG, "trimmed": True,
+                             "trimmed_reason": f"document exceeded "
+                                               f"{MAX_FILE_BYTES} bytes"}
     if len(_dump(trimmed)) > MAX_FILE_BYTES:
         trimmed["arena"] = dict(trimmed.get("arena") or {})
         trimmed["arena"].pop("block_bytes_by_group", None)
+    if len(trimmed) != len(document):
+        _contrib_state["dropped"] = int(_contrib_state["dropped"]) + 1
     return trimmed
 
 
@@ -504,6 +744,14 @@ def write_snapshot(handler, rank, rank_source) -> dict:
         _state["bytes_written"] = len(raw)
         _state["last_path"] = final
         _state["last_write_mono"] = time.monotonic()
+        # What the contributions cost this file, measured on the document that was
+        # actually written: a section refused by the byte ceiling or dropped by the
+        # triage must not be reported as shipped.
+        shipped = {name: value for name, value in document.items()
+                   if name not in KEEP_KEYS}
+        _contrib_state["sections"] = len(shipped)
+        _contrib_state["bytes"] = sum(len(_dump({name: value}))
+                                      for name, value in shipped.items())
         # NOT `last_signature`: only `_maybe_write` may settle it, and only with
         # the signature it computed WITH the arena size. Setting a differently
         # shaped one here made every following step look "changed" and defeated

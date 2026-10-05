@@ -368,7 +368,32 @@ FINGERPRINT_FIELDS = (
 )
 
 
-def _validate_string(name: str, value) -> dict:
+def _validate_string(name: str, value, *,
+                     allow_path_separator: bool = False) -> dict:
+    """A fingerprint string: printable, bounded, never a NUL.
+
+    `allow_path_separator` exists because of a measured outage, and the reasoning
+    is the whole point of the parameter. A fingerprint field is NEVER a path
+    component: the file name is built from `key16`, its 2-char shard and the
+    digest (`build_slot_path`), all three hexadecimal by validation, and the
+    fingerprint itself only ever enters a SHA digest as digested text. The values
+    that DO reach a path are validated elsewhere and stay strict
+    (`validate_key16`, `validate_geometry_digest`, `validate_root`).
+
+    So refusing a separator here could not protect a path - it could only refuse
+    the identity itself, and that is exactly what it did: the box boots from a
+    local model directory (`vllm serve /home/user/<model>`), so
+    `model_config.model` - the first candidate for `model_id` - is an absolute
+    path, and every step on every rank was refused as `fingerprint_incomplete`
+    with zero files written. A rule that silently disables the feature it guards
+    is not a safety rule. Rendering the identity honestly also matters: taking a
+    basename to dodge the ban would fold two different model directories into one
+    digest, which is the one failure this layer exists to prevent.
+
+    The rule that stays is the one with teeth: printable text only (a control
+    character in a digested field is a writer bug), a length cap, and never a NUL
+    - and a rank keeps the strict form regardless (see the `rank` kind).
+    """
     if not isinstance(value, str):
         return _fail(f"{name} must be a string, got {type(value).__name__}")
     text = value.strip()
@@ -379,8 +404,10 @@ def _validate_string(name: str, value) -> dict:
                      f"{MAX_FP_STRING_CHARS}")
     if any(ord(char) < 32 or ord(char) == 127 for char in text):
         return _fail(f"{name} contains a control character")
-    if "/" in text or "\\" in text or "\x00" in text:
-        return _fail(f"{name} contains a path separator or a NUL byte")
+    if "\x00" in text:
+        return _fail(f"{name} contains a NUL byte")
+    if not allow_path_separator and ("/" in text or "\\" in text):
+        return _fail(f"{name} contains a path separator")
     return {"ok": True, "reason": None, "value": text}
 
 
@@ -531,7 +558,9 @@ def validate_fingerprint(fingerprint) -> dict:
     for name, kind in FINGERPRINT_FIELDS:
         value = fingerprint[name]
         if kind == "string":
-            check = _validate_string(name, value)
+            # A digested identity field, never a path component: see
+            # `_validate_string` for why a local model PATH is legal here.
+            check = _validate_string(name, value, allow_path_separator=True)
         elif kind == "rank":
             text = _validate_string(name, value)
             if not text["ok"]:

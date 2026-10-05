@@ -164,11 +164,24 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import logging
 import os
 import sys
 import time
 
 from . import config, disk_layout, disk_spill, snapshot
+
+# The engine's logging posture is why this module logs at WARNING, not INFO: a
+# plugin logger is not one of the `vllm.*` loggers the engine configures, so an
+# INFO line from here never reaches the log an operator greps. Measured on the box
+# on 2026-10-05: `/tmp/vllm-serve.log` carries every `logger.warning` this plugin
+# emits (the `BOOT[auto]` line, the connector-hook line, `KV tier ARMED`) and NOT
+# ONE of its `logger.info` lines - zero matches for "SSD spill", "diagnostics
+# writer", "attached to EngineCore". A verdict logged at INFO is a verdict nobody
+# can read, and "the plugin never tried" was indistinguishable from "it tried and
+# refused" for exactly that reason.
+_logger = logging.getLogger("kvtier_dev_plugin.disk_store")
+_logged_lines: list = []
 
 # --- the fork's names, resolved only against an already-imported module ------
 
@@ -214,6 +227,7 @@ MAX_SOURCES_PER_FIELD = 6           # candidate read paths tried for one field
 
 POLL_INTERVAL_SECONDS = 2.0         # SECONDS between spill-one relay polls
 REQUEST_TTL_SECONDS = 120.0         # SECONDS a spill-one request stays live
+MAX_BOOT_LINE_CHARS = 160           # CHARS of one refusal reason in the boot line
 PROTOCOL_VERSION = 2                # 1: the one-digest-per-boot contract (impossible)
 ROLE = "disk-spill-one"
 WRITER_TAG = "kvtier-dev-plugin/disk-store-2"
@@ -267,6 +281,9 @@ _state: dict = {
     "slots_capped": 0,
     "scan_skipped": 0,
     "refused": {reason: 0 for reason in REFUSAL_REASONS},
+    "refusals_total": 0,
+    "last_refusal": None,
+    "boot_line": None,
     "fallbacks": 0,
     "errors": 0,
     # the rank-local fingerprint this process names files under
@@ -320,6 +337,7 @@ def reset_state_for_tests() -> None:
         "slots_offered": 0, "spill_queued": 0, "delegated_refusals": 0,
         "slots_capped": 0, "scan_skipped": 0,
         "refused": {reason: 0 for reason in REFUSAL_REASONS},
+        "refusals_total": 0, "last_refusal": None, "boot_line": None,
         "fallbacks": 0, "errors": 0,
         "fingerprint": None, "geometry_digest": None,
         "fingerprint_sources": {}, "fingerprint_missing": [],
@@ -337,6 +355,7 @@ def reset_state_for_tests() -> None:
     })
     _state["served"] = {}
     _state["handled"] = {}
+    _logged_lines.clear()
     _retained.clear()
 
 
@@ -375,9 +394,19 @@ def _clip(text, chars: int = MAX_STRING_CHARS):
 
 
 def _count(reason: str, detail: str | None = None) -> None:
-    """One counted refusal, and the last one remembered. Never raises."""
+    """One counted refusal, and the last one remembered. Never raises.
+
+    `refusals_total` and `last_refusal` exist because a rank file has to answer
+    "did the tier refuse, and how many times" in ONE reading. A per-reason table
+    whose non-zero entry is buried among fifteen zeros is how a live box looked
+    idle: the counters were right and nobody could see them.
+    """
     key = reason if reason in _state["refused"] else "bad_call"
     _state["refused"][key] = int(_state["refused"][key]) + 1
+    _state["refusals_total"] = int(_state["refusals_total"]) + 1
+    _state["last_refusal"] = {"reason": key,
+                              "count": int(_state["refused"][key]),
+                              "detail": _clip(detail, 90) if detail else None}
     if detail is not None:
         _state["last_reason"] = _clip(detail)
 
@@ -1837,6 +1866,208 @@ def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG
     return _trim(response)
 
 
+# --- what a WORKER publishes about this module: the rank-file contribution ----
+
+def _nonzero_refusals() -> dict:
+    """Only the refusal reasons that happened, with their counts.
+
+    Fifteen keys of which fourteen are zero is the reason this tier's silence was
+    unreadable for a whole boot; a contribution that repeats the zeros spends the
+    rank file's byte budget on nothing.
+    """
+    return {name: int(count) for name, count in _state["refused"].items()
+            if count}
+
+
+def worker_report() -> dict:
+    """THE worker's disk verdict, for the rank file `worker_diag` writes.
+
+    This is the answer to the question a boot could not answer on 2026-10-05: the
+    engine wrote zero files while four ranks parked KV, and nothing in the worker
+    said why. So the report names the gate (configured/armed/root), the identity
+    (`digest`, or the fields it could not read), the engine fields AS OBSERVED ON AN
+    ACTUAL STEP (`engine_fields.observed_on_a_step`: "the class declares
+    `store_keys`" and "a metadata object this worker bound carried it" are
+    different claims and only the second one means a spill can be named), the
+    per-reason refusals, and the bytes that actually landed.
+
+    BOUNDED and self-checking: `worker_diag` refuses a section over its byte cap,
+    so a report that would be refused degrades ITSELF (drops the readable detail
+    first, then the field names, says `truncated`) rather than costing the worker
+    its whole section. Never raises; a JSON-serialisable dict in every path.
+    """
+    try:
+        state = disk_spill.counters()
+        fields = engine_fields()
+        missing = [str(item.get("field"))
+                   for item in list(_state["fingerprint_missing"])[:8]
+                   if isinstance(item, dict)]
+        report = {"section": "disk", "writer": WRITER_TAG,
+                  "protocol_version": PROTOCOL_VERSION,
+                  "installed": bool(_state["installed"]),
+                  "class": _state["class"],
+                  "install_reason": _clip(_state["skip_reason"], 120),
+                  "installs": int(_state["installs"]),
+                  "reinstalls": int(_state["reinstalls"]),
+                  "configured": bool(state["configured"]),
+                  "armed": bool(disk_spill.is_armed()),
+                  "root": _clip(disk_spill.disk_root(), 120),
+                  "ceiling_bytes": disk_spill.capacity_ceiling_bytes(),
+                  "digest": _state["geometry_digest"],
+                  "fingerprint_ready": _state["fingerprint"] is not None,
+                  "fingerprint_missing": missing,
+                  "binds": int(_state["binds"]),
+                  "steps_idle": int(_state["steps_idle"]),
+                  "completions": int(_state["completions"]),
+                  "slots_offered": int(_state["slots_offered"]),
+                  "spill_queued": int(_state["spill_queued"]),
+                  "retained_events": int(len(_retained)),
+                  "refused": _nonzero_refusals(),
+                  "refusals_total": int(_state["refusals_total"]),
+                  "last_refusal": _state["last_refusal"],
+                  "files_written": int(state["spilled"]),
+                  "duplicates": int(state["duplicates"]),
+                  "bytes_written": int(state["bytes_written"]),
+                  "drops": int(state["drops"]),
+                  "evictions": int(state["evictions"]),
+                  "queue_depth": int(state["queue_depth"]),
+                  "writer_thread_alive": bool(state["thread_alive"]),
+                  "spill_errors": int(state["errors"]),
+                  "hook_errors": int(_state["errors"]),
+                  "fallbacks": int(_state["fallbacks"]),
+                  "engine_fields": {"verdict": fields["verdict"],
+                                    "store_keys": fields["store_keys"],
+                                    "observed_on_a_step":
+                                        fields["observed_on_a_step"],
+                                    "fingerprint_observed_on_a_step":
+                                        fields["fingerprint_observed_on_a_step"],
+                                    "class_probe": fields["class_probe"]},
+                  "reason": _clip(_state["last_reason"], 120),
+                  "note": ("THE DISK TIER'S OWN VERDICT, FROM THIS RANK. "
+                           "files_written is the only proof bytes landed; "
+                           "refusals_total > 0 with files_written == 0 means the "
+                           "tier ran and REFUSED, and refused names the reason. "
+                           "engine_fields.observed_on_a_step is the runtime proof "
+                           "that a metadata object carried store_keys - the class "
+                           "declaring the field proves nothing about a step.")}
+        return _degrade_report(report)
+    except Exception as exc:  # noqa: BLE001 - a report is never a step fault
+        snapshot._error(exc, "disk_store worker report")
+        return {"section": "disk", "writer": WRITER_TAG,
+                "installed": bool(_state["installed"]),
+                "report_error": type(exc).__name__}
+
+
+def _degrade_report(report: dict) -> dict:
+    """Keep the report inside the seam's byte cap by shedding detail, not truth."""
+    from . import worker_diag  # noqa: PLC0415 - the seam owns its own cap
+    limit = worker_diag.MAX_CONTRIBUTION_BYTES
+    for step in ("detail", "fields", "minimal"):
+        if len(json.dumps(report, default=str)) <= limit:
+            return report
+        if step == "detail":
+            report = dict(report)
+            report["fingerprint_missing"] = []
+            report["note"] = "(trimmed to fit the rank file's byte cap)"
+        elif step == "fields":
+            report = dict(report)
+            report["last_refusal"] = None
+            report["reason"] = None
+            report["install_reason"] = None
+        else:
+            return {"section": "disk", "writer": WRITER_TAG,
+                    "truncated": True, "installed": report["installed"],
+                    "armed": report["armed"],
+                    "refusals_total": report["refusals_total"],
+                    "files_written": report["files_written"],
+                    "note": "the report exceeded the seam's byte cap"}
+    return report
+
+
+def register_contribution() -> dict:
+    """Offer this module's verdict to the rank-file writer. Idempotent.
+
+    Registered only where the module is RELEVANT: `install()` calls it after it has
+    found the worker class, so an EngineCore or API-server process (which writes no
+    rank file and has nothing to say about a spill) registers nothing and the
+    section is simply absent - never an empty object that would make every rank
+    file on every boot claim a disk tier it does not have.
+    """
+    from . import worker_diag  # noqa: PLC0415 - one writer, and no import cycle
+    return worker_diag.register_contribution("disk", worker_report,
+                                             owner="kvtier-dev-plugin/disk-store")
+
+
+def boot_line() -> str:
+    r"""ONE greppable line: what the disk tier can and did do in THIS process.
+
+    The pair to `BOOT[auto]`, which says nothing about the disk tier at all. Fixed
+    field order, bounded values, and the refusal table inline: `grep DISK\[spill\]`
+    must answer "did the worker try, and why did it not write" without a verb.
+
+    It is a LOG line and deliberately not a payload field: `op:status` already
+    carries the digest at its top level, and pasting this line into that payload
+    would put a third copy of one identity in one document (see the `hook_section`
+    one-copy rule).
+
+    It never raises. The line is the fallback for a reader that cannot call a verb,
+    so a line that fails because a module it reads is broken - the exact situation it
+    exists to describe - would be the worst possible failure mode.
+    """
+    try:
+        fields = engine_fields()
+        refused = _nonzero_refusals()
+        parts = ["DISK[spill]"]
+        parts.append("installed={}".format("YES" if _state["installed"] else "NO"))
+        parts.append("class={}".format(_state["class"] or "none"))
+        parts.append("configured={}".format("YES" if disk_spill.disk_root()
+                                            else "NO"))
+        parts.append("root={}".format(_clip(disk_spill.disk_root(), 80) or "-"))
+        parts.append("tier={}".format("ARMED" if disk_spill.is_armed()
+                                      else "DISARMED"))
+        parts.append("engine_fields={}".format(fields["verdict"]))
+        parts.append("keys_on_step={}".format(_state["keys_observed_on_a_step"]))
+        parts.append("digest={}".format(_state["geometry_digest"] or "none"))
+        parts.append("binds={}".format(int(_state["binds"])))
+        parts.append("files={}".format(int(disk_spill.counters()["spilled"])))
+        parts.append("refused={}".format(",".join(f"{name}:{count}"
+                                                  for name, count in
+                                                  sorted(refused.items())[:4])
+                     or "none"))
+        if refused and len(refused) > 4:
+            parts.append("refused_more={}".format(len(refused) - 4))
+        reason = _state["last_reason"] or _state["skip_reason"]
+        if reason:
+            parts.append("reason={}".format(_clip(reason, MAX_BOOT_LINE_CHARS)))
+        line = " ".join(parts)
+    except Exception as exc:  # noqa: BLE001 - the fallback cannot be allowed to fail
+        snapshot._error(exc, "disk_store boot_line")
+        _state["fallbacks"] = int(_state["fallbacks"]) + 1
+        line = (f"DISK[spill] installed={'YES' if _state['installed'] else 'NO'} "
+                f"unreadable={type(exc).__name__}")
+    return line[:MAX_BOOT_LINE_CHARS * 3]
+
+
+def emit_boot_line() -> dict:
+    """Log `boot_line()` where the operator will actually read it. Once per distinct
+    verdict per process: install runs at plugin load AND again off the handshake,
+    and a per-step or per-retry echo of the same line is noise, not a signal."""
+    try:
+        line = boot_line()
+        _state["boot_line"] = line
+        if line in _logged_lines:
+            return {"logged": False, "reason": "this verdict is already logged",
+                    "line": line}
+        _logged_lines.append(line)
+        del _logged_lines[:-4]
+        _logger.warning("kvtier-dev-plugin: %s", line)
+        return {"logged": True, "reason": None, "line": line}
+    except Exception as exc:  # noqa: BLE001 - a log line never breaks an install
+        snapshot._error(exc, "disk_store boot line")
+        return {"logged": False, "reason": f"logging raised {type(exc).__name__}",
+                "line": None}
+
+
 # --- install / uninstall: the engine hook ------------------------------------
 
 def _layer_is_ours(method) -> bool:
@@ -1912,6 +2143,10 @@ def install() -> dict:
     tier is unarmed is a couple of `os.environ.get` calls, and the gate that matters
     (`_may_touch_disk`) is the one that can be changed at runtime by the verb. The
     two-switch rule still holds - no root, no arm, no spill.
+
+    Every outcome announces itself. The line goes in a `finally` because the refusal
+    paths ARE the ones worth reading: on 2026-10-05 this function succeeded, the
+    engine's metadata could not name a file, and nothing in the log said so.
     """
     if _state["installed"]:
         return {"installed": True, "reason": "already installed",
@@ -1950,6 +2185,10 @@ def install() -> dict:
         _state["installed"] = True
         _state["class"] = cls.__name__
         _state["skip_reason"] = None
+        # A worker only: this is the process that can see the spill gate, and
+        # `worker_diag` is the only writer of the rank file, so the verdict goes to it
+        # rather than becoming a fourth file or a second writer.
+        register_contribution()
         report.update({"installed": True, "class": cls.__name__,
                        "reason": (f"{cls.__name__}.{METHOD_BIND_METADATA} and "
                                   f"{cls.__name__}.{METHOD_GET_FINISHED} now spill "
@@ -1963,6 +2202,10 @@ def install() -> dict:
         report["reason"] = f"install raised {type(exc).__name__}"
         _state["skip_reason"] = report["reason"]
         return report
+    finally:
+        # `finally`, not the success path: the verdict a reader needs is the one that
+        # says NO. Contained by `emit_boot_line` itself.
+        emit_boot_line()
 
 
 def ensure_installed(connector=None) -> dict:  # noqa: ARG001 - the handshake's object
@@ -2046,6 +2289,8 @@ def hook_section(include_fingerprint: bool = True) -> dict:
             "reinstalls": int(_state["reinstalls"]),
             "uninstalls": int(_state["uninstalls"]),
             "class": _state["class"], "skip_reason": _state["skip_reason"],
+            "refusals_total": int(_state["refusals_total"]),
+            "last_refusal": _state["last_refusal"],
             "wraps": list(_state["nested"]),
             "methods": list(WRAPPED_METHODS),
             "binds": int(_state["binds"]),
@@ -2099,6 +2344,8 @@ def section() -> dict:
             "protocol_version": PROTOCOL_VERSION,
             "installed": bool(_state["installed"]),
             "class": _state["class"], "skip_reason": _state["skip_reason"],
+            "refusals_total": int(_state["refusals_total"]),
+            "last_refusal": _state["last_refusal"],
             "wraps": list(_state["nested"]),
             "methods": list(WRAPPED_METHODS),
             "armed": armed, "configured": bool(state["configured"]),
