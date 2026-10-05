@@ -21,6 +21,7 @@ import fakes_debug  # noqa: E402 - the shared fake engine structures
 from kvtier_dev_plugin import (  # noqa: E402
     blockdump,
     config,
+    disk_index,
     disk_spill,
     disk_store,
     evictions,
@@ -80,6 +81,7 @@ def reset_dev_state():
              "blockdump": dict(blockdump._state),
              "evictions": dict(evictions._state),
              "disk_spill": dict(disk_spill._state),
+             "disk_index": dict(disk_index._state),
              "disk_store": dict(disk_store._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
@@ -96,6 +98,11 @@ def reset_dev_state():
     # The SSD spill tier holds an arm, a queue and a THREAD. Dropping the queue
     # reference is what keeps a spilled job from one test landing in the next.
     disk_spill.reset_state_for_tests()
+    # The spill journal's index is per-process scheduler state (entries, cursors,
+    # sequences, and a `journal_seeded` flag that decides whether the FIRST append
+    # reads the file's tail). A test that inherited it would either replay another
+    # test's journal or seed its sequence from a file that is not there.
+    disk_index.reset_state_for_tests()
     # The store-completion hook wraps the worker class and keeps its own retention
     # map of (slot, key16) pairs; both are engine-visible state that a test must not
     # inherit. Its unwrap handle lives on the wrapper, so `unwrap_everything` is what
@@ -107,6 +114,7 @@ def reset_dev_state():
            "blockdump": blockdump._state,
            "evictions": evictions._state,
            "disk_spill": disk_spill._state,
+           "disk_index": disk_index._state,
            "disk_store": disk_store._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
@@ -122,6 +130,7 @@ def reset_dev_state():
                        ("blockdump", blockdump._state),
                        ("evictions", evictions._state),
                        ("disk_spill", disk_spill._state),
+                       ("disk_index", disk_index._state),
                        ("disk_store", disk_store._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()

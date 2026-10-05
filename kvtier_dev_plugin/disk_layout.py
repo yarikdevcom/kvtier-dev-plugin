@@ -51,20 +51,43 @@ a pool-wide total) would corrupt live KV rather than merely be wrong.
 
 THE NAME IS THE IDENTITY OF THE BYTES
 -------------------------------------
-    ``<root>/<key16[0:2]>/kvslot-<key16>-<geodigest12>.bin``
-``<key16>`` is the first 16 hex characters of the engine's block hash INCLUDING
-the group id (the engine packs the group into the hash via
-``make_block_hash_with_group_id``), lower-cased so one key cannot become two
-files. The two-character shard directory keeps a future 100k-file store in
-cheap directories. ``<geodigest12>`` is a digest of the whole integrity
-fingerprint - model id and revision, cache dtype, tensor dtype, the slot width,
-every group's block size, the scheduler and hash block sizes, which groups are
+    ``<root>/<key16[0:2]>/kvslot-<key16>-g<group>-<geodigest12>.bin``
+``<key16>`` is the first 16 hex characters of the engine's block hash DIGEST and
+``g<group>`` is the KV-cache group id the engine appended to that hash - the
+4-byte big-endian suffix ``make_block_hash_with_group_id``
+(``kv_cache_utils.py:83``) adds and ``get_group_id`` (``key[-4:]``) reads back.
+Both are taken from the FULL group-qualified key by ``split_block_key``, the ONE
+place that suffix is unpacked; nothing here re-implements the packing.
+
+WHY THE GROUP IS A SEPARATE NAME COMPONENT, AND NOT PART OF THE DIGEST. The
+first version of this name truncated the group-qualified hash to its leading 16
+hex characters and called the result the identity, documenting the key as "the
+block hash INCLUDING the group id". That sentence was true of the INPUT and
+false of the IDENTITY: the group sits at the END of the value, so the first 16
+hex characters are entirely digest, and two prefix-cacheable groups hashing the
+same token chain named the SAME FILE with different bytes. The write side
+noticed nothing (the second writer found the file and was counted as a
+``duplicate``); only the read side would have known, and it had no way to tell
+whose bytes it had been handed. A discriminator that is truncated away is not an
+identity, so the group is now a name component a reader can SEE - and a name
+without one is ``stale_key_shape``, unlinkable and never matchable by a lookup,
+because a file from before this fix cannot be attributed to a group at all.
+
+Hex is lower-cased so one key cannot become two files. The two-character shard
+directory keeps a future 100k-file store in cheap directories.
+``<geodigest12>`` is a digest of the whole integrity fingerprint - model id and
+revision, cache dtype, tensor dtype, the slot width, every group's block size,
+the scheduler and hash block sizes, which groups are
 prefix-cacheable, the hash algorithm, the ``NONE_HASH`` seed, the rank, the world
 size, and the decode/CONTEXT parallel widths. Everything that changes the MEANING
 of the bytes is in it, so a file written under a different configuration is not
 misread, it is simply never found: un-findability is the safety property, not a
 side effect. A file whose name carries a digest this boot did not compute is
-``stale_geometry`` to this boot and is unlinkable, never loadable.
+``stale_geometry`` to this boot and is unlinkable, never loadable. THE PROPERTY
+THAT HAD TO SURVIVE THE GROUP CHANGE IS THIS ONE, UNWEAKENED: a configuration
+change produces a different FILENAME, so stale bytes are un-findable rather than
+mis-read. ``<geodigest12>`` carries the rank/stride/dtype half of that and
+``g<group>`` carries the group half.
 
 A COMMIT IS A RENAME
 --------------------
@@ -109,13 +132,42 @@ import time
 SLOT_FILE_PREFIX = "kvslot-"
 SUFFIX_DATA = ".bin"
 SUFFIX_PART = ".part"              # the in-flight name; never a committed file
-FILENAME_TEMPLATE = "kvslot-<key16>-<geodigest12>.bin"
+FILENAME_TEMPLATE = "kvslot-<key16>-g<group>-<geodigest12>.bin"
 
-KEY_DIGEST_CHARS = 16              # <key16>: hex chars of the engine's block hash
+KEY_DIGEST_CHARS = 16              # <key16>: hex chars of the block hash DIGEST
 GEOMETRY_DIGEST_BYTES = 6          # -> 12 hex characters in the file name
 GEOMETRY_DIGEST_CHARS = GEOMETRY_DIGEST_BYTES * 2
 SHARD_CHARS = 2                    # <key16[0:2]>, one directory per 256 keys
 HEX_DIGITS = frozenset("0123456789abcdef")
+
+# The group id the engine appends: FOUR BYTES big-endian at the END of the block
+# hash (`kv_cache_utils.py:83`), so EIGHT hex characters on the wire the engine's
+# `BlockHashWithGroupId` renders to. `MIN_KEY_HEX_CHARS` is the shortest key that
+# can carry a digest AND that suffix: a shorter value has no group in it, and a
+# name built from one would be the pre-fix identity again - the ambiguous one -
+# rather than a refusal.
+GROUP_SUFFIX_BYTES = 4
+GROUP_SUFFIX_HEX_CHARS = GROUP_SUFFIX_BYTES * 2
+MIN_KEY_HEX_CHARS = KEY_DIGEST_CHARS + GROUP_SUFFIX_HEX_CHARS
+MIN_KEY_BYTES = KEY_DIGEST_CHARS // 2 + GROUP_SUFFIX_BYTES
+
+# The `g<group>` name component. DECIMAL and unpadded on purpose: the group id is
+# a small ordinal, decimal is what a human greps for, and leading zeros are
+# refused so one identity cannot have two spellings (the same rule that folds a
+# key's case). The bound is deliberately far above any real group count - the
+# fingerprint caps groups at `MAX_NUM_GROUPS` - because its only job is to refuse
+# a suffix that is not a group id at all (a truncated key, a mis-packed digest,
+# a hand-edited name) rather than to police an engine.
+GROUP_FIELD_PREFIX = "g"
+MAX_GROUP_ID = 4096
+
+# The whole key's length is bounded too, so a value that is not a block hash at all
+# (a concatenation, a doubled hex, a hand-pasted blob) cannot become a 300-character
+# file name. The cap is far above the longest digest the engine's hash algorithms
+# render (`sha256` -> 64 hex, `sha512` -> 128 hex, both plus the 8-char group
+# suffix), so it refuses nonsense and never a real key.
+MAX_KEY_BYTES = 128
+MAX_KEY_HEX_CHARS = MAX_KEY_BYTES * 2
 
 MIN_WORLD_SIZE = 1
 MAX_WORLD_SIZE = 4096
@@ -148,20 +200,32 @@ FORBIDDEN_ROOT_PREFIXES = ("/tmp", "/dev/shm", "/run", "/var/run")  # noqa: S108
 # reader must be able to enumerate them from the payload.
 NAME_CURRENT = "current"
 NAME_STALE_GEOMETRY = "stale_geometry"
+NAME_STALE_KEY_SHAPE = "stale_key_shape"
 NAME_PEER_RANK = "peer_rank"
 NAME_MALFORMED = "malformed"
 NAME_NOTOURS = "not_ours"
 NAME_REFUSED = "refused"
-NAME_CLASSIFICATIONS = (NAME_CURRENT, NAME_STALE_GEOMETRY, NAME_PEER_RANK,
-                        NAME_MALFORMED, NAME_NOTOURS, NAME_REFUSED)
+NAME_CLASSIFICATIONS = (NAME_CURRENT, NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
+                        NAME_PEER_RANK, NAME_MALFORMED, NAME_NOTOURS,
+                        NAME_REFUSED)
 
 # A malformed name is REPORTED and never unlinked: our prefix plus our suffix is
 # not proof the file is OURS, and the cost of deleting someone's
 # `kvslot-backup-notes.bin` is infinite next to the cost of leaving it. A
 # peer-rank file is not stale either: it is another rank's LIVE data, sitting in
 # the same store, and only capacity eviction may touch it (see the plan order).
-UNLINKABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY,)
-EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_CURRENT, NAME_PEER_RANK)
+#
+# `stale_key_shape` IS ours and IS unlinkable, and that is deliberately the
+# opposite of the malformed rule: a 2-field `kvslot-<key16>-<geodigest12>.bin` is
+# the identity this plugin emitted before the group fix, so we know who wrote it
+# and we know what it cannot prove - that its bytes belong to the group its
+# `key16` is now associated with. Its digest can match this boot, so nothing but
+# this classification keeps it out of a load path; and leaving it in place is what
+# makes a store 9 GiB of unattributable capacity the ceiling logic cannot even
+# see, let alone shed.
+UNLINKABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE)
+EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
+                             NAME_CURRENT, NAME_PEER_RANK)
 
 # Directory states. A missing directory and an unreadable one are different facts
 # and are never collapsed into "no files".
@@ -189,6 +253,10 @@ UNITS_BY_NAME = {
     "current": "files",
     "dcp_world_size": "ranks",
     "default_seconds": "seconds",
+    "digest_group_overflow": "events",
+    "digest_groups_cap": "key16s",
+    "digest_groups_dropped": "key16s",
+    "digest_groups_tracked": "key16s",
     "disarmed": "refusals",
     "dropped": "jobs",
     "drops": "jobs",
@@ -216,8 +284,22 @@ UNITS_BY_NAME = {
     "free_percent_of_total": "percent",
     "freed_bytes": "bytes",
     "geometry_chars": "chars",
+    "group_collisions": "events",
+    "group_id": "groups",
+    "group_id_a": "groups",
+    "group_id_b": "groups",
     "hash_block_size": "tokens",
     "headroom_bytes": "bytes",
+    "journal_cap_bytes": "bytes",
+    "journal_directory": "paths",
+    "journal_fields": "fields",
+    "journal_failures": "writes",
+    "journal_lines": "lines",
+    "journal_records": "files",
+    "journal_removals": "files",
+    "journal_seq_seed": "lines",
+    "journal_writes": "lines",
+    "journal_write_errors": "writes",
     "key_chars": "chars",
     "key_count_mismatch": "refusals",
     "length_bytes": "bytes",
@@ -262,6 +344,7 @@ UNITS_BY_NAME = {
     "reserve_bytes": "bytes",
     "reserved_for_root_bytes": "bytes",
     "retained_events": "events",
+    "sibling_probe_failures": "probes",
     "scanned": "entries",
     "scheduler_block_size": "tokens",
     "seconds_left": "seconds",
@@ -275,6 +358,7 @@ UNITS_BY_NAME = {
     "spilled": "slots",
     "stale_first": "files",
     "stale_geometry": "files",
+    "stale_key_shape": "files",
     "target_bytes": "bytes",
     "thread_alive": "boolean",
     "thread_started": "threads",
@@ -374,11 +458,12 @@ def _validate_string(name: str, value, *,
 
     `allow_path_separator` exists because of a measured outage, and the reasoning
     is the whole point of the parameter. A fingerprint field is NEVER a path
-    component: the file name is built from `key16`, its 2-char shard and the
-    digest (`build_slot_path`), all three hexadecimal by validation, and the
-    fingerprint itself only ever enters a SHA digest as digested text. The values
-    that DO reach a path are validated elsewhere and stay strict
-    (`validate_key16`, `validate_geometry_digest`, `validate_root`).
+    component: the file name is built from `key16`, its 2-char shard, the
+    `g<group>` component and the digest (`build_slot_path`), every one of them
+    hexadecimal or decimal by validation, and the fingerprint itself only ever
+    enters a SHA digest as digested text. The values that DO reach a path are
+    validated elsewhere and stay strict (`split_block_key`,
+    `validate_geometry_digest`, `validate_root`).
 
     So refusing a separator here could not protect a path - it could only refuse
     the identity itself, and that is exactly what it did: the box boots from a
@@ -690,7 +775,15 @@ def fingerprint_section(fingerprint) -> dict:
 # --- names -------------------------------------------------------------------
 
 def validate_key16(key) -> dict:
-    """The first 16 hex chars of the engine's block hash (group id included).
+    """The DIGEST half of an identity: exactly 16 hex characters, lower-cased.
+
+    THIS IS NOT THE ENGINE'S KEY. `key16` is the leading 16 hex characters of the
+    block hash DIGEST, i.e. `split_block_key(...)["key16"]`; the group id the
+    engine appends is NOT in it (it lives at the END of the engine's value, which
+    is exactly why the first version of this layer, which truncated to these 16
+    characters and stopped there, gave two groups the same file name). Anything
+    that names a file, journals a file or looks one up must go through
+    `split_block_key` and carry the group as well.
 
     Upper case is NORMALISED, not refused: ext4 is case-sensitive, so accepting
     both would let one key own two files, and a key that is findable under two
@@ -707,6 +800,74 @@ def validate_key16(key) -> dict:
     if any(char not in HEX_DIGITS for char in text):
         return _fail("the key is not hexadecimal")
     return {"ok": True, "reason": None, "value": text}
+
+
+def split_block_key(key) -> dict:
+    """Unpack the engine's group-qualified block hash into (digest, group id).
+
+    THE ONE PLACE THE 4-BYTE GROUP SUFFIX IS READ. The engine builds
+    `BlockHashWithGroupId` by appending `group_id.to_bytes(4, "big")` to the block
+    hash (`kv_cache_utils.py:83`), and reads it back as `key[:-4]` /
+    `int.from_bytes(key[-4:], "big")` (`get_block_hash` / `get_group_id`). Those
+    are the two accessors used here, on the raw BYTES when a caller hands bytes and
+    on the same eight hex characters when a caller hands the hex the engine puts on
+    the wire. Nothing here re-packs, re-hashes or re-derives a key: a plugin that
+    invented its own packing would disagree with the engine about which bytes are
+    the group, which is the same bug wearing a different hat.
+
+    REFUSALS, never exceptions, for: a value that is not bytes or str; a value too
+    SHORT to carry the suffix (`MIN_KEY_BYTES` / `MIN_KEY_HEX_CHARS` - this is the
+    pre-fix 16-hex key, and accepting it is what put two groups in one file);
+    non-hex text; and a group id outside `[0, MAX_GROUP_ID]`, which cannot be a
+    group ordinal at all. A refusal carries no numbers, so a caller cannot spill a
+    half-resolved identity by accident.
+    """
+    if isinstance(key, bytes):
+        if len(key) < MIN_KEY_BYTES:
+            return _fail(f"the key is {len(key)} bytes; a group-qualified block "
+                         f"hash needs at least {MIN_KEY_BYTES} "
+                         f"({KEY_DIGEST_CHARS // 2} digest + "
+                         f"{GROUP_SUFFIX_BYTES} group bytes), so this one carries "
+                         "no group id and cannot name a file")
+        if len(key) > MAX_KEY_BYTES:
+            return _fail(f"the key is {len(key)} bytes; the cap is "
+                         f"{MAX_KEY_BYTES}, so this is not a block hash and cannot "
+                         "name a file")
+        digest_hex = key[:-GROUP_SUFFIX_BYTES].hex()
+        group_id = int.from_bytes(key[-GROUP_SUFFIX_BYTES:], "big",
+                                  signed=False)
+    elif isinstance(key, str):
+        text = key.strip().lower()
+        if len(text) < MIN_KEY_HEX_CHARS:
+            return _fail(f"the key is {len(text)} hex chars; a group-qualified "
+                         f"block hash needs at least {MIN_KEY_HEX_CHARS} "
+                         f"({KEY_DIGEST_CHARS} digest + "
+                         f"{GROUP_SUFFIX_HEX_CHARS} group chars), so this one "
+                         "carries no group id and cannot name a file")
+        if len(text) > MAX_KEY_HEX_CHARS:
+            return _fail(f"the key is {len(text)} hex chars; the cap is "
+                         f"{MAX_KEY_HEX_CHARS}, so this is not a block hash and "
+                         "cannot name a file")
+        digest_hex = text[:-GROUP_SUFFIX_HEX_CHARS]
+        group_hex = text[-GROUP_SUFFIX_HEX_CHARS:]
+        if any(char not in HEX_DIGITS for char in text):
+            return _fail("the key is not hexadecimal")
+        group_id = int(group_hex, 16)
+    else:
+        return _fail("a key must be the engine's block hash bytes or their hex, "
+                     f"got {type(key).__name__}")
+    if group_id > MAX_GROUP_ID:
+        return _fail(f"the group id {group_id} is outside [0, {MAX_GROUP_ID}]: "
+                     "that is not a KV-cache group ordinal, so the suffix this key "
+                     "ends with is not a group id and the name it would produce "
+                     "means nothing")
+    key16 = digest_hex[:KEY_DIGEST_CHARS]
+    return _ok(units=_units("key_chars", "group_id", "shard_chars"),
+               key16=key16, group_id=group_id,
+               group_field=f"{GROUP_FIELD_PREFIX}{group_id}",
+               digest_hex=digest_hex,
+               key_hex=digest_hex + f"{group_id:08x}",
+               shard=key16[:SHARD_CHARS], key_chars=len(key16))
 
 
 def validate_root(path) -> dict:
@@ -768,36 +929,46 @@ def validate_geometry_digest(digest) -> dict:
 
 
 def build_slot_name(key, geometry_digest) -> dict:
-    """``kvslot-<key16>-<geodigest12>.bin``, and nothing else.
+    """``kvslot-<key16>-g<group>-<geodigest12>.bin``, and nothing else.
 
-    Both parts are validated here so a name built by this function is a name
+    `key` is the FULL group-qualified block hash (the engine's bytes, or their
+    hex); `split_block_key` is what turns it into the digest and the `g<group>`
+    component, so a caller cannot pass a half-key and get the pre-fix ambiguous
+    name. Every part is validated here, so a name built by this function is a name
     `parse_path` accepts and a sweep can classify. The digest is NOT re-derived
     from a fingerprint: the caller already has it (or is testing what a different
     digest produces, which is the whole point of the scheme).
     """
-    checked_key = validate_key16(key)
-    if not checked_key["ok"]:
-        return _fail(str(checked_key["reason"]))
-    key16 = checked_key["value"]
+    split = split_block_key(key)
+    if not split["ok"]:
+        return _fail(str(split["reason"]))
+    key16 = split["key16"]
+    group_field = split["group_field"]
     checked_digest = validate_geometry_digest(geometry_digest)
     if not checked_digest["ok"]:
         return _fail(f"geometry_digest {geometry_digest!r}: "
                      f"{checked_digest['reason']}")
     digest = checked_digest["value"]
-    name = (f"{SLOT_FILE_PREFIX}{key16}-{digest}{SUFFIX_DATA}")
+    name = (f"{SLOT_FILE_PREFIX}{key16}-{group_field}-{digest}{SUFFIX_DATA}")
     if len(name) > MAX_NAME_CHARS:
         return _fail(f"the file name is {len(name)} chars; the cap is "
                      f"{MAX_NAME_CHARS}")
-    return _ok(units=_units("name_chars", "key_chars", "geometry_chars",
-                            "shard_chars"),
-               filename=name, key16=key16, geometry_digest=digest,
+    return _ok(units=_units("name_chars", "key_chars", "group_id",
+                            "geometry_chars", "shard_chars"),
+               filename=name, key16=key16, group_id=split["group_id"],
+               group_field=group_field, geometry_digest=digest,
                shard=key16[:SHARD_CHARS], part_name=name + SUFFIX_PART,
                name_chars=len(name), key_chars=len(key16),
                geometry_chars=len(digest), shard_chars=SHARD_CHARS)
 
 
 def build_slot_path(root, key, geometry_digest) -> dict:
-    """``<root>/<shard>/kvslot-<key16>-<geodigest12>.bin``. Creates nothing.
+    """``<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin``. Creates nothing.
+
+    ``key`` is the FULL group-qualified block hash, exactly as in
+    `build_slot_name`: the group is part of the identity, so it is part of the
+    path, and a caller holding only a 16-hex digest gets a refusal rather than a
+    path it cannot own.
 
     ``root`` is only joined and vetted (never ``realpath``-ed, never walked):
     stage 2 points it at wherever the operator said, and this module deliberately
@@ -814,10 +985,12 @@ def build_slot_path(root, key, geometry_digest) -> dict:
     if len(path) > MAX_PATH_CHARS:
         return _fail(f"the path is {len(path)} chars; the cap is "
                      f"{MAX_PATH_CHARS}")
-    return _ok(units=_units("path_chars", "shard_chars"),
+    return _ok(units=_units("path_chars", "shard_chars", "group_id"),
                path=path, directory=directory, filename=named["filename"],
                part_path=os.path.join(directory, named["part_name"]),
-               key16=named["key16"], geometry_digest=named["geometry_digest"],
+               key16=named["key16"], group_id=named["group_id"],
+               group_field=named["group_field"],
+               geometry_digest=named["geometry_digest"],
                shard=named["shard"], path_chars=len(path))
 
 
@@ -842,14 +1015,17 @@ def _name_text(name) -> dict:
 def parse_path(name) -> dict:
     """Parse one of our file names. TOTAL: never raises, always classifies.
 
-    ``ok`` only for a name that is exactly ours and fully parses. A name that does
-    not start with our prefix or does not end in our suffix is ``not_ours`` - the
-    sweep leaves those alone and does not even call them malformed, because they
-    belong to someone else. A name that looks like ours but whose fields do not
-    parse is ``malformed`` with a reason naming the field. A committed ``.part``
-    name is OURS but never a committed file: it is classified here so the sweep
-    can clean it up, and `classify_name` keeps it out of any load path by
-    construction (a partial write has no final name to be found under).
+    ``ok`` only for a name that is exactly ours AND fully parses AS A GROUP-
+    QUALIFIED IDENTITY. A name that does not start with our prefix or does not end
+    in our suffix is ``not_ours`` - the sweep leaves those alone and does not even
+    call them malformed, because they belong to someone else. A name that looks
+    like ours but whose fields do not parse is ``malformed`` with a reason naming
+    the field. OUR OLD TWO-FIELD NAME IS NOT malformed and is not ok either: it is
+    ``stale_key_shape``, counted and unlinkable, because a `key16` with no group
+    component cannot say whose bytes it holds (see the module docstring). A
+    committed ``.part`` name is OURS but never a committed file: it is classified
+    here so the sweep can clean it up, and `classify_name` keeps it out of any load
+    path by construction (a partial write has no final name to be found under).
     """
     text = _name_text(name)
     if not text["ok"]:
@@ -883,16 +1059,49 @@ def parse_path(name) -> dict:
                      classification=NAME_MALFORMED, ours=False, filename=base,
                      partial=partial)
     parts = fields.split("-")
-    if len(parts) != 2:
-        return _fail(f"expected exactly 2 '-'-separated fields after "
+    if len(parts) == 2:
+        # THE PRE-FIX SHAPE: `kvslot-<key16>-<geodigest12>.bin`. Recognised, named
+        # and NEVER matched by a lookup. A key16 alone does not say which group's
+        # bytes are inside, so the identity is ambiguous by construction and no
+        # group-qualified lookup may resolve to it - which is why this is its own
+        # classification rather than `malformed` (we know who wrote it) or
+        # `current` (we cannot say what it holds).
+        legacy_key, legacy_digest = parts
+        legacy_key_ok = validate_key16(legacy_key)["ok"]
+        legacy_digest_ok = (len(legacy_digest) == GEOMETRY_DIGEST_CHARS
+                            and all(char in HEX_DIGITS
+                                    for char in legacy_digest.lower()))
+        if legacy_key_ok and legacy_digest_ok:
+            return _fail("the name carries no g<group> component: it is the "
+                         "identity this plugin emitted before group-qualified "
+                         "naming, whose bytes cannot be attributed to a KV-cache "
+                         "group, so it is stale by construction and never "
+                         "loadable",
+                         classification=NAME_STALE_KEY_SHAPE, ours=True,
+                         filename=base, partial=partial,
+                         key16=legacy_key.lower(),
+                         geometry_digest=legacy_digest.lower())
+        return _fail(f"expected 3 '-'-separated fields after {SLOT_FILE_PREFIX!r} "
+                     f"(<key16>, g<group>, <geodigest12>), found {len(parts)}, "
+                     "and the 2-field form is not a valid pre-fix name either",
+                     classification=NAME_MALFORMED, ours=False, filename=base,
+                     partial=partial)
+    if len(parts) != 3:
+        return _fail(f"expected 3 '-'-separated fields after "
                      f"{SLOT_FILE_PREFIX!r}, found {len(parts)}",
                      classification=NAME_MALFORMED, ours=False, filename=base,
                      partial=partial)
-    key_text, digest = parts
+    key_text, group_text, digest = parts
     checked_key = validate_key16(key_text)
     if not checked_key["ok"]:
         return _fail(f"the key field {key_text!r} is not {KEY_DIGEST_CHARS} hex "
                      f"characters: {checked_key['reason']}",
+                     classification=NAME_MALFORMED, ours=False, filename=base,
+                     partial=partial)
+    checked_group = _parse_group_field(group_text)
+    if not checked_group["ok"]:
+        return _fail(f"the group field {group_text!r} is not usable: "
+                     f"{checked_group['reason']}",
                      classification=NAME_MALFORMED, ours=False, filename=base,
                      partial=partial)
     if (len(digest) != GEOMETRY_DIGEST_CHARS
@@ -908,9 +1117,42 @@ def parse_path(name) -> dict:
             "filename": base,
             "partial": partial,
             "key16": checked_key["value"],
+            "group_id": checked_group["value"],
+            "group_field": f"{GROUP_FIELD_PREFIX}{checked_group['value']}",
             "shard": checked_key["value"][:SHARD_CHARS],
             "geometry_digest": digest.lower(),
-            "units": _units("key_chars", "geometry_chars", "shard_chars")}
+            "units": _units("key_chars", "group_id", "geometry_chars",
+                            "shard_chars")}
+
+
+def _parse_group_field(text) -> dict:
+    """`g<group>` exactly: the prefix, plain decimal, canonical, in bounds.
+
+    Leading zeros are refused because they would give ONE identity TWO names -
+    `g01` and `g1` cannot both be findable for group 1, which is the same "one key,
+    one file" rule that folds a key's case. A group id above `MAX_GROUP_ID` is
+    refused for the same reason `split_block_key` refuses it: it is not a group
+    ordinal, so a name carrying it means nothing.
+    """
+    if not isinstance(text, str):
+        return _fail(f"a group field must be a string, got {type(text).__name__}")
+    if not text.startswith(GROUP_FIELD_PREFIX):
+        return _fail(f"it must start with {GROUP_FIELD_PREFIX!r}, so a reader can "
+                     "see that the component is a group id")
+    digits = text[len(GROUP_FIELD_PREFIX):]
+    if not digits or not digits.isdigit():
+        return _fail("its digits are missing or are not decimal")
+    if len(digits) > 1 and digits[0] == "0":
+        return _fail("it has a leading zero: g01 and g1 would be two names for one "
+                     "identity")
+    if len(digits) > 10:
+        return _fail(f"its digits are {len(digits)} chars long, which is not a "
+                     "plausible group id")
+    value = int(digits)
+    if value > MAX_GROUP_ID:
+        return _fail(f"the group id {value} is above {MAX_GROUP_ID}, so it is not a "
+                     "group ordinal this engine could have produced")
+    return {"ok": True, "reason": None, "value": value}
 
 
 def classify_name(name, geometry_digest, peer_digests=()) -> dict:
@@ -926,15 +1168,20 @@ def classify_name(name, geometry_digest, peer_digests=()) -> dict:
     file carrying one of those is ``peer_rank`` - not stale, not ours to sweep, and
     reachable only by capacity eviction. A ``.part`` file is never current: an
     in-flight write is, by definition, not committed.
+
+    A name in the pre-group SHAPE is ``stale_key_shape`` and is unlinkable BEFORE
+    any digest comparison: even a byte-identical digest cannot make a name that
+    does not say which group its bytes belong to into a loadable identity.
     """
     parsed = parse_path(name)
     if not parsed["ok"]:
+        stale_shape = parsed["classification"] == NAME_STALE_KEY_SHAPE
         return {"ok": False,
                 "reason": str(parsed["reason"]),
                 "classification": parsed["classification"],
                 "ours": bool(parsed["ours"]),
                 "filename": parsed["filename"],
-                "unlinkable": False,
+                "unlinkable": bool(stale_shape),
                 "units": {}}
     if parsed["partial"]:
         return _ok(units={}, reason=("it is an in-flight .part file: not a "
@@ -1523,8 +1770,14 @@ def _validate_unlink(path, root, geometry_digest, peer_digests,
         return _fail(f"{base} does not resolve directly inside {root}: this "
                      "deletion never walks out of the directory it was handed")
     parsed = parse_path(base)
-    if not parsed["ok"]:
+    if not parsed["ok"] and parsed["classification"] != NAME_STALE_KEY_SHAPE:
         return _fail(f"{base} is not ours to delete: {parsed['reason']}")
+    # A name that does not parse AS CURRENT is not automatically foreign: the
+    # pre-group shape is OURS and is named stale on purpose, so it has to reach the
+    # classification check below instead of stopping at "this name does not parse".
+    # Without that, a sweep could PLAN the ambiguous files and this executor could
+    # then refuse them - invisible capacity nobody reclaims, which is the exact
+    # dead weight the classification exists to make removable.
     if geometry_digest is not None:
         fresh = classify_name(base, geometry_digest, peer_digests)
         classification = fresh["classification"]

@@ -44,11 +44,25 @@ PKG = Path(dl.__file__).resolve().parent
 # per slot on PP0, ~12.9 MB on PP1, 4 ranks, 5 KV cache groups.
 PP0_BYTES = 11_468_800
 PP1_BYTES = 12_902_400
-KEY = "a3f0b7c1d4e5f607"
+# THE IDENTITY IS GROUP-QUALIFIED. `KEY16` is the digest half - what the layout
+# layer calls key16 - and `KEY` is the FULL engine value: the digest hex plus the
+# 4-byte big-endian group id `make_block_hash_with_group_id` appends at the END.
+# A bare `KEY16` is no longer a usable file key at all, so the tests that name a
+# file use `KEY` and the tests that check the refusal use `KEY16`.
+KEY16 = "a3f0b7c1d4e5f607"
+GROUP = 3
+GROUP_HEX = f"{GROUP:08x}"
+KEY = KEY16 + "1" * 48 + GROUP_HEX
+# The same digest, a different group: TWO FILES, two identities, one key16. This
+# pair is the bug the name carries a group to close.
+KEY_GROUP_7 = KEY16 + "1" * 48 + f"{7:08x}"
 # Shares KEY's shard directory, so a sweep of one directory sees both a current
 # and a stale file (the shard is part of the name's meaning, not an attribute of
 # the key's value).
-KEY_OTHER = "a300111122223333"
+KEY_OTHER16 = "a300111122223333"
+KEY_OTHER = KEY_OTHER16 + "2" * 48 + GROUP_HEX
+# The name this plugin emitted before the group fix: 2 fields, no g<group>.
+LEGACY_NAME = f"kvslot-{KEY16}-abcdef123456.bin"
 # The real tmpfs policy, saved so the ONE test that proves the rule can put it
 # back after the autouse fixture below clears it for the rest of the file.
 REAL_FORBIDDEN_ROOTS = dl.FORBIDDEN_ROOT_PREFIXES
@@ -401,24 +415,106 @@ def test_the_name_is_key_plus_digest_and_shards_by_the_key_prefix():
     geo = digest()
     made = dl.build_slot_path("/home/user/kv-tier/disk", KEY, geo)
     assert made["ok"] is True
-    assert made["filename"] == f"kvslot-{KEY}-{geo}.bin"
+    assert made["filename"] == f"kvslot-{KEY16}-g{GROUP}-{geo}.bin"
+    assert made["key16"] == KEY16
+    assert made["group_id"] == GROUP
+    assert made["group_field"] == f"g{GROUP}"
     assert made["shard"] == "a3"
-    assert made["path"] == f"/home/user/kv-tier/disk/a3/kvslot-{KEY}-{geo}.bin"
+    assert (made["path"]
+            == f"/home/user/kv-tier/disk/a3/kvslot-{KEY16}-g{GROUP}-{geo}.bin")
     assert made["part_path"].endswith(".bin.part")
     assert made["units"]["shard_chars"] == "chars"
 
 
+def test_the_group_id_is_part_of_the_identity_and_the_digest_part_is_not():
+    """THE bug, as a test: one `key16`, two groups, TWO files.
+
+    Before the fix both keys truncated to the same 16 hex characters and named ONE
+    file, so the second group's bytes replaced the first's while every counter
+    reported a benign `duplicate`. The group is a name component now, so the two
+    files are distinct AND a reader can see which group each one is.
+    """
+    geo = digest()
+    group3 = dl.build_slot_name(KEY, geo)
+    group7 = dl.build_slot_name(KEY_GROUP_7, geo)
+    assert group3["ok"] and group7["ok"]
+    assert group3["key16"] == group7["key16"] == KEY16
+    assert group3["group_id"] == 3 and group7["group_id"] == 7
+    assert group3["filename"] != group7["filename"]
+    assert "-g3-" in group3["filename"] and "-g7-" in group7["filename"]
+    # ...and a lookup for one never resolves to the other's name.
+    assert dl.parse_path(group3["filename"])["group_id"] == 3
+    assert dl.parse_path(group7["filename"])["group_id"] == 7
+
+
+@pytest.mark.parametrize("too_short", [KEY16, KEY16 + "0" * 7, "a3f0", "",
+                                        "a" * 23, None, 7, object(), b"x" * 12])
+def test_a_key_too_short_to_carry_the_group_suffix_is_refused(too_short):
+    """A 16-hex key is the pre-fix identity: refused at the door, never truncated.
+
+    Accepting it would re-open the exact ambiguity - a name with no group cannot
+    say whose bytes it holds - so the refusal is the safety property, and the
+    reason says why instead of just "bad length".
+    """
+    assert dl.split_block_key(too_short)["ok"] is False
+    assert dl.build_slot_name(too_short, digest())["ok"] is False
+    assert dl.build_slot_path("/home/user/kv-tier/disk", too_short,
+                              digest())["ok"] is False
+
+
+def test_the_group_suffix_is_unpacked_the_way_the_engine_packs_it():
+    """`key[:-4]` and `int.from_bytes(key[-4:], "big")`, on hex AND on raw bytes."""
+    raw = bytes.fromhex(KEY)
+    from_hex = dl.split_block_key(KEY)
+    from_bytes = dl.split_block_key(raw)
+    assert from_hex["ok"] and from_bytes["ok"]
+    assert from_bytes["key16"] == from_hex["key16"] == KEY16
+    assert from_bytes["digest_hex"] == KEY[:-dl.GROUP_SUFFIX_HEX_CHARS]
+    assert from_bytes["group_id"] == int.from_bytes(raw[-4:], "big") == GROUP
+    assert from_bytes["key_hex"] == from_hex["key_hex"] == KEY
+    # Group 0 is a real group, not an absence.
+    zero = dl.split_block_key(KEY16 + "1" * 48 + "00000000")
+    assert zero["ok"] and zero["group_id"] == 0
+    assert zero["group_field"] == "g0"
+
+
+@pytest.mark.parametrize("group_hex", ["ffffffff", "00002000", "00010000"])
+def test_an_absurd_group_id_is_refused_rather_than_named(group_hex):
+    """A suffix above `MAX_GROUP_ID` is not an ordinal, so not an identity."""
+    key = KEY16 + "1" * 48 + group_hex
+    split = dl.split_block_key(key)
+    assert split["ok"] is False
+    assert "group id" in split["reason"]
+    assert dl.build_slot_name(key, digest())["ok"] is False
+
+
+def test_a_non_hex_key_is_refused_even_when_it_is_long_enough():
+    assert dl.split_block_key("z" * 40)["ok"] is False
+    assert dl.split_block_key("a3f0b7c1d4e5f60 7" + "0" * 8)["ok"] is False
+
+
 def test_an_upper_case_key_is_normalized_because_ext4_is_case_sensitive():
-    lower = dl.build_slot_name("a3f0b7c1d4e5f607", digest())
-    upper = dl.build_slot_name("A3F0B7C1D4E5F607", digest())
+    lower = dl.build_slot_name(KEY, digest())
+    upper = dl.build_slot_name(KEY.upper(), digest())
     assert lower["ok"] and upper["ok"]
     assert lower["filename"] == upper["filename"]
 
 
 @pytest.mark.parametrize("junk", ["a3f0", "z3f0b7c1d4e5f607", "", "a3f0b7c1d4e5f60",
-                                  "a3f0b7c1d4e5f6078", None, 7, "a3f0 b7c1d4e5f60"])
+                                  "a3f0b7c1d4e5f6078", None, 7,
+                                  "a3f0 b7c1d4e5f60"])
 def test_a_key_that_is_not_16_hex_chars_is_refused(junk):
     assert dl.build_slot_name(junk, digest())["ok"] is False
+    assert dl.validate_key16(junk)["ok"] is False
+
+
+def test_validate_key16_is_the_digest_half_and_is_not_a_file_key():
+    """`validate_key16` still validates a NAME's key field; it does not name one."""
+    assert dl.validate_key16(KEY16)["ok"] is True
+    assert dl.validate_key16(KEY16.upper())["value"] == KEY16
+    # It is exactly 16 chars, so the full group-qualified key is not what it takes.
+    assert dl.validate_key16(KEY)["ok"] is False
+    assert dl.split_block_key(KEY)["key16"] == dl.validate_key16(KEY16)["value"]
 
 
 def test_a_digest_that_is_not_12_hex_chars_is_refused():
@@ -450,31 +546,44 @@ def test_the_name_round_trips_and_nothing_else_is_accepted():
     geo = digest()
     parsed = dl.parse_path(dl.build_slot_path("/root", KEY, geo)["filename"])
     assert parsed["ok"] is True
-    assert parsed["key16"] == KEY
+    assert parsed["key16"] == KEY16
+    assert parsed["group_id"] == GROUP
+    assert parsed["group_field"] == f"g{GROUP}"
     assert parsed["shard"] == "a3"
     assert parsed["geometry_digest"] == geo
     assert parsed["partial"] is False
 
 
 @pytest.mark.parametrize(("name", "classification"), [
-    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.bin", None),      # ours
-    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.bin.part", None),  # ours, in flight
-    ("kvslot-a3f0b7c1d4e5f607-abcdef123456.txt", "not_ours"),
-    ("kvslot-a3f0b7c1d4e5f607-abcdef123456", "not_ours"),
+    (f"kvslot-{KEY16}-g3-abcdef123456.bin", None),        # ours
+    (f"kvslot-{KEY16}-g0-abcdef123456.bin", None),        # ours, group 0
+    (f"kvslot-{KEY16}-g3-abcdef123456.bin.part", None),   # ours, in flight
+    (LEGACY_NAME, "stale_key_shape"),        # OURS, the pre-fix shape: never matched
+    (LEGACY_NAME + ".part", "stale_key_shape"),
+    (f"kvslot-{KEY16}-g7-abcdef123456.bin", None),
+    (f"kvslot-{KEY16}-abcdef123456.txt", "not_ours"),
+    (f"kvslot-{KEY16}-abcdef123456", "not_ours"),
     ("kvtier-ab12cd34-PP0_TP0-gabcdef123456.bin", "not_ours"),  # stage 1's name
     ("notes.bin", "not_ours"),
     ("kvslot-backup-notes.bin", "malformed"),
-    ("kvslot-a3f0b7c1d4e5f60.bin", "malformed"),
+    (f"kvslot-{KEY16[:12]}.bin", "malformed"),
     ("kvslot-z3f0b7c1d4e5f607-abcdef123456.bin", "malformed"),
     ("kvslot-a3f0b7c1d4e5f607-abcdef12345.bin", "malformed"),
     ("kvslot-a3f0b7c1d4e5f607-abcdef123456-extra.bin", "malformed"),
-    ("kvslot-a3f0b7c1d4e5f607/abcdef123456.bin", "not_ours"),   # a basename only
+    ("kvslot-a3f0b7c1d4e5f607-g3-abcdef123456-extra.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-g03-abcdef123456.bin", "malformed"),   # not canonical
+    ("kvslot-a3f0b7c1d4e5f607-3-abcdef123456.bin", "malformed"),     # no g prefix
+    ("kvslot-a3f0b7c1d4e5f607-g-abcdef123456.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-g999999-abcdef123456.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-g3-abcdef12345.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607-g3-zbcdef123456.bin", "malformed"),
     ("kvslot-a3f0b7c1d4e5f607\\abcdef123456.bin", "malformed"),
+    ("kvslot-a3f0b7c1d4e5f607/abcdef123456.bin", "not_ours"),   # a basename only
     (".", "not_ours"),
     ("", "not_ours"),
     (None, "refused"),
     (7, "refused"),
-    (b"kvslot-a3f0b7c1d4e5f607-abcdef123456.bin", "refused"),
+    (b"kvslot-a3f0b7c1d4e5f607-g3-abcdef123456.bin", "refused"),
 ])
 def test_parse_path_is_total_and_classifies_rather_than_raising(name,
                                                                 classification):
@@ -485,6 +594,51 @@ def test_parse_path_is_total_and_classifies_rather_than_raising(name,
         return
     assert parsed["ok"] is False
     assert parsed["classification"] == classification
+
+
+def test_the_pre_group_name_is_stale_by_construction_and_never_loadable():
+    """The 827 files / 9.38 GiB already on the box, named honestly.
+
+    A 2-field name can match this boot's DIGEST and still be unattributable: its
+    `key16` says nothing about which group's bytes are inside. So it is its own
+    classification (not `malformed` - we know who wrote it; not `current` - we
+    cannot say what it holds), it is OURS, and it is unlinkable so the capacity
+    logic can reclaim the 9 GiB it occupies.
+    """
+    geo = digest()
+    verdict = dl.classify_name(LEGACY_NAME, geo)
+    assert verdict["classification"] == "stale_key_shape"
+    assert verdict["unlinkable"] is True
+    assert verdict["ours"] is True
+    assert "group" in verdict["reason"]
+    # A digest match does NOT rescue it: the name is compared for shape first.
+    same_digest_name = LEGACY_NAME.replace("abcdef123456", geo)
+    assert dl.classify_name(same_digest_name, geo)["classification"] == \
+        "stale_key_shape"
+    assert dl.classify_name(same_digest_name, geo)["unlinkable"] is True
+    assert "stale_key_shape" in dl.NAME_CLASSIFICATIONS
+    assert "stale_key_shape" in dl.UNLINKABLE_CLASSIFICATIONS
+    assert "stale_key_shape" in dl.EVICTABLE_CLASSIFICATIONS
+    # ...and it is never `current`, for ANY digest, so no load path can select it.
+    assert dl.classify_name(LEGACY_NAME, "abcdef123456")["classification"] != \
+        "current"
+
+
+def test_a_legacy_file_is_shed_before_this_boot_own_current_file():
+    """Capacity sheds the unattributable bytes first: they are pure cost."""
+    geo = digest()
+    entries = [
+        {"path": "/store/a3/" + LEGACY_NAME, "filename": LEGACY_NAME,
+         "size_bytes": 1000, "mtime_ns": 9_000_000},          # newest, but stale
+        {"path": f"/store/a3/kvslot-{KEY16}-g3-{geo}.bin",
+         "filename": f"kvslot-{KEY16}-g3-{geo}.bin",
+         "size_bytes": 1000, "mtime_ns": 1_000_000},          # this boot's own
+    ]
+    plan = dl.lru_eviction_plan(entries, geometry_digest=geo,
+                                ceiling_bytes=1500, used_bytes=2000)
+    assert plan["ok"] and plan["needed"]
+    assert plan["paths"][0].endswith(LEGACY_NAME)
+    assert plan["stale_first"] == 1
 
 
 def test_a_part_name_is_ours_but_is_never_a_committed_file():
@@ -712,6 +866,34 @@ def test_a_directory_is_not_walked_and_not_planned(tmp_path):
     assert sweep["planned_paths"] == []
 
 
+def test_a_sweep_plans_the_pre_group_files_and_unlinks_them(tmp_path):
+    """The boot sweep is what reclaims the 9.38 GiB of ambiguous bytes on the box.
+
+    A legacy file is OURS, is unlinkable, and appears in the plan; the two-phase
+    executor re-validates it against the digest handed in NOW and deletes it, while
+    this boot's own current file and a malformed near-miss both survive.
+    """
+    geo = digest()
+    current = slot_path(tmp_path, KEY, geo)
+    os.makedirs(os.path.dirname(current["path"]), exist_ok=True)
+    with open(current["path"], "wb") as handle:
+        handle.write(b"x" * 64)
+    legacy = tmp_path / LEGACY_NAME
+    legacy.write_bytes(b"y" * 64)
+    (tmp_path / "kvslot-backup-notes.bin").write_bytes(b"not ours")
+    sweep = dl.boot_sweep(tmp_path, geo)
+    assert sweep["ok"] is True
+    assert sweep["counts"]["stale_key_shape"] == 1
+    assert sweep["counts"]["malformed"] == 1
+    assert sweep["planned_paths"] == [str(legacy)]
+    done = dl.execute_unlink_plan(tmp_path, sweep["planned_paths"], dry_run=False,
+                                  geometry_digest=geo)
+    assert done["counts"]["unlinked"] == 1
+    assert not legacy.exists()
+    assert os.path.exists(current["path"])
+    assert (tmp_path / "kvslot-backup-notes.bin").exists()
+
+
 def test_a_symlink_inside_the_store_is_refused_not_followed(tmp_path):
     outside = tmp_path.parent / "outside-target.bin"
     outside.write_bytes(b"a file outside the store")
@@ -818,15 +1000,22 @@ def test_the_sweep_refuses_unusable_caps_rather_than_defaulting(tmp_path, junk):
 # --- capacity: an LRU that runs on mtime, not atime ------------------------
 
 def entries(*specs):
-    """`specs` is (name, size_bytes, mtime_ns, digest) with the digest optional."""
+    """`specs` is (name, size_bytes, mtime_ns, digest) with the digest optional.
+
+    Each entry's filename is built from a FULL group-qualified key (the index in
+    the digest half, group 0 as the suffix), because that is the only shape
+    `build_slot_name` accepts now.
+    """
     geo = digest()
     out = []
     for index, spec in enumerate(specs):
         name, size, when = spec[0], spec[1], spec[2]
         geo_of = spec[3] if len(spec) > 3 else geo
+        key = f"{index:016x}" + "0" * dl.GROUP_SUFFIX_HEX_CHARS
+        made = dl.build_slot_name(key, geo_of)
+        assert made["ok"], made["reason"]
         out.append({"path": f"/store/a3/{name}",
-                    "filename": dl.build_slot_name(f"{index:016x}",
-                                                   geo_of)["filename"],
+                    "filename": made["filename"],
                     "size_bytes": size, "mtime_ns": when})
     return out
 

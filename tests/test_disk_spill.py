@@ -37,7 +37,14 @@ from pathlib import Path
 
 import pytest
 
-from kvtier_dev_plugin import blockdump, config, disk_layout, disk_spill, snapshot
+from kvtier_dev_plugin import (
+    blockdump,
+    config,
+    disk_index,
+    disk_layout,
+    disk_spill,
+    snapshot,
+)
 
 # A small but real slot width: 4 KiB keeps the byte assertions honest while
 # staying above disk_layout.MIN_BLOCK_BYTES (1 KiB), which is the floor that
@@ -141,7 +148,20 @@ def fingerprint(**overrides) -> dict:
     return base
 
 
-KEY = "a3f0b7c1d4e5f607"
+# THE IDENTITY IS GROUP-QUALIFIED: `KEY` is the engine's full block-hash hex (the
+# digest half plus the 4-byte big-endian group id at the END), which is the only
+# thing `spill_slot` will name a file with. `KEY16` is the digest half - the
+# `key16` a name carries - and is what a refusal for "no group in it" is about.
+def full_key(index: int, group: int = 3) -> str:
+    """A group-qualified block hash for test slot `index` (group 3 by default)."""
+    return f"{index:016x}" + "0" * 48 + f"{group:08x}"
+
+
+KEY16 = "a3f0b7c1d4e5f607"
+GROUP = 3
+KEY = KEY16 + "1" * 48 + f"{GROUP:08x}"
+# Same digest, different group: the second identity the old name could not express.
+KEY_OTHER_GROUP = KEY16 + "1" * 48 + f"{7:08x}"
 REAL_FORBIDDEN_ROOTS = disk_layout.FORBIDDEN_ROOT_PREFIXES
 
 
@@ -271,9 +291,63 @@ def test_a_slot_round_trips_to_the_file_the_fingerprint_names():
     assert result["bytes_written"] == SLOT_BYTES
     assert result["sha256"] == hashlib.sha256(expected).hexdigest()
     digest = disk_layout.fingerprint_digest(fingerprint())["geometry_digest"]
-    assert Path(result["path"]).name == f"kvslot-{KEY}-{digest}.bin"
+    assert result["group_id"] == GROUP
+    assert result["group_field"] == f"g{GROUP}"
+    assert Path(result["path"]).name == f"kvslot-{KEY16}-g{GROUP}-{digest}.bin"
     assert Path(result["path"]).read_bytes() == expected
-    assert result["path"].endswith(f"/a3/kvslot-{KEY}-{digest}.bin")
+    assert result["path"].endswith(f"/a3/kvslot-{KEY16}-g{GROUP}-{digest}.bin")
+
+
+def test_a_key_without_the_group_suffix_is_refused_before_any_byte_is_written():
+    """The identity bug, at the door that writes.
+
+    A bare `key16` is what the engine's hash LOOKS like after truncation, and it is
+    exactly what two groups share, so naming a file from it is refused - with no
+    directory created and no byte written - rather than silently producing a name
+    another group will overwrite.
+    """
+    root = disk_spill._state["root"]
+    refused = disk_spill.spill_slot(caches(), 1, KEY16)
+    assert refused["ok"] is False
+    assert refused["reason_kind"] == "bad_key"
+    assert "group" in refused["reason"]
+    planned = disk_spill.plan_slot_write(caches(), 1, KEY16)
+    assert planned["ok"] is False
+    assert not os.path.exists(os.path.join(str(root), KEY16[:2]))
+
+
+def test_two_groups_over_one_chain_get_two_files_and_a_counter():
+    """The collision witness, proven end to end on real bytes.
+
+    Same token chain, two KV-cache groups, so two identities sharing a `key16`:
+    BOTH spill, to two files, with the group id visible in each name - and the
+    second one counts a `group_collision`, which is the number the tier is armed to
+    measure. Nothing is refused: the names are distinct, so the event is data.
+    """
+    first = disk_spill.spill_slot(caches(), 1, KEY)
+    assert first["ok"] is True
+    assert first["group_collision"] is None
+    again_same_group = disk_spill.spill_slot(caches(), 1, KEY)
+    assert again_same_group["duplicate"] is True
+    assert disk_spill.counters()["group_collisions"] == 0
+    other = disk_spill.spill_slot(caches(), 1, KEY_OTHER_GROUP)
+    assert other["ok"] is True
+    assert other["duplicate"] is False
+    assert other["path"] != first["path"]
+    assert "-g7-" in other["path"] and "-g3-" in first["path"]
+    state = disk_spill.counters()
+    assert state["group_collisions"] == 1
+    assert state["refused"]["write_failed"] == 0
+    sample = state["group_collision_samples"][-1]
+    assert sample["key16"] == KEY16
+    assert sorted([sample["group_id_a"], sample["group_id_b"]]) == [3, 7]
+    assert sample["sibling_on_disk"] is True
+    assert json.dumps(state["group_collision_samples"], default=str)
+    # ...and the third group of the same chain is a third event, not a re-count of
+    # the first pair.
+    disk_spill.spill_slot(caches(), 1,
+                          KEY16 + "1" * 48 + f"{11:08x}")
+    assert disk_spill.counters()["group_collisions"] == 2
 
 
 def test_a_multi_region_slot_concatenates_in_name_order():
@@ -315,10 +389,14 @@ def test_verify_reads_back_exactly_what_was_written():
 
 
 def test_verifying_a_slot_that_was_never_written_is_a_clean_absence():
-    checked = disk_spill.verify_slot("0123456789abcdef")
+    checked = disk_spill.verify_slot("0123456789abcdef" + "0" * 8)
     assert checked["ok"] is False
     assert checked["exists"] is False
     assert "not there" in checked["reason"]
+    # A key with no group suffix cannot even be resolved to a name.
+    ungrouped = disk_spill.verify_slot("0123456789abcdef")
+    assert ungrouped["ok"] is False
+    assert "group" in ungrouped["reason"]
 
 
 # --- the fingerprint: missing is a refusal, never a guess ------------------
@@ -456,8 +534,9 @@ def test_spilling_the_same_slot_twice_is_a_benign_duplicate():
     assert os.stat(first["path"]).st_mtime_ns == stamp
     # Through the queue, the counters say the same thing: a repeat is a duplicate
     # and a new identity is a spill, and neither is a failure.
-    disk_spill.request_spill(caches(), 1, KEY)            # written above
-    disk_spill.request_spill(caches(), 2, "b" + KEY[1:])  # a different identity
+    disk_spill.request_spill(caches(), 1, KEY)             # written above
+    disk_spill.request_spill(caches(), 2,
+                             "b" + KEY16[1:] + "1" * 48 + f"{GROUP:08x}")
     assert disk_spill.drain(timeout_seconds=5.0)["drained"] is True
     assert disk_spill._state["spilled"] == 1
     assert disk_spill._state["duplicates"] == 1
@@ -519,7 +598,7 @@ def test_requesting_a_spill_never_blocks_the_caller():
     """20 distinct slots: the call is a `put_nowait`, and the thread does the I/O."""
     started = time.perf_counter()
     for slot in range(20):
-        disk_spill.request_spill(caches(blocks=64), slot, f"{slot:016x}")
+        disk_spill.request_spill(caches(blocks=64), slot, full_key(slot))
     elapsed = time.perf_counter() - started
     assert elapsed < 1.0                       # 20 accepted jobs, all queued
     drained = disk_spill.drain(timeout_seconds=10.0)
@@ -601,8 +680,8 @@ def test_the_worker_object_is_read_by_name_like_worker_diag_does():
 
 def test_eviction_sheds_the_oldest_file_by_mtime_first():
     written = []
-    for index, key in enumerate(("0" * 16, "1" * 16, "2" * 16)):
-        result = disk_spill.spill_slot(caches(), index, key)
+    for index in range(3):
+        result = disk_spill.spill_slot(caches(), index, full_key(index))
         assert result["ok"] is True
         written.append(Path(result["path"]))
     # Backdate them so the ORDER is chosen by the test and not by the clock.
@@ -802,7 +881,7 @@ def _verify_and_plan_payloads():
 def _entries(root, *specs):
     """Sweep-shaped entries: (index, size_bytes, mtime_ns) with real names."""
     geo = digest()
-    named = [disk_layout.build_slot_name(f"{index:016x}", geo)["filename"]
+    named = [disk_layout.build_slot_name(full_key(index), geo)["filename"]
              for index, _size, _when in specs]
     return [{"path": f"{root}/a3/{name}",
              "filename": name,
@@ -822,8 +901,11 @@ def _all_disk_payloads():
         yield disk_layout.validate_fingerprint({})
         yield disk_layout.fingerprint_digest(fingerprint())
         yield disk_layout.fingerprint_digest({})
-        yield disk_layout.validate_key16(KEY)
-        yield disk_layout.validate_key16(KEY[:12])
+        yield disk_layout.validate_key16(KEY16)
+        yield disk_layout.validate_key16(KEY16[:12])
+        yield disk_layout.split_block_key(KEY)
+        yield disk_layout.split_block_key(KEY16)
+        yield disk_layout.split_block_key(None)
         yield disk_layout.validate_root(root)
         yield disk_layout.validate_root("/tmp/store")
         yield disk_layout.build_slot_name(KEY, geo)
@@ -862,6 +944,14 @@ def _all_disk_payloads():
         yield disk_spill.section()
         yield disk_spill.drain(timeout_seconds=0.01)
         yield disk_spill.stop_writer()
+        # The journal's own payloads are held to the same units contract: a counter
+        # that reaches a dashboard without a unit is the same bug in a new module.
+        yield disk_index.section()
+        yield disk_index.record_spill("kvslot-nope.bin", 10)
+        yield disk_index.journal_append("+", KEY16, 10, 3)
+        yield disk_index.journal_path("not/a/rank")
+        yield disk_index.lookup(KEY)
+        yield disk_index.lookup(KEY16)
 
 
 def test_every_number_in_a_disk_payload_declares_its_unit():
@@ -886,3 +976,201 @@ def test_every_number_in_a_disk_payload_declares_its_unit():
                 seen += 1
     assert not sorted(set(gaps)), gaps
     assert seen > 100
+
+
+# --- the journal: the spill telling the scheduler the file exists -----------
+
+@pytest.fixture
+def channel(tmp_path, monkeypatch):
+    """A diagnostics directory and a rank: the whole requirement for a journal.
+
+    The tier stays armed by the autouse `armed_tier`; this only opens the channel
+    the journal lives in, so a test that does not ask for it proves the tier works
+    WITHOUT one.
+    """
+    directory = tmp_path / "diag"
+    directory.mkdir()
+    monkeypatch.setenv(config.ENV_DIAG_DIR, str(directory))
+    monkeypatch.setenv(config.ENV_DIAG_RANK, "PP0_TP0")
+    return directory
+
+
+def journal_lines():
+    where = disk_index.journal_path()
+    assert where["ok"] is True, where["reason"]
+    if not os.path.exists(where["path"]):
+        return []
+    with open(where["path"], "r", encoding="utf-8") as handle:
+        return handle.read().splitlines()
+
+
+def test_a_committed_spill_is_journalled_and_the_replay_offers_that_identity(
+        channel):
+    """THE WIRING, from the engine-facing door to the index a restore reads.
+
+    Before this, `record_spill` had no caller: the journal was never written, so the
+    restore index was starved no matter how many files landed. The assertions run in
+    the order the failure would appear: the spill's own receipt, the line on disk,
+    then what the replay makes of it.
+    """
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is True and result["journalled"] is True
+    assert result["group_id"] == GROUP
+    assert disk_spill.counters()["journal_records"] == 1
+    assert disk_spill.counters()["journal_failures"] == 0
+
+    lines = journal_lines()
+    assert len(lines) == 1
+    seq, op, key_text, size_text, group_text = lines[0].split(" ")
+    assert (seq, op) == ("1", "+")
+    assert key_text == KEY16 and size_text == str(SLOT_BYTES)
+    assert group_text == str(GROUP)
+
+    refreshed = disk_index.refresh(force=True)
+    assert refreshed["ok"] is True and refreshed["entries"] == 1
+    found = disk_index.lookup(KEY)
+    assert found["present"] is True
+    assert found["bytes"] == SLOT_BYTES and found["group_id"] == GROUP
+    assert disk_index.contains(KEY) is True
+
+
+def test_a_second_spill_of_the_same_identity_adds_no_second_record(channel):
+    """A duplicate did not land, so there is nothing new to say.
+
+    The file was already recorded - possibly by an earlier boot whose journal this
+    one continues - and appending a second `+` for it would make the index count one
+    file's bytes twice.
+    """
+    assert disk_spill.spill_slot(caches(), 1, KEY)["journalled"] is True
+    second = disk_spill.spill_slot(caches(), 1, KEY)
+    assert second["duplicate"] is True and second["journalled"] is False
+    assert disk_spill.counters()["journal_records"] == 1
+    assert len(journal_lines()) == 1
+
+
+def test_a_write_that_never_landed_is_never_journalled(monkeypatch, channel):
+    """The record follows the `os.replace`, never precedes it.
+
+    A journal that says a file exists when it does not is the ONE corruption this
+    index cannot survive: the scheduler would offer a restore that fails on every
+    attempt. So the append happens after the commit, and a write that died at the
+    rename leaves the journal as it found it - empty.
+    """
+    def fail_replace(a, b, **kwargs):
+        raise OSError("the rename blew up")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is False
+    assert journal_lines() == []
+    assert disk_spill.counters()["journal_records"] == 0
+    assert disk_index.refresh(force=True)["entries"] == 0
+
+
+def test_a_journal_that_raises_cannot_fail_the_spill(channel, monkeypatch):
+    """The bytes are the product; the index is a report about them.
+
+    `disk_index` catches its own exceptions, so a raise here means a future edit
+    broke that rule - and the spill must STILL succeed, because the alternative is a
+    diagnostic costing the tier its whole purpose. The failure is counted and named
+    rather than swallowed.
+    """
+    def boom(*args, **kwargs):
+        raise ZeroDivisionError("a future edit divided by zero in the journal")
+
+    monkeypatch.setattr(disk_index, "record_spill", boom)
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is True
+    assert result["journalled"] is False
+    assert os.path.exists(result["path"])
+    counters = disk_spill.counters()
+    assert counters["journal_records"] == 0
+    assert counters["journal_failures"] == 1
+    assert counters["last_error"] == "ZeroDivisionError"
+
+
+def test_a_journal_that_refuses_cannot_fail_the_spill(channel, monkeypatch):
+    """The same rule for the ordinary case: a refusal (no space, capped file) is
+    reported, not propagated. No exception is involved and nothing changes."""
+    monkeypatch.setattr(
+        disk_index, "record_spill",
+        lambda *a, **k: {"ok": False, "reason": "the journal is capped"})
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is True and result["journalled"] is False
+    assert disk_spill.counters()["journal_failures"] == 1
+    assert "capped" in disk_spill.counters()["last_reason"]
+    assert os.path.exists(result["path"])
+
+
+def test_without_a_diagnostics_channel_the_spill_still_lands(monkeypatch):
+    """The journal lives in the diagnostics directory; the tier does not.
+
+    A box can arm the tier and leave diagnostics off, and then EVERY spill fails to
+    journal. That is a counted, reported condition - never a reason to stop spilling
+    to disk, which is the only thing the tier was asked to do.
+    """
+    monkeypatch.delenv(config.ENV_DIAG_DIR, raising=False)
+    result = disk_spill.spill_slot(caches(), 1, KEY)
+    assert result["ok"] is True
+    assert result["journalled"] is False
+    assert os.path.exists(result["path"])
+    assert disk_spill.counters()["journal_failures"] == 1
+    assert disk_spill.counters()["journal_records"] == 0
+
+
+def test_an_evicted_file_is_journalled_as_a_removal_and_stops_being_offered(
+        channel):
+    """Capacity is the other half of the journal, and it is the dangerous half.
+
+    A file deleted by the ceiling plan with its record still in the index is a
+    restore that cannot be served. So the unlink is journalled too - and the entry
+    the replay builds from the journal is gone, not merely stale.
+    """
+    written = []
+    for index in range(3):
+        result = disk_spill.spill_slot(caches(), index, full_key(index))
+        assert result["ok"] is True
+        written.append(Path(result["path"]))
+    for offset, path in enumerate(reversed(written)):
+        stamp = 1_600_000_000 + offset * 100
+        os.utime(path, (stamp, stamp))
+    disk_index.refresh(force=True)
+    assert disk_index.counters()["entries"] == 3
+    oldest = written[-1]
+    disk_spill._state["ceiling_bytes"] = SLOT_BYTES + SLOT_BYTES // 2
+    disk_spill._state["estimated_bytes"] = 3 * SLOT_BYTES
+    disk_spill._enforce_ceiling()
+    assert not oldest.exists()
+
+    lines = journal_lines()
+    removals = [line for line in lines if line.split(" ")[1] == "-"]
+    assert removals, lines
+    key16 = disk_layout.parse_path(oldest.name)["key16"]
+    group = disk_layout.parse_path(oldest.name)["group_id"]
+    assert removals[0].split(" ")[2] == key16
+    assert removals[0].split(" ")[4] == str(group)
+    assert disk_spill.counters()["journal_removals"] >= 1
+
+    refreshed = disk_index.refresh(force=True)
+    assert refreshed["removals"] >= 1
+    assert disk_index.lookup(full_key(2))["present"] is False
+    # The survivors are still offered: a removal journalled badly would be the one
+    # bug that takes the whole index down with it.
+    assert disk_index.lookup(full_key(0))["present"] is True
+
+
+def test_the_journal_counters_reach_the_payloads_the_dashboard_reads(channel):
+    """A counter nobody publishes is a counter that does not exist at 3 a.m.
+
+    The spill's own section, the worker's contribution seam and the snapshot payload
+    all have to carry the journal's state, because "the tier is writing but the
+    index is empty" is a question that can only be answered from a payload.
+    """
+    disk_spill.spill_slot(caches(), 1, KEY)
+    section = disk_spill.section()
+    assert json.dumps(section, default=str)
+    assert section["journal_records"] == 1
+    assert section["journal_failures"] == 0
+    counters = disk_spill.counters()
+    assert counters["journal_records"] == 1
+    assert disk_index.section()["journal_writes"] == 1

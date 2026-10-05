@@ -65,9 +65,18 @@ from kvtier_dev_plugin import (  # noqa: E402 - the module under test
     worker_diag,
 )
 
-KEY = "a3f0b7c1d4e5f607"              # a key16, as the layout layer defines it
-LONG_KEY = "a3f0b7c1d4e5f607" + "1" * 56   # the hex a BlockHashWithGroupId renders to
-OTHER_KEY = "0f1e2d3c4b5a6978"
+KEY16 = "a3f0b7c1d4e5f607"            # the digest half of an identity
+LONG_KEY = ("a3f0b7c1d4e5f607" + "1" * 48 + "00000003")
+# THE KEY IS THE WHOLE VALUE. `LONG_KEY` is the hex a `BlockHashWithGroupId` renders
+# to - 32 digest bytes plus the 4-byte big-endian group id at the END - and the
+# spill-side key is that hex UNTRUNCATED, because the group is the discriminator
+# that two prefix-cacheable groups over one token chain otherwise share.
+OTHER_KEY = "0f1e2d3c4b5a6978" + "2" * 48 + "00000003"
+# `KEY` is the name the rest of this file uses for "the key of the step under test";
+# it is the FULL group-qualified hash, because that is the only thing that can name
+# a file now.
+KEY = LONG_KEY
+THIRD_KEY = "1111222233334444" + "0" * 48 + "00000003"
 GROUP_SIZES = [1, 4, 4, 8, 16]
 
 
@@ -697,24 +706,47 @@ def test_every_slot_unnamed_is_a_refusal_and_not_an_empty_retention(tier):
 
 
 @pytest.mark.parametrize(("raw", "expected", "why"), [
-    (LONG_KEY, KEY, "the layout's own truncation: first 16 hex chars"),
-    (LONG_KEY.upper(), KEY, "hex is case-folded, so one hash is one key"),
-    ("  " + LONG_KEY + "  ", KEY, "surrounding space is not part of a key"),
-    (KEY, KEY, "already a key16"),
-    ("0" * 15, None, "one char short of the identity the name carries"),
-    ("a3f0b7c1d4e5f60g", None, "not hexadecimal"),
+    (LONG_KEY, LONG_KEY, "the whole group-qualified hash: digest AND group"),
+    (LONG_KEY.upper(), LONG_KEY, "hex is case-folded, so one hash is one key"),
+    ("  " + LONG_KEY + "  ", LONG_KEY, "surrounding space is not part of a key"),
+    ("0" * 23, None, "one char short of carrying the 4-byte group suffix"),
+    (KEY16, None, "16 hex chars is the digest ALONE: the pre-fix identity, refused"),
+    ("0" * 15, None, "far short of the identity the name carries"),
+    ("a3f0b7c1d4e5f60g" + "0" * 8, None, "not hexadecimal"),
+    (KEY16 + "1" * 48 + "ffffffff", None, "a suffix that is not a group ordinal"),
     ("", None, "the placeholder: no hash for this slot"),
     (None, None, "not text at all"),
     (7, None, "an int is not a block hash"),
 ])
-def test_the_key_is_the_layouts_truncation_and_nothing_inventive(raw, expected, why):
+def test_the_key_is_the_engines_value_and_nothing_inventive(raw, expected, why):
     """`BlockHashWithGroupId` is bytes (a digest plus a 4-byte group id) and the
-    engine sends its hex - far more than 16 chars. Taking the first 16 is what
-    `disk_layout.validate_key16` DOCUMENTS the key to be, so this is a contract, not
-    a choice: same engine, same hash, same 16 chars, in every process."""
-    key, reason = disk_store.key16(raw)
+    engine sends its hex. This function normalises that hex and hands on ALL of it:
+    the layout layer splits the group out of the END (`key[-4:]`, the engine's own
+    `get_group_id`), so truncating here would discard the one field that separates
+    two groups over the same token chain - which is the identity bug this pins shut.
+    """
+    key, reason = disk_store.file_key(raw)
     assert key == expected, why
     assert reason is None if expected else bool(reason)
+
+
+def test_the_truncation_that_caused_the_bug_is_refused_not_reproduced():
+    """The old `key16()` took the first 16 chars and called that the key.
+
+    Two groups over one chain then produced one file name, so the second writer
+    "safely" overwrote the first while every counter said `duplicate`. A caller that
+    hands that truncated value here now gets a refusal naming the group, and the
+    digest half alone can never become a file name.
+    """
+    truncated, why = disk_store.file_key(KEY16)
+    assert truncated is None
+    assert "group" in why
+    assert disk_layout.build_slot_name(KEY16, "a" * 12)["ok"] is False
+    # The full hash still resolves, and its digest half is exactly the old key.
+    whole, _why = disk_store.file_key(LONG_KEY)
+    assert whole == LONG_KEY
+    assert disk_layout.split_block_key(LONG_KEY)["key16"] == KEY16
+    assert disk_layout.split_block_key(LONG_KEY)["group_id"] == 3
 
 
 # --- 4. a completed store becomes a real file at the right name -------------
@@ -1242,7 +1274,7 @@ def test_ls_lists_real_files_and_reads_nothing(tier):
 
 def test_ls_is_bounded_by_its_limit_and_says_so(tier):
     caches = {"g0": FakeRegion(4, SLOT_BYTES)}
-    for index, key in enumerate((KEY, OTHER_KEY, "1111222233334444")):
+    for index, key in enumerate((KEY, OTHER_KEY, THIRD_KEY)):
         spill_slot_now(caches, index, key)
     answer = disk_store.disk_for_engine(None, {"op": "ls", "limit": 2})
     assert answer["count"] == 2 and answer["truncated"] is True
@@ -1276,7 +1308,7 @@ def test_a_payload_is_trimmed_rather_than_allowed_to_grow(tier, monkeypatch):
     test that passes only while that text happens to be a certain size.
     """
     caches = {"g0": FakeRegion(4, SLOT_BYTES)}
-    for key in (KEY, OTHER_KEY, "1111222233334444"):
+    for key in (KEY, OTHER_KEY, THIRD_KEY):
         spill_slot_now(caches, 1, key)
     full = json.dumps(disk_store.disk_for_engine(None, {"op": "ls"}),
                       default=str).encode()
@@ -1435,7 +1467,7 @@ def test_the_poll_is_rate_limited_and_suppressed_when_the_gate_is_closed(
     ({"seq": 0}, "positive integer seq"),
     ({"requested_ts": "yesterday"}, "numeric requested_ts"),
     ({"slot": "three"}, "names no slot"),
-    ({"key": "not-a-key"}, "not 16 hex characters"),
+    ({"key": "not-a-key"}, "not a group-qualified block hash"),
     ({"fingerprint": "zzz"}, "neither empty nor 12 hex"),
 ])
 def test_a_request_that_does_not_match_the_contract_is_counted_and_ignored(

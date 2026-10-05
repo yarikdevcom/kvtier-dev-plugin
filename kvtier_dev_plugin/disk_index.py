@@ -12,11 +12,20 @@ crosses as a file). So the scheduler cannot read a worker's memory; it can read
 what the worker WROTE DOWN.
 
 That is this module: `disk_spill` appends one line per committed spill and one
-per eviction to a per-rank journal, and this module replays those lines into an
-in-process `key16 -> {bytes, path, rank}` index. It is the same cursor-over-a-
-file idiom the spill tier's arm file and the plugin's byte-dump receipts already
-use, for the same reason: an append-only file written by one process and read by
-another with a byte cursor is the smallest thing that cannot lie about ordering.
+per eviction to a per-rank journal (it does: its writer thread calls
+`record_spill` after the commit's `os.replace` and `record_removal` for every
+file the ceiling plan unlinks, both from the spill thread and never from an
+engine thread), and this module replays those lines into an in-process
+`identity -> {bytes, rank}` index. It is the same cursor-over-a-file idiom the
+spill tier's arm file and the plugin's byte-dump receipts already use, for the
+same reason: an append-only file written by one process and read by another with a
+byte cursor is the smallest thing that cannot lie about ordering.
+
+A JOURNAL FAILURE IS NEVER A SPILL FAILURE. The spill is the product; this index
+is an index of it. Every entry point a writer calls - `record_spill`,
+`record_removal`, `journal_append` - catches `Exception`, counts, and returns a
+classified refusal, and none of them may raise into, block or fail the write that
+called them. A worker whose journal cannot be written keeps spilling.
 
 THE INDEX MAY ONLY EVER BE STALE IN THE SAFE DIRECTION
 ------------------------------------------------------
@@ -36,17 +45,24 @@ never allowed to raise:
 
 WHAT A KEY IS, AND WHY THE PATH IS ONLY A GUESS
 -----------------------------------------------
-The key is `key16` - the first 16 hex characters of the group-qualified block
-hash, exactly as `disk_layout.validate_key16` defines it and exactly as
-`disk_store.key16` produces it for a spill. The PATH recorded here is the path
-built with the digest the SPILLING RANK computed, and it is stored for
-diagnosis only: the digest covers rank-local fields (`rank`, and
-`total_bytes_per_block`, which is 11,468,800 B on PP0 and 12,902,400 B on PP1),
-so four ranks name one key four different ways and no single path can be right
-for all of them. `disk_restore` therefore sends the key to the workers inside a
-path-shaped string and every worker resolves the name it would have written
-itself. A path in this index is a claim about a file that exists; it is not a
-claim about the name YOUR rank would use.
+The index is keyed by an IDENTITY, `<key16>:g<group>`: the leading 16 hex
+characters of the block hash DIGEST plus the KV-cache group id the engine appends
+to it (`kv_cache_utils.py:83`), unpacked by `disk_layout.split_block_key` - the
+same split that names the file. Keying the index on `key16` alone was the same
+identity bug one layer up: two prefix-cacheable groups over one token chain share
+a `key16`, so one entry would have stood for two files and a restore could be
+offered for a group whose bytes are not in it. A journal line therefore carries
+the group explicitly, and a caller that hands `lookup()` a bare 16-hex digest gets
+a miss rather than a guess.
+
+The PATH is not stored at all. Four ranks name one identity four different ways,
+because the digest covers rank-local fields (`rank`, and `total_bytes_per_block`,
+which is 11,468,800 B on PP0 and 12,902,400 B on PP1), and no single path could be
+right for all of them. `disk_restore` sends the identity to the workers inside a
+path-shaped string and every worker resolves the name IT would have written; a
+worker that cannot name it reports a miss. What the journal records per identity
+is the byte count (for the capacity view) and which rank's journal contributed it
+(for diagnosis), and nothing else.
 
 Stdlib only. No thread, no vllm, no torch. Every entry point returns a dict and
 never raises into the caller, because `refresh()` runs on the scheduler's lookup
@@ -73,18 +89,22 @@ REFRESH_MIN_INTERVAL_SECONDS = 1.0  # SECONDS between journal refreshes
 
 JOURNAL_PREFIX = "disk-spill-journal-"
 JOURNAL_SUFFIX = ".jsonl"
-JOURNAL_FIELDS = 4                  # "<seq> <+|-> <key16> <bytes>"
+JOURNAL_FIELDS = 5                  # "<seq> <+|-> <key16> <bytes> <group>"
 SPILL_LINE = "+"
 REMOVE_LINE = "-"
 LINE_SEP = " "
+IDENTITY_SEP = ":"
+GROUP_PREFIX = "g"                  # `<key16>:g<group>` is an index key
+MAX_JOURNAL_SIZE_BYTES = 1 << 40    # BYTES one line may claim (a slot is 11.5 MB)
+SEQ_TAIL_READ_BYTES = 4096          # BYTES of the journal tail read to seed a seq
 
 # Why a line was not applied. A closed vocabulary, one counter each.
 DROP_REASONS = ("malformed_line", "bad_op", "bad_key", "bad_size", "bad_seq",
-                "journal_shrank", "journal_capped", "line_cap", "read_cap",
-                "stopped")
+                "bad_group", "journal_shrank", "journal_capped", "line_cap",
+                "read_cap", "stopped")
 
 _state: dict = {
-    "entries": {},                    # key16 -> entry dict (insertion ordered)
+    "entries": {},                    # identity -> entry dict (insertion ordered)
     "cursors": {},                    # journal path -> byte offset
     "seq": {},                        # journal path -> last applied seq
     "stopped": {},                    # journal path -> reason it stopped
@@ -100,6 +120,8 @@ _state: dict = {
     "journal_full": False,
     "journal_lines": 0,
     "journal_bytes": 0,
+    "journal_seeded": False,
+    "journal_seq_seed": 0,
     "refreshes": 0,
     "refresh_skipped": 0,
     "last_reason": None,
@@ -123,6 +145,7 @@ def reset_state_for_tests() -> None:
         "dropped": {reason: 0 for reason in DROP_REASONS},
         "journal_writes": 0, "journal_write_errors": 0, "journal_full": False,
         "journal_lines": 0, "journal_bytes": 0,
+        "journal_seeded": False, "journal_seq_seed": 0,
         "refreshes": 0, "refresh_skipped": 0,
         "last_reason": None, "last_error": None, "last_journal": None,
         "last_refresh_mono": None, "bytes_indexed": 0,
@@ -156,6 +179,16 @@ def _ok(**fields) -> dict:
 
 def _is_plain_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def identity_of(key16, group_id) -> str:
+    """`<key16>:g<group>`, the one key this index is stored under.
+
+    Built here and nowhere else, so the writer of a journal line and the reader of
+    a lookup cannot drift into two different spellings of one identity (which
+    would look exactly like a missing file).
+    """
+    return f"{key16}{IDENTITY_SEP}{GROUP_PREFIX}{int(group_id)}"
 
 
 # --- the journal: one rank's write/eviction stream ---------------------------
@@ -207,13 +240,75 @@ def journal_path(rank=None) -> dict:
                rank=text)
 
 
-def journal_append(op, key, size_bytes=None) -> dict:
+def _read_tail_seq(path) -> dict:
+    """The last complete line's sequence number, from the file's tail.
+
+    WHY A NEW BOOT CARES ABOUT AN OLD BOOT'S SEQUENCE: the journal lives in the
+    diagnostics directory and OUTLIVES the process that wrote it, while `_state`
+    starts at zero. Seeding the first line of boot 2 at 1 would hand the
+    scheduler's replay a DECREASING sequence, and the replay's one rule about a
+    journal it can no longer trust is to STOP applying it - which would silently
+    un-wire this whole index after the first restart. So the sequence is seeded
+    from the file, monotone across boots, and nothing is deleted or renamed.
+
+    Bounded: the last `SEQ_TAIL_READ_BYTES` of the file, one read, once per
+    process. No complete line parses to a positive int means `ok: False`, and the
+    writer refuses to guess a number it cannot prove is increasing.
+    """
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        return _ok(seq=0, empty=True)
+    except OSError as exc:
+        return _fail(f"the journal's size could not be read: "
+                     f"{type(exc).__name__}")
+    if size <= 0:
+        return _ok(seq=0, empty=True)
+    want = min(size, SEQ_TAIL_READ_BYTES)
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(size - want)
+            raw = handle.read(want)
+    except OSError as exc:
+        return _fail(f"the journal's tail could not be read: "
+                     f"{type(exc).__name__}")
+    if size > want:
+        # The window may start mid-line: drop everything before the first newline
+        # so a partial line can never be parsed as a sequence.
+        cut = raw.find(b"\n")
+        raw = raw[cut + 1:] if cut >= 0 else b""
+    lines = [row for row in raw.split(b"\n") if row.strip()]
+    if size > want and not lines:
+        return _fail("the journal is larger than the tail window and that window "
+                     "holds no complete line")
+    for row in reversed(lines):
+        fields = row.decode("utf-8", errors="replace").split(LINE_SEP)
+        if len(fields) < JOURNAL_FIELDS:
+            continue
+        try:
+            seq = int(fields[0])
+        except ValueError:
+            continue
+        if seq >= 1:
+            return _ok(seq=seq, empty=False)
+    return _fail("no complete journal line in the tail carries a usable sequence "
+                 "number")
+
+
+def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
     """Append one line to THIS process's journal. Bounded; never raises.
 
     Called from `disk_spill`'s writer thread (the only thread that knows a file
     was committed, and the only one that deletes one), never from an engine
     thread. One `write()` of one line, so a reader that stops at the last
     newline can never apply half a record.
+
+    `key` is the engine's FULL group-qualified block hash, or a `key16` with the
+    `group_id` handed in beside it (what `record_spill` does, because it parses a
+    PATH rather than carrying a key through the writer thread). Both forms resolve
+    through `disk_layout.split_block_key`/`validate_key16`, so the writer cannot
+    invent a third spelling of an identity - and a line that cannot name a group is
+    refused, because an identity without one is the bug this journal exists above.
 
     Once the journal reaches `MAX_JOURNAL_BYTES` it STOPS: the writer refuses
     and counts, and the scheduler's index then simply stops learning new files.
@@ -224,14 +319,28 @@ def journal_append(op, key, size_bytes=None) -> dict:
         if op not in (SPILL_LINE, REMOVE_LINE):
             return _fail(f"the journal op must be {SPILL_LINE!r} or "
                          f"{REMOVE_LINE!r}, got {op!r}")
-        checked = disk_layout.validate_key16(key)
-        if not checked["ok"]:
-            return _fail(f"the key is not a usable journal key: "
-                         f"{checked['reason']}")
-        key16 = checked["value"]
+        if group_id is not None:
+            checked = disk_layout.validate_key16(key)
+            if not checked["ok"]:
+                return _fail(f"the key is not a usable journal key: "
+                             f"{checked['reason']}")
+            key16 = checked["value"]
+            if not _is_plain_int(group_id) or not 0 <= int(group_id) <= (
+                    disk_layout.MAX_GROUP_ID):
+                return _fail(f"the group id {group_id!r} is not an int in "
+                             f"[0, {disk_layout.MAX_GROUP_ID}]")
+            group = int(group_id)
+        else:
+            split = disk_layout.split_block_key(key)
+            if not split["ok"]:
+                return _fail(f"the key is not a usable journal key: "
+                             f"{split['reason']}")
+            key16, group = split["key16"], split["group_id"]
         size = int(size_bytes or 0)
-        if not _is_plain_int(size) or size < 0:
-            return _fail(f"the size must be a non-negative int, got {size!r}")
+        if not _is_plain_int(size) or size < 0 or size > MAX_JOURNAL_SIZE_BYTES:
+            return _fail(f"the size must be an int in [0, "
+                         f"{MAX_JOURNAL_SIZE_BYTES}], got {size_bytes!r} "
+                         "(unit: bytes)")
         named = journal_path()
         if not named["ok"]:
             _state["journal_write_errors"] += 1
@@ -254,8 +363,23 @@ def journal_append(op, key, size_bytes=None) -> dict:
                   "learning about this rank's files (never a wrong claim)")
             return _fail("the journal is at its size cap",
                          reason_kind="journal_capped", path=path)
+        if not _state["journal_seeded"]:
+            seeded = _read_tail_seq(path)
+            if not seeded["ok"]:
+                # A number we cannot prove is increasing is not a sequence, and a
+                # decreasing one would stop the reader for this rank forever.
+                _state["journal_write_errors"] += 1
+                _note(seeded["reason"])
+                return _fail(f"the journal's sequence could not be seeded: "
+                             f"{seeded['reason']}",
+                             reason_kind="journal_error", path=path)
+            _state["journal_lines"] = int(seeded["seq"])
+            _state["journal_seq_seed"] = int(seeded["seq"])
+            _state["journal_seeded"] = True
+            _state["journal_bytes"] = int(current)
         seq = int(_state["journal_lines"]) + 1
-        line = f"{seq}{LINE_SEP}{op}{LINE_SEP}{key16}{LINE_SEP}{size}\n"
+        line = (f"{seq}{LINE_SEP}{op}{LINE_SEP}{key16}{LINE_SEP}{size}"
+                f"{LINE_SEP}{group}\n")
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "ab") as handle:
@@ -457,16 +581,25 @@ def _forget_rank(path) -> None:
 
 
 def _apply_line(text, path):
-    """Apply one journal line.
+    """Apply one journal line: `<seq> <+|-> <key16> <bytes> <group>`.
 
     Returns the line's op on success, or None to mean STOP: the stream is no
     longer trustworthy and nothing further from this journal may be applied.
+
+    A line without the group field is not "an old line with an unknown group", it
+    is an identity that cannot be named: applying it would put a `key16`-only entry
+    in an index whose whole contract is that an entry says which GROUP's bytes it
+    stands for. So the 4-field shape stops the journal, exactly like any other
+    line this build cannot interpret - and it can only appear if someone hand-edits
+    a journal, because nothing in this repo wrote one before the group fix.
     """
     fields = text.split(LINE_SEP)
     if len(fields) != JOURNAL_FIELDS:
         return _stop(path, f"the line {text[:80]!r} has {len(fields)} fields; "
-                           f"{JOURNAL_FIELDS} are required", "malformed_line")
-    seq_text, op, key_text, size_text = fields
+                           f"{JOURNAL_FIELDS} are required (a line without a group "
+                           "field names an identity this index cannot hold)",
+                     "malformed_line")
+    seq_text, op, key_text, size_text, group_text = fields
     if op not in (SPILL_LINE, REMOVE_LINE):
         return _stop(path, f"the op {op!r} is neither {SPILL_LINE!r} nor "
                            f"{REMOVE_LINE!r}", "bad_op")
@@ -479,26 +612,32 @@ def _apply_line(text, path):
     try:
         seq = int(seq_text)
         size = int(size_text)
+        group = int(group_text)
     except ValueError:
         return _stop(path, f"the line {text[:80]!r} carries a non-integer "
-                           "sequence or size", "bad_size")
-    if size < 0:
-        return _stop(path, f"the size {size} is negative", "bad_size")
+                           "sequence, size or group", "bad_size")
+    if size < 0 or size > MAX_JOURNAL_SIZE_BYTES:
+        return _stop(path, f"the size {size} is outside [0, "
+                           f"{MAX_JOURNAL_SIZE_BYTES}]", "bad_size")
+    if not 0 <= group <= disk_layout.MAX_GROUP_ID:
+        return _stop(path, f"the group id {group} is outside [0, "
+                           f"{disk_layout.MAX_GROUP_ID}]", "bad_group")
     if seq < 1 or seq <= int(_state["seq"].get(path, 0)):
         return _stop(path, f"the sequence {seq} does not increase (the last "
                            f"applied was "
                            f"{int(_state['seq'].get(path, 0))})", "bad_seq")
     _state["seq"][path] = seq
     _state["applied"] += 1
+    identity = identity_of(key16, group)
     if op == REMOVE_LINE:
         _state["removals"] += 1
-        gone = _state["entries"].pop(key16, None)
+        gone = _state["entries"].pop(identity, None)
         if gone is not None:
             _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
                                           - int(gone["bytes"]))
         return REMOVE_LINE
     _state["spills"] += 1
-    _insert(key16, size, path)
+    _insert(identity, size, path, group)
     return SPILL_LINE
 
 
@@ -514,10 +653,10 @@ def _stop(path, reason, kind):
     return
 
 
-def _insert(key16, size, path) -> None:
-    """Add or refresh one entry, honouring the hard cap."""
+def _insert(identity, size, path, group_id=None) -> None:
+    """Add or refresh one entry, honouring the hard cap. Keyed by IDENTITY."""
     entries = _state["entries"]
-    existing = entries.get(key16)
+    existing = entries.get(identity)
     if existing is not None:
         existing["bytes"] = int(size)
         existing["journal"] = path
@@ -531,35 +670,46 @@ def _insert(key16, size, path) -> None:
                                       - int(dropped["bytes"]))
         _state["last_reason"] = (f"the index is at its {MAX_INDEX_ENTRIES}-entry "
                                  f"cap: {oldest} was dropped to admit a newer "
-                                 "key (a dropped entry is a missed restore)")
-    entries[key16] = {"bytes": int(size), "journal": path,
-                      "seen_ts": round(time.time(), 6)}
+                                 "identity (a dropped entry is a missed restore)")
+    entries[identity] = {"bytes": int(size), "journal": path,
+                         "group": (int(group_id) if _is_plain_int(group_id)
+                                   else None),
+                         "seen_ts": round(time.time(), 6)}
     _state["bytes_indexed"] = int(_state["bytes_indexed"]) + int(size)
 
 
 # --- the index itself --------------------------------------------------------
 
 def lookup(key) -> dict:
-    """`{present, key16, bytes, reason}` for one key. Never raises."""
+    """`{present, key16, group_id, bytes, rank, reason}` for one identity.
+
+    `key` is the engine's FULL group-qualified block hash (bytes or hex). A bare
+    16-hex `key16` is a MISS with a reason, never a guess: it does not say which
+    group's bytes are wanted, and offering the wrong group's file is the exact
+    silent-corruption class the identity carries the group to avoid. Never raises.
+    """
     try:
-        checked = disk_layout.validate_key16(key)
-        if not checked["ok"]:
-            return _fail(str(checked["reason"]), present=False, key16=None)
-        key16 = checked["value"]
-        entry = _state["entries"].get(key16)
+        split = disk_layout.split_block_key(key)
+        if not split["ok"]:
+            return _fail(f"the index cannot look this up: {split['reason']}",
+                         present=False, key16=None, group_id=None)
+        key16, group = split["key16"], split["group_id"]
+        entry = _state["entries"].get(identity_of(key16, group))
         if entry is None:
             _state["misses"] += 1
-            return _ok(present=False, key16=key16, bytes=0,
+            return _ok(present=False, key16=key16, group_id=group, bytes=0,
+                       rank=None,
                        reason="this boot's journal does not name a file for "
-                              "this key")
+                              "this key and group")
         _state["hits"] += 1
-        return _ok(present=True, key16=key16, bytes=int(entry["bytes"]),
+        return _ok(present=True, key16=key16, group_id=group,
+                   bytes=int(entry["bytes"]),
                    rank=_rank_of(entry.get("journal")), reason=None)
     except Exception as exc:  # noqa: BLE001 - a lookup never breaks a schedule
         _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
         snapshot._error(exc, "disk_index lookup")
         return _fail(f"the lookup raised {type(exc).__name__}", present=False,
-                     key16=None)
+                     key16=None, group_id=None)
 
 
 def _rank_of(journal_path_value):
@@ -571,36 +721,45 @@ def _rank_of(journal_path_value):
     return name[len(JOURNAL_PREFIX):-len(JOURNAL_SUFFIX)]
 
 
-def contains(key16) -> bool:
+def contains(key) -> bool:
     """The bare membership test the offer loop uses, without a counter move.
 
     `lookup()` counts hits and misses for the witness; the offer loop probes the
-    SAME key several times across groups and must not inflate those counters, so
-    it asks this instead. No validation either: the caller built the key.
+    SAME chain for several groups and must not inflate those counters, so it asks
+    this instead. It still resolves the identity through `split_block_key` - an
+    ungrouped key is not present, and answering "present" to one would hand the
+    offer loop exactly the ambiguity the identity exists to remove. Cheaper than
+    `lookup()` by the counters and the dict build, not by the parsing.
     """
     try:
-        return key16 in _state["entries"]
-    except Exception:  # noqa: BLE001 - a dict membership test cannot be fatal
+        split = disk_layout.split_block_key(key)
+        if not split["ok"]:
+            return False
+        return identity_of(split["key16"], split["group_id"]) in _state["entries"]
+    except Exception:  # noqa: BLE001 - a membership test cannot be fatal
         return False
 
 
-def remove(key16) -> dict:
+def remove(key) -> dict:
     """Drop one entry, because its file is gone. Bounded and counted.
 
-    Used by eviction notices that arrive in-process (the tests, and a future
-    same-process spill) as well as by the journal replay.
+    Takes the same full group-qualified key as `lookup()`. Used by eviction notices
+    that arrive in-process (the tests, and a future same-process spill) as well as
+    by reasoning that a file this rank deleted is no longer restorable.
     """
     try:
-        checked = disk_layout.validate_key16(key16)
-        if not checked["ok"]:
-            return _fail(str(checked["reason"]))
-        gone = _state["entries"].pop(checked["value"], None)
+        split = disk_layout.split_block_key(key)
+        if not split["ok"]:
+            return _fail(str(split["reason"]))
+        identity = identity_of(split["key16"], split["group_id"])
+        gone = _state["entries"].pop(identity, None)
         if gone is None:
-            return _ok(removed=False, reason="no entry for this key")
+            return _ok(removed=False, reason="no entry for this identity")
         _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
                                       - int(gone["bytes"]))
         _state["removals"] += 1
-        return _ok(removed=True, reason=None, bytes=int(gone["bytes"]))
+        return _ok(removed=True, reason=None, bytes=int(gone["bytes"]),
+                   key16=split["key16"], group_id=split["group_id"])
     except Exception as exc:  # noqa: BLE001
         snapshot._error(exc, "disk_index remove")
         return _fail(f"the removal raised {type(exc).__name__}")
@@ -628,8 +787,11 @@ def section() -> dict:
         "journals_stopped": sorted(_state["stopped"]),
         "journal_writes": int(_state["journal_writes"]),
         "journal_lines": int(_state["journal_lines"]),
+        "journal_seq_seed": int(_state["journal_seq_seed"]),
         "journal_full": bool(_state["journal_full"]),
         "journal_write_errors": int(_state["journal_write_errors"]),
+        "journal_fields": JOURNAL_FIELDS,
+        "journal_cap_bytes": MAX_JOURNAL_BYTES,
         "refreshes": int(_state["refreshes"]),
         "applied_lines": int(_state["applied"]),
         "spills_seen": int(_state["spills"]),
@@ -640,20 +802,31 @@ def section() -> dict:
         "journal_directory": journal_directory(),
         "last_reason": _state["last_reason"],
         "last_error": _state["last_error"],
-        "units": {"entries": "keys", "entry_cap": "keys",
-                  "entries_dropped": "keys", "bytes_indexed": "bytes",
+        "units": {"entries": "identities", "entry_cap": "identities",
+                  "entries_dropped": "identities", "bytes_indexed": "bytes",
                   "journals_tracked": "files", "journal_writes": "lines",
                   "journal_lines": "lines", "journal_write_errors": "writes",
+                  "journal_seq_seed": "lines", "journal_fields": "fields",
+                  "journal_cap_bytes": "bytes",
                   "refreshes": "refreshes", "applied_lines": "lines",
                   "spills_seen": "files", "removals_seen": "files",
-                  "lookup_hits": "lookups", "lookup_misses": "lookups"},
+                  "lookup_hits": "lookups", "lookup_misses": "lookups",
+                  # `dropped` is a closed vocabulary (DROP_REASONS), one counter per
+                  # reason, and the walk descends into it - so each reason needs its
+                  # own unit rather than inheriting a parent's guess.
+                  **{reason: "lines" for reason in DROP_REASONS},
+                  # ...except the one that is not per-line: a shrunken journal is a
+                  # whole file stopped, counted once per replay that noticed it.
+                  "journal_shrank": "journals"},
         "note": ("the scheduler-side view of what THIS BOOT wrote to the SSD "
-                 "tier, replayed from each rank's spill journal. It can be "
-                 "wrong only in the safe direction: an entry dropped by the cap "
-                 "or lost to a truncated journal costs a restore, and a file "
-                 "evicted but not yet un-indexed costs a reported load failure "
-                 "(a recompute). The path a spill journal records is the "
-                 "SPILLING RANK's name; a worker resolves its own."),
+                 "tier, replayed from each rank's spill journal. Entries are "
+                 "keyed by IDENTITY, `<key16>:g<group>` - a `key16` alone does "
+                 "not say whose bytes it holds. It can be wrong only in the safe "
+                 "direction: an entry dropped by the cap or lost to a truncated "
+                 "journal costs a restore, and a file evicted but not yet "
+                 "un-indexed costs a reported load failure (a recompute). No path "
+                 "is published: four ranks name one identity four ways, so every "
+                 "worker resolves the name IT would have written."),
     }
 
 
@@ -661,8 +834,13 @@ def record_spill(path, size_bytes) -> dict:
     """The door `disk_spill` calls after committing a file. Never raises.
 
     Takes a PATH rather than a key so the caller does not have to carry the key
-    through the writer thread: the name is the identity, and
-    `disk_layout.parse_path` is the one parser of it.
+    through the writer thread: the name IS the identity, and
+    `disk_layout.parse_path` is the one parser of it - which is why the group half
+    of the identity arrives with the path rather than being re-derived (or, in the
+    first version of this seam, dropped).
+
+    A refusal here is INVISIBLE to the spill that called it, by design: the write
+    already happened, and the worst a journal can do is fail to mention it.
     """
     return _record_line(path, size_bytes, SPILL_LINE)
 
@@ -682,7 +860,8 @@ def _record_line(path, size_bytes, op) -> dict:
             return _fail("an in-flight .part name is not a committed file",
                          reason_kind="partial")
         size = int(size_bytes or 0)
-        return journal_append(op, parsed["key16"], size)
+        return journal_append(op, parsed["key16"], size,
+                              parsed["group_id"])
     except Exception as exc:  # noqa: BLE001 - a journal never breaks a write
         snapshot._error(exc, "disk_index record")
         return _fail(f"journaling raised {type(exc).__name__}",

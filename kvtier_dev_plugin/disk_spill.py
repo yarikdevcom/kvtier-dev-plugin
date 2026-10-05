@@ -5,7 +5,28 @@ WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT
 The RAM tier parks evicted GPU KV into pinned host-RAM slots that a worker reads
 out of `cpu_kv_caches`. This module takes a slot's bytes out of those SAME tensors
 and writes them to disk under a name that IS their identity
-(`disk_layout.build_slot_path`: `<root>/<shard>/kvslot-<key16>-<geodigest12>.bin`).
+(`disk_layout.build_slot_path`:
+`<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin`).
+
+IT ALSO KEEPS THE RESTORE INDEX FROM BEING STARVED. Every file this module commits
+is journalled (`disk_index.record_spill`, called AFTER the `os.replace`, so a torn
+write is never recorded) and every file its ceiling plan deletes is journalled too
+(`record_removal`). Both happen on the writer thread and both are strictly
+subordinate to the write: the SPILL is the product and the journal is an index of
+it, so a journal that cannot be written costs a missed restore and never a failed
+spill. `journal_failures` counts those, and the spill still reports success.
+
+AND IT COUNTS GROUP COLLISIONS, because only a number settles how often two
+KV-cache groups hash the same token chain. Two groups over one chain share a
+`key16` and differ only in the group id - the discriminator the first version of
+this name truncated away, which made them name ONE file with different bytes. When
+this module is asked to spill a `key16` it has already spilled under a DIFFERENT
+group id, it counts a `group_collision`, records both ids and (bounded) whether the
+sibling file is actually on disk, and spills BOTH anyway: the names are distinct
+now, so the event is a measurement and not a fault. It is readable in the snapshot's
+`disk_spill`, in the `/plugins/kvtier/disk` `op:status` payload, and in a rank
+file's `disk` section - no restart, no restore path, no engine change needed to see
+the rate.
 
 It is the WRITE side of a 5-stage design and it deliberately has no read path, no
 restore, no lookup and no re-publication of hashes. That is not laziness, it is a
@@ -149,7 +170,7 @@ import queue
 import threading
 import time
 
-from . import blockdump, config, disk_layout, snapshot
+from . import blockdump, config, disk_index, disk_layout, snapshot
 
 # --- the caps, and the unit of every one of them ----------------------------
 
@@ -162,6 +183,15 @@ MAX_STRING_CHARS = 160
 MAX_SHARD_DIRS = 288                 # shard directories a capacity walk will open
 MAX_WALK_FILES = 20_000              # FILES a capacity walk will stat
 EVICT_TARGET_FRACTION = 0.9          # FRACTION of the ceiling eviction aims under
+
+# The group-collision witness: which group ids this process has seen spill each
+# `key16`. Three caps, because this is a witness and not a database. The map is
+# what makes a collision observable in O(1) per spill with no directory scan on the
+# write path; each cap bounds what the witness itself costs.
+MAX_TRACKED_DIGESTS = 4_096          # key16s remembered (oldest dropped first)
+MAX_GROUPS_PER_DIGEST = 8            # group ids remembered for ONE key16
+MAX_COLLISION_SAMPLES = 8            # collision EVENTS kept for a payload
+MAX_COLLISION_SCAN = 4_096           # directory entries a sibling probe will read
 
 # The arm. In-process here (a worker's truth is the arm FILE, the `blockdump`
 # one-way-per-process problem again), with a bounded, stat-first read so an armed
@@ -221,6 +251,16 @@ _state: dict = {
     "estimated_bytes": 0,
     "walk_truncated": False,
     "errors": 0,
+    # the group-collision witness (see MAX_TRACKED_DIGESTS) and the journal
+    "group_collisions": 0,
+    "group_collision_samples": [],
+    "digest_groups": {},
+    "digest_groups_dropped": 0,
+    "digest_group_overflow": 0,
+    "sibling_probe_failures": 0,
+    "journal_records": 0,
+    "journal_failures": 0,
+    "journal_removals": 0,
     "last_path": None,
     "last_reason": None,
     "last_error": None,
@@ -260,12 +300,27 @@ def reset_state_for_tests() -> None:
         "drops": 0, "refused": {reason: 0 for reason in REFUSAL_REASONS},
         "evictions": 0, "evicted_bytes": 0, "estimated_bytes": 0,
         "walk_truncated": False, "errors": 0,
+        "group_collisions": 0, "group_collision_samples": [],
+        "digest_groups": {}, "digest_groups_dropped": 0,
+        "digest_group_overflow": 0, "sibling_probe_failures": 0,
+        "journal_records": 0, "journal_failures": 0, "journal_removals": 0,
         "last_path": None, "last_reason": None, "last_error": None,
     })
 
 
 def counters() -> dict:
-    return dict(_state)
+    """A copy for a payload. The collision WITNESS is published as a COUNT.
+
+    `digest_groups` is the map itself, bounded at `MAX_TRACKED_DIGESTS` key16s -
+    several KiB of text when full, which no polled payload should carry. Its count
+    is the fact a reader wants; the capped `group_collision_samples` are the detail
+    that is worth publishing.
+    """
+    out = dict(_state)
+    out["digest_groups"] = int(len(_state["digest_groups"]))
+    out["group_collision_samples"] = [dict(row)
+                                      for row in _state["group_collision_samples"]]
+    return out
 
 
 def _fail(reason, **extra) -> dict:
@@ -772,6 +827,12 @@ def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
     from the tensor stride and `worker_diag.rank_id()`), and accepting a digest
     from anywhere else would put two computing sites on the SAME field, which is
     precisely how files become un-findable.
+
+    `key` must be the engine's FULL group-qualified block hash: `build_slot_path`
+    splits it into the digest and the `g<group>` name component, so a key that does
+    not carry the group suffix is a refusal (`bad_key`) rather than the ambiguous
+    pre-fix name. That is the identity bug this closes, enforced at the door that
+    writes.
     """
     adopted = fingerprint if fingerprint is not None else _state["fingerprint"]
     if adopted is None:
@@ -782,7 +843,7 @@ def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
     digested = disk_layout.fingerprint_digest(adopted)
     if not digested["ok"]:
         return _fail(str(digested["reason"]), reason_kind="fingerprint_invalid")
-    named = disk_layout.build_slot_path(_state["root"] or "", str(key),
+    named = disk_layout.build_slot_path(_state["root"] or "", key,
                                         digested["geometry_digest"])
     if not named["ok"]:
         return _fail(str(named["reason"]), reason_kind="bad_key")
@@ -791,10 +852,12 @@ def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
         return _fail(str(read["reason"]),
                      reason_kind=read.get("reason_kind", "read_failed"))
     return _ok(units=disk_layout._units("bytes_per_file", "ceiling_bytes",
-                             "slot", "block_id"),
+                             "slot", "block_id", "group_id"),
                path=named["path"], part_path=named["part_path"],
                directory=named["directory"], filename=named["filename"],
-               key16=named["key16"], shard=named["shard"],
+               key16=named["key16"], group_id=named["group_id"],
+               group_field=named["group_field"],
+               shard=named["shard"],
                geometry_digest=named["geometry_digest"],
                bytes_per_file=read["bytes_per_file"], sha256=read["sha256"],
                slot=slot, blob=read["bytes"])
@@ -819,6 +882,126 @@ def _space_target(path: str) -> str:
     return current
 
 
+def _note_digest_group(key16, group_id, filename, shard) -> dict | None:
+    """Remember which group spilled a `key16`, and count it when two disagree.
+
+    Returns a bounded collision record when this spill's group id differs from a
+    group id already recorded for the same `key16` - two KV-cache groups whose
+    prefix hash landed on the same digest - and None otherwise. Called on the spill
+    thread only, and does no I/O unless a collision actually happened.
+
+    WHY A MEMORY MAP AND NOT A DIRECTORY SCAN EVERY SPILL: the rate is what we are
+    measuring, so the check must cost nothing on the 99.99% of spills with no
+    collision. The map is per-process and per-boot, which is exactly the window the
+    operator reads (arm the tier today, read the counter tomorrow); a sibling file
+    from a previous boot is not silently ignored either, because the collision
+    probe looks at the shard directory when the map fires and records what is really
+    on disk.
+
+    The spill is NEVER refused by this: both files are legitimately distinct now,
+    and refusing one would trade a measured collision for an unmeasured one.
+    """
+    groups = _state["digest_groups"].get(key16)
+    if groups is None:
+        while len(_state["digest_groups"]) >= MAX_TRACKED_DIGESTS:
+            oldest = next(iter(_state["digest_groups"]))
+            _state["digest_groups"].pop(oldest, None)
+            _state["digest_groups_dropped"] += 1
+        _state["digest_groups"][key16] = {int(group_id): 1}
+        return None
+    if group_id in groups:
+        groups[int(group_id)] += 1
+        return None
+    # Deterministic and honest: the highest group id ALREADY recorded for this
+    # digest. Computed before the new id is added, or the collision would be
+    # reported as a collision between the new group and itself.
+    prior = max(groups)
+    if len(groups) >= MAX_GROUPS_PER_DIGEST:
+        # A key16 with more distinct groups than the witness holds is itself the
+        # finding; say so with a counter rather than grow the witness without bound.
+        _state["digest_group_overflow"] += 1
+    else:
+        groups[int(group_id)] = 1
+    _state["group_collisions"] += 1
+    record = {"key16": key16,
+              "group_id_a": int(prior), "group_id_b": int(group_id),
+              "filename": str(filename)[:disk_layout.MAX_NAME_CHARS],
+              "shard": str(shard)[:8],
+              "sibling_on_disk": _sibling_on_disk(shard, key16, filename),
+              "groups_seen": sorted(groups),
+              "ts": round(time.time(), 6),
+              "units": disk_layout._units("group_id_a", "group_id_b")}
+    _state["group_collision_samples"] = (list(_state["group_collision_samples"])
+                                         + [record])[-MAX_COLLISION_SAMPLES:]
+    _state["last_reason"] = (f"group collision on {key16}: spilled for group "
+                             f"{group_id} after group {prior} used the same digest")
+    return record
+
+
+def _sibling_on_disk(shard, key16, filename):
+    """Is a DIFFERENT group's file for this `key16` actually in the shard? Runs only
+    on a counted collision, so the cost is bounded by the collision rate.
+
+    `None` means "could not look", never "is not there": an unreadable directory is
+    a different fact from an absent file, and the counter must not invent the
+    comfortable one.
+    """
+    root = _state["root"]
+    if not root or not shard:
+        return None
+    directory = os.path.join(str(root), str(shard))
+    prefix = f"{disk_layout.SLOT_FILE_PREFIX}{key16}-"
+    try:
+        seen = 0
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if seen >= MAX_COLLISION_SCAN:
+                    return None
+                seen += 1
+                name = entry.name
+                if (name.startswith(prefix) and name != str(filename)
+                        and name.endswith(disk_layout.SUFFIX_DATA)):
+                    return True
+        return False
+    except OSError as exc:
+        _state["sibling_probe_failures"] += 1
+        _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
+        return None
+
+
+def _journal_write(path, size_bytes, *, removal: bool = False) -> dict:
+    """Journal one committed file or one deleted file. The spill does not care.
+
+    THE ONE RULE: this never changes the caller's verdict. A journal failure is
+    counted (`journal_failures`) and reported in `last_reason`, and the bytes stay
+    on disk either way - the spill is the product and this is an index of it, so the
+    worst outcome here is a file the scheduler does not know about, which costs a
+    recompute and nothing else.
+    """
+    try:
+        if removal:
+            recorded = disk_index.record_removal(path, size_bytes)
+        else:
+            recorded = disk_index.record_spill(path, size_bytes)
+        if recorded.get("ok"):
+            if removal:
+                _state["journal_removals"] += 1
+            else:
+                _state["journal_records"] += 1
+        else:
+            _state["journal_failures"] += 1
+            _state["last_reason"] = ("the spill journal did not record "
+                                     f"{os.path.basename(str(path))}: "
+                                     f"{str(recorded.get('reason'))[:96]}")
+        return recorded
+    except Exception as exc:  # noqa: BLE001 - an index never breaks a write
+        _state["journal_failures"] += 1
+        _state["errors"] += 1
+        snapshot._error(exc, "disk_spill journal")
+        _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
+        return {"ok": False, "reason": f"journaling raised {type(exc).__name__}"}
+
+
 def spill_slot(caches, slot, key, fingerprint=None) -> dict:
     """Read one slot and commit it. The whole write path, synchronously.
 
@@ -826,6 +1009,14 @@ def spill_slot(caches, slot, key, fingerprint=None) -> dict:
     synchronous caller). It NEVER raises: every failure is a classified dict, and
     `final_exists: False` on a failed write is the property `disk_layout`
     guarantees and this function preserves.
+
+    Two things happen AFTER a successful commit and neither can affect it: the group
+    collision witness is updated (`group_collisions`, see
+    `_note_digest_group`) and the file is journalled (`disk_index.record_spill`,
+    AFTER `write_committed_file` did its `os.replace`, so a write that never landed
+    is never recorded as having landed). A duplicate is not journalled: the file was
+    already there, which means it was already recorded - possibly by a boot whose
+    journal this one continues.
     """
     started = time.monotonic()
     plan = plan_slot_write(caches, slot, key, fingerprint)
@@ -848,15 +1039,25 @@ def spill_slot(caches, slot, key, fingerprint=None) -> dict:
         return {"ok": False, "final_exists": bool(written.get("final_exists")),
                 "reason": written["reason"], "reason_kind": "write_failed",
                 "path": plan["path"]}
+    collision = _note_digest_group(plan["key16"], plan["group_id"],
+                                   plan["filename"], plan["shard"])
+    journalled = None
+    if not written["duplicate"]:
+        journalled = _journal_write(plan["path"], int(written["write_bytes"]))
     return {"ok": True, "duplicate": bool(written["duplicate"]),
             "path": plan["path"], "key16": plan["key16"],
+            "group_id": plan["group_id"], "group_field": plan["group_field"],
             "shard": plan["shard"], "filename": plan["filename"],
             "bytes_written": int(written["write_bytes"]),
             "bytes_per_file": plan["bytes_per_file"], "sha256": plan["sha256"],
             "slot": slot, "elapsed_seconds": elapsed,
+            "group_collision": collision,
+            "journalled": bool(journalled and journalled.get("ok")),
+            "journal_reason": (journalled or {}).get("reason"),
             "directory_synced": written.get("directory_synced"),
             "reason": written.get("reason"),
-            "units": disk_layout._units("bytes_written", "bytes_per_file")}
+            "units": disk_layout._units("bytes_written", "bytes_per_file",
+                                        "group_id")}
 
 
 # --- the queue and its thread ------------------------------------------------
@@ -998,6 +1199,16 @@ def _enforce_ceiling() -> None:
             geometry_digest=_state["geometry_digest"], for_capacity=True)
         if done["ok"]:
             freed += int(done["counts"].get("planned_bytes") or 0)
+            # EVERY file this plan actually deleted is journalled, so the
+            # scheduler's index stops offering it within one refresh. Without this
+            # half the journal the index would keep offering files whose bytes the
+            # ceiling already reclaimed - the one direction of index error that
+            # costs a reported load failure instead of a plain recompute.
+            for action in done.get("actions") or []:
+                if isinstance(action, dict) and action.get("action") == "unlinked":
+                    _journal_write(action.get("path"),
+                                   int(action.get("size_bytes") or 0),
+                                   removal=True)
     _state["evictions"] = int(_state["evictions"]) + int(plan["planned"])
     _state["evicted_bytes"] = int(_state["evicted_bytes"]) + freed
     _state["estimated_bytes"] = max(0, int(walk["used_bytes"]) - freed)
@@ -1046,7 +1257,16 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None) -> dict:
                     except OSError:
                         continue
                     parsed = disk_layout.parse_path(child.name)
-                    if not parsed["ok"] or parsed["partial"]:
+                    stale_shape = parsed["classification"] == (
+                        disk_layout.NAME_STALE_KEY_SHAPE)
+                    if parsed["partial"] or (
+                            not parsed["ok"] and not stale_shape):
+                        # Only ONE non-current shape is worth measuring and
+                        # shedding: the pre-group name, which is ours, occupies
+                        # real bytes, and is unlinkable. Anything else that does
+                        # not parse (malformed, not ours) is left alone exactly as
+                        # `parse_path` says - but it must not be invisible either,
+                        # or the ceiling logic under-counts a store it cannot read.
                         continue
                     counted += 1
                     used += int(info.st_size)
@@ -1221,7 +1441,9 @@ def verify_slot(key, fingerprint=None) -> dict:
 
     Stage 2 is allowed exactly this much reading: enough to prove a spill landed
     with the bytes we handed it. There is deliberately no "find a slot to load"
-    helper, because there is nothing that could act on a hit.
+    helper, because there is nothing that could act on a hit. `key` is the FULL
+    group-qualified block hash - the same identity `plan_slot_write` named the file
+    with, so a verification cannot succeed against another group's bytes.
     """
     try:
         adopted = fingerprint if fingerprint is not None else _state["fingerprint"]
@@ -1231,7 +1453,7 @@ def verify_slot(key, fingerprint=None) -> dict:
         digested = disk_layout.fingerprint_digest(adopted)
         if not digested["ok"]:
             return _fail(str(digested["reason"]))
-        named = disk_layout.build_slot_path(_state["root"] or "", str(key),
+        named = disk_layout.build_slot_path(_state["root"] or "", key,
                                             digested["geometry_digest"])
         if not named["ok"]:
             return _fail(str(named["reason"]))
@@ -1291,6 +1513,21 @@ def section() -> dict:
         "estimated_bytes": int(_state["estimated_bytes"]),
         "walk_truncated": bool(_state["walk_truncated"]),
         "errors": int(_state["errors"]),
+        # The collision witness and the journal, next to the counters they qualify:
+        # `group_collisions` is the rate the tier was armed to measure, and
+        # `journal_failures` is why the restore index may lag a store that is fine.
+        "group_collisions": int(_state["group_collisions"]),
+        "group_collision_samples": [dict(row) for row
+                                    in _state["group_collision_samples"]],
+        "digest_groups_tracked": int(len(_state["digest_groups"])),
+        "digest_groups_cap": MAX_TRACKED_DIGESTS,
+        "digest_groups_dropped": int(_state["digest_groups_dropped"]),
+        "digest_group_overflow": int(_state["digest_group_overflow"]),
+        "sibling_probe_failures": int(_state["sibling_probe_failures"]),
+        "journal_records": int(_state["journal_records"]),
+        "journal_removals": int(_state["journal_removals"]),
+        "journal_failures": int(_state["journal_failures"]),
+        "journal_directory": disk_index.journal_directory(),
         "thread_started": int(_state["thread_started"]),
         "thread_alive": bool(_state["thread_alive"]),
         "queue_depth": int(_state["queue_depth"]),
@@ -1311,7 +1548,13 @@ def section() -> dict:
                      "max_bytes_per_file", "evict_target_fraction")},
         "naming": {"template": disk_layout.FILENAME_TEMPLATE,
                    "root": state["root"],
-                   "shard": f"<key16[0:{disk_layout.SHARD_CHARS}]>"},
+                   "shard": f"<key16[0:{disk_layout.SHARD_CHARS}]>",
+                   "key": ("the FULL group-qualified block hash: <key16> is its "
+                           "first 16 hex chars and g<group> is the 4-byte suffix "
+                           "the engine appended, split by "
+                           "disk_layout.split_block_key - a key too short to carry "
+                           "the suffix is refused, never truncated into an "
+                           "ambiguous name")},
         "inert_when_off": ("no thread, no directory created, no byte written: the "
                            "queue is not even constructed until a job is accepted"),
         "wiring": ("the store-completion hook lives in `disk_store.py`: it wraps "
@@ -1333,7 +1576,13 @@ def section() -> dict:
                                     "accepted", "spilled", "duplicates",
                                     "drops", "evictions", "errors", "queue_depth",
                                     "queue_depth_peak", "queue_max", "window_files",
-                                    "thread_started", "thread_alive"),
+                                    "thread_started", "thread_alive",
+                                    "group_collisions", "digest_groups_tracked",
+                                    "digest_groups_cap",
+                                    "digest_groups_dropped",
+                                    "digest_group_overflow",
+                                    "sibling_probe_failures", "journal_records",
+                                    "journal_removals", "journal_failures"),
     }
 
 

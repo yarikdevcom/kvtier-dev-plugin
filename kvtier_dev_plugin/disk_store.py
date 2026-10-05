@@ -44,7 +44,8 @@ BOTH methods and keeps its own bounded record between them:
     the step's `store_event` - tuples of ints and hex strings, never a tensor and
     never the metadata object itself;
   * the `get_finished` wrapper diffs `_completed_store_events` around the fork's own
-    call and, for each newly-completed event, hands `(slot, key16)` pairs to
+    call and, for each newly-completed event, hands `(slot, full block hash)` pairs
+    to
     `disk_spill.request_spill`.
 
 Composition, not replacement. Both methods already carry wrappers from this package
@@ -359,7 +360,7 @@ def reset_state_for_tests() -> None:
     _retained.clear()
 
 
-# The one piece of between-call memory that is not a counter: the (slot, key16)
+# The one piece of between-call memory that is not a counter: the (slot, key) pairs
 # pairs kept between `bind_connector_metadata` and store completion. Module-level
 # because it is worker state that outlives one call, BOUNDED by `_remember_event`
 # because a map that grows with load is an outage with a timer. The event-dedup set
@@ -887,34 +888,35 @@ def adopt_fingerprint(handler, force: bool = False) -> dict:
                reason="this rank's fingerprint is now the naming authority")
 
 
-# --- the resolver: metadata -> (slots, key16s, cross-check digest) -----------
+# --- the resolver: metadata -> (slots, group-qualified keys, cross-check) ----
 
-def key16(value) -> tuple:
-    """The file-name key for one engine block hash: `(key16 | None, why)`.
+def file_key(value) -> tuple:
+    """The file-name key for one engine block hash: `(full key | None, why)`.
 
     `BlockHashWithGroupId` is BYTES - a digest plus a 4-byte big-endian group id
-    (`kv_cache_utils.py:86-92`) - and the engine sends its hex, which is LONGER than
-    the 16 hex chars a name carries. TAKING THE FIRST 16 is the layout layer's own
-    definition of the key (`disk_layout.validate_key16`: "the first 16 hex chars of
-    the engine's block hash"), so this is the documented truncation, not a guess:
-    same engine, same hash, same 16 chars, always.
+    (`kv_cache_utils.py:86-92`) - and the engine sends its hex. THE WHOLE VALUE IS
+    THE KEY: it is normalised (stripped, lower-cased) and passed on UNTRUNCATED,
+    because `disk_layout.build_slot_path` splits it into the digest and the
+    `g<group>` name component. Truncating it to 16 hex characters here - which is
+    what this function used to do, citing `disk_layout.validate_key16` as the
+    authority - is precisely the bug: the group id sits at the END of the value, so
+    the leading 16 characters are digest only, and two prefix-cacheable groups over
+    one token chain then named the same file with different bytes.
 
-    An entry the engine could not fill arrives as the empty string, which means THAT
-    SLOT has no identity: it is refused and counted on its own, and the rest of the
-    step still spills. That is the difference between a placeholder (the contract's
-    shape) and a peer bug (a length mismatch), which refuses the whole step.
+    A value too short to carry the 4-byte suffix is REFUSED, not truncated: a
+    16-hex key cannot be attributed to a group, so it has no identity to write
+    under. An entry the engine could not fill arrives as the empty string, which
+    means THAT SLOT has no identity: it is refused and counted on its own, and the
+    rest of the step still spills. That is the difference between a placeholder (the
+    contract's shape) and a peer bug (a length mismatch), which refuses the whole
+    step.
     """
     if not isinstance(value, str):
         return None, f"a key must be a hex string, got {type(value).__name__}"
-    text = value.strip().lower()
-    if not text:
-        return None, "the engine had no block hash for this slot"
-    if len(text) < disk_layout.KEY_DIGEST_CHARS:
-        return None, (f"the key is {len(text)} hex chars; a name needs "
-                      f"{disk_layout.KEY_DIGEST_CHARS}")
-    if any(char not in disk_layout.HEX_DIGITS for char in text):
-        return None, "the key is not hexadecimal"
-    return text[:disk_layout.KEY_DIGEST_CHARS], None
+    split = disk_layout.split_block_key(value)
+    if not split["ok"]:
+        return None, str(split["reason"])
+    return split["key_hex"], None
 
 
 def resolve_store_keys(metadata) -> dict:
@@ -926,9 +928,9 @@ def resolve_store_keys(metadata) -> dict:
     once the two lists are in different hands.
 
     Returns `{ok, slots, keys, placeholders, count, expected_digest}` - `keys` being
-    16-hex strings with `None` for a slot the engine could not name, and
-    `expected_digest` the cross-check value or None - or `{ok: False, reason_kind,
-    reason}` with the numbers named.
+    the FULL group-qualified block hashes (normalised hex) with `None` for a slot the
+    engine could not name, and `expected_digest` the cross-check value or None - or
+    `{ok: False, reason_kind, reason}` with the numbers named.
     """
     if metadata is None:
         _count("bad_call", "no metadata object was handed in")
@@ -995,7 +997,7 @@ def resolve_store_keys(metadata) -> dict:
     keys = []
     placeholders = 0
     for value in keys_raw:
-        resolved, why = key16(value)
+        resolved, why = file_key(value)
         keys.append(resolved)
         if resolved is None:
             placeholders += 1
@@ -1050,8 +1052,9 @@ def retained_view() -> dict:
                              for record in _retained.values())),
             "slot_capacity_per_event": MAX_SLOTS_PER_EVENT,
             "dropped": int(_state["retained_dropped"]),
-            "note": ("the (slot, key16) pairs kept between bind_connector_metadata "
-                     "and store completion. Only the shape is reported: the keys are "
+            "note": ("the (slot, block hash) pairs kept between "
+                     "bind_connector_metadata and store completion. Only the shape "
+                     "is reported: the keys are "
                      "block hashes, and a snapshot is not a place to publish them.")}
 
 
@@ -1283,9 +1286,10 @@ def _read_pending_record(path) -> tuple:
     if _int(document.get("slot")) is None:
         _state["pending_malformed"] = int(_state["pending_malformed"]) + 1
         return None, "the request names no slot"
-    if not disk_layout.validate_key16(document.get("key"))["ok"]:
+    if not disk_layout.split_block_key(document.get("key"))["ok"]:
         _state["pending_malformed"] = int(_state["pending_malformed"]) + 1
-        return None, "the request's key is not 16 hex characters"
+        return None, ("the request's key is not a group-qualified block hash "
+                      "(a digest plus the engine's 4-byte group suffix)")
     # The fingerprint is an OPTIONAL cross-check here too: empty is normal, and a
     # value that is not a digest is a lie about the naming identity.
     fingerprint = document.get("fingerprint")
@@ -1309,7 +1313,7 @@ def _write_receipt(rank, record, *, refused, reason, queued, path) -> dict:
                 "ts": round(time.time(), 6),
                 "request_seq": _int(record.get("seq")),
                 "slot": _int(record.get("slot")),
-                "key": _clip(record.get("key"), 64),
+                "key": _clip(record.get("key"), 80),
                 "fingerprint": _clip(record.get("fingerprint"), 32),
                 "refused": bool(refused), "reason": _clip(reason),
                 "queued": bool(queued), "expected_path": _clip(path),
@@ -1478,7 +1482,7 @@ def _op_spill_one(body: dict) -> dict:
         return {"ok": False, "reason": f"{config.ENV_DIAG_DIR} is not set, so there "
                                        f"is no channel to a worker; point it at the "
                                        f"directory the engine's rank files are in"}
-    checked_key = disk_layout.validate_key16(body.get("key"))
+    checked_key = disk_layout.split_block_key(body.get("key"))
     if not checked_key["ok"]:
         return {"ok": False, "reason": f"the key is not a usable block hash: "
                                        f"{checked_key['reason']}"}
@@ -1519,7 +1523,8 @@ def _op_spill_one(body: dict) -> dict:
               "seq": seq, "epoch": str(snapshot.epoch()),
               "requested_ts": round(now, 6),
               "expires_ts": round(now + REQUEST_TTL_SECONDS, 6),
-              "slot": slot, "key": checked_key["value"], "fingerprint": fingerprint,
+              "slot": slot, "key": checked_key["key_hex"],
+              "fingerprint": fingerprint,
               "writer": WRITER_TAG,
               "scope": ("rank-agnostic: every worker that polls this answers it for "
                         "ITS OWN slot with that index, under ITS OWN digest, and "
@@ -1788,8 +1793,11 @@ def _op_status(_body: dict) -> dict:
                        "bytes_written", "drops", "evictions", "evicted_bytes",
                        "estimated_bytes", "errors", "thread_started",
                        "thread_alive", "queue_depth", "queue_depth_peak",
-                       "window_files")},
+                       "window_files", "group_collisions", "journal_records",
+                       "journal_removals", "journal_failures")},
             "spill_refused": dict(state["refused"]),
+            "group_collisions": int(state["group_collisions"]),
+            "group_collision_samples": list(state["group_collision_samples"]),
             "queue_max": disk_spill.MAX_QUEUE_DEPTH,
             "spill_one": {"pending": pending_path, "pending_state": pending_reason,
                           "requests_written": int(_state["requests_written"]),
@@ -1927,6 +1935,11 @@ def worker_report() -> dict:
                   "last_refusal": _state["last_refusal"],
                   "files_written": int(state["spilled"]),
                   "duplicates": int(state["duplicates"]),
+                  "group_collisions": int(state["group_collisions"]),
+                  "group_collision_groups": _collision_digest_list(state),
+                  "journal_records": int(state["journal_records"]),
+                  "journal_failures": int(state["journal_failures"]),
+                  "journal_removals": int(state["journal_removals"]),
                   "bytes_written": int(state["bytes_written"]),
                   "drops": int(state["drops"]),
                   "evictions": int(state["evictions"]),
@@ -1947,6 +1960,10 @@ def worker_report() -> dict:
                            "files_written is the only proof bytes landed; "
                            "refusals_total > 0 with files_written == 0 means the "
                            "tier ran and REFUSED, and refused names the reason. "
+                           "group_collisions counts spills whose key16 this rank "
+                           "had already spilled under a DIFFERENT group id - the "
+                           "cross-group digest collisions the name now separates, "
+                           "and the rate the tier is armed to measure. "
                            "engine_fields.observed_on_a_step is the runtime proof "
                            "that a metadata object carried store_keys - the class "
                            "declaring the field proves nothing about a step.")}
@@ -1956,6 +1973,25 @@ def worker_report() -> dict:
         return {"section": "disk", "writer": WRITER_TAG,
                 "installed": bool(_state["installed"]),
                 "report_error": type(exc).__name__}
+
+
+def _collision_digest_list(state: dict) -> list:
+    """The collision samples, COMPACTED for the rank file's byte cap.
+
+    The section payloads carry the full records; a contribution to someone else's
+    file publishes one short string per event (`key16:gA/gB`) so the rate and the
+    identities are readable without spending the seam's 4 KiB on it. A truncated
+    sample list is still an honest count, because `group_collisions` above is the
+    counter and this is only its evidence.
+    """
+    out = []
+    for row in list(state.get("group_collision_samples") or [])[:4]:
+        if not isinstance(row, dict):
+            continue
+        out.append(f"{str(row.get('key16'))[:16]}"
+                   f":g{row.get('group_id_a')}/g{row.get('group_id_b')}"
+                   f"{'/disk' if row.get('sibling_on_disk') else ''}")
+    return out
 
 
 def _degrade_report(report: dict) -> dict:
@@ -2364,14 +2400,15 @@ def section() -> dict:
             "fallbacks": int(_state["fallbacks"]),
             "spill": {key: state[key] for key in
                       ("spilled", "accepted", "requests", "drops", "bytes_written",
-                       "evictions", "errors")},
+                       "evictions", "errors", "group_collisions",
+                       "journal_records", "journal_failures")},
             "retained": retained_view(),
             "spill_one": {"requests_written": int(_state["requests_written"]),
                           "fulfilled": int(_state["fulfilled"]),
                           "poll_interval_seconds": POLL_INTERVAL_SECONDS,
                           "ttl_seconds": REQUEST_TTL_SECONDS},
             "wiring": ("THE ENGINE CALLS THIS. `bind_connector_metadata` remembers "
-                       "each step's (slot, key16) pairs and `get_finished` spills "
+                       "each step's (slot, block hash) pairs and `get_finished` spills "
                        "them when the store event completes; both compose with "
                        "worker_diag and blockdump and hand the fork's return value "
                        "back untouched. Names come from the fingerprint THIS worker "
