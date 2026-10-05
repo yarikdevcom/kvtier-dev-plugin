@@ -1645,15 +1645,59 @@ def verify_slot(key, fingerprint=None) -> dict:
 
 # --- the status view ---------------------------------------------------------
 
+def journal_view(*, fs: dict | None = None,
+                 index: dict | None = None) -> dict:
+    """The spill journal's own block: where it lives, and what landed in it.
+
+    ONE SHAPE, published in two places (the snapshot's `spill.journal` and the
+    `/disk` verb's `journal`), so a `POST /disk {"op":"status"}` answer and a
+    snapshot can never disagree about the number that means "the scheduler's index
+    was never told about these files".
+
+    `writable: false` with its `directory_error` is the failure this block exists
+    to make impossible to miss: the journal directory was named by
+    `VLLM_E2_TIER_DISK_JOURNAL_DIR` and cannot be created or written, so every
+    spill this rank makes commits a KV file and records nothing. The spill is not
+    refused for that (a logging problem does not get to cost the whole tier) - it
+    is said, here, in the payload an operator queries.
+
+    State only, plus `disk_index`'s per-directory cached filesystem verdict and the
+    one `access` its writability costs; no walk, no statvfs. `fs`/`index` let a
+    caller that already read them reuse the read.
+    """
+    fs = disk_index.journal_fs_state() if fs is None else fs
+    index = disk_index.counters() if index is None else index
+    return {"directory": disk_index.journal_directory(),
+            "directory_env": config.ENV_DISK_JOURNAL_DIR,
+            "fallback_env": config.ENV_DIAG_DIR,
+            # THE JOURNAL'S OWN VOICE: the count of lines that never landed, the
+            # last reason, and whether the directory can be written at all.
+            "write_errors": int(index["journal_write_errors"]),
+            "last_error": index["journal_last_error"],
+            "writable": fs.get("writable"),
+            "directory_error": fs.get("directory_error"),
+            "fs": fs}
+
 def section() -> dict:
     """The snapshot view. STABLE IN SHAPE, and it reads NO files.
 
     `snapshot.dev_state_sections()` runs on every polled status, so this reports
     only this process's own state and the configuration - never a directory walk,
     never a statvfs, never the store's size. The counters are the point: spilled,
-    refused PER REASON, bytes, seconds, drops, evictions.
+    refused PER REASON, bytes, seconds, drops, evictions. (The journal's filesystem
+    and writability are the two reads it does make, both of them per-directory
+    cached or one syscall, because "where does the map live" is a first-class
+    counter's-equal: it is the difference between an empty index and a lost store.)
     """
     state = configured()
+    # ONE read of the journal's own view, reused by every journal field below.
+    # `disk_index`'s counters are THIS process's, and that is the right process:
+    # the writer thread that could not write a line runs here. `journal_fs_state()`
+    # adds one `access` on the journal directory (deliberately uncached, so an
+    # operator who chmods the path is reflected on the next poll) on top of the
+    # mount-table read it already cached per directory.
+    journal_fs = disk_index.journal_fs_state()
+    journal_index = disk_index.counters()
     return {
         "capability": capability(),
         "configured": bool(state["configured"]),
@@ -1692,15 +1736,23 @@ def section() -> dict:
         "journal_records": int(_state["journal_records"]),
         "journal_removals": int(_state["journal_removals"]),
         "journal_failures": int(_state["journal_failures"]),
+        # THE SAME FAILURE, IN THE WORDS THE INDEX USES, on the verb an operator
+        # actually queries: `journal_write_errors` is the index's own count of lines
+        # it was never told about and `journal_last_error` is the one-line reason.
+        # A spill whose journal line fails COSTS DISK SPACE, so the tier keeps
+        # spilling - but it does not get to be quiet about it.
+        "journal_write_errors": int(journal_index["journal_write_errors"]),
+        "journal_last_error": journal_index["journal_last_error"],
+        # False here means every spill this rank makes is invisible to the
+        # scheduler's restore index: the number that explains an empty index on a
+        # store that is anything but empty.
+        "journal_directory_writable": journal_fs.get("writable"),
         "journal_directory": disk_index.journal_directory(),
         # THE JOURNAL'S FILESYSTEM, named where an operator reading this verb will
         # look: `fs.on_tmpfs: true` means the map dies at reboot while the KV files
         # it describes survive (2026-10-05: 107 GB spilled, `entries: 0`). The fix
         # is `VLLM_E2_TIER_DISK_JOURNAL_DIR`; the arm file stays behind on purpose.
-        "journal": {"directory": disk_index.journal_directory(),
-                    "directory_env": config.ENV_DISK_JOURNAL_DIR,
-                    "fallback_env": config.ENV_DIAG_DIR,
-                    "fs": disk_index.journal_fs_state()},
+        "journal": journal_view(fs=journal_fs, index=journal_index),
         "thread_started": int(_state["thread_started"]),
         "thread_alive": bool(_state["thread_alive"]),
         "queue_depth": int(_state["queue_depth"]),
@@ -1755,7 +1807,8 @@ def section() -> dict:
                                     "digest_groups_dropped",
                                     "digest_group_overflow",
                                     "sibling_probe_failures", "journal_records",
-                                    "journal_removals", "journal_failures"),
+                                    "journal_removals", "journal_failures",
+                                    "journal_write_errors", "write_errors"),
     }
 
 

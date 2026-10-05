@@ -42,6 +42,26 @@ booting with the restore path armed is the precondition of a livelock, not a
 convenience (see `disk_spill._read_arm_file`, which fails closed on its contents for
 the same reason).
 
+MAKING THE DIRECTORY IS PART OF READING THE PATH, AND IT IS NOT A SPILL FAILURE
+-------------------------------------------------------------------------------
+An operator who sets `VLLM_E2_TIER_DISK_JOURNAL_DIR=/home/user/kv-tier/journal`
+before that path exists has pointed the tier at the exact failure the variable
+exists to prevent, only self-inflicted: every journal append fails, the KV file
+still commits, and the index never learns the file exists. So the ONE place a
+journal path is composed also CREATES the directory
+(`_ensure_journal_directory()`, called from `journal_path()` and nowhere else -
+never inside `refresh()` or `_read_tail_seq()`, which read). Creation is
+attempted ONCE per resolved directory and cached with its outcome, because the
+append path is meant to be one `write()` of one line and not a filesystem walk;
+a failed attempt is retried no more than once per `JOURNAL_DIR_RETRY_SECONDS`, so
+a directory the operator fixes by hand starts working without a restart. It never
+raises: a directory that cannot be made is a counted, named reason
+(`journal_directory_writable: false`, `journal_directory_error`, and
+`journal_dir=unwritable` on the boot line) and the spill still lands.
+
+`journal_directory_state()` answers the same question WITHOUT creating anything,
+which is what the boot line and every status view read.
+
 `journal_fs_state()` asks `disk_layout.tmpfs_verdict` - the same tmpfs logic the
 store root is refused by - whether that directory survives a reboot. On the DEFAULT
 configuration the journal still lands in `/tmp`, so this can only be a warning:
@@ -121,6 +141,28 @@ FS_TMPFS = "tmpfs"
 FS_DISK = "disk"
 FS_UNSET = "unset"
 FS_UNKNOWN = "unknown"
+# "We tried, and we cannot put the journal there." Deliberately NOT `unknown`:
+# `unknown` means the mount table could not tell us, which asks for a look; this
+# means the first journal line cannot be written at all, which asks for a chmod.
+# Conflating them loses exactly the distinction that matters at 3 a.m.
+FS_UNWRITABLE = "unwritable"
+
+# The mode of a journal directory this plugin creates. It is NOT invented here:
+# `disk_layout.write_committed_file` gives the store's own shard directories
+# 0o750 (disk_layout.py:1696), and the journal sits on the same spill path, so
+# one box has one convention for a directory the spill tier made for itself.
+JOURNAL_DIR_MODE = 0o750
+
+# SECONDS a FAILED directory attempt is believed before it is retried. A success
+# is cached for the life of the process (the append path owes one `write()`); a
+# failure is retried slowly so an operator who chmods or mkdirs the path
+# mid-boot heals the tier without a restart, while a permanently-wrong path costs
+# the writer thread one `makedirs` a minute and nothing else.
+JOURNAL_DIR_RETRY_SECONDS = 60.0
+
+# HOW FAR UP to look for an existing ancestor when the journal directory does not
+# exist yet (a writability probe, not a walk that creates anything).
+MAX_ANCESTOR_WALK = 32
 
 JOURNAL_PREFIX = "disk-spill-journal-"
 JOURNAL_SUFFIX = ".jsonl"
@@ -152,6 +194,15 @@ _state: dict = {
     "dropped": {reason: 0 for reason in DROP_REASONS},
     "journal_writes": 0,
     "journal_write_errors": 0,
+    # ONE-LINE reason of the last journal failure, beside the counter that counts
+    # them: the counter says the index is falling behind, this says why, in the
+    # same payload, without a log search.
+    "journal_last_error": None,
+    # THE DIRECTORY ITSELF: the one cached creation attempt for the directory this
+    # process resolved, and how many attempts/failures it has taken.
+    "journal_dir": None,
+    "journal_directory_attempts": 0,
+    "journal_directory_errors": 0,
     "journal_full": False,
     "journal_lines": 0,
     "journal_bytes": 0,
@@ -188,7 +239,10 @@ def reset_state_for_tests() -> None:
         "applied": 0, "spills": 0, "removals": 0, "misses": 0, "hits": 0,
         "entries_dropped": 0,
         "dropped": {reason: 0 for reason in DROP_REASONS},
-        "journal_writes": 0, "journal_write_errors": 0, "journal_full": False,
+        "journal_writes": 0, "journal_write_errors": 0,
+        "journal_last_error": None, "journal_dir": None,
+        "journal_directory_attempts": 0, "journal_directory_errors": 0,
+        "journal_full": False,
         "journal_lines": 0, "journal_bytes": 0,
         "journal_seeded": False, "journal_seq_seed": 0,
         "refreshes": 0, "refresh_skipped": 0,
@@ -252,6 +306,13 @@ def journal_fs_state() -> dict:
     move within a boot and this is read by the snapshot, the verb and the boot
     line. It cannot raise: an unreadable mount table is `on_tmpfs: None`, which is
     reported as `journal_dir=unknown` and warned about never.
+
+    WRITABILITY TRUMPS FILESYSTEM, and the two are published apart. `writable:
+    false` means the first journal line cannot be written there at all, so the
+    boot line answers `journal_dir=unwritable` rather than going on to claim
+    `disk`: "we tried and failed" and "we could not tell" (`unknown`) are
+    different facts and get different words. The tmpfs half of the answer stays
+    published next to it, so nothing is lost by the louder one winning the field.
     """
     directory = journal_directory()
     cached = _state.get("journal_fs")
@@ -263,6 +324,8 @@ def journal_fs_state() -> dict:
         return {"directory": None, "on_tmpfs": None, "method": "unset",
                 "fstype": None, "mount_point": None, "warned": False,
                 "label": FS_UNSET,
+                "writable": None, "writable_basis": "unset",
+                "directory_error": None,
                 "reason": f"{config.ENV_DISK_JOURNAL_DIR} is not set, and neither "
                           f"is {config.ENV_DIAG_DIR}: there is no directory to "
                           "write a spill journal into"}
@@ -275,7 +338,12 @@ def journal_fs_state() -> dict:
         _state["journal_on_tmpfs"] = verdict.get("on_tmpfs")
         _state["journal_fs_directory"] = directory
     on_tmpfs = verdict.get("on_tmpfs")
-    label = (FS_TMPFS if on_tmpfs is True else
+    # READ-ONLY (it creates nothing) and deliberately NOT cached: an operator who
+    # chmods the path mid-boot must see the view change on the next poll.
+    directory_state = journal_directory_state()
+    writable = directory_state.get("writable")
+    label = (FS_UNWRITABLE if writable is False else
+             FS_TMPFS if on_tmpfs is True else
              FS_UNKNOWN if on_tmpfs is None else FS_DISK)
     warned = False
     if on_tmpfs is True:
@@ -301,13 +369,27 @@ def journal_fs_state() -> dict:
             "mount_point": verdict.get("mount_point"),
             "absolute": verdict.get("absolute"),
             "warned": warned, "label": label,
+            # CAN A JOURNAL LINE BE WRITTEN HERE AT ALL, and how do we know.
+            # `writable: false` outranks `label`'s filesystem answer: a map that
+            # cannot be written is a worse fact than a map that will not survive a
+            # reboot, and `directory_error` says what to do about it.
+            "writable": writable,
+            "writable_basis": directory_state.get("basis"),
+            "directory_error": directory_state.get("reason"),
             "warnings": int(_state["journal_tmpfs_warnings"]),
             "units": {"warnings": "warnings"},
             "reason": verdict.get("reason")}
 
 
 def journal_fs_label() -> str:
-    """One token for the boot line: `tmpfs` / `disk` / `unset` / `unknown`.
+    """One token for the boot line: `tmpfs` / `disk` / `unset` / `unknown` /
+    `unwritable`.
+
+    `unwritable` is the newest of the five and the one an operator can act on: it
+    means the directory is not there and cannot be made (or is there and cannot be
+    written), so NO journal line will ever land there. It is deliberately not
+    folded into `unknown`, which means "we could not tell" and invites a look
+    rather than a chmod.
 
     Never raises: a boot line that cannot print a field prints the field's failure,
     not no line at all.
@@ -370,6 +452,201 @@ def journal_directory():
     return None if directory is None else str(directory)
 
 
+def _probe_journal_directory(directory: str) -> dict:
+    """Could a journal be written at `directory`, judged WITHOUT creating it?
+
+    Two shapes, both cheap (one `isdir`, one `access`, plus one `access` per
+    missing level bounded by `MAX_ANCESTOR_WALK`):
+
+      * the directory EXISTS: the question is whether this process can write into
+        it, which an `makedirs(exist_ok=True)` would happily answer "yes" to and
+        the `open()` would then answer with an errno - so ask directly;
+      * it does NOT exist yet: the question belongs to the nearest directory that
+        does, because that is where the first `makedirs` has to land.
+
+    `writable: None` means "nothing in the chain could be examined" - reported as
+    `unknown`, never as `unwritable`, because a failure we did not observe is not
+    a failure we may claim. Never raises: a probe that cannot answer says so.
+    """
+    try:
+        text = str(directory)
+        if os.path.isdir(text):
+            if os.access(text, os.W_OK | os.X_OK):
+                return {"exists": True, "writable": True, "reason": None}
+            return {"exists": True, "writable": False,
+                    "reason": f"{text} exists but this process cannot write into "
+                              "it (EACCES): no spill journal line can be created "
+                              "there"}
+        parent = os.path.dirname(os.path.normpath(text))
+        steps = 0
+        while parent and steps < MAX_ANCESTOR_WALK:
+            if os.path.isdir(parent):
+                if os.access(parent, os.W_OK | os.X_OK):
+                    return {"exists": False, "writable": True, "reason": None}
+                return {"exists": False, "writable": False,
+                        "reason": f"{text} does not exist and {parent} cannot be "
+                                  "written to by this process (EACCES), so the "
+                                  "journal directory cannot be created"}
+            if os.path.exists(parent):
+                # Something that is NOT a directory sits on the way down, and no
+                # amount of writability makes a path through it creatable
+                # (`makedirs` answers NotADirectoryError). Without this the walk
+                # would hop over the obstruction, find a writable ancestor and
+                # report a directory that can never exist as `writable: true`.
+                return {"exists": False, "writable": False,
+                        "reason": f"{parent} exists and is not a directory, so "
+                                  f"{text} cannot be created"}
+            if os.path.dirname(parent) == parent:
+                break
+            parent = os.path.dirname(parent)
+            steps += 1
+        return {"exists": False, "writable": None,
+                "reason": "no existing directory was found above the journal "
+                          "directory, so its writability could not be told"}
+    except Exception as exc:  # noqa: BLE001 - a probe that cannot tell says so
+        snapshot._error(exc, "disk_index journal dir probe")
+        return {"exists": None, "writable": None,
+                "reason": f"the journal directory could not be examined: "
+                          f"{type(exc).__name__}"}
+
+
+def _ensure_journal_directory(directory: str) -> dict:
+    """Create the journal directory, ONCE per resolved directory. Never raises.
+
+    WHY IT EXISTS: `VLLM_E2_TIER_DISK_JOURNAL_DIR` names a path the operator may
+    not have made yet, and an append into a directory that is not there fails -
+    quietly, because `journal_append` never raises - which leaves a store full of
+    committed KV files that no index can name. Making the directory is therefore
+    part of composing the path, not a boot-time ceremony.
+
+    WHY IT IS CACHED: the append runs on `disk_spill`'s writer thread and is meant
+    to cost one `write()` of one line. A successful attempt is remembered for the
+    life of the process (the cache hit does no filesystem call at all); a FAILED
+    one is retried when a cheap `access` shows the path has become writable, and
+    otherwise at most once per `JOURNAL_DIR_RETRY_SECONDS`, so a path the operator
+    fixes mid-boot resumes journaling on the next line and a hopeless path costs
+    one `makedirs` a minute.
+
+    The outcome is the record `journal_directory_state()` reports on an `attempt`
+    basis: this is the only place in the plugin that creates a journal directory.
+    """
+    cached = _state.get("journal_dir")
+    now = time.monotonic()
+    if isinstance(cached, dict) and cached.get("directory") == directory:
+        if cached.get("ok"):
+            return cached
+        tried = cached.get("attempted_mono")
+        inside = bool(isinstance(tried, (int, float))
+                      and (now - float(tried)) < JOURNAL_DIR_RETRY_SECONDS)
+        # The clock bounds the expensive part (`makedirs`), not the recovery: one
+        # `access` says whether the operator has fixed the path under us, and if
+        # they have, the attempt happens NOW rather than up to
+        # `JOURNAL_DIR_RETRY_SECONDS` from now. A tier that stayed blind for a
+        # minute after a chmod would be its own small incident.
+        if inside and not _probe_journal_directory(directory).get("writable"):
+            return cached
+    outcome = {"directory": directory, "ok": False, "created": False,
+               "reason": None, "attempted_mono": now}
+    _state["journal_directory_attempts"] += 1
+    try:
+        if os.path.isdir(directory):
+            # Not `makedirs(exist_ok=True)`: that answers "already there" for a
+            # directory this process may not be allowed to write into, and the
+            # `open()` would be the one to report the errno - three layers away.
+            if os.access(directory, os.W_OK | os.X_OK):
+                outcome["ok"] = True
+            else:
+                outcome["reason"] = (f"{directory} exists but this process cannot "
+                                     "write into it (EACCES)")
+        else:
+            os.makedirs(directory, mode=JOURNAL_DIR_MODE, exist_ok=True)
+            outcome["created"] = True
+            outcome["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - a journal directory is never fatal
+        outcome["reason"] = (f"{type(exc).__name__}: "
+                             f"{str(exc)[:MAX_STRING_CHARS - 40]}")
+    _state["journal_dir"] = outcome
+    if not outcome["ok"]:
+        _state["journal_directory_errors"] += 1
+        notice_once(f"journal-unwritable:{directory}",
+                    f"the spill JOURNAL directory cannot be created or written: "
+                    f"{directory} ({outcome['reason']}). Every spill this rank "
+                    "makes still lands on the store, but nothing about it is "
+                    "recorded, so the scheduler's restore index will never see "
+                    "those files (a recompute, and a store that grows with "
+                    "unreachable bytes). Create the directory, or point "
+                    f"{config.ENV_DISK_JOURNAL_DIR} somewhere writable.")
+    return outcome
+
+
+def journal_directory_state() -> dict:
+    """Can a spill journal be written where `journal_directory()` points?
+
+    The READ-ONLY answer, for the boot line and every status view: it creates
+    nothing. Two kinds of evidence, kept apart on purpose, because "we tried and
+    failed", "we can see it cannot work" and "we cannot tell" are three different
+    facts at 3 a.m.:
+
+      * `basis: "attempt"` - this process already tried to prepare the directory
+        on the way to a journal line, and a real errno beats any prediction;
+      * `basis: "probe"` - nobody has written a line yet, so an `os.access` on the
+        directory (or on its nearest existing parent) answers instead;
+      * `writable: None` - neither could tell: that is `unknown`, and it must
+        never be reported as `unwritable`.
+
+    A failed attempt that the probe now contradicts (the operator made the
+    directory by hand) reports the probe, so the view heals while the process
+    keeps running. Never raises.
+    """
+    try:
+        directory = journal_directory()
+        if directory is None:
+            return {"directory": None, "exists": False, "writable": None,
+                    "basis": "unset", "reason": None}
+        probed = _probe_journal_directory(directory)
+        attempted = _state.get("journal_dir")
+        if (isinstance(attempted, dict)
+                and attempted.get("directory") == directory):
+            if attempted.get("ok"):
+                return {"directory": directory, "exists": True,
+                        "writable": True, "basis": "attempt", "reason": None}
+            if probed.get("writable") is True:
+                return {"directory": directory,
+                        "exists": bool(probed.get("exists")),
+                        "writable": True, "basis": "probe", "reason": None}
+            return {"directory": directory,
+                    "exists": bool(probed.get("exists")), "writable": False,
+                    "basis": "attempt",
+                    "reason": attempted.get("reason") or probed.get("reason")}
+        return {"directory": directory,
+                "exists": bool(probed.get("exists")),
+                "writable": probed.get("writable"),
+                "basis": "probe", "reason": probed.get("reason")}
+    except Exception as exc:  # noqa: BLE001 - a view is never worth a fault
+        snapshot._error(exc, "disk_index journal directory state")
+        return {"directory": None, "exists": None, "writable": None,
+                "basis": "unknown",
+                "reason": f"the journal directory state raised "
+                          f"{type(exc).__name__}"}
+
+
+def _journal_failure(reason) -> None:
+    """Record one counted, NAMED journal failure. Never raises.
+
+    THE SILENCE IS THE BUG THIS EXISTS TO KILL. A spill whose journal line fails
+    costs disk space; refusing that spill would cost the whole tier for a logging
+    problem - so the tier keeps writing and the failure becomes impossible to
+    miss: `journal_write_errors` for a dashboard to alert on, `journal_last_error`
+    for the human reading the same payload, both published by `section()`, the
+    `/disk` verb and the snapshot.
+    """
+    text = str(reason)[:MAX_STRING_CHARS]
+    _state["journal_write_errors"] += 1
+    _state["journal_last_error"] = text
+    _state["last_error"] = text
+    _note(text)
+
+
 def journal_path(rank=None) -> dict:
     """`(path | None, why)` for one rank's journal.
 
@@ -377,6 +654,14 @@ def journal_path(rank=None) -> dict:
     `worker_diag.rank_id()`, so a worker's journal is named by the same id its
     rank file uses). A scheduler process has no rank and must pass one to read
     a specific file; `refresh()` globs instead.
+
+    THIS IS ALSO THE ONLY PLACE THE JOURNAL DIRECTORY IS CREATED. Every journal
+    path - append, tail-seed, the refresh glob - is composed here or from
+    `journal_directory()`, so making the directory once, at the one composition
+    point, is what keeps "written here" and "read from here" the same place;
+    creating it inside `journal_path()` AND `refresh()` AND `_read_tail_seq()`
+    would be three sites to keep in sync for no extra guarantee. See
+    `_ensure_journal_directory()` for the once-per-directory cache.
     """
     directory = journal_directory()
     if directory is None:
@@ -401,6 +686,14 @@ def journal_path(rank=None) -> dict:
         # theoretical worry - `VLLM_E2_TIER_DIAG_RANK` is operator input.
         return _fail("a rank id may not contain a path separator or a NUL",
                      path=None)
+    # The directory comes with the path: a journal line written into a directory
+    # that does not exist is a line that was never written, and the spill that
+    # asked for it does not fail - it just becomes invisible to the index.
+    prepared = _ensure_journal_directory(directory)
+    if not prepared["ok"]:
+        return _fail(f"the spill journal directory {directory} could not be "
+                     f"prepared: {prepared['reason']}", path=None,
+                     reason_kind="journal_unwritable")
     return _ok(path=os.path.join(directory,
                                  f"{JOURNAL_PREFIX}{text}{JOURNAL_SUFFIX}"),
                rank=text)
@@ -461,13 +754,30 @@ def _read_tail_seq(path) -> dict:
                  "number")
 
 
+def _write_journal_line(path, line: str) -> tuple:
+    """Append one line. `(ok, why)`, and the ONLY place a journal line is written.
+
+    Returns the errno NAME on failure so the published reason names the syscall's
+    verdict instead of guessing at it. Never raises: the caller is a spill, and the
+    whole contract of this module is that its own failures are data.
+    """
+    try:
+        with open(path, "ab") as handle:
+            handle.write(line.encode("utf-8"))
+        return True, None
+    except OSError as exc:  # noqa: BLE001 - reported, never re-raised
+        return False, type(exc).__name__
+
+
 def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
     """Append one line to THIS process's journal. Bounded; never raises.
 
     Called from `disk_spill`'s writer thread (the only thread that knows a file
     was committed, and the only one that deletes one), never from an engine
     thread. One `write()` of one line, so a reader that stops at the last
-    newline can never apply half a record.
+    newline can never apply half a record - which is also why the DIRECTORY is
+    not created here but at the one path-composition point (`journal_path`),
+    once per resolved directory and cached: an append owes no filesystem walk.
 
     `key` is the engine's FULL group-qualified block hash, or a `key16` with the
     `group_id` handed in beside it (what `record_spill` does, because it parses a
@@ -509,16 +819,21 @@ def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
                          "(unit: bytes)")
         named = journal_path()
         if not named["ok"]:
-            _state["journal_write_errors"] += 1
-            _note(named["reason"])
-            return _fail(named["reason"], reason_kind="no_channel")
+            _journal_failure(named["reason"])
+            # `no_channel` is the historical reason (nothing is configured at all);
+            # a directory that exists but cannot be made or written names itself
+            # `journal_unwritable` instead, because the operator's fix is a chmod,
+            # not an export.
+            return _fail(named["reason"],
+                         reason_kind=named.get("reason_kind") or "no_channel")
         path = named["path"]
         try:
             current = os.path.getsize(path)
         except FileNotFoundError:
             current = 0
         except OSError as exc:
-            _state["journal_write_errors"] += 1
+            _journal_failure(f"the journal could not be stat'ed: "
+                             f"{type(exc).__name__}")
             return _fail(f"the journal could not be stat'ed: "
                          f"{type(exc).__name__}", reason_kind="journal_error")
         if current >= MAX_JOURNAL_BYTES:
@@ -534,8 +849,8 @@ def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
             if not seeded["ok"]:
                 # A number we cannot prove is increasing is not a sequence, and a
                 # decreasing one would stop the reader for this rank forever.
-                _state["journal_write_errors"] += 1
-                _note(seeded["reason"])
+                _journal_failure(f"the journal's sequence could not be seeded: "
+                                 f"{seeded['reason']}")
                 return _fail(f"the journal's sequence could not be seeded: "
                              f"{seeded['reason']}",
                              reason_kind="journal_error", path=path)
@@ -546,24 +861,29 @@ def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
         seq = int(_state["journal_lines"]) + 1
         line = (f"{seq}{LINE_SEP}{op}{LINE_SEP}{key16}{LINE_SEP}{size}"
                 f"{LINE_SEP}{group}\n")
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "ab") as handle:
-                handle.write(line.encode("utf-8"))
-        except OSError as exc:
-            _state["journal_write_errors"] += 1
-            _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
-            return _fail(f"the journal line could not be written: "
-                         f"{type(exc).__name__}", reason_kind="journal_error",
-                         path=path)
+        written, why = _write_journal_line(path, line)
+        if not written:
+            # A cached "the directory is there" can be wrong - an operator clearing
+            # a tmpfs, a mount that moved - and a dropped line drops the FACT for
+            # good, so this is the one place that pays a second filesystem trip:
+            # forget the cache, which makes `journal_path()` prepare the directory
+            # again, and write the line once more. Only a second failure is one.
+            _state["journal_dir"] = None
+            again = journal_path()
+            if again["ok"]:
+                path = again["path"]
+            written, why = _write_journal_line(path, line)
+        if not written:
+            _journal_failure(f"the journal line could not be written: {why}")
+            return _fail(f"the journal line could not be written: {why}",
+                         reason_kind="journal_error", path=path)
         _state["journal_writes"] += 1
         _state["journal_lines"] = seq
         _state["journal_bytes"] = current + len(line)
         _state["last_journal"] = path
         return _ok(path=path, seq=seq, bytes=len(line), rank=named["rank"])
     except Exception as exc:  # noqa: BLE001 - a journal never breaks a spill
-        _state["journal_write_errors"] += 1
-        _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
+        _journal_failure(f"journaling raised {type(exc).__name__}")
         snapshot._error(exc, "disk_index journal_append")
         return _fail(f"journaling raised {type(exc).__name__}",
                      reason_kind="journal_error")
@@ -945,6 +1265,9 @@ def forget_all(reason: str | None = None) -> dict:
 
 def section() -> dict:
     """The index's state for a snapshot or a verb. Reads nothing from disk."""
+    # ONE read of the journal directory's filesystem + writability, reused by the
+    # fields below and by `journal_fs`, so a payload cannot contradict itself.
+    fs = journal_fs_state()
     return {
         "entries": int(len(_state["entries"])),
         "entry_cap": MAX_INDEX_ENTRIES,
@@ -956,7 +1279,17 @@ def section() -> dict:
         "journal_lines": int(_state["journal_lines"]),
         "journal_seq_seed": int(_state["journal_seq_seed"]),
         "journal_full": bool(_state["journal_full"]),
+        # THE FAILURE THAT USED TO BE SILENT. A spill whose journal line is not
+        # written costs disk space and nothing else (refusing it would cost the
+        # whole tier for a logging problem), so the tier keeps spilling and THESE
+        # carry the cost out loud: a count to alert on, one line to read, and the
+        # directory's own verdict with the reason that names the fix.
         "journal_write_errors": int(_state["journal_write_errors"]),
+        "journal_last_error": _state["journal_last_error"],
+        "journal_directory_attempts": int(_state["journal_directory_attempts"]),
+        "journal_directory_errors": int(_state["journal_directory_errors"]),
+        "journal_directory_writable": fs.get("writable"),
+        "journal_directory_error": fs.get("directory_error"),
         "journal_fields": JOURNAL_FIELDS,
         "journal_cap_bytes": MAX_JOURNAL_BYTES,
         "refreshes": int(_state["refreshes"]),
@@ -970,7 +1303,7 @@ def section() -> dict:
         # WHERE THAT DIRECTORY LIVES, filesystem-wise. `journal_on_tmpfs: true` is
         # the 2026-10-05 failure made visible: the map survives nothing and the KV
         # files survive everything. A warning, never a refusal.
-        "journal_fs": journal_fs_state(),
+        "journal_fs": fs,
         "journal_on_tmpfs": _state["journal_on_tmpfs"],
         "journal_tmpfs_warnings": int(_state["journal_tmpfs_warnings"]),
         "last_reason": _state["last_reason"],
@@ -979,6 +1312,8 @@ def section() -> dict:
                   "entries_dropped": "identities", "bytes_indexed": "bytes",
                   "journals_tracked": "files", "journal_writes": "lines",
                   "journal_lines": "lines", "journal_write_errors": "writes",
+                  "journal_directory_attempts": "attempts",
+                  "journal_directory_errors": "failures",
                   "journal_seq_seed": "lines", "journal_fields": "fields",
                   "journal_cap_bytes": "bytes",
                   "journal_tmpfs_warnings": "warnings",

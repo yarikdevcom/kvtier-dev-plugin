@@ -84,7 +84,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DEV_ALLOW` | extra peers beyond loopback: a comma-separated list of addresses or CIDRs. **Unset/empty = loopback only** (the pre-allowlist behaviour). A malformed entry is logged and skipped - never fatal, never an opening. See *Access model*. |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | seconds the HTTP layer waits for the engine before answering 504. Default `5.0`, clamped to `[0.05, 60]`. |
 | `VLLM_E2_TIER_DIAG` | the worker diagnostics directory (capability 5). **Unset = the worker writer is completely inert: no directory created, no file written, nothing wrapped in the worker.** Set it to a path both the worker ranks and the proxy host's reader can see. |
-| `VLLM_E2_TIER_DISK_JOURNAL_DIR` | where the SSD tier's spill **journal** lives, apart from the rest of the diagnostics directory. **Unset = fall back to `VLLM_E2_TIER_DIAG`** (the pre-0.2.19 behaviour). Set it to storage that survives a reboot: the journal is the only map from a KV identity to a spilled file and cannot be rebuilt, while the KV files it describes outlive it. **Only the journal follows this var** - the spill arm file stays in `VLLM_E2_TIER_DIAG` and dies at boot, because an arm must not survive a reboot. A journal on tmpfs is warned about once and reported (`journal_dir=tmpfs` on the boot line), never refused. |
+| `VLLM_E2_TIER_DISK_JOURNAL_DIR` | where the SSD tier's spill **journal** lives, apart from the rest of the diagnostics directory. **Unset = fall back to `VLLM_E2_TIER_DIAG`** (the pre-0.2.19 behaviour). Set it to storage that survives a reboot: the journal is the only map from a KV identity to a spilled file and cannot be rebuilt, while the KV files it describes outlive it. **The path does not have to exist** - the plugin creates it (mode `0750`, the mode the store's own shard directories get) on the way to the first journal line, once per directory. **Only the journal follows this var** - the spill arm file stays in `VLLM_E2_TIER_DIAG` and dies at boot, because an arm must not survive a reboot. A journal on tmpfs is warned about once and reported (`journal_dir=tmpfs` on the boot line), and a journal directory that cannot be created or written is reported (`journal_dir=unwritable`, `journal.writable: false`, `journal.directory_error`, `journal.write_errors`) - either way it is never a refusal to spill. |
 | `VLLM_E2_TIER_DIAG_INTERVAL` | how often a rank rewrites its file, in engine steps. Default `50`, clamped to `[1, 100000]`. A step that *changed* something writes immediately (subject to the floor below). |
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
@@ -1009,7 +1009,7 @@ set it to a path on storage that **survives a reboot** (e.g.
 `/home/user/kv-tier/diag`) if you want the restore index to come back with its
 entries. On 2026-10-05 a reboot destroyed a journal that lived in `/tmp` while 107 GB
 of KV files survived on the RAID array, and the index came up at `entries: 0`. The
-boot line prints `journal_dir=tmpfs|disk|unset|unknown`, `GET /plugins/kvtier/disk`
+boot line prints `journal_dir=tmpfs|disk|unset|unknown|unwritable`, `GET /plugins/kvtier/disk`
 answers `journal.fs`, and a tmpfs journal logs one warning per boot
 (`journal_tmpfs_warnings` counts them). It is a warning, never a refusal: a
 degraded-but-loud tier beats a silent one. **Only the journal moves** - the spill
@@ -1019,6 +1019,26 @@ nobody having asked). The arm now fails closed on its own contents as well: it
 records the kernel boot id and its epoch with an `epoch_scope`, and a reader refuses a
 file naming a different boot, with a reason that says `epoch mismatch` or `boot id
 mismatch` (`arm_file_boot_refusals` in `arm_state`).
+
+**The named path is created for you, and a journal that cannot be written is never
+silent.** A path you set that does not exist yet used to mean every journal append
+failed quietly: the KV file committed, the journal recorded nothing, and the index
+never learned the file existed - the 2026-10-05 failure again, only self-inflicted,
+and with no reboot to explain it. `disk_index.journal_path()` now creates the
+journal directory (mode `0750`, matching the store's shard directories; `0775` would
+be a new convention, not the existing one) on the way to the first line, once per
+directory, and the writer still costs one `write()` per line. A directory that
+cannot be created or written does **not** stop a spill - a logging problem does not
+get to cost the whole tier - it makes the payload say so instead: the boot line
+reads `journal_dir=unwritable` (deliberately a different word from `unknown`, which
+means "we could not tell"), `journal.writable: false` with `journal.directory_error`
+naming the errno, `journal.write_errors` counting the lines that never landed, and
+`journal.last_error` holding the one-line reason. Those fields are on
+`POST /disk {"op":"status"}`, on the snapshot's `disk_restore.index`, and in
+`disk_index.section()`; `why_no_restore` names the same blindness in prose, because
+"`entries: 0` over a store that is not empty" is the symptom and the cause is what
+an operator needs. A failed creation is retried when a cheap `access` shows the path
+has become writable, so a `chmod` mid-boot heals the tier without a restart.
 
 `spill-one` is **relayed**: the EngineCore has no KV memory, so the ask becomes one
 small file under `VLLM_E2_TIER_DIAG` that every rank answers for its own slot on its

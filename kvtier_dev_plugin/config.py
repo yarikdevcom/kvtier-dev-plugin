@@ -388,6 +388,14 @@ def disk_journal_dir() -> Path | None:
     operator sets the new variable. The fallback is deliberate - the variable exists
     so the journal can be moved to a filesystem that survives a reboot, not to make
     the tier demand another knob.
+
+    A path named here is not required to exist: `disk_index.journal_path()` creates
+    it (once per resolved directory, mode `disk_index.JOURNAL_DIR_MODE`) on the way
+    to the first journal line, because a journal that cannot be written leaves a
+    store full of KV files no index can name. A path that cannot be CREATED is a
+    counted, published failure (`journal_write_errors`,
+    `journal_directory_writable: false`, `journal_dir=unwritable` on the boot line)
+    and never a refused spill.
     """
     raw = os.environ.get(ENV_DISK_JOURNAL_DIR, "").strip()
     if raw and "\x00" not in raw:

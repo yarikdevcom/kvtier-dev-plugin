@@ -2077,14 +2077,22 @@ def _disk_tier_field() -> str:
 
 
 def _journal_dir_field() -> str:
-    """`disk` / `tmpfs` / `unknown` / `unset`: the SPILL JOURNAL's filesystem.
+    """`disk` / `tmpfs` / `unknown` / `unset` / `unwritable`: the SPILL JOURNAL's home.
 
     A separate field from `disk_tier=` because it is a different fact about a
     different thing: the arm says whether this boot writes KV to disk, this says
-    whether the INDEX that lets it be read back will still exist after a reboot.
-    Read through `disk_index.journal_fs_label()`, which cannot raise; the
-    try/except here only covers the import and is reported rather than swallowing
-    the field.
+    whether the INDEX that lets it be read back will still exist after a reboot -
+    and whether it can exist at all.
+
+    `unwritable` is not a fifth way of saying `unknown`, and the difference is the
+    whole point of having a field: `unknown` means the mount table could not tell
+    us (look), `unwritable` means the directory is not there and cannot be made, or
+    is there and cannot be written (chmod it, or point
+    `VLLM_E2_TIER_DISK_JOURNAL_DIR` somewhere writable) - so every spill this boot
+    makes commits a KV file and records nothing, and the restore index will come up
+    at `entries: 0` over a store full of bytes. Read through
+    `disk_index.journal_fs_label()`, which cannot raise; the try/except here only
+    covers the import and is reported rather than swallowing the field.
     """
     try:
         from . import disk_index  # noqa: PLC0415 - sibling layer, lazy by idiom
@@ -2131,13 +2139,19 @@ def boot_line(boot: dict) -> str:
     parts.append("disk_tier={}".format(_disk_tier_field()))
     parts.append("tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
     parts.append("faults={}".format(int(boot.get("faults_at_boot") or 0)))
-    # WHERE THE SPILL JOURNAL LIVES, in one token: `disk`, `tmpfs`, `unknown` or
-    # `unset`. A journal is the only map from a KV identity to a spilled file, and
-    # on the default configuration it still lands in `/tmp` - so a reboot eats the
-    # map while the 107 GB of KV files it describes survive, silently, which is
-    # exactly what happened on 2026-10-05. The warning is logged once (`disk_index
-    # .journal_fs_state`); this is the field that stays greppable afterwards. It is
-    # INFORMATIONAL: a tmpfs journal degrades the tier, it does not stop it.
+    # WHERE THE SPILL JOURNAL LIVES, in one token: `disk`, `tmpfs`, `unknown`,
+    # `unset` or `unwritable`. A journal is the only map from a KV identity to a
+    # spilled file, and on the default configuration it still lands in `/tmp` - so
+    # a reboot eats the map while the 107 GB of KV files it describes survive,
+    # silently, which is exactly what happened on 2026-10-05. The warning is logged
+    # once (`disk_index.journal_fs_state`); this is the field that stays greppable
+    # afterwards. `unwritable` is the newer half of the same idea and the one that
+    # needs no reboot to hurt: the directory named by
+    # `VLLM_E2_TIER_DISK_JOURNAL_DIR` could not be created or written, so this boot
+    # spills into a store nobody can read back. INFORMATIONAL EITHER WAY: a tmpfs
+    # journal degrades the tier and an unwritable one blinds its index, and neither
+    # stops a spill - a tier that refused to write because of its INDEX would be a
+    # diagnostic causing the outage it measures.
     parts.append("journal_dir={}".format(_journal_dir_field()))
     if boot.get("nested"):
         parts.append("guard_over={}".format(

@@ -3181,6 +3181,61 @@ def test_the_why_no_restore_walks_the_chain_in_order(monkeypatch, armed):
             sys.modules.pop(disk_restore.SCHED_MODULE, None)
 
 
+def test_the_why_no_restore_names_a_journal_that_could_not_be_written(monkeypatch,
+                                                                       armed):
+    """An empty index now says WHICH of its two causes it is.
+
+    "entries: 0" was the whole 2026-10-05 story, and it explained nothing. Two
+    causes produce it and both are now in the first sentence an operator reads: the
+    journal directory cannot be written at all (so nothing this boot spills can
+    ever be indexed), or lines could not be recorded (so files exist that the index
+    cannot name). A counter three payloads away is not a diagnosis.
+    """
+    saved = sys.modules.get(disk_restore.SCHED_MODULE)
+    fakes_debug.fork_class(disk_restore.SCHED_MODULE, disk_restore.SCHED_CLASS,
+                           FORK_SCHED_SOURCE, register=True)
+    try:
+        assert disk_restore.install()["installed"] is True
+        assert disk_restore.gate()["ok"] is True
+        disk_index.reset_state_for_tests()
+
+        # (a) the directory itself cannot be written: named as such, errno and all.
+        blocker = os.path.join(armed, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("not a directory")
+        monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR,
+                           os.path.join(blocker, "journal"))
+        assert disk_index.journal_append("+", "a3f0b7c1d4e5f607", 10,
+                                        3)["ok"] is False
+        view = disk_restore.scheduler_section()
+        assert view["index"]["journal_directory_writable"] is False
+        assert view["index"]["journal_write_errors"] == 1
+        why = view["why_no_restore"]
+        assert "JOURNAL DIRECTORY CANNOT BE WRITTEN" in why, why
+        assert "NotADirectoryError" in why, why
+
+        # (b) the directory is fine and a LINE failed: the count and its reason.
+        disk_index.reset_state_for_tests()
+        journal = os.path.join(armed, "journal")
+        os.makedirs(os.path.join(journal,
+                                 f"{disk_index.JOURNAL_PREFIX}PP0_TP0"
+                                 f"{disk_index.JOURNAL_SUFFIX}"), exist_ok=True)
+        monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, journal)
+        assert disk_index.journal_append("+", "a3f0b7c1d4e5f607", 10,
+                                        3)["ok"] is False
+        view = disk_restore.scheduler_section()
+        assert view["index"]["journal_directory_writable"] is True
+        assert view["index"]["journal_write_errors"] == 1
+        why = view["why_no_restore"]
+        assert "journal line(s) could not be recorded" in why, why
+        assert "IsADirectoryError" in why, why
+    finally:
+        if saved is not None:
+            sys.modules[disk_restore.SCHED_MODULE] = saved
+        else:
+            sys.modules.pop(disk_restore.SCHED_MODULE, None)
+
+
 def test_the_disk_verb_answers_about_restore_too():
     """`/disk` is where the operator asks about the SSD tier - both directions."""
     answer = disk_store.disk_for_engine(None, {"op": "status"})

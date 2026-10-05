@@ -741,9 +741,18 @@ def test_the_boot_line_carries_the_journal_directorys_filesystem(tmp_path,
     assert re.search(r"tier=ARMED.*journal_dir=", line), line
     assert line.split("journal_dir=")[0].count("tier=") == 3, line
 
-    # A journal on platter says so and warns about nothing.
+    # A journal on platter says so and warns about nothing. THE PATH IS UNDER
+    # `tmp_path`, NOT a made-up `/home/kv`: this field now also reports whether a
+    # journal could be WRITTEN there, and a path whose parent the unprivileged test
+    # user cannot write (`/home` is 0755 root) is honestly `unwritable`. Asserting
+    # `disk` from a fixture the plugin could never create would pin the field to
+    # whoever owns the directory on the machine running pytest.
+    platter = tmp_path / "kv"
+    (platter / "diag").mkdir(parents=True)
+    mounts.write_text(f"tmpfs /tmp tmpfs rw 0 0\n/dev/md0 {platter} ext4 rw 0 0\n",
+                      encoding="utf-8")
     disk_index.reset_state_for_tests()
-    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, "/home/kv/diag")
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(platter / "diag"))
     _r2, on_disk, _c2, _m2 = boot()
     assert "journal_dir=disk" in on_disk["line"], on_disk["line"]
 

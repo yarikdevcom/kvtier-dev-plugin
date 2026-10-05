@@ -3972,6 +3972,20 @@ def scheduler_section() -> dict:
                f"{int(index.get('journals_tracked') or 0)}; "
                f"{index.get('journal_directory')}). A fresh boot knows nothing "
                "until its ranks have spilled.")
+        # THE BLINDNESS, NAMED, IN THE SENTENCE AN OPERATOR READS FIRST. An empty
+        # index over a store that is not empty has exactly two loud causes: the
+        # writers could not record their lines, or the journal directory cannot be
+        # written at all. Say which, because "entries: 0" alone is a mystery that
+        # costs an afternoon (2026-10-05: 107 GB of KV bytes and no map).
+        missed = int(index.get("journal_write_errors") or 0)
+        if index.get("journal_directory_writable") is False:
+            why += (" The JOURNAL DIRECTORY CANNOT BE WRITTEN ("
+                    f"{index.get('journal_directory_error')}), so no spill this "
+                    "boot makes can ever be indexed.")
+        elif missed:
+            why += (f" {missed} journal line(s) could not be recorded "
+                    f"(journal_last_error: {index.get('journal_last_error')}): "
+                    "those files exist and this index cannot name them.")
     elif ranks == 0:
         why = (f"no rank file proves a fitted worker half ({proof.get('reason')}): "
                "offering disk tokens would DMA CPU slots nobody fills, so the "
@@ -4070,6 +4084,16 @@ def scheduler_section() -> dict:
                   "journals_tracked": int(index.get("journals_tracked") or 0),
                   "refreshes": int(state["index_refreshes"]),
                   "refresh_errors": int(state["index_refresh_errors"]),
+                  # THE INDEX'S OWN BLINDNESS, counted and named: lines the writers
+                  # could not record (so files exist that this index cannot name)
+                  # and whether the journal directory can be written at all. An
+                  # `entries: 0` over a store that is not empty is explained by
+                  # these two fields or it is not explained at all.
+                  "journal_write_errors": int(
+                      index.get("journal_write_errors") or 0),
+                  "journal_last_error": index.get("journal_last_error"),
+                  "journal_directory_writable": index.get(
+                      "journal_directory_writable"),
                   "last_reason": index.get("last_reason")},
         "ranks_proven": ranks,
         "digests_expected": ranks,
@@ -4100,6 +4124,11 @@ def scheduler_section() -> dict:
             "index.journals_tracked": "journal files",
             "index.refreshes": "journal replays",
             "index.refresh_errors": "raised replays",
+            "index.journal_write_errors": "journal lines the writers could not "
+                                          "record: spilled files this index was "
+                                          "never told about, so they cannot be "
+                                          "offered (never a wrong claim, always a "
+                                          "recompute)",
             "ranks_proven": "rank files attesting a fitted worker half",
             "digests_expected": "distinct geometry digests a restore must satisfy "
                                 "(one per proven rank: the WORKER names the file "

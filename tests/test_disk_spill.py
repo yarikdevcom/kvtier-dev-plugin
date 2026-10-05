@@ -811,6 +811,47 @@ def test_a_journal_on_tmpfs_still_spills_and_says_so_loudly(tmp_path, monkeypatc
                 if "spill JOURNAL directory" in rec.getMessage()]) == 1
 
 
+def test_a_journal_directory_that_cannot_be_written_still_spills_and_says_so(
+        tmp_path, monkeypatch):
+    """The other half of "keep spilling, make it loud": a journal that CANNOT exist.
+
+    `VLLM_E2_TIER_DISK_JOURNAL_DIR` points under a directory this process cannot
+    write, so the journal directory cannot be created at all - the self-inflicted
+    twin of the 2026-10-05 failure. The spill is not the casualty: the KV file
+    lands, the tier keeps working, and every payload an operator can read says the
+    index is blind, with a count and a reason. Refusing the spill instead would let
+    a logging problem cost the whole tier, which is the trade this test exists to
+    keep somebody from quietly reversing.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root is not refused by a 0o555 directory")
+    blocked = tmp_path / "locked"
+    blocked.mkdir()
+    blocked.chmod(0o555)
+    monkeypatch.setenv(config.ENV_DIAG_RANK, "PP0_TP0")
+    monkeypatch.setenv(config.ENV_DISK_JOURNAL_DIR, str(blocked / "journal"))
+    try:
+        result = disk_spill.spill_slot(caches(), 1, KEY)
+        assert result["ok"] is True, result      # the spill is the product
+        assert result["journalled"] is False, result  # ... index not told
+        assert os.path.exists(result["path"]), "the KV bytes must outlive their index"
+        assert sum(disk_spill._state["refused"].values()) == 0, "not a spill refusal"
+        section = disk_spill.section()
+        assert section["journal_failures"] == 1
+        assert section["journal_write_errors"] == 1
+        assert section["journal_directory_writable"] is False
+        assert section["journal"]["write_errors"] == 1
+        assert section["journal"]["writable"] is False
+        assert "PermissionError" in str(section["journal"]["directory_error"])
+        assert str(blocked / "journal") in str(section["journal_last_error"])
+        assert json.dumps(section, default=str)
+        # And the index agrees with the spill about what it never learned.
+        assert disk_index.section()["journal_write_errors"] == 1
+        assert disk_index.journal_fs_label() == "unwritable"
+    finally:
+        blocked.chmod(0o755)                     # let pytest remove the tree
+
+
 # --- the queue: bounded, dropping, and never blocking ----------------------
 
 def test_a_full_queue_drops_and_counts_rather_than_growing(monkeypatch):

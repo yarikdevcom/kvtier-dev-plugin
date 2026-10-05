@@ -170,7 +170,7 @@ import os
 import sys
 import time
 
-from . import config, disk_layout, disk_spill, snapshot
+from . import config, disk_index, disk_layout, disk_spill, snapshot
 
 # The engine's logging posture is why this module logs at WARNING, not INFO: a
 # plugin logger is not one of the `vllm.*` loggers the engine configures, so an
@@ -1778,6 +1778,9 @@ def _op_status(_body: dict) -> dict:
     from . import worker_diag  # noqa: PLC0415 - one rank rule, not two
     rank, source = worker_diag.rank_id()
     state = disk_spill.counters()
+    # ONE read of the index's journal view, reused by the fields below.
+    journal_fs = disk_index.journal_fs_state()
+    journal_index = disk_index.counters()
     pending_path = _pending_path()
     _record, pending_reason = _read_pending_record(pending_path)
     return {"ok": True, "reason": None, "op": "status", "rank": rank,
@@ -1799,6 +1802,17 @@ def _op_status(_body: dict) -> dict:
                        "thread_alive", "queue_depth", "queue_depth_peak",
                        "window_files", "group_collisions", "journal_records",
                        "journal_removals", "journal_failures")},
+            # THE JOURNAL, SAYING IT OUT LOUD. `spill.journal_failures` is this
+            # process's count of refusals it was handed; `journal.write_errors` is
+            # the INDEX's count of lines it never got, and `journal.writable:
+            # false` is the reason a store full of KV bytes can come up with an
+            # empty index over it. The spill commits and the journal records
+            # nothing - a cost in disk space, deliberately not a cost in tier -
+            # so the payload is where that trade becomes visible.
+            "journal": disk_spill.journal_view(fs=journal_fs, index=journal_index),
+            "journal_write_errors": int(journal_index["journal_write_errors"]),
+            "journal_last_error": journal_index["journal_last_error"],
+            "journal_directory_writable": journal_fs.get("writable"),
             "spill_refused": dict(state["refused"]),
             "group_collisions": int(state["group_collisions"]),
             "group_collision_samples": list(state["group_collision_samples"]),
