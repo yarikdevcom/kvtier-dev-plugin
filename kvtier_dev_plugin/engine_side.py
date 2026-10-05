@@ -18,7 +18,14 @@ the connector's BASE class - the CPU capacity clamp, the per-rank diagnostics
 writer, the raw-byte dump hook and the SSD spill hook (`worker_diag`, `blockdump`
 and `disk_store`, all retrying off the handshake hook, because a worker never
 imports `EngineCore` and nothing in a worker is reachable over the utility
-channel; all three compose on the same `get_finished`, in that order). `EngineCoreProc`
+channel; all three compose on the same `get_finished`, in that order). THE SSD
+RESTORE PATH IS DIFFERENT AND THAT MATTERS: it has TWO halves in TWO processes, and
+each half is driven by the moment its OWN process can see its class - the worker
+half by the handshake hook above, the SCHEDULER half by `disk_restore.adopt_if_missed()`
+from the connector-creation boot (`backport.boot_from_connector`) and from the
+snapshot verb. Wiring the scheduler half to the worker's hook is the bug that made
+four ranks report `DISK[restore] installed=YES` while the process that makes the
+offer had nothing fitted at all. `EngineCoreProc`
 (and `DPEngineCoreProc`, the actor classes) inherit them, and the UTILITY
 dispatch looks them up with `getattr(self, method_name)`
 (vllm/v1/engine/core.py:1669-1671), so a class-level method is exactly what
@@ -109,6 +116,17 @@ def _make_snapshot_method():
         cpu_capacity.ensure_installed()
         cpu_capacity.adopt_if_missed(self)
         backport.ensure_installed(self)
+        # The SSD restore path's SCHEDULER half, re-fitted if the connector-creation
+        # boot missed it. In this process the manager class does not exist when
+        # `register()` runs, so the plugin-load install is a guaranteed no-op and
+        # the worker handshake that retries the other half never fires here - the
+        # boot above is the primary driver and this verb is the backstop, in the
+        # same role `evictions.adopt_if_missed` plays below. Cheap: a fitted layer
+        # returns on a marker check, an un-imported manager on two dict lookups.
+        # The live manager's CLASS is handed over so a fork that moved the module
+        # still gets its scheduler wrapped.
+        manager = backport.manager_of(self)
+        disk_restore.adopt_if_missed(type(manager) if manager else None)
         # Arm the LRU-eviction counter on the live CPU pool once, so the arena's
         # steady state (99.9% full, parked spans recycled to serve new stores) is
         # visible instead of argued about. Fail-closed to a null section, never a
@@ -567,9 +585,15 @@ def register() -> None:
               "the tier's own load with spans read back from the spill tier and "
               "reports every failed read as a load error so the scheduler "
               "recomputes; inert until POST %s {\"op\":\"arm\"} AND the tier arm. "
-              "Its verdict line is DISK[restore-witness]",
+              "The scheduler half of it is fitted at CONNECTOR CREATION, not here "
+              "(the manager module does not exist yet in this process): read the "
+              "BOOT line's restore=/restore_gate= fields, the WARNING "
+              "DISK[restore] line (role=scheduler) and GET %s's disk_restore "
+              "section - whose why_no_restore field is the one-line answer. The "
+              "worker-side verdict line is DISK[restore-witness]",
               restore_hook, disk_restore.gate()["ok"],
-              config.ROUTE_PREFIX + config.ROUTE_DISK)
+              config.ROUTE_PREFIX + config.ROUTE_DISK,
+              config.ROUTE_PREFIX + config.ROUTE_SNAPSHOT)
         # WHAT THE BOOT WILL DO, stated at plugin load, and what it DID stated at
         # connector creation. Guard mode has no env var of its own and never will
         # (arming a bug-masking facility from a launcher script is the thing the

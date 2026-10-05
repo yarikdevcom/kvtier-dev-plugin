@@ -154,6 +154,15 @@ METHOD_LOAD_ERRORS = "get_block_ids_with_load_errors"
 SCHED_METHODS = (METHOD_MATCHED, METHOD_BUILD_META, METHOD_UPDATE_OUTPUT)
 WORKER_METHODS = (METHOD_BIND, METHOD_START_LOAD, METHOD_GET_FINISHED)
 
+# WHY A HALF IS NOT AN INSTALL. The scheduler half and the worker half land in
+# DIFFERENT PROCESSES, and a `installed=YES` printed in a worker says nothing about
+# the process that makes the offer. `role_here()` names the halves THIS process has
+# classes for, so every verdict this module prints is a verdict about a role.
+ROLE_SCHEDULER = "scheduler"
+ROLE_WORKER = "worker"
+ROLE_BOTH = "scheduler+worker"
+ROLE_NONE = "none"
+
 OWNER_ATTR = "__kvtier_dev_diskrestore_owner__"
 OWNER_TAG = "kvtier-dev-plugin/disk-restore-1"
 ORIGINAL_ATTR = "__kvtier_dev_diskrestore_original__"
@@ -240,6 +249,63 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "no_channel", "path_build_failed", "index_refresh_failed",
                   "too_many_loads", "ram_hit_not_block_aligned",
                   "no_worker_proof")
+
+# EVERY REFUSAL SPELLED OUT. `refused` says WHICH counter moved; this says what the
+# counter MEANS, so "why is there no restore?" is answerable from one payload read
+# instead of from the source. A name with no entry here is a bug in this table, and
+# `scheduler_section()` publishes the gap as `<name>: "undefined reason"` rather
+# than hiding it.
+OFFER_REFUSAL_WHY = {
+    "not_configured": "no store to read: VLLM_E2_TIER_DISK_ROOT is unset in this "
+                      "process, so there is no directory a file could come from",
+    "disarmed": "the spill tier is disarmed (its arm file is absent or expired), "
+                "and restore is deliberately not separately armable",
+    "tier_disarmed": "the KV tier itself is disarmed, so no lookup reaches the "
+                     "connector at all",
+    "bad_call": "the scheduler handed this wrapper something unusable (a request "
+                "id, a computed-token count or a result shape it cannot read)",
+    "bad_result": "the fork's own get_num_new_matched_tokens() returned a shape "
+                  "this module cannot extend",
+    "unaligned_local_prefix": "the local prefix does not end on a boundary every "
+                              "group can address, so a disk span could not be "
+                              "appended to it",
+    "skip_read_requested": "the request opted out of external reads (the fork's "
+                           "own skip_read flag)",
+    "no_tokens_left": "the whole prompt is already computed, so nothing is left "
+                      "to serve from disk",
+    "no_block_hashes": "the request carries no block hashes to name a file with",
+    "no_key_helpers": "vllm.v1.core.kv_cache_utils is not importable here, so the "
+                      "engine's own key-packing/view functions cannot be called "
+                      "(this module refuses to re-implement them)",
+    "no_eligible_group": "no prefix-cacheable, positionally-stable group has "
+                         "block_size == the scheduler block size, so a merged "
+                         "tuple cannot be extended one whole block at a time",
+    "ram_shape": "the host-RAM hit's per-group block lists do not add up to its "
+                 "own token count, so the merged tuple could not be trusted",
+    "no_disk_run": "the index holds no contiguous span at the next block for every "
+                   "eligible group (the usual answer for a prefix that was never "
+                   "spilled, or that a restart dropped from the index)",
+    "disk_run_below_one_block": "the disk run is shorter than one scheduler block, "
+                                "so offering it would park the request for a load "
+                                "the scheduler discards",
+    "no_cpu_slots": "the CPU pool cannot spare a whole span's slots above the "
+                    "reserve, so a destination does not exist",
+    "alloc_refused": "the CPU pool refused the allocation outright",
+    "no_channel": "no diagnostics directory, so no identity could be handed to a "
+                  "worker",
+    "path_build_failed": "the file name for an identity was rejected by the layout "
+                         "rules",
+    "index_refresh_failed": "the scheduler-side index could not be refreshed from "
+                            "the journals, so a stale view was refused instead of "
+                            "read",
+    "too_many_loads": "the tracked disk-load cap is already reached",
+    "ram_hit_not_block_aligned": "the host-RAM hit is not a whole number of "
+                                 "scheduler blocks, so appending disk blocks would "
+                                 "break the fork's own alignment assert",
+    "no_worker_proof": "no fresh rank file attests a fitted worker half, so the "
+                       "CPU slots an offer allocates might never be filled - the "
+                       "one refusal that exists to prevent serving stale KV",
+}
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
                    "read_failed", "file_missing", "size_mismatch", "short_read",
@@ -249,12 +315,18 @@ WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "deadline_expired", "thread_dead", "not_tracked", "abandoned")
 
 _state: dict = {
-    # install / posture
+    # install / posture. `installed` is THIS PROCESS's verdict about the halves it
+    # could reach; `sched_fitted` is the one that answers "can this process make an
+    # offer?" and `methods_fitted` names what is actually wrapped here.
     "installed": False, "class": None, "installs": 0, "reinstalls": 0,
     "uninstalls": 0, "skip_reason": None, "nested": [], "errors": 0,
     "fallbacks": 0, "boot_line": None,
+    "sched_fitted": False, "worker_fitted": False, "methods_fitted": [],
+    "install_refusals": 0, "install_deferrals": 0, "missing_methods": [],
+    "install_refusal_line": None,
     # scheduler-side ledger
-    "lookups": 0, "offers": 0, "offered_tokens": 0, "adopted": 0,
+    "lookups": 0, "offers": 0, "offered_tokens": 0, "blocks_offered": 0,
+    "adopted": 0,
     "adopted_tokens": 0, "restorations": 0, "refused": {r: 0
                                                         for r in OFFER_REFUSALS},
     "refusals_total": 0, "last_refusal": None, "last_reason": None,
@@ -291,20 +363,27 @@ _witness_state: dict = {"line": None, "emitted_mono": None}
 def reset_state_for_tests() -> None:
     """Back to a fresh boot: no ledgers, no counters, no installed layer."""
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
+    global _install_refusal_lines, _sched_cls_seen
     _loads = {}
     _slot_paths = {}
     _wloads = {}
     _wbatches = {}
     _invalid = {}
     _logged_lines = []
+    _install_refusal_lines = []
+    _sched_cls_seen = None
     _witness_state.update({"line": None, "emitted_mono": None})
     _proof_cache.update({"mono": None, "result": None})
     _deferred_finished.clear()
     for key, value in {
             "installed": False, "class": None, "installs": 0, "reinstalls": 0,
             "uninstalls": 0, "skip_reason": None, "nested": [], "errors": 0,
-            "fallbacks": 0, "boot_line": None, "lookups": 0, "offers": 0,
-            "offered_tokens": 0, "adopted": 0, "adopted_tokens": 0,
+            "fallbacks": 0, "boot_line": None, "sched_fitted": False,
+            "worker_fitted": False, "methods_fitted": [], "install_refusals": 0,
+            "install_deferrals": 0, "missing_methods": [],
+            "install_refusal_line": None,
+            "lookups": 0, "offers": 0, "offered_tokens": 0,
+            "blocks_offered": 0, "adopted": 0, "adopted_tokens": 0,
             "restorations": 0, "refusals_total": 0, "last_refusal": None,
             "last_reason": None, "paths_emitted_steps": 0, "path_entries": 0,
             "path_entries_empty": 0, "path_length_violations": 0,
@@ -332,6 +411,9 @@ def counters() -> dict:
     out["tracked_slots"] = len(_slot_paths)
     out["tracked_worker_loads"] = len(_wloads)
     out["pending_invalid_blocks"] = len(_invalid)
+    out["methods_fitted"] = list(_state["methods_fitted"])
+    out["missing_methods"] = list(_state["missing_methods"])
+    out["role_here"] = role_here()
     return counters_view(out)
 
 
@@ -341,6 +423,14 @@ def counters_view(out: dict) -> dict:
         "offers": "requests a disk offer was made for",
         "offered_tokens": "tokens offered beyond the host-RAM hit",
         "installs": "times the restore layer was fitted in this process",
+        "install_refusals": "install passes refused in this process because a "
+                            "class was there and a method was not (or was "
+                            "refused): each one has a line in the log",
+        "install_deferrals": "install attempts that found no tier class imported "
+                             "in this process yet: the EXPECTED state at plugin "
+                             "load, counted separately so a healthy boot never "
+                             "reports a refusal it did not have",
+        "blocks_offered": "scheduler blocks offered from disk",
         "errors": "internal exceptions caught and counted by this module",
         "fallbacks": "degradations to the fork's own behaviour, each with a reason",
         "reinstalls": "times install() found the layer already fitted",
@@ -377,6 +467,104 @@ def counters_view(out: dict) -> dict:
         "pending_invalid_blocks": "GPU block ids awaiting their report",
     }
     return out
+
+
+# --- which role is THIS process? ---------------------------------------------
+
+_sched_cls_seen = None
+"""The manager class this process was ASKED to fit, when the name missed.
+
+`_class_of` resolves by name out of `sys.modules`, which is right for the box - and
+it is the only reason a boot can say "no tier class is imported here" while holding
+the live manager object in its hand. The connector-creation boot has that object
+(`type(connector.scheduler_manager)`), so it hands it over and the fit does not
+depend on the module being reachable under the name this file expects. A fork that
+relocated the module must not be able to turn a fitted scheduler into an
+offer-less one by moving a file.
+"""
+
+
+def _sched_class(known=None):
+    """The scheduler class THIS process can fit: by name, else the one in hand."""
+    cls = _class_of(SCHED_MODULE, SCHED_CLASS)
+    if cls is None and known is not None \
+            and getattr(known, "__name__", None) == SCHED_CLASS:
+        cls = known if isinstance(known, type) else None
+    elif cls is None and _sched_cls_seen is not None \
+            and getattr(_sched_cls_seen, "__name__", None) == SCHED_CLASS:
+        cls = _sched_cls_seen
+    return cls
+
+
+def role_here() -> str:
+    """Which halves of the tier this process has classes for. Never raises.
+
+    `scheduler` is the EngineCore: the process the fork calls
+    `get_num_new_matched_tokens` on, and therefore the ONLY process in which a
+    restore can begin. `worker` is a rank: it can move bytes but can never make an
+    offer. A worker printing `installed=YES` proves nothing about the scheduler -
+    which is exactly the reading this field exists to make impossible.
+    """
+    try:
+        sched = _sched_class() is not None
+        worker = _class_of(WORKER_MODULE, WORKER_CLASS) is not None
+    except Exception as exc:  # noqa: BLE001 - a role read never breaks a step
+        snapshot._error(exc, "disk_restore role_here")
+        return ROLE_NONE
+    if sched and worker:
+        return ROLE_BOTH
+    if sched:
+        return ROLE_SCHEDULER
+    if worker:
+        return ROLE_WORKER
+    return ROLE_NONE
+
+
+def sched_fitted_here() -> bool:
+    """Is the OFFER-MAKING half wrapped in THIS process, right now?
+
+    Checked against the class, not against `_state`, because the state can be older
+    than the class: `backport._rewrap` can rebuild a method from a new base and
+    leave our layer off it. `installed=YES` in a rank file and `false` here is the
+    exact signature of tonight's failure, and this is the field that shows it.
+    """
+    try:
+        cls = _sched_class()
+        if cls is None:
+            return False
+        return all(_layer_is_ours(cls.__dict__.get(name))
+                   or _restore_layer_beneath(cls.__dict__.get(name))
+                   for name in SCHED_METHODS)
+    except Exception as exc:  # noqa: BLE001 - a verdict of False is a refusal
+        snapshot._error(exc, "disk_restore sched_fitted_here")
+        return False
+
+
+def _restore_layer_beneath(method) -> bool:
+    """True when our layer sits under a guard/switch wrapper on the same name."""
+    if method is None:
+        return False
+    try:
+        from . import backport  # noqa: PLC0415 - the layer vocabulary lives there
+        layers, _bottom = backport._layers_of(method)
+    except Exception as exc:  # noqa: BLE001 - an unreadable chain is "not fitted"
+        snapshot._error(exc, "disk_restore layer walk")
+        return False
+    return any(kind == LAYER_KIND for kind, _ in layers)
+
+
+def fitted_methods_here() -> list:
+    """The scheduler methods our layer is actually on in this process, in order."""
+    try:
+        cls = _sched_class()
+        if cls is None:
+            return []
+        return [name for name in SCHED_METHODS
+                if _layer_is_ours(cls.__dict__.get(name))
+                or _restore_layer_beneath(cls.__dict__.get(name))]
+    except Exception as exc:  # noqa: BLE001 - a name list is never a step fault
+        snapshot._error(exc, "disk_restore fitted_methods_here")
+        return []
 
 
 # --- small helpers ------------------------------------------------------------
@@ -675,9 +863,11 @@ def _group_positionally_stable(manager, group: int) -> bool:
     """Can this group's blocks be addressed by a POSITIONAL hash at all?
 
     The fork gates its own spill path on exactly this flag
-    (`manager.py:872-873`: `single_type_managers[g].has_positionally_stable_blocks`
-    -> `continue`), and the reason carries over untouched: a spilled file is named
-    after a hash derived from the request's tokens at a fixed position, so a group
+    (`manager.py:874-876` on the deployed in-tree-fixed build, `manager.py:835-836`
+    at the fork HEAD 10b8e07 this suite's fixture is generated from:
+    `single_type_managers[g].has_positionally_stable_blocks` -> `continue`), and
+    the reason carries over untouched: a spilled file is named after a hash derived
+    from the request's tokens at a fixed position, so a group
     whose block content is not a function of position (a sliding window that
     rewrites its own blocks, for instance) has no stable name to restore from.
     Reading such a group back would paste bytes computed for different positions
@@ -955,6 +1145,7 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     _register_load(request_id, merged, disk_tokens)
     _state["offers"] += 1
     _state["offered_tokens"] += disk_tokens
+    _state["blocks_offered"] += blocks
     _state["slots_allocated"] += needed
     _note(f"offered {disk_tokens} disk tokens for {request_id[:48]} in {blocks} "
           f"span(s) across {per_block} group(s)")
@@ -2227,18 +2418,27 @@ def emit_witness(force: bool = False) -> dict:
 # --- the boot line and the rank file ------------------------------------------
 
 def boot_line() -> str:
-    r"""`DISK[restore] installed=... armed=... ...`, once per distinct verdict.
+    r"""`DISK[restore] installed=... role=... methods=... armed=... ...`.
 
     The pair to `DISK[spill]`: that line says whether bytes could be WRITTEN, this
     one whether they could be READ BACK. Same posture, same reason - the refusal
     paths are the ones an operator needs, and a plugin that only logs success is a
     plugin whose failure looks exactly like idleness.
+
+    `role=` and `methods=` are what make the line readable across a distributed
+    boot. Four ranks and one scheduler each print one of these, and a bare
+    `installed=YES` from a rank used to be indistinguishable from the same verdict
+    from the scheduler - while only the scheduler's half can produce an offer. The
+    label set is unique by construction, and the fields name the CLASS and the
+    METHODS wrapped in the process that printed the line.
     """
     try:
         opened = gate()
         parts = ["DISK[restore]"]
         parts.append("installed={}".format("YES" if _state["installed"] else "NO"))
         parts.append("class={}".format(_state["class"] or "none"))
+        parts.append("role={}".format(role_here()))
+        parts.append("methods={}".format(_methods_field(fitted_methods_here())))
         parts.append("armed={}".format("YES" if opened["ok"] else "NO"))
         parts.append("root={}".format(_clip(disk_spill.disk_root(), 60) or "-"))
         parts.append("index={}".format(int(disk_index.counters()["entries"])))
@@ -2266,6 +2466,23 @@ def boot_line() -> str:
         line = (f"DISK[restore] installed={'YES' if _state['installed'] else 'NO'} "
                 f"unreadable={type(exc).__name__}")
     return line[:MAX_BOOT_LINE_CHARS * 4]
+
+
+def _methods_field(names: list, cap: int = 62) -> str:
+    """`a+b+Nmore`, never a name cut in half. A truncated label misreads as a fact."""
+    text = "+".join(names)
+    if not names:
+        return "none"
+    if len(text) <= cap:
+        return text
+    kept: list = []
+    used = 0
+    for name in names:
+        if used + len(name) + 1 > cap - 8:
+            break
+        kept.append(name)
+        used += len(name) + 1
+    return "+".join(kept) + f"+{len(names) - len(kept)}more"
 
 
 def emit_boot_line() -> dict:
@@ -2543,7 +2760,16 @@ def _install_sched_method(cls, name: str):
 
 
 def _install_pass(cls, names, installer, report) -> bool:
-    """Run one install pass. True to continue, False when a refusal is fatal."""
+    """Run one install pass. True to continue, False when a refusal is fatal.
+
+    A refusal is COUNTED AND LOGGED, not merely returned. This closes the failure
+    mode that hid a bug for hours earlier in this project: an install that finds no
+    method to wrap returns cleanly, a boot with nothing wrapped looks exactly like a
+    boot with nothing to restore, and the only evidence that the fork renamed a
+    method is a string in a dict nobody reads. `install_refusals` is the counter and
+    `DISK[restore-install]` is the line; the suite asserts both, so a refusal cannot
+    go silent in either direction.
+    """
     global _reused_this_install
     for name in names:
         refusal = installer(cls, name)
@@ -2553,14 +2779,47 @@ def _install_pass(cls, names, installer, report) -> bool:
         if refusal:
             report["reason"] = refusal
             _state["skip_reason"] = refusal
+            _state["install_refusals"] += 1
+            missing = f"{cls.__name__}.{name}"
+            if missing not in _state["missing_methods"]:
+                _state["missing_methods"].append(missing)
+            emit_install_refusal(f"{cls.__name__}: {refusal}")
             return False
     return True
 
 
 _reused_this_install = False
 
+_install_refusal_lines: list = []
 
-def install() -> dict:
+
+def emit_install_refusal(reason: str) -> dict:
+    """ONE WARNING per distinct install-refusal reason, per process.
+
+    Distinct from `emit_boot_line()`: the boot line reports the POSTURE (armed or
+    not, with the gate's reason) and can therefore read normally while nothing is
+    wrapped; an install refusal cannot be carried by the posture at all. A fork
+    rename, a half-imported process, a wrapper we refuse to stack on: each prints
+    exactly once, at the level the engine's log carries.
+    """
+    try:
+        line = (f"DISK[restore-install] installed=NO role={role_here()} "
+                f"reason={_clip(reason, MAX_BOOT_LINE_CHARS)}")
+        _state["install_refusal_line"] = line
+        if line in _install_refusal_lines:
+            return {"logged": False, "reason": "this refusal is already logged",
+                    "line": line}
+        _install_refusal_lines.append(line)
+        del _install_refusal_lines[:-4]
+        _logger.warning("kvtier-dev-plugin: %s", line)
+        return {"logged": True, "reason": None, "line": line}
+    except Exception as exc:  # noqa: BLE001 - a log line never breaks an install
+        snapshot._error(exc, "disk_restore install refusal line")
+        return {"logged": False, "reason": f"logging raised {type(exc).__name__}",
+                "line": None}
+
+
+def install(refit: bool = False, sched_cls=None) -> dict:
     """Fit the restore layer onto whichever halves of the tier this process has.
 
     Idempotent, never raises, and announces its verdict in a `finally` - the same
@@ -2574,8 +2833,32 @@ def install() -> dict:
     both here would mean the layer could never fit anywhere. The cross-process risk
     that tolerance opens - a scheduler offering slots no worker will fill - is closed
     by `gate()` requiring `worker_proof()`, not by this function.
+
+    IT IS CALLED WHEN THE CLASSES EXIST, NOT WHEN THE PLUGIN LOADS. `register()`
+    calls it once, and in the EngineCore that is BEFORE the connector imports the
+    manager (`cpu_capacity`'s docstring measures exactly that ordering), so the
+    plugin-load call is a no-op there by construction. The retry that matters is
+    driven by the process that can see the class it needs: the worker half by the
+    handshake hook (`engine_side._on_worker_report`, which fires inside the
+    WORKER-side `get_handshake_metadata` and therefore only in a worker), and the
+    SCHEDULER half by `adopt_if_missed()` from the connector-creation boot
+    (`backport.boot_from_connector`) and from the snapshot verb. Wiring the scheduler
+    half to the worker's hook is the bug that made four ranks print `installed=YES`
+    while the one process that could make an offer printed nothing: a worker fitting
+    the SCHEDULER class is a wrapper no interpreter will ever call.
+    `refit=True` re-runs the passes even when this process already believes it is
+    fitted: `backport._rewrap()` rebuilds a method from a new base and can leave our
+    layer off it, and a belief that survives the layer being gone is exactly how a
+    half-wrapped class reads as healthy. Our own layers answer `_REUSED`, so a refit
+    cannot double-stack - it can only fill a hole.
+
+    `sched_cls` is the manager class a caller is HOLDING (the connector-creation
+    boot has it). It is accepted only under the name this module wraps, and it is
+    remembered, so a process whose manager arrived as an object rather than as a
+    `sys.modules` entry can still be asked, afterwards, whether it can offer.
     """
-    if _state["installed"]:
+    global _sched_cls_seen
+    if _state["installed"] and not refit:
         return {"installed": True, "reason": "already installed",
                 "class": _state["class"]}
     report = {"installed": False, "reason": None, "class": None}
@@ -2583,7 +2866,7 @@ def install() -> dict:
     _reused_this_install = False
     worker_refusal = None
     try:
-        sched_cls = _class_of(SCHED_MODULE, SCHED_CLASS)
+        sched_cls = _sched_class(sched_cls)
         worker_cls = _class_of(WORKER_MODULE, WORKER_CLASS)
         if sched_cls is None and worker_cls is None:
             report["reason"] = (
@@ -2591,6 +2874,15 @@ def install() -> dict:
                 f"{WORKER_MODULE}.{WORKER_CLASS} is imported in this process: "
                 "there is nothing to hook here")
             _state["skip_reason"] = report["reason"]
+            # Counted and logged like any other refusal - but as a DEFERRAL, not a
+            # refusal. "Nothing imported" is the EXPECTED answer at plugin load in
+            # every process (`register()` runs before the connector imports its
+            # modules), and a healthy boot must not read as one that was refused.
+            # What it must never be is the last thing said about an install that
+            # never came back: the line prints once, and `install_deferrals` says
+            # how many times this process asked and found nothing.
+            _state["install_deferrals"] += 1
+            emit_install_refusal(report["reason"])
             return report
         halves = []
         if sched_cls is not None:
@@ -2627,6 +2919,17 @@ def install() -> dict:
             _state["installs"] += 1
         _state["installed"] = True
         _state["class"] = "+".join(halves)
+        # WHICH HALF, IN THIS PROCESS. `installed` alone was the reading that let a
+        # worker's `YES` stand in for the scheduler's: record the halves and the
+        # method names, and every line and payload this module prints can say which
+        # of the two it is talking about.
+        _state["sched_fitted"] = sched_cls is not None
+        _state["worker_fitted"] = worker_cls is not None and not worker_refusal
+        _state["methods_fitted"] = fitted_methods_here()
+        if sched_cls is not None:
+            # Remembered so `sched_fitted_here()` can answer for a class that is not
+            # reachable by name (see `_sched_cls_seen`).
+            _sched_cls_seen = sched_cls
         # A REFUSED HALF MUST STAY VISIBLE. `skip_reason` is what `boot_line()`
         # prints when the gate is open, so clearing it here used to erase the only
         # record that the worker half was refused - and "the worker half was
@@ -2709,8 +3012,46 @@ def ensure_installed(connector=None) -> dict:  # noqa: ARG001 - the handshake's 
     module resolves its classes BY NAME from the already-imported modules rather
     than reaching into an instance, so the argument is genuinely unused - the same
     honest signature `disk_store.ensure_installed` has.
+
+    THIS IS THE WORKER'S ENTRY POINT. It is reached only from the worker-side
+    handshake producer (`cpu_capacity._call_worker_report_hook`), so a scheduler
+    that depends on this call alone never installs - see `adopt_if_missed()` for the
+    scheduler-side door and the reason it exists.
     """
     return install()
+
+
+def adopt_if_missed(manager_cls=None) -> dict:
+    """THE SCHEDULER-SIDE ENTRY POINT: fit the layer if this process can and has not.
+
+    Called from the connector-creation boot (`backport.boot_from_connector`) and
+    from the snapshot verb, because those run in the process the fork calls
+    `get_num_new_matched_tokens` on, and they run AFTER the connector has imported
+    the manager - which is the first moment the scheduler class exists at all. The
+    cheap exit is a marker check: `install()` returns at once when the layer is on,
+    and when the manager is not imported here it is two `sys.modules` lookups, so
+    this is safe on a path a dashboard polls every few seconds.
+
+    It never arms anything: the gate is `gate()`, and a fitted-but-disarmed layer is
+    the normal, cost-free state of a fresh boot.
+
+    `manager_cls` is the manager class the caller is holding, when it has one: the
+    connector-creation boot passes `type(connector.scheduler_manager)` so the fit
+    does not hinge on the fork's module being importable under the name this file
+    expects. The snapshot verb passes nothing and gets the name-based lookup.
+    """
+    if _state["installed"] and sched_fitted_here():
+        return {"installed": True, "reason": "already installed", "adopted": False,
+                "class": _state["class"]}
+    if _sched_class(manager_cls) is None \
+            and _class_of(WORKER_MODULE, WORKER_CLASS) is None:
+        return {"installed": bool(_state["installed"]), "adopted": False,
+                "class": _state["class"],
+                "reason": "no tier class is imported in this process yet, so there "
+                          "is nothing here to fit"}
+    report = install(refit=True, sched_cls=manager_cls)
+    report["adopted"] = not _reused_this_install
+    return report
 
 
 def _uninstall_worker_half() -> None:
@@ -2772,6 +3113,9 @@ def uninstall() -> dict:
                 report["restored"].append(f"connector.{METHOD_LOAD_ERRORS}")
         _state["uninstalls"] += 1
         _state["installed"] = False
+        _state["sched_fitted"] = sched_fitted_here()
+        _state["worker_fitted"] = False
+        _state["methods_fitted"] = fitted_methods_here()
         report["uninstalled"] = bool(report["restored"])
         if not report["uninstalled"] and not report["reason"]:
             report["reason"] = "no layer of ours was installed on any class"
@@ -2814,3 +3158,156 @@ def section() -> dict:
                     "received. Inert until a root is set AND the spill tier's arm "
                     "AND the tier's arm are raised.")
     return view
+
+
+def scheduler_section() -> dict:
+    """THE one-call answer to "why is there no restore?", from THIS process.
+
+    WHY THIS EXISTS. The restore path lives in two processes and only ONE of them -
+    the scheduler - can start a restore, yet everything this module published about
+    itself was readable as a single verdict. A boot in which four ranks fitted the
+    layer and the scheduler fitted nothing printed four `installed=YES` lines and no
+    answer, and the truth was only reachable by counting process names in a 200,000
+    line log. This section is the same facts split by role, in the payload a poller
+    already reads, with the chain walked for the reader: the layer, the gate, the
+    index, the worker proof, the offers - `why_no_restore` names the first link that
+    is missing, so one `GET /plugins/kvtier/snapshot` (or the `/disk` verb) settles
+    the question without a grep.
+
+    Reads no KV byte, walks no directory beyond the rank files `worker_proof()`
+    already reads through its cache, and never raises.
+    """
+    here = fitted_methods_here()
+    missing = [name for name in SCHED_METHODS if name not in here]
+    opened = gate()
+    proof = worker_proof()
+    index = disk_index.section()
+    counters = _state
+    offers = int(counters["offers"])
+    entries = int(index.get("entries") or 0)
+    # From the PROOF, not only from the counter: `worker_proof()` publishes the
+    # count it read and a caller that patched the door (a test, or a future cached
+    # verdict source) must still be reported honestly.
+    ranks = int(proof.get("count") or counters["ranks_proven"] or 0)
+    installed_here = bool(_state["sched_fitted"]) and not missing
+    last_refusal_line = (counters["install_refusal_line"]
+                         or counters["skip_reason"] or "none")
+    if not installed_here:
+        why = ("the scheduler half of the restore layer is not fitted in THIS "
+               f"process (wrapped here: {here or 'none'}; role here: "
+               f"{role_here()}). No offer is possible: "
+               f"{SCHED_METHODS[0]} is not ours here. Refusals this boot: "
+               f"{int(counters['install_refusals'])} "
+               f"(deferrals: {int(counters['install_deferrals'])}); last reason: "
+               f"{last_refusal_line}")
+    elif not opened["ok"]:
+        why = (f"the gate is closed: {opened['reason']}")
+    elif entries == 0:
+        why = ("the scheduler-side index holds no identities, so nothing is known "
+               f"to be on disk (journals tracked: "
+               f"{int(index.get('journals_tracked') or 0)}; "
+               f"{index.get('journal_directory')}). A fresh boot knows nothing "
+               "until its ranks have spilled.")
+    elif ranks == 0:
+        why = (f"no rank file proves a fitted worker half ({proof.get('reason')}): "
+               "offering disk tokens would DMA CPU slots nobody fills, so the "
+               "refusal is the design working")
+    elif offers == 0:
+        why = ("the layer is fitted, the gate is open, the index holds "
+               f"{entries} identities and {ranks} rank(s) are proven - but no "
+               "offer has been made. Read `refused`: the per-request refusals "
+               "(usually `no_disk_run`: the spilled spans do not continue the "
+               "prefix this request asked for)")
+    else:
+        why = (f"restore is live in this process: {offers} offer(s), "
+               f"{int(counters['offered_tokens'])} tokens, "
+               f"{int(counters['blocks_offered'])} scheduler blocks; "
+               f"{int(counters['restorations'])} load(s) reported disk bytes back. "
+               "An offer that is not adopted is a scheduler decision, not this "
+               "module's: see lookup_ledger.")
+    return {
+        # WHICH PROCESS ANSWERED. The single most important field on the page: a
+        # `true` here and a rank file's `installed: true` are different facts about
+        # different processes, and only this one can start a restore.
+        "layer_installed_here": installed_here,
+        "role": role_here(),
+        "class_here": _state["class"],
+        "sched_fitted": bool(_state["sched_fitted"]),
+        "worker_fitted_here": bool(_state["worker_fitted"]),
+        "methods_expected": list(SCHED_METHODS),
+        "methods_here": here,
+        "methods_missing": missing,
+        "install_refusals": int(counters["install_refusals"]),
+        "install_deferrals": int(counters["install_deferrals"]),
+        "install_refusal_line": counters["install_refusal_line"],
+        "missing_methods": list(counters["missing_methods"]),
+        "installs": int(counters["installs"]),
+        "reinstalls": int(counters["reinstalls"]),
+        "gate": {"ok": bool(opened["ok"]), "reason": opened.get("reason"),
+                 "reason_kind": opened.get("reason_kind")},
+        "offers": offers,
+        "tokens_offered": int(counters["offered_tokens"]),
+        "blocks_offered": int(counters["blocks_offered"]),
+        "slots_allocated": int(counters["slots_allocated"]),
+        "restorations": int(counters["restorations"]),
+        "adopted": int(counters["adopted"]),
+        "adopted_tokens": int(counters["adopted_tokens"]),
+        "refused": {name: int(counters["refused"].get(name) or 0)
+                    for name in OFFER_REFUSALS},
+        "refusal_reasons": {name: OFFER_REFUSAL_WHY.get(
+            name, "undefined reason: this refusal has no entry in "
+                   "OFFER_REFUSAL_WHY") for name in OFFER_REFUSALS},
+        "last_refusal": counters["last_refusal"],
+        "index": {"entries": entries,
+                  "source": index.get("journal_directory"),
+                  "bytes_indexed": int(index.get("bytes_indexed") or 0),
+                  "journals_tracked": int(index.get("journals_tracked") or 0),
+                  "refreshes": int(counters["index_refreshes"]),
+                  "refresh_errors": int(counters["index_refresh_errors"]),
+                  "last_reason": index.get("last_reason")},
+        "ranks_proven": ranks,
+        "digests_expected": ranks,
+        "ranks": list(proof.get("ranks") or []),
+        "proof_reads": int(counters["proof_reads"]),
+        "proof_reason": proof.get("reason"),
+        "deadline_seconds": RESTORE_DEADLINE_SECONDS,
+        "boot_line": _state["boot_line"],
+        "why_no_restore": why,
+        "units": {
+            "install_refusals": "install passes refused here because a method was "
+                                "missing or refused",
+            "install_deferrals": "attempts that found no tier class imported yet "
+                                 "(expected at plugin load, not a refusal)",
+            "installs": "times the layer was fitted in this process",
+            "reinstalls": "times a pass found our layer already on the method",
+            "offers": "requests this process offered a disk span to",
+            "tokens_offered": "tokens offered beyond the host-RAM hit",
+            "blocks_offered": "scheduler blocks offered from disk",
+            "slots_allocated": "CPU slots allocated as disk destinations",
+            "restorations": "loads that reported disk bytes back",
+            "adopted": "requests whose disk slots reached a worker",
+            "adopted_tokens": "tokens the scheduler adopted from disk",
+            "refused": "refusals, one counter per reason",
+            "last_refusal": "refusals",
+            "index.entries": "identities known to be on disk",
+            "index.bytes_indexed": "bytes",
+            "index.journals_tracked": "journal files",
+            "index.refreshes": "journal replays",
+            "index.refresh_errors": "raised replays",
+            "ranks_proven": "rank files attesting a fitted worker half",
+            "digests_expected": "distinct geometry digests a restore must satisfy "
+                                "(one per proven rank: the WORKER names the file "
+                                "with its own digest, so four ranks are four names "
+                                "per identity, not one)",
+            "proof_reads": "rank files read for that proof",
+            "deadline_seconds": "SECONDS an unreported load may live before the "
+                                "watchdog reports it as a failure",
+            "methods_here": "scheduler methods our layer is on in this process",
+            "methods_expected": "scheduler methods it must be on to offer at all",
+        },
+        "note": ("THE SCHEDULER'S OWN ANSWER: the scheduler half, the gate, the "
+                 "index and the worker proof, walked in that order, with "
+                 "`why_no_restore` naming the first link that is missing. A rank "
+                 "file's `disk_restore.installed` is a DIFFERENT process's verdict "
+                 "and cannot start a restore; this one can."),
+    }

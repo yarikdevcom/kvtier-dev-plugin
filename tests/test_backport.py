@@ -1420,6 +1420,11 @@ def _six_group_class(drift=None):
         cls, _ns = FX.build_fork_class(selector_namespace())
     standins = {
         "get_num_new_matched_tokens": lambda self, r, n: (4096, True),
+        # The fork DOES define this one (`manager.py:951` at HEAD 10b8e07), and
+        # `disk_restore` wraps it: a stand-in class that omits a method the fork
+        # really has makes every sibling install that enumerates the fork's real
+        # names REFUSE the whole half - a fixture gap that reads as a fork rename.
+        "update_connector_output": lambda self, connector_output: None,
         "has_pending_stores": lambda self: bool(self._pending_finished_stores),
         "_find_fa_partial_tail_source": lambda self, request, block_ids: None,
         "prepare_store_specs": _prepare_store_specs,

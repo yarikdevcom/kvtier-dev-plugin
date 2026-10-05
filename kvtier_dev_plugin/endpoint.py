@@ -715,25 +715,38 @@ def status_payload(dev_state: dict | None = None) -> dict:
             "ops": ["status", "arm", "disarm", "spill-one", "ls"],
             "root_env": config.ENV_DISK_ROOT,
             "ceiling_env": config.ENV_DISK_BYTES,
-            "note": ("the write side of the SSD spill tier: KV slots evicted from "
-                     "the host-RAM tier are spilled to one file each on the "
+            "note": ("the SSD spill tier, both halves. WRITE: KV slots evicted "
+                     "from the host-RAM tier are spilled to one file each on the "
                      "engine's own disk, named "
-                     "kvslot-<key16>-<geodigest12>.bin by the SCHEDULER's "
-                     "fingerprint digest (never re-derived worker-side). OFF twice "
-                     f"over: {config.ENV_DISK_ROOT} must name a real filesystem "
+                     "kvslot-<key16>-g<group>-<geodigest12>.bin. The group id is "
+                     "PART OF THE NAME, because two KV-cache groups can hash the "
+                     "same token chain: the older 2-field shape "
+                     "kvslot-<key16>-<geodigest12>.bin gave them ONE file for two "
+                     "different payloads and is now refused as malformed. The "
+                     "digest half is the RANK'S OWN: every worker rebuilds the name "
+                     "with its own measured slot width and rank id (the scheduler "
+                     "sends a 12-zero placeholder for that field and the worker "
+                     "replaces it), because one scheduler cannot broadcast one "
+                     "digest that is four ranks' digests - the per-rank "
+                     "re-derivation is the safety keystone, not an oversight. "
+                     "OFF twice over: "
+                     f"{config.ENV_DISK_ROOT} must name a real filesystem "
                      "(tmpfs roots are refused) AND the tier must be armed; no env "
                      "var arms it and an arm expires. `spill-one` is relayed to "
                      "the workers through VLLM_E2_TIER_DIAG because a worker has "
                      "no utility channel, and the write runs on the spill thread. "
-                     "There is deliberately no restore path yet. Read "
+                     "READ BACK: a restore path HAS existed since 0.2.14, and every "
+                     "answer from this verb carries it under `restore` - the "
+                     "SCHEDULER's own verdict (layer fitted here, gate, index "
+                     "entries, worker proof, offers per refusal reason) with "
+                     "`restore.why_no_restore` naming the first missing link. It "
+                     "EXTENDS the fork's host-RAM load with spans read off this "
+                     "store, needs the spill arm AND the tier arm, and refuses "
+                     "without a rank file proving the worker half. Read "
                      "`engine_fields` from the engine to know whether this boot's "
                      "metadata carries store_keys: without it the worker refuses "
-                     "and counts `no_key_for_slot` and writes zero bytes. A file "
-                     "name comes from the fingerprint the WORKER builds for itself "
-                     "(its own measured slot width and rank id), because one "
-                     "scheduler cannot broadcast one digest that is four ranks' "
-                     "digests; `fingerprint` on `spill-one` is an optional "
-                     "cross-check, and a GET will not run a mutating op."),
+                     "and counts `no_key_for_slot` and writes zero bytes; a GET "
+                     "will not run a mutating op."),
         },
         "tier": {
             "route": config.ROUTE_PREFIX + config.ROUTE_TIER,
@@ -1172,15 +1185,23 @@ async def route_disk(request: Request):
 
 @router.post(config.ROUTE_DISK)
 async def route_disk_post(request: Request):
-    """THE SSD SPILL TIER - write side only, arm-gated, off by default.
+    """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
     `{op: status|arm|disarm|spill-one|ls, slot?, key?, fingerprint?, seconds?,
     limit?}`. KV slots evicted from the RAM tier are spilled to
-    `<root>/<shard>/kvslot-<key16>-<geodigest12>.bin` on the engine's own disk, so
-    the RAM tier can shrink. There is no restore path yet, by design: a hit is
-    resolved in the scheduler's `cached_block_hash_to_block` and only
-    scheduler-side store-completion publishes into it, so a file is a verifiable,
-    disposable copy and nothing more.
+    `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin` on the engine's own
+    disk, so the RAM tier can shrink - the group id is part of the identity, since
+    two groups can hash the same token chain, and the digest half is rebuilt by
+    each WORKER from its own slot width and rank id.
+
+    THERE IS A RESTORE PATH (`disk_restore`, since 0.2.14): on a host-RAM shortfall
+    the SCHEDULER offers the SSD's continuation as external tokens, extends the
+    fork's own load tuple with the CPU slots it allocated, and the worker reads the
+    file back into them. It never publishes into `cached_block_hash_to_block`, which
+    is why a restored block helps only the request that paid for it. Every answer
+    from this verb carries the scheduler's own verdict under `restore`, and
+    `restore.why_no_restore` names the first link that is missing (layer not fitted
+    here / gate closed / index empty / no worker proof / no offer made).
 
       * TOKEN-GATED like `/guard` and `/blockdump`: this route can arm a facility
         that writes KV bytes to disk, so it is a dev-state route in every shape.

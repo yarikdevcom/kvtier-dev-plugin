@@ -998,6 +998,7 @@ def dev_state_sections() -> dict:
     """
     from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
         blockdump,
+        disk_restore,
         disk_spill,
         disk_store,
         guard_mode,
@@ -1077,6 +1078,22 @@ def dev_state_sections() -> dict:
         _error(exc, "disk store section")
         out["disk_store"] = {"error": f"{type(exc).__name__}"[:200]}
         out["disk_store_installed"] = None
+    try:
+        # THE RESTORE PATH'S SCHEDULER HALF, in the payload a poller already reads.
+        # The rank files answer "did a WORKER fit its half" and nothing else, so a
+        # boot whose scheduler fitted nothing looked healthy from every angle this
+        # payload offered - four ranks said YES and the one process that can start a
+        # restore said nothing. `disk_restore.scheduler_section()` is that process
+        # talking about itself: layer, gate, index, worker proof, offers per reason,
+        # and `why_no_restore` naming the first missing link. Reads no KV byte; the
+        # rank-file reads it may do ride `worker_proof`'s one-second cache.
+        out["disk_restore"] = disk_restore.scheduler_section()
+        out["disk_restore_installed"] = bool(
+            out["disk_restore"]["layer_installed_here"])
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk restore section")
+        out["disk_restore"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["disk_restore_installed"] = None
     return out
 
 

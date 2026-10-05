@@ -1867,6 +1867,18 @@ def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG
     response["engine_fields"] = engine_fields()
     if "armed" not in response:
         response["armed"] = disk_spill.is_armed()
+    # THE RESTORE SIDE OF THE SAME STORE, from THIS process. `/disk` is where an
+    # operator comes to ask about the SSD tier, and before this the verb described
+    # the write side only - so "it spilled 400 files and restored none" had no
+    # answer here either. `scheduler_section()` is the SCHEDULER talking about its
+    # own layer (the half that makes the offer), with `why_no_restore` naming the
+    # first missing link. Contained: a restore verdict never breaks the spill verb.
+    try:
+        from . import disk_restore  # noqa: PLC0415 - it imports this module
+        response.setdefault("restore", disk_restore.scheduler_section())
+    except Exception as exc:  # noqa: BLE001 - a missing section is data
+        snapshot._error(exc, "disk_store restore section")
+        response.setdefault("restore", {"error": f"{type(exc).__name__}"[:200]})
     # Trim LAST, after the fields this wrapper adds. A budget enforced before the
     # shared fields were appended would be a guarantee the caller never receives:
     # `engine_fields` alone is a few hundred bytes, so an op that obediently trimmed

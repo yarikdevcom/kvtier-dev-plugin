@@ -1873,6 +1873,54 @@ def _boot_guard(cls) -> dict:
         return out
 
 
+def _boot_restore(cls) -> dict:
+    """Fit the SCHEDULER half of the SSD restore path, and report what is on.
+
+    A dev-path convenience with the same safety posture as everything else in this
+    boot: `disk_restore.adopt_if_missed(cls)` installs nothing unless there IS a
+    scheduler class to fit (the one resolved by name, or the one this boot is
+    holding), arms nothing (the restore gate is the spill tier's arm plus the
+    tier's arm, read at offer time), and cannot raise.
+
+    The report answers the boot-time question - "can this process restore from the
+    SSD tier, and if not, which link is missing?" - in the same shape on every
+    path, because `pr56810.boot.restore` is what an operator reads without a grep.
+    """
+    from . import disk_restore  # noqa: PLC0415 - sibling layer, lazy by idiom
+    out = {"fitted": False, "class": None,
+           "manager_class": getattr(cls, "__name__", None),
+           "methods": [],
+           "methods_expected": list(disk_restore.SCHED_METHODS),
+           "gate": "unknown", "gate_reason": None, "ranks_proven": 0,
+           "index_entries": 0, "install_refusals": 0, "install_deferrals": 0,
+           "reason": None, "role": None}
+    try:
+        out["role"] = disk_restore.role_here()
+        report = disk_restore.adopt_if_missed(cls)
+        view = disk_restore.scheduler_section()
+        out["fitted"] = bool(view["layer_installed_here"])
+        out["class"] = view["class_here"]
+        out["methods"] = list(view["methods_here"])
+        out["gate"] = "open" if view["gate"]["ok"] else "closed"
+        out["gate_reason"] = view["gate"]["reason"]
+        out["ranks_proven"] = int(view["ranks_proven"])
+        out["index_entries"] = int(view["index"]["entries"])
+        out["install_refusals"] = int(view["install_refusals"])
+        out["install_deferrals"] = int(view["install_deferrals"])
+        if not out["fitted"]:
+            detail = (view["install_refusal_line"] or report.get("reason")
+                      or view["gate"]["reason"] or "no reason recorded")
+            out["reason"] = (
+                f"the scheduler half is not fitted here (role={out['role']}, "
+                f"wrapped={view['methods_here'] or 'none'}): {detail}"
+            )[:MAX_BOOT_ITEM_CHARS]
+        return out
+    except Exception as exc:  # noqa: BLE001 - a restore verdict never breaks a boot
+        snapshot._error(exc, "backport boot restore")
+        out["reason"] = f"the restore fit raised {type(exc).__name__}"[:200]
+        return out
+
+
 def boot_from_connector(cls, install_report, manager) -> dict:
     """THE BOOT, run by the connector-creation hook. Never raises.
 
@@ -1893,6 +1941,12 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             # live on the class). `backport: True` alone cannot tell those apart,
             # and after this work `in_tree` is the state every box should reach.
             "backport_source": None,
+            # THE SSD RESTORE PATH's scheduler half, fitted at this same moment.
+            # `None` means this boot never reached the restore step; a dict is the
+            # verdict, and `fitted: false` there is a FAULT TO READ, because a boot
+            # that has a manager and does not fit the restore layer is a boot whose
+            # spilled KV can never be read back. See `_boot_restore`.
+            "restore": None,
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -1951,6 +2005,24 @@ def boot_from_connector(cls, install_report, manager) -> dict:
                                  else "the guard left entry points unwrapped"))
                 boot["refusals"].append(f"tier: not armed, {blocked}")
             boot["faults_at_boot"] = guard_mode_faults()
+
+        # THE SSD RESTORE PATH, SCHEDULER HALF, fitted HERE - the first instant in
+        # the one process that can start a restore at which the manager class exists
+        # AND our guard/backport layers are already on its methods, so
+        # `disk_restore._install_sched_method` can insert the restore layer at the
+        # BOTTOM and keep the guard outermost (its own layer walk, no new rule).
+        # Nothing else in the EngineCore process ever retried the install after the
+        # plugin-load attempt found the manager un-imported: the worker half's retry
+        # driver is the worker's handshake hook, which by construction never runs
+        # here. That is why four ranks reported `installed=YES` while this process
+        # made no offer at all - see `disk_restore.install`'s docstring.
+        restore = _boot_restore(cls)
+        boot["restore"] = restore
+        if not restore.get("fitted"):
+            boot["refusals"].append("restore: {}".format(
+                (restore.get("reason") or "the scheduler half of the disk restore "
+                 "layer is not fitted on this manager: spilled KV can be written "
+                 "but never read back")[:MAX_BOOT_ITEM_CHARS]))
 
         _state["boots"] += 1
         _state["boot"] = boot
@@ -2018,6 +2090,17 @@ def boot_line(boot: dict) -> str:
         if len(not_covered) > MAX_BOOT_ITEMS:
             parts.append("not_covered_more={}".format(
                 len(not_covered) - MAX_BOOT_ITEMS))
+    restore = boot.get("restore")
+    if isinstance(restore, dict):
+        # THE SSD RESTORE VERDICT, on the line an operator already reads. Before
+        # this, a boot whose scheduler could not restore from NVMe said so nowhere:
+        # the four workers' `DISK[restore] installed=YES` lines described a role
+        # that cannot make an offer, and this line said nothing about the role that
+        # can. `restore=NO` here is that reading, in one field.
+        parts.append("restore={}".format("YES" if restore.get("fitted") else "NO"))
+        parts.append("restore_gate={}".format(restore.get("gate") or "?"))
+        parts.append("restore_ranks={}".format(int(restore.get("ranks_proven")
+                                                   or 0)))
     if boot.get("guard_armed"):
         # LABEL DISCIPLINE: this tail used to read `faults=POST ...`, so the one line
         # an operator greps at boot carried `faults=0` AND `faults=POST ...` - two
@@ -2043,7 +2126,7 @@ def boot_section() -> dict:
                 "backport": False, "guard": False, "guard_armed": False,
                 "tier": False, "faults_at_boot": 0, "refusals": [],
                 "not_covered": [], "nested": [], "live_check": None,
-                "install_reason": None, "manager": None,
+                "install_reason": None, "manager": None, "restore": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "

@@ -926,8 +926,13 @@ can be written to one file on the engine's own filesystem, named so that a
 configuration change makes the old files un-findable rather than mis-readable:
 
 ```
-<VLLM_E2_TIER_DISK_ROOT>/<key16[0:2]>/kvslot-<key16>-<geodigest12>.bin
+<VLLM_E2_TIER_DISK_ROOT>/<key16[0:2]>/kvslot-<key16>-g<group>-<geodigest12>.bin
 ```
+
+* The group id is **part of the identity**. Two KV-cache groups can hash the same
+  token chain, so a `key16` alone does not say whose bytes a file holds; the older
+  2-field shape `kvslot-<key16>-<geodigest12>.bin` named ONE file for two different
+  payloads and is now refused as malformed (`disk_layout`).
 
 * `key16` is the first 16 hex chars of the engine's block hash for that slot (the
   contract's `store_keys`, index-aligned with `store_cpu_blocks`; a slot the engine
@@ -972,14 +977,28 @@ the receipt says `queued` and names the file it will land in, and `ls` is the pr
 `ls` is read-only and bounded (walk caps, `limit`, and a response-byte ceiling that
 trims and says so).
 
-**There is no restore path, deliberately.** A prefix hit is resolved in the
-scheduler's `cached_block_hash_to_block`, and only scheduler-side store-completion
-publishes into it (`manager.py:1017-1044`), so a file is a verifiable, disposable
-copy and nothing more. One consequence of running the write side alone: the bytes are
-read on the writer thread, so a slot recycled between completion and the write would
-be captured as its NEW contents under the OLD name - a wasted write, never a wrong
-answer, because nothing reads it. When restore lands, the spill becomes a
-copy-at-completion (`disk_spill.spill_slot`'s synchronous core is the seam).
+**The restore path exists (`disk_restore.py`, since 0.2.14) and it does not touch the
+hash index.** A prefix hit is resolved in the scheduler's
+`cached_block_hash_to_block`, and only scheduler-side store-completion publishes into
+it (the fork calls `_process_store_completion` at `manager.py:1028-1032` on the
+deployed in-tree-fixed build, at `manager.py:988-992` at the fork HEAD 10b8e07 this
+suite's fixture is generated from). A restore therefore does not try to make a lookup
+hit: on a host-RAM shortfall the SCHEDULER offers the SSD's continuation as external
+tokens, appends the CPU slots it allocated to the fork's own pending-hit tuple, and
+the fork's `update_state_after_alloc` / `start_load_kv` do the pinning and the DMA.
+A restored block helps exactly the request that paid for it; the next request reads
+the file again (~10 ms per 3,200-token span against ~3.2 s to recompute it). The
+worker rebuilds each name with its **own** digest, and a disagreement is a counted
+failure, not a guess.
+
+**Why nothing was restored is one HTTP call.** `GET /plugins/kvtier/disk` (and the
+`disk_restore` section of `/snapshot`) reports the SCHEDULER's own verdict - the layer
+fitted in that process, the gate and its reason, the index size and its source, the
+worker proof, and every offer refusal with its meaning - under `restore`, with
+`restore.why_no_restore` naming the first missing link. A rank file's
+`disk_restore.installed: true` describes a WORKER and cannot start a restore; only
+the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
+is that verdict at boot.
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 

@@ -25,19 +25,26 @@ group id, it counts a `group_collision`, records both ids and (bounded) whether 
 sibling file is actually on disk, and spills BOTH anyway: the names are distinct
 now, so the event is a measurement and not a fault. It is readable in the snapshot's
 `disk_spill`, in the `/plugins/kvtier/disk` `op:status` payload, and in a rank
-file's `disk` section - no restart, no restore path, no engine change needed to see
-the rate.
+file's `disk` section - no restart, no engine change, and nothing armed to see the
+rate.
 
-It is the WRITE side of a 5-stage design and it deliberately has no read path, no
-restore, no lookup and no re-publication of hashes. That is not laziness, it is a
-property of the connector contract: a hit is resolved by a lookup in the
-scheduler's `cached_block_hash_to_block`, and the only code that publishes into it
-is scheduler-side store-completion (`manager.py:1017-1044`,
-`_process_store_completion` -> `cpu_block_pool._insert_block_hash`). There is no
-way to make a lookup hit from a file or from a worker, so "restore" would need an
-engine change that does not exist yet. A file written here is verifiable
-(`verify_slot`) and disposable (`Deleting a file is always safe`), and nothing
-else.
+It is the WRITE side of a 5-stage design and THIS module has no read path, no
+restore, no lookup and no re-publication of hashes - deliberately, because a hit is
+resolved by a lookup in the scheduler's `cached_block_hash_to_block`, and the only
+code that publishes into it is scheduler-side store-completion (the fork calls
+`_process_store_completion` at `manager.py:1028-1032` on the deployed in-tree-fixed
+build, at `manager.py:988-992` at the fork HEAD 10b8e07 this suite's fixture is
+generated from; the method itself starts at `manager.py:1009` there and its
+`cpu_block_pool._insert_block_hash` calls are at `manager.py:1026-1043`).
+
+WHAT CHANGED IN 0.2.14: a lookup does not have to hit for a restore to happen.
+`disk_restore` reads these files back WITHOUT touching that hash index, by extending
+the fork's own `get_num_new_matched_tokens` answer with spans whose bytes it puts
+into CPU slots the fork then DMAs - so no engine change was needed, and a restored
+block helps exactly the request that paid for it instead of becoming matchable by
+everyone. "Restore" is therefore live (see `disk_restore.py` and the `restore`
+section of `/plugins/kvtier/disk`), and a file written here remains verifiable
+(`verify_slot`) and disposable (`Deleting a file is always safe`).
 
 THE HARD PART: THE WORKER HAS THE BYTES, THE SCHEDULER HAS THE HASH
 -------------------------------------------------------------------

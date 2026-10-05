@@ -62,6 +62,7 @@ from kvtier_dev_plugin import (
     disk_store,
     engine_side,
     guard_mode,
+    snapshot,
     worker_diag,
 )
 
@@ -1516,8 +1517,25 @@ def test_the_worker_hook_installs_the_restore_half(monkeypatch):
     assert calls == ["disk_restore"]
 
 
-def test_register_logs_the_restore_hook(monkeypatch, caplog):
-    """The boot says whether the restore layer is fitted, in the engine's own log."""
+def test_the_plugin_load_install_cannot_be_the_scheduler_fit(monkeypatch,
+                                                             caplog):
+    """WHAT THE OLD ASSERTION ACTUALLY PROVED - and what this one pins instead.
+
+    This test used to assert that `register()` LOGS about the restore layer, and
+    nothing else: an INFO line (which the engine's log drops), about the one install
+    call that CANNOT succeed in the EngineCore. `register()` runs at
+    `core.py:214-217`; the tier connector is built at `core.py:260`, and the
+    connector is what imports the manager - so the manager class does not exist yet
+    when plugin load calls `disk_restore.install()`. That ordering is not the bug.
+    The bug was that nothing else in this process ever called it again, while four
+    WORKER ranks (whose handshake DOES drive a retry) printed `installed=YES` about
+    a class they never execute. A tier that could spill but never restore read as
+    healthy in every field this suite checked.
+
+    So the assertion is inverted to the claim that matters in this role, at this
+    moment: the offering half is NOT fitted, the refusal is COUNTED, and it is
+    announced at WARNING - the level the box's log actually keeps.
+    """
     monkeypatch.setenv(config.ENV_ENABLE, "1")
     monkeypatch.setattr(engine_side, "attach_methods",
                         lambda cls: {"attached": True, "reason": "ok"})
@@ -1525,11 +1543,31 @@ def test_register_logs_the_restore_hook(monkeypatch, caplog):
     # Boot lines are INFO only on the first install in a process; a full-suite run
     # has already installed, so make this registration the first.
     monkeypatch.setitem(engine_side._INSTALLS, "count", 1)
-    with caplog.at_level(logging.DEBUG):
-        engine_side.register()
-    text = "\n".join(rec.getMessage() for rec in caplog.records)
-    assert "SSD restore hook" in text
-    assert "restore-witness" in text
+    # THE ROLE: an EngineCore at plugin-load time. Neither tier class is imported
+    # yet - which is exactly why this install can only be a no-op.
+    saved = sys.modules.pop(disk_restore.SCHED_MODULE, None)
+    saved_worker = sys.modules.pop(disk_restore.WORKER_MODULE, None)
+    try:
+        with caplog.at_level(logging.WARNING):
+            engine_side.register()
+        counters = disk_restore.counters()
+        assert counters["sched_fitted"] is False
+        assert counters["installed"] is False
+        # DEFERRED, not refused: no tier class is imported at this moment, which is
+        # the expected posture and must not read as a refusal on a healthy boot.
+        assert counters["install_deferrals"] >= 1
+        assert counters["install_refusals"] == 0
+        loud = "\n".join(rec.getMessage() for rec in caplog.records
+                         if rec.levelno >= logging.WARNING)
+        assert "DISK[restore-install]" in loud
+        assert "DISK[restore] installed=NO" in loud
+    finally:
+        for name, previous in ((disk_restore.SCHED_MODULE, saved),
+                               (disk_restore.WORKER_MODULE, saved_worker)):
+            if previous is not None:
+                sys.modules[name] = previous
+            else:
+                sys.modules.pop(name, None)
 
 
 def test_no_env_var_arms_the_restore_path():
@@ -2521,3 +2559,339 @@ def test_every_counter_has_a_unit():
     for name, value in counters.items():
         if isinstance(value, int) and not isinstance(value, bool):
             assert name in units, name
+
+
+# --- n: THE SCHEDULER ROLE, the only role that can start a restore -----------
+#
+# Everything above this line installs into a process that has BOTH tier classes,
+# because that is the shape a worker has after the connector imports its modules -
+# and a worker cannot make an offer. Which is how the live box came to print four
+# `DISK[restore] installed=YES class=SimpleCPUOffloadScheduler+SimpleCPUOffloadWorker`
+# lines, none of them from the process that reads the prefix: the suite had never
+# asked what an EngineCore does. These tests install into a SCHEDULER-role fake -
+# the manager class present, the worker class absent - and ask that question.
+
+@pytest.fixture
+def scheduler_role(monkeypatch):
+    """A process with the SCHEDULER class and no worker class: an EngineCore.
+
+    The class is the fork-shaped one `test_backport` builds from the fork's REAL
+    method text (`fixtures_pr56810`, fingerprint-verified against the fork at HEAD
+    10b8e07), registered in `sys.modules` under the fork's manager module name so
+    `_class_of` resolves it exactly as the EngineCore does. The worker module is
+    removed, because an EngineCore never imports it - and the state that
+    `boot_from_connector` writes (an armed tier, an armed guard) is saved and
+    restored, so booting here cannot leak a live tier into the next test.
+    """
+    import test_backport as TB
+
+    cls = TB._six_group_class()
+    manager = TB._production_manager(cls)
+    module = types.ModuleType(disk_restore.SCHED_MODULE)
+    module.SimpleCPUOffloadScheduler = cls
+    saved = {name: sys.modules.get(name) for name in FORK_MODULES}
+    sys.modules[disk_restore.SCHED_MODULE] = module
+    sys.modules.pop(disk_restore.WORKER_MODULE, None)
+    saved_state = {"backport": dict(backport._state),
+                   "guard": dict(guard_mode._state)}
+    backport.reset_state_for_tests()
+    guard_mode.reset_state_for_tests()
+    try:
+        yield {"cls": cls, "manager": manager, "helpers": TB}
+    finally:
+        disk_restore.uninstall()
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        for name, state in (("backport", backport), ("guard", guard_mode)):
+            state._state.clear()
+            state._state.update(saved_state[name])
+
+
+def sched_layer_kinds(cls, name: str) -> list:
+    """The layer kinds on the method THE SCHEDULER resolves, outermost first."""
+    current = getattr(cls, name, None)
+    if current is None:
+        return []
+    layers, _bottom = backport._layers_of(backport._function_of(current))
+    return [kind for kind, _wrapper in layers]
+
+
+def test_the_connector_boot_fits_the_offering_half_in_the_scheduler_role(
+        scheduler_role, caplog):
+    """THE REGRESSION. A scheduler-role boot must end with the offer wrapped.
+
+    Before the fix, `disk_restore.ensure_installed` was reachable ONLY from
+    `engine_side._on_worker_report`, and that hook fires inside the WORKER-side
+    `get_handshake_metadata` producer (`cpu_capacity.py`) - so in an EngineCore the
+    layer was fitted exactly never, and no offer was ever possible. Four ranks said
+    YES; the scheduler said nothing; a 9,216-token prefix recomputed in 2.72 s and
+    2.85 s instead of reading ~10 ms per 3,200-token span off NVMe.
+    """
+    cls, manager, TB = (scheduler_role["cls"], scheduler_role["manager"],
+                        scheduler_role["helpers"])
+    assert disk_restore.role_here() == disk_restore.ROLE_SCHEDULER
+    report = backport.install(cls, TB.our_shape_config(), manager)
+    with caplog.at_level(logging.WARNING):
+        boot = backport.boot_from_connector(cls, report, manager)
+
+    # THE OFFER IS WRAPPED HERE, and the guard is still outermost.
+    kinds = sched_layer_kinds(cls, disk_restore.METHOD_MATCHED)
+    assert "restore" in kinds, kinds
+    assert kinds[0] == "guard", kinds
+    assert disk_restore.sched_fitted_here() is True
+    assert disk_restore.fitted_methods_here() == list(disk_restore.SCHED_METHODS)
+
+    # THE BOOT SAYS SO, in its line and in its report, because a verdict that only
+    # lives in a dict is a verdict nobody reads at 3 a.m.
+    assert boot["restore"]["fitted"] is True
+    assert boot["restore"]["methods"] == list(disk_restore.SCHED_METHODS)
+    assert "restore=YES" in boot["line"]
+    assert "restore_gate=" in boot["line"]
+    assert not [item for item in boot["refusals"] if item.startswith("restore:")]
+
+    # THE LINE, at the level the engine's log keeps, naming the ROLE it belongs to.
+    lines = [rec.getMessage() for rec in caplog.records
+             if "DISK[restore]" in rec.getMessage()
+             and rec.levelno >= logging.WARNING]
+    assert any("installed=YES" in line and "role=scheduler" in line
+               for line in lines), lines
+
+
+def test_the_restore_wrapper_is_on_the_method_the_live_scheduler_calls(
+        scheduler_role, armed):
+    """Identity proof: the INSTANCE resolves the wrapper, not just the class dict.
+
+    A wrapper on a method the interpreter never reaches is the whole failure mode,
+    so this asserts the object the scheduler call actually binds. Then it drives the
+    call for real, with the gate open (the `armed` fixture) and an unusable request:
+    the fork's answer must come back byte-identical AND the refusal must be counted,
+    which is what makes "live but refusing" distinguishable from "absent".
+    """
+    cls, manager, TB = (scheduler_role["cls"], scheduler_role["manager"],
+                        scheduler_role["helpers"])
+    report = backport.install(cls, TB.our_shape_config(), manager)
+    backport.boot_from_connector(cls, report, manager)
+
+    attr = cls.__dict__[disk_restore.METHOD_MATCHED]
+    assert manager.get_num_new_matched_tokens.__func__ is attr
+    assert "restore" in sched_layer_kinds(cls, disk_restore.METHOD_MATCHED)
+
+    assert disk_restore.gate()["ok"] is True
+    before = disk_restore.counters()["refusals_total"]
+    # The fork's own answer, unchanged, and the refusal counted by name: the wrapper
+    # is on the call path and refuses in the open.
+    assert manager.get_num_new_matched_tokens(object(), 0) == (4096, True)
+    counters = disk_restore.counters()
+    assert counters["refusals_total"] == before + 1
+    assert counters["last_refusal"]
+    assert counters["offers"] == 0
+
+
+def test_an_install_that_finds_no_target_method_is_counted_and_logged(caplog):
+    """A fork rename must be a NO with a counter and a line - never a YES.
+
+    The fake is built by `fakes_debug.fork_class` from source that renames the ONE
+    method the offer rides, using the fork's real names for the other two: exactly
+    the shape a fork update has. `install()` used to return `installed: False` with
+    the reason in a dict and nothing else; if that ever degrades back to a silent
+    success, this is the test that fails.
+    """
+    renamed = '''
+class SimpleCPUOffloadScheduler:
+    """The fork, one rename away from the shape this module expects."""
+
+    def lookup_offload_hit(self, request, num_computed_tokens):
+        return 0, False
+
+    def build_connector_meta(self, scheduler_output=None):
+        return "METADATA"
+
+    def update_connector_output(self, connector_output):
+        return None
+'''
+    saved = sys.modules.get(disk_restore.SCHED_MODULE)
+    fakes_debug.fork_class(disk_restore.SCHED_MODULE,
+                           disk_restore.SCHED_CLASS, renamed, register=True)
+    try:
+        with caplog.at_level(logging.WARNING):
+            report = disk_restore.install()
+        assert report["installed"] is False, report
+        counters = disk_restore.counters()
+        assert counters["install_refusals"] >= 1
+        # A REFUSAL, not a deferral: the class is right here and the method the
+        # offer rides is not on it. That is the case that must never be silent.
+        assert counters["install_deferrals"] == 0
+        assert f"{disk_restore.SCHED_CLASS}.{disk_restore.METHOD_MATCHED}" \
+            in counters["missing_methods"]
+        loud = "\n".join(rec.getMessage() for rec in caplog.records
+                         if rec.levelno >= logging.WARNING)
+        assert "DISK[restore-install]" in loud
+        assert disk_restore.METHOD_MATCHED in loud
+        assert disk_restore.sched_fitted_here() is False
+    finally:
+        if saved is not None:
+            sys.modules[disk_restore.SCHED_MODULE] = saved
+        else:
+            sys.modules.pop(disk_restore.SCHED_MODULE, None)
+
+
+class _NoPolicyHolder:
+    def ensure_loaded(self):
+        return {"ok": False, "error": "no policy in this test", "traceback": None}
+
+    @property
+    def decide(self):
+        return None
+
+
+def test_the_snapshot_payload_carries_the_scheduler_restore_section():
+    """"Why is there no restore?" must be answerable from ONE payload.
+
+    Before this, a recursive walk of `/snapshot` and `/disk` found ZERO keys matching
+    `restore`: `section()` existed but nothing surfaced it from the scheduler
+    process, and the worker-only contribution seam was the only publisher. The
+    diagnosis took four rounds of log archaeology instead of one HTTP call.
+    """
+    engine = types.SimpleNamespace(scheduler=None)
+    payload = snapshot.snapshot_for_engine(engine, _NoPolicyHolder())
+    view = payload["disk_restore"]
+    assert payload["disk_restore_installed"] is view["layer_installed_here"]
+    for key in ("layer_installed_here", "role", "class_here", "methods_expected",
+                "methods_here", "methods_missing", "install_refusals",
+                "install_deferrals", "install_refusal_line", "gate", "offers",
+                "tokens_offered", "blocks_offered", "refused", "refusal_reasons",
+                "index", "ranks_proven", "digests_expected", "why_no_restore",
+                "units", "boot_line"):
+        assert key in view, key
+    # EVERY OFFER REFUSAL, counted AND spelled out: the closed vocabulary is the
+    # whole answer, and a name without a sentence is a name nobody can act on.
+    assert set(view["refused"]) == set(disk_restore.OFFER_REFUSALS)
+    for name in disk_restore.OFFER_REFUSALS:
+        assert isinstance(view["refused"][name], int)
+        assert len(view["refusal_reasons"][name]) > 20, name
+        assert "undefined reason" not in view["refusal_reasons"][name], name
+    # EVERY FIELD WITH A NUMBER OWNS A UNIT (the repo convention, and the only way
+    # `blocks_offered` cannot be read as bytes, seconds or requests).
+    units = view["units"]
+    for key in ("offers", "tokens_offered", "blocks_offered", "ranks_proven",
+                "digests_expected", "install_refusals", "install_deferrals",
+                "index.entries", "index.bytes_indexed", "proof_reads",
+                "deadline_seconds"):
+        assert key in units and units[key], key
+    # The index is reported WITH ITS SOURCE, because an empty index and an index
+    # read from the wrong directory look identical without it.
+    assert "entries" in view["index"] and "source" in view["index"]
+    # And the one field that answers the question outright.
+    assert isinstance(view["why_no_restore"], str) and view["why_no_restore"]
+    assert "not fitted" in view["why_no_restore"]
+
+
+def test_the_why_no_restore_walks_the_chain_in_order(monkeypatch, armed):
+    """The verdict names the FIRST missing link, not the last one to be checked.
+
+    Fitted + gate open + an empty index is "nothing is known to be on disk", not
+    "no worker proof" (which is also true) - the order is the diagnosis.
+    """
+    saved = sys.modules.get(disk_restore.SCHED_MODULE)
+    fakes_debug.fork_class(disk_restore.SCHED_MODULE, disk_restore.SCHED_CLASS,
+                           FORK_SCHED_SOURCE, register=True)
+    try:
+        assert disk_restore.install()["installed"] is True
+        assert disk_restore.gate()["ok"] is True
+        view = disk_restore.scheduler_section()
+        assert view["layer_installed_here"] is True
+        assert "index holds no identities" in view["why_no_restore"]
+        fill(disk_spill.disk_root(), blocks=2)
+        view = disk_restore.scheduler_section()
+        assert view["index"]["entries"] == 6      # 2 blocks x 3 cacheable groups
+        assert view["ranks_proven"] == 1          # the `armed` fixture proves them
+        assert "no offer has been made" in view["why_no_restore"]
+        assert view["index"]["source"]
+    finally:
+        if saved is not None:
+            sys.modules[disk_restore.SCHED_MODULE] = saved
+        else:
+            sys.modules.pop(disk_restore.SCHED_MODULE, None)
+
+
+def test_the_disk_verb_answers_about_restore_too():
+    """`/disk` is where the operator asks about the SSD tier - both directions."""
+    answer = disk_store.disk_for_engine(None, {"op": "status"})
+    assert "restore" in answer
+    assert "layer_installed_here" in answer["restore"]
+    assert "why_no_restore" in answer["restore"]
+
+
+def test_the_boot_line_names_the_role_and_the_methods():
+    """A line printed by four ranks and one scheduler must say which printed it."""
+    line = disk_restore.boot_line()
+    assert "role=" in line and "methods=" in line
+    labels = [part.split("=")[0] for part in line.split(" ") if "=" in part]
+    assert len(labels) == len(set(labels)), labels
+
+
+def test_adopt_if_missed_is_the_scheduler_door_and_arms_nothing(monkeypatch):
+    """The backstop door: fitting is not arming, and a no-class process is cheap.
+
+    With nothing imported it must return without calling `install()` at all (the
+    snapshot verb calls this every few seconds), and it must never touch the gate.
+    """
+    saved = sys.modules.pop(disk_restore.SCHED_MODULE, None)
+    saved_worker = sys.modules.pop(disk_restore.WORKER_MODULE, None)
+    calls = []
+    monkeypatch.setattr(disk_restore, "install",
+                        lambda refit=False: calls.append(refit) or {})
+    try:
+        report = disk_restore.adopt_if_missed()
+        assert report["installed"] is False
+        assert calls == []
+        assert disk_restore.gate()["ok"] is False
+    finally:
+        if saved is not None:
+            sys.modules[disk_restore.SCHED_MODULE] = saved
+        if saved_worker is not None:
+            sys.modules[disk_restore.WORKER_MODULE] = saved_worker
+
+
+def test_the_fitted_wrapper_actually_offers_in_the_scheduler_role(armed):
+    """END TO END: a scheduler-role process, wrapped, OFFERS disk tokens.
+
+    The two tests above prove the layer is fitted and reachable; this one proves
+    what it is for. A class built from the fork's own three entry points (answering
+    the way the fork does when host RAM finds nothing), installed in a process that
+    has the manager class and no worker class, then driven the way the scheduler
+    drives it: the answer comes back RAISED by the spilled span - the behaviour the
+    live box never produced, because in the one process where this could happen
+    nothing was ever fitted.
+    """
+    saved = sys.modules.get(disk_restore.SCHED_MODULE)
+    cls, _module = fakes_debug.fork_class(disk_restore.SCHED_MODULE,
+                                          disk_restore.SCHED_CLASS,
+                                          FORK_SCHED_SOURCE, register=True)
+    try:
+        assert disk_restore.install()["installed"] is True
+        assert disk_restore.role_here() == disk_restore.ROLE_SCHEDULER
+
+        class Live(cls, Manager):
+            """The fork's class, an instance carrying the manager's real fields."""
+
+        fill(armed, blocks=3)
+        live = Live()
+        assert live.get_num_new_matched_tokens(Req(blocks=3), 0) == (3 * BLOCK, True)
+        counters = disk_restore.counters()
+        assert counters["offers"] == 1
+        assert counters["offered_tokens"] == 3 * BLOCK
+        assert counters["blocks_offered"] == 3
+        # ...and the section reports it, so the same fact is one HTTP call away.
+        view = disk_restore.scheduler_section()
+        assert view["layer_installed_here"] is True
+        assert view["role"] == disk_restore.ROLE_SCHEDULER
+        assert view["why_no_restore"].startswith("restore is live")
+    finally:
+        if saved is not None:
+            sys.modules[disk_restore.SCHED_MODULE] = saved
+        else:
+            sys.modules.pop(disk_restore.SCHED_MODULE, None)

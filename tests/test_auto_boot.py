@@ -132,6 +132,12 @@ def test_a_clean_boot_installs_guards_and_arms_without_any_verb():
     assert boot_report["refusals"] == []
     assert boot_report["mode"] == "auto"
     assert backport.section()["armed"] is True
+    # THE SSD RESTORE PATH'S SCHEDULER HALF rides the same boot. A tier that boots
+    # armed but cannot read its own spill tier back is a tier that pays 2.7 s of
+    # recompute for every cross-boot prefix, and until this line was asserted the
+    # boot had nothing at all to say about it.
+    assert boot_report["restore"]["fitted"] is True
+    assert "restore=YES" in boot_report["line"]
 
 
 def test_the_boot_reports_the_manager_it_booted_and_its_fault_count():
@@ -268,14 +274,23 @@ def test_a_method_the_fork_does_not_define_is_reported_but_does_not_block():
 def test_a_method_inherited_from_outside_the_fork_is_a_limit_not_a_refusal():
     """THE PRODUCTION SHAPE: a real `SimpleCPUOffloadScheduler` has these methods.
 
-    `take_events`, `reset` and `update_connector_output` are inherited from the
-    connector BASE class (`vllm.distributed...v1.base`), and `guard_mode.install()`
-    will not shadow a method whose home is another module - correctly, since taking
-    over another module's method is not this plugin's to do. So on the real engine
-    those three can never carry a guard layer, and a gate that read "attribute
-    exists, therefore the guard must own it" would refuse to arm on EVERY real boot:
-    fail-closed, safe, and a feature that works in a fixture and nowhere else. The
-    gate therefore asks who OWNS the attribute. The limit is reported, not hidden.
+        `take_events` and `reset` are inherited from the connector BASE class
+    (`vllm.distributed...v1.base`), and `guard_mode.install()` will not shadow a
+    method whose home is another module - correctly, since taking over another
+    module's method is not this plugin's to do. So on the real engine those two can
+    never carry a guard layer, and a gate that read "attribute exists, therefore the
+    guard must own it" would refuse to arm on EVERY real boot: fail-closed, safe,
+    and a feature that works in a fixture and nowhere else. The gate therefore asks
+    who OWNS the attribute. The limit is reported, not hidden.
+
+    (`update_connector_output` used to be listed here as a third example. It is
+    wrong: the fork defines it on `SimpleCPUOffloadScheduler` itself
+    (`manager.py:951` at HEAD 10b8e07) - the stand-in class simply omitted it, and
+    the fixture gap masqueraded as a fact about the fork. Now that the fixture
+    carries the method the fork really has (which `disk_restore` also wraps, so an
+    absent one is a REFUSAL there), it is guarded like its neighbours and is out of
+    this test's set. The mechanism under test - an attribute whose home is an
+    ancestor outside the fork's module - is unchanged, and two examples prove it.
     """
     cls = TB._six_group_class()
     base_home = "vllm.distributed.kv_transfer.kv_connector.v1.base"
@@ -284,7 +299,7 @@ def test_a_method_inherited_from_outside_the_fork_is_a_limit_not_a_refusal():
         pass
 
     Base.__module__ = base_home
-    for name in ("take_events", "reset", "update_connector_output"):
+    for name in ("take_events", "reset"):
         def make(_name):
             def method(self, *args, **kwargs):
                 return None
@@ -301,7 +316,7 @@ def test_a_method_inherited_from_outside_the_fork_is_a_limit_not_a_refusal():
     live = production.__new__(production)
     vars(live).update(vars(manager))
 
-    for name in ("take_events", "reset", "update_connector_output"):
+    for name in ("take_events", "reset"):
         assert backport._class_owns(production, name) is False, name
         assert backport._class_owns(production, "build_connector_meta") is True
 
@@ -310,8 +325,7 @@ def test_a_method_inherited_from_outside_the_fork_is_a_limit_not_a_refusal():
     assert boot_report["tier"] is True, "inherited methods must not veto the arm"
     assert backport.is_armed() is True
     assert boot_report["refusals"] == []
-    assert set(boot_report["not_covered"]) == {
-        "take_events", "reset", "update_connector_output"}
+    assert set(boot_report["not_covered"]) == {"take_events", "reset"}
     # And they are in the line, so the limit is visible from the log alone.
     assert "not_covered=" in boot_report["line"]
 
