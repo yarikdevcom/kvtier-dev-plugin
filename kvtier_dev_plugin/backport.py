@@ -1988,7 +1988,13 @@ def boot_line(boot: dict) -> str:
             parts.append("not_covered_more={}".format(
                 len(not_covered) - MAX_BOOT_ITEMS))
     if boot.get("guard_armed"):
-        parts.append('faults=POST {} {{"op":"captures"}}'.format(
+        # LABEL DISCIPLINE: this tail used to read `faults=POST ...`, so the one line
+        # an operator greps at boot carried `faults=0` AND `faults=POST ...` - two
+        # labels with the same name, one of them non-numeric. A reader (or a grep that
+        # takes the last match) got a pointer where it expected a count. Every label in
+        # the boot line must appear exactly once; the test in test_auto_boot.py holds
+        # that line.
+        parts.append('captures=POST {} {{"op":"captures"}}'.format(
             config.ROUTE_PREFIX + config.ROUTE_GUARD))
     return " ".join(parts)
 

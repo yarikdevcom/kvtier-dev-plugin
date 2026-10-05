@@ -625,6 +625,18 @@ def test_the_boot_line_states_every_verdict_and_the_mode_in_one_line():
     assert "\n" not in line, "one line, or the grep loses it"
     assert len(line) < 2000, "bounded, or it floods the engine log"
 
+    # Each label appears EXACTLY ONCE. This caught a real bug: the guard tail was
+    # emitted as `faults=POST /plugins/kvtier/guard {"op":"captures"}`, so the line
+    # carried two `faults=` labels and the second was not a number - a grep for the
+    # fault count could read the pointer instead. `faults=0` is the only faults label,
+    # and the captures pointer is its own label.
+    for label in ("backport=", "guard=", "tier=", "faults=", "guard_over=",
+                  "not_covered=", "captures="):
+        repeat = line.count(label)
+        assert repeat <= 1, f"{label} appears {repeat}x"
+    assert line.count("faults=") == 1
+    assert "faults=POST" not in line, "the pointer must not masquerade as a count"
+
     section = backport.section()
     assert section["boot"]["line"] == line
     assert section["boot"]["ran"] is True
