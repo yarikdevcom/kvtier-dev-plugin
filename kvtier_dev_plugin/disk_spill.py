@@ -47,18 +47,43 @@ A content-addressed name needs both. Investigated in the order the brief demands
    depends on which fields msgspec keeps - exactly the "invented channel" the
    brief forbids.
 
-3. SO: THE CORE IS BUILT AGAINST AN INJECTED RESOLVER. `request_spill(worker,
+3. SO: THE CORE IS BUILT AGAINST AN INJECTED RESOLVER. (And read THE DIGEST below:
+   the digest half of this analysis was WRONG as first written, and the wiring that
+   replaced it has each worker compute its own. The wrong reasoning is kept because
+   it is the reasoning someone will be tempted by again.) `request_spill(worker,
    slot, key=..., resolver=...)` takes the key from the caller, or from a
    `slot -> key16` callable handed in, and refuses with a counter when neither
    answers. Everything except the wiring is implemented and tested. THE SINGLE
-   ENGINE CHANGE THAT UNBLOCKS THE WIRING: add one field to
-   `SimpleCPUOffloadMetadata` (metadata.py) - `store_keys: list[str]`, the
-   16-hex-char group-qualified block hash per stored slot, index-aligned with
-   `store_cpu_blocks` - populate it in `build_connector_meta` (manager.py:543-556)
-   from the hashes that function already has in hand, and read it in the worker
-   from the metadata the worker already binds (`worker.py:246-252`). No new
-   channel, no direction the fork does not already use, no scheduler mutation from
-   a worker.
+   ENGINE CHANGE THAT UNBLOCKS THE WIRING: add fields to `SimpleCPUOffloadMetadata`
+   (metadata.py) - `store_keys: list[str]`, the hex group-qualified block hash per
+   stored slot, index-aligned with `store_cpu_blocks` (a slot the engine could not
+   hash gets `""`, never a dropped entry); `store_fingerprint: str`, an OPTIONAL
+   cross-check digest sent once per store batch (`""` means nothing, and it is
+   `""` today); and `load_paths: list[str]` for the restore milestone - then
+   populate them in `build_connector_meta` (manager.py), which already holds those
+   hashes. THE WIRING FOR IT IS `disk_store.py`: it wraps the worker's
+   `bind_connector_metadata`/`get_finished`, reads those fields off the metadata the
+   worker already binds, truncates each hash to the layout's 16-hex key, and calls
+   `request_spill(worker, slot, key=...)` - the NAME coming from the fingerprint
+   this worker built and adopted for itself, not from the broadcast. On an
+   unpatched engine the hook refuses and counts (`no_key_for_slot`) and writes
+   nothing, which is the point: the same build is correct on both engines.
+THE DIGEST: ONE COMPUTING SITE PER FIELD, NOT ONE PER BOOT. The first version of
+this contract said "never compute the digest worker-side; the scheduler's
+`store_fingerprint` is the only source of truth". That is IMPOSSIBLE, and shipping
+it would have caused the exact failure it was written to prevent:
+`FINGERPRINT_FIELDS` include `total_bytes_per_block` (the live box measures
+11,468,800 B on PP0 and 12,902,400 B on PP1) and `rank` (`PP<n>_TP<m>`), while
+there is ONE `SimpleCPUOffloadScheduler` broadcasting ONE `store_fingerprint` to
+four ranks. No scheduler-computed digest can equal four different rank digests, so
+every rank would write files the others could never resolve. The rule that replaces
+it is narrower and actually satisfiable: each FIELD has exactly one computing site.
+The rank-local fields (the measured slot width, this rank's id) are the worker's;
+the rank-invariant ones are read from the config objects the worker already holds;
+and every site calls the same `disk_layout.fingerprint_digest`. The metadata's
+`store_fingerprint` survives as an optional CROSS-CHECK only - a non-empty one that
+disagrees with this rank's own digest is a counted refusal, and the empty string
+the unpatched and freshly-patched engine both send means nothing at all.
 
 SAFETY ENVELOPE (the same posture as `blockdump.py`, which this mirrors)
 ------------------------------------------------------------------------
@@ -68,10 +93,10 @@ SAFETY ENVELOPE (the same posture as `blockdump.py`, which this mirrors)
     exists to relieve) AND the facility must be ARMED. There is no env var that
     arms it: an env var may only ever turn a dev facility OFF, which is the
     `guard_mode` rule, and the same rule `blockdump` follows.
-  * NO HOOK IS INSTALLED ANYWHERE. This module wraps no fork method and touches no
-    fork object, so every existing entry point returns the fork's value untouched
-    by construction, not by promise. Wiring is blocked on the engine change above,
-    and pretending otherwise would put an un-testable wrapper on a serving box.
+  * NO HOOK IS INSTALLED IN THIS MODULE. It wraps no fork method and touches no
+    fork object, so every entry point here returns the fork's value untouched by
+    construction, not by promise. The engine hook lives in `disk_store.py`, which
+    composes over the existing worker wrappers and keeps this module's shape.
   * NEVER RAISES INTO THE ENGINE. Every public entry point catches `Exception`
     (never `BaseException`) and counts. A disk tier that can crash inference is
     worse than no disk tier.
@@ -87,11 +112,13 @@ SAFETY ENVELOPE (the same posture as `blockdump.py`, which this mirrors)
     slot index is bounded by the region's own block count, the file's bytes by the
     fingerprint's `total_bytes_per_block`, the queue by `MAX_QUEUE_DEPTH`, the
     write rate by `MAX_FILES_PER_WINDOW`, a sweep/walk by its caps.
-  * THE FINGERPRINT IS NOT OPTIONAL. A spill whose fingerprint is missing any
-    field is refused, and a fingerprint whose region bytes do not add up to
-    `total_bytes_per_block` is refused: that mismatch means the fingerprint does
-    not describe these bytes, which is the one case a content-addressed name
-    cannot survive.
+  * THE IDENTITY IS NEVER OPTIONAL. A spill is named by a fingerprint whose fields
+    all validate (this module's `configure`, fed worker-side by `disk_store` out of
+    its own measurements), and no door here accepts a digest from elsewhere. A
+    fingerprint whose region bytes do not add up to `total_bytes_per_block` is
+    refused: that mismatch means the fingerprint does not describe these bytes,
+    which is the one case a content-addressed name cannot survive - and on this box
+    it is also the check that stops one PP stage spilling another's bytes.
 
 WHAT IS CAPPED, AND IN WHAT UNIT
 --------------------------------
@@ -152,7 +179,7 @@ PROTOCOL_VERSION = 1
 # Refusal reasons are a closed vocabulary: a counter per reason, so "nothing
 # happened" is always attributable rather than inferred.
 REFUSAL_REASONS = ("not_configured", "disarmed", "no_key_for_slot",
-                   "fingerprint_missing", "fingerprint_invalid",
+                   "fingerprint_missing", "fingerprint_invalid", "bad_digest",
                    "no_region_tensors", "region_not_contiguous",
                    "slot_out_of_range", "region_width_mismatch",
                    "read_failed", "no_free_space", "over_rate_window",
@@ -680,6 +707,55 @@ def sample_slot_bytes(worker, group, block_id: int, length_bytes: int) -> dict:
 
 # --- the synchronous core: plan, read, commit, shed -------------------------
 
+def measured_slot_bytes(caches) -> dict:
+    """The width of one slot as THIS rank's tensors declare it: the sum of every
+    region's `stride(0) * element_size()`.
+
+    THIS is what a fingerprint's `total_bytes_per_block` is built FROM
+    (`disk_store.build_worker_fingerprint`): the slot width is rank-local - the
+    live box measures 11,468,800 B on PP0 and 12,902,400 B on PP1 - so the one
+    fingerprint field that differs per rank is read per rank and never accepted
+    from a broadcast. A fingerprint whose declared width disagrees with these
+    tensors is refused downstream by `read_slot_bytes`, which is the check that
+    stops a PP0 fingerprint from spilling PP1's bytes.
+    """
+    if not isinstance(caches, dict) or not caches:
+        return _fail("cpu_kv_caches is not a dict of region tensors")
+    names = sorted(str(name) for name in caches)
+    if len(names) > MAX_REGIONS:
+        return _fail(f"the region set has {len(names)} tensors; the cap is "
+                     f"{MAX_REGIONS}")
+    total = 0
+    widths: dict = {}
+    for name in names:
+        tensor = caches[name]
+        try:
+            shape = tuple(getattr(tensor, "shape", ()) or ())
+            if len(shape) < 1:
+                return _fail(f"region {name!r} is 0-dimensional")
+            stride0 = tensor.stride(0)
+            itemsize = tensor.element_size()
+        except Exception as exc:  # noqa: BLE001 - a hostile tensor is a refusal
+            return _fail(f"region {name!r}: inspecting it raised "
+                         f"{type(exc).__name__}")
+        if isinstance(stride0, bool) or isinstance(itemsize, bool) \
+                or not isinstance(stride0, int) or not isinstance(itemsize, int) \
+                or stride0 <= 0 or itemsize <= 0:
+            return _fail(f"region {name!r}: stride(0) or element_size() is not a "
+                         "positive int")
+        width = stride0 * itemsize
+        if width > disk_layout.MAX_BLOCK_BYTES:
+            return _fail(f"region {name!r} is {width} bytes per slot, past the "
+                         f"{disk_layout.MAX_BLOCK_BYTES}-byte cap")
+        widths[name] = width
+        total += width
+    if total <= 0 or total > disk_layout.MAX_BLOCK_BYTES:
+        return _fail(f"the slot totals {total} bytes, outside (0, "
+                     f"{disk_layout.MAX_BLOCK_BYTES}]")
+    return _ok(units=disk_layout._units("bytes_per_file"),
+               bytes_per_file=total, widths=widths, regions=names)
+
+
 def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
     """Everything that can be refused, checked BEFORE any byte is written.
 
@@ -687,6 +763,15 @@ def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
     refusal naming the check that fired. No I/O, no allocation of the slot's
     bytes: the queue's job is a plan, so a job that cannot succeed is dropped
     before the writer thread touches the disk.
+
+    ONE NAMING MODE, deliberately: the digest comes from the fingerprint THIS
+    process was configured with, and a missing or invalid one is a refusal
+    (`fingerprint_missing` / `fingerprint_invalid`). There is no "hand me a digest"
+    door, because the digest is a function of rank-local facts - the slot width and
+    the rank are this process's own readings (`disk_store` builds the fingerprint
+    from the tensor stride and `worker_diag.rank_id()`), and accepting a digest
+    from anywhere else would put two computing sites on the SAME field, which is
+    precisely how files become un-findable.
     """
     adopted = fingerprint if fingerprint is not None else _state["fingerprint"]
     if adopted is None:
@@ -918,31 +1003,40 @@ def _enforce_ceiling() -> None:
     _state["estimated_bytes"] = max(0, int(walk["used_bytes"]) - freed)
 
 
-def _walk_store(root) -> dict:
+def _walk_store(root, *, max_files=None, max_shard_dirs=None) -> dict:
     """Measure the store, bounded. Every shard directory, capped files, no links.
 
     Two caps rather than one: shard DIRECTORIES (288 - the space is 256, so the cap
     only fires on garbage) and FILES statted. A truncated walk reports `truncated`
     so the ceiling logic knows its measurement is a floor, and a symlink inside
     the store is skipped rather than followed.
+
+    `max_files` / `max_shard_dirs` TIGHTEN the caps for a caller that must be cheap
+    (the polled snapshot section stats a handful of files; the `/disk` verb's `ls`
+    uses the full caps). They may only lower them: a caller cannot widen a walk
+    this module decided was the safe size.
     """
     entries: list[dict] = []
     used = 0
     truncated = False
+    cap_files = MAX_WALK_FILES if max_files is None else min(MAX_WALK_FILES,
+                                                             int(max_files))
+    cap_dirs = MAX_SHARD_DIRS if max_shard_dirs is None \
+        else min(MAX_SHARD_DIRS, int(max_shard_dirs))
     try:
         top = list(os.scandir(root))
     except OSError as exc:
         return _fail(f"the store could not be listed: {type(exc).__name__}",
                      entries=[], used_bytes=0, truncated=False)
     shard_dirs = [entry for entry in top if entry.is_dir(follow_symlinks=False)]
-    if len(shard_dirs) > MAX_SHARD_DIRS:
+    if len(shard_dirs) > cap_dirs:
         truncated = True
     counted = 0
-    for shard in shard_dirs[:MAX_SHARD_DIRS]:
+    for shard in shard_dirs[:cap_dirs]:
         try:
             with os.scandir(shard.path) as children:
                 for child in children:
-                    if counted >= MAX_WALK_FILES:
+                    if counted >= cap_files:
                         truncated = True
                         break
                     if child.is_symlink() or not child.is_file(follow_symlinks=False):
@@ -971,7 +1065,7 @@ def _walk_store(root) -> dict:
 
 def request_spill(caches=None, slot=None, key=None, *, worker=None,
                   fingerprint=None, resolver=None) -> dict:
-    """THE entry point a future hook would call. Cheap, bounded, never blocks.
+    """THE entry point the store-completion hook calls. Cheap, bounded, never blocks.
 
     `key` is the 16-hex-char, group-qualified block hash for this slot, or None;
     when it is None the module's injected `resolver(slot)` is asked. A slot the
@@ -1002,7 +1096,8 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
         if adopted is None:
             _state["refused"]["fingerprint_missing"] += 1
             return _refused("fingerprint_missing",
-                            "no fingerprint is configured for this boot")
+                            "no fingerprint is configured for this boot: nothing "
+                            "here names a file without an identity to name it under")
         if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
             _state["refused"]["bad_call"] += 1
             return _refused("bad_call", f"slot must be a non-negative int, got "
@@ -1219,11 +1314,13 @@ def section() -> dict:
                    "shard": f"<key16[0:{disk_layout.SHARD_CHARS}]>"},
         "inert_when_off": ("no thread, no directory created, no byte written: the "
                            "queue is not even constructed until a job is accepted"),
-        "wiring": ("NO engine hook is installed. request_spill is ready for the "
-                   "store path; the block hash it needs does not cross to the "
-                   "worker today (metadata.py:16-38), so it is injected. One "
-                   "field on SimpleCPUOffloadMetadata, filled by "
-                   "build_connector_meta, is the whole gap."),
+        "wiring": ("the store-completion hook lives in `disk_store.py`: it wraps "
+                   "the worker's bind_connector_metadata/get_finished, reads the "
+                   "per-slot keys off the metadata, builds THIS rank's fingerprint "
+                   "from its own measured slot width and rank id (configure()), and "
+                   "calls request_spill. On an UNPATCHED engine (no store_keys on "
+                   "SimpleCPUOffloadMetadata, metadata.py:16-38) that hook refuses "
+                   "and counts, and this module is never reached."),
         "read_path": ("none by design: a hit is resolved in the scheduler's "
                       "cached_block_hash_to_block, and only scheduler-side "
                       "store-completion publishes into it (manager.py:1017-1044)"),

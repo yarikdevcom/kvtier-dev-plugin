@@ -193,14 +193,67 @@ def test_an_unknown_field_is_refused_rather_than_ignored():
     ("world_size", 0),
     ("world_size", True),                        # a bool is not a rank count
     ("dcp_world_size", 1.5),
-    ("none_hash_seed", "not hex"),
     ("none_hash_seed", None),
+    ("none_hash_seed", ""),                      # a seed that names nothing
+    ("none_hash_seed", 1.5),                     # a float is not a seed
+    ("none_hash_seed", True),                    # a bool is not a seed
+    ("none_hash_seed", "a" * 300),
+    ("none_hash_seed", "line\nbreak"),
+    ("none_hash_seed", "hex:zz"),                 # a prefixed seed must BE hex
+    ("none_hash_seed", "int:"),                   # a prefix with no digits
     ("prefix_caching_hash_algo", " " * 300),
 ])
 def test_a_fingerprint_that_could_not_come_from_a_real_boot_is_refused(field, junk):
     refused = dl.validate_fingerprint(fingerprint(**{field: junk}))
     assert refused["ok"] is False
     assert refused["reason"]
+
+
+@pytest.mark.parametrize("seed", [
+    "vllm-none-hash",          # DEFAULT_NONE_HASH_SEED (kv_cache_utils.py:121): the
+                               # value a cryptographic hasher gets with no
+                               # PYTHONHASHSEED, i.e. the NORMAL production boot
+    0xEBCE,                    # a PYTHONHASHSEED-derived int (kv_cache_utils.py:139)
+    "ebce",                    # the same seed as bare hex text
+    "0xEBCE",                  # ...or the 0x spelling of it
+    "str:vllm-none-hash",      # an already-canonical opaque seed
+])
+def test_every_shape_the_fork_actually_reports_the_seed_in_builds_a_digest(seed):
+    """The seed is read from `get_none_hash_seed()`, and that accessor's return type
+    is not one thing: an int for a seeded run, and the non-hex
+    `DEFAULT_NONE_HASH_SEED` string for the common unseeded-cryptographic boot.
+
+    A layout that demanded hex refused the fork's own default, and the failure was
+    silent in the worst way: the worker could never build a fingerprint, so the tier
+    spilled nothing and every refusal reason was the wrong excuse. What stays refused
+    is what cannot be RENDERED into a digest at all (see the junk table above).
+    """
+    checked = dl.validate_fingerprint(fingerprint(none_hash_seed=seed))
+    assert checked["ok"] is True, checked["reason"]
+    canonical = checked["fingerprint"]["none_hash_seed"]
+    assert canonical.startswith(("hex:", "str:"))
+    # Idempotent, because `disk_spill` re-validates the fingerprint on every spill.
+    again = dl.validate_fingerprint(checked["fingerprint"])
+    assert again == checked, (seed, again["reason"])
+    assert dl.compute_geometry_digest(again["fingerprint"]) == \
+        dl.compute_geometry_digest(checked["fingerprint"])
+
+
+def test_the_three_spellings_of_one_hex_seed_are_one_identity_and_text_is_another():
+    """Normalization is what makes two call sites that read the same fact through
+    different accessors agree; an opaque seed is a DIFFERENT fact, so it must move
+    the digest rather than collapse onto the hex spelling."""
+    hexes = [dl.compute_geometry_digest(
+        dl.validate_fingerprint(fingerprint(none_hash_seed=seed))["fingerprint"])
+        for seed in (0xEBCE, "ebce", "0xEBCE", "hex:ebce")]
+    assert len(set(hexes)) == 1, hexes
+    opaque = dl.compute_geometry_digest(dl.validate_fingerprint(
+        fingerprint(none_hash_seed="vllm-none-hash"))["fingerprint"])
+    assert opaque not in hexes
+    # The case of an opaque seed is part of its identity: two different secrets.
+    other_case = dl.compute_geometry_digest(dl.validate_fingerprint(
+        fingerprint(none_hash_seed="VLLM-NONE-HASH"))["fingerprint"])
+    assert other_case != opaque
 
 
 def test_a_group_id_outside_the_described_groups_is_refused():

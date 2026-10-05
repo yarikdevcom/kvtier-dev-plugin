@@ -22,6 +22,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     blockdump,
     config,
     disk_spill,
+    disk_store,
     evictions,
     guard_mode,
     lookup_ledger,
@@ -77,6 +78,7 @@ def reset_dev_state():
              "blockdump": dict(blockdump._state),
              "evictions": dict(evictions._state),
              "disk_spill": dict(disk_spill._state),
+             "disk_store": dict(disk_store._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -92,12 +94,18 @@ def reset_dev_state():
     # The SSD spill tier holds an arm, a queue and a THREAD. Dropping the queue
     # reference is what keeps a spilled job from one test landing in the next.
     disk_spill.reset_state_for_tests()
+    # The store-completion hook wraps the worker class and keeps its own retention
+    # map of (slot, key16) pairs; both are engine-visible state that a test must not
+    # inherit. Its unwrap handle lives on the wrapper, so `unwrap_everything` is what
+    # puts the fork's methods back - the reset only zeroes counters and `_retained`.
+    disk_store.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
            "blockdump": blockdump._state,
            "evictions": evictions._state,
            "disk_spill": disk_spill._state,
+           "disk_store": disk_store._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -110,6 +118,7 @@ def reset_dev_state():
                        ("blockdump", blockdump._state),
                        ("evictions", evictions._state),
                        ("disk_spill", disk_spill._state),
+                       ("disk_store", disk_store._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])

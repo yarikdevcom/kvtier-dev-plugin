@@ -985,7 +985,7 @@ def backport_section(engine) -> dict:
 
 def dev_state_sections() -> dict:
     """The DEVELOPMENT-state sections: guard mode, the trace ring, the worker writer,
-    the lookup ledger, the raw-byte dump, the SSD spill tier.
+    the lookup ledger, the raw-byte dump, the SSD spill tier, the spill wiring.
 
     These are the pieces of the plugin that CHANGE what the engine does (or
     put a wrapper on its path), so every snapshot publishes them. Guard mode in
@@ -999,6 +999,7 @@ def dev_state_sections() -> dict:
     from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
         blockdump,
         disk_spill,
+        disk_store,
         guard_mode,
         step_trace,
         trace_ring,
@@ -1061,6 +1062,21 @@ def dev_state_sections() -> dict:
         _error(exc, "disk spill section")
         out["disk_spill"] = {"error": f"{type(exc).__name__}"[:200]}
         out["disk_spill_armed"] = None
+    try:
+        # THE WIRING's own section: whether the engine hook is installed, what it
+        # refused and WHY (`engine_fields`: does this boot's metadata carry
+        # `store_keys`?), which fingerprint this rank named files under, and the
+        # shape of its retention map. `disk_spill.section()` above describes the
+        # WRITE MECHANISM; this one describes the half that decides whether a spill
+        # is possible at all - the two fail differently, so a reader must be able to
+        # tell "no root configured" from "the engine never sent a key". `section()`
+        # reads no files and walks no directory, so it stays safe on a polled path.
+        out["disk_store"] = disk_store.section()
+        out["disk_store_installed"] = bool(disk_store.counters()["installed"])
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk store section")
+        out["disk_store"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["disk_store_installed"] = None
     return out
 
 

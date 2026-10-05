@@ -11,14 +11,14 @@ inside `EngineCore.__init__` (vllm/v1/engine/core.py:214-217), from
     is skipped with a warning instead of clobbered;
   * total: nothing it does can raise into the process that loaded it.
 
-What it installs: NINE methods on the `EngineCore` class, plus one wrapper on
+What it installs: TEN methods on the `EngineCore` class, plus one wrapper on
 `KVConnectorFactory.create_connector` (the connector-creation hook that lands the
 PR #56810 install when the tier connector is built), plus - in every process, on
 the connector's BASE class - the CPU capacity clamp, the per-rank diagnostics
-writer and the raw-byte dump hook (`worker_diag` and `blockdump`, both
-file-channel facilities that retry off the handshake hook, because a worker never
+writer, the raw-byte dump hook and the SSD spill hook (`worker_diag`, `blockdump`
+and `disk_store`, all retrying off the handshake hook, because a worker never
 imports `EngineCore` and nothing in a worker is reachable over the utility
-channel). `EngineCoreProc`
+channel; all three compose on the same `get_finished`, in that order). `EngineCoreProc`
 (and `DPEngineCoreProc`, the actor classes) inherit them, and the UTILITY
 dispatch looks them up with `getattr(self, method_name)`
 (vllm/v1/engine/core.py:1669-1671), so a class-level method is exactly what
@@ -46,6 +46,7 @@ from . import (
     blockdump,
     config,
     cpu_capacity,
+    disk_store,
     evictions,
     guard_mode,
     kvconfig,
@@ -302,6 +303,30 @@ def _make_blockdump_method():
     return kvtier_dev_blockdump
 
 
+def _make_disk_method():
+    def kvtier_dev_disk(self, args=None):  # noqa: ARG001 - bound method
+        """The SSD spill tier: status / arm / disarm / spill-one / ls.
+
+        THIS process has no KV memory, so it never spills anything itself: `arm`
+        and `disarm` set `disk_spill`'s gate (and publish it in the arm FILE a
+        worker reads), `status`/`ls` measure the store from this side (bounded
+        walks, no file contents), and `spill-one` leaves one small request file a
+        worker answers on its next step. The bytes are written on `disk_spill`'s
+        own thread in the worker, never on this loop and never over this channel.
+        """
+        return disk_store.disk_for_engine(self, args)
+
+    kvtier_dev_disk.__doc__ = (
+        "kvtier-dev-plugin: the SSD spill tier's control verb "
+        "(status/arm/disarm/spill-one/ls). DISARMED at every boot, no env var arms "
+        "it, and an arm expires. `spill-one` is relayed to the workers by a file "
+        "because a worker has no utility channel; the write itself happens on the "
+        "spill thread. `engine_fields` in every answer says whether this boot's "
+        "metadata carries store_keys, i.e. whether the engine half of the wiring "
+        "is live.")
+    return kvtier_dev_disk
+
+
 _FACTORIES = {
     config.METHOD_SNAPSHOT: _make_snapshot_method,
     config.METHOD_RELOAD_POLICY: _make_reload_method,
@@ -312,6 +337,7 @@ _FACTORIES = {
     config.METHOD_TIER: _make_tier_method,
     config.METHOD_LOOKUPS: _make_lookups_method,
     config.METHOD_BLOCKDUMP: _make_blockdump_method,
+    config.METHOD_DISK: _make_disk_method,
 }
 
 
@@ -350,19 +376,24 @@ def _engine_core_class():
 
 
 def _on_worker_report(connector) -> None:
-    """Both file-channel facilities, in the ONE order that matters.
+    """The three worker-method facilities, in the ONE order that matters.
 
     The handshake hook is the only moment a worker process definitely has an
-    offload handler, so it drives BOTH file-channel installs - and `worker_diag`
-    must attempt first, because both wrap the SAME method
-    (`SimpleCPUOffloadWorker.get_finished`). Whichever lands second composes on
-    top of the other (the `guard_mode` sibling rule), so a later ordering change
+    offload handler, so it drives ALL THREE worker installs - and `worker_diag`
+    must attempt first, because all three touch the SAME method
+    (`SimpleCPUOffloadWorker.get_finished`). Whichever lands last composes on top
+    of the others (the `guard_mode` sibling rule), so a later ordering change
     cannot silently drop one; running the rank-file writer first is still the
     order that keeps the proxy host's reader fed, which is the facility real
-    dashboards depend on. Each call is contained on its own, so a broken first
-    listener cannot cost the second one its install.
+    dashboards depend on. `disk_store` goes LAST deliberately: its completion hook
+    must read `_completed_store_events` AFTER the fork's own bookkeeping has run,
+    and being outermost is what guarantees that.
+
+    Each call is contained on its own, so a broken first listener cannot cost the
+    second one its install.
     """
-    for hook in (worker_diag.ensure_installed, blockdump.ensure_installed):
+    for hook in (worker_diag.ensure_installed, blockdump.ensure_installed,
+                 disk_store.ensure_installed):
         name = getattr(hook, "__name__", "listener")
         try:
             hook(connector)
@@ -400,6 +431,13 @@ def register() -> None:
         # monotonic comparison per step plus one `os.stat` per poll interval, and
         # no KV byte is read. `blockdump.py` owns the caps and the arm.
         dump_hook = blockdump.install()
+        # THE SSD SPILL TIER'S WORKER HALF, fitted last for the reason in
+        # `_on_worker_report` (it composes outermost on the same `get_finished`).
+        # Installing it is NOT arming it, and it is gated on no env var either:
+        # while `VLLM_E2_TIER_DISK_ROOT` is unset or the tier is unarmed - which is
+        # every fresh boot, since no env var arms it - the wrappers' cost is two
+        # `os.environ.get` calls per step: no stat, no open, no copy, no byte.
+        spill_hook = disk_store.install()
         # THE CONNECTOR-CREATION HOOK, and it comes before anything that could
         # refuse: this is what turns "patched before the first request" from an
         # operator habit into a property of the boot order. `create_connector` is
@@ -423,6 +461,8 @@ def register() -> None:
             logger.info("kvtier-dev-plugin: raw-byte dump hook %s (armed: %s)",
                         blockdump.counters()["skip_reason"] or dump_hook,
                         blockdump.is_armed())
+            logger.info("kvtier-dev-plugin: SSD spill hook %s; posture %s",
+                        spill_hook, disk_store.boot_note())
             return
         report = attach_methods(cls)
         # Usually a no-op here: at this point in EngineCore.__init__ the
@@ -467,6 +507,16 @@ def register() -> None:
               "design, armed only by POST %s {\"op\":\"arm\"} (it expires), and "
               "while disarmed a worker reads no KV byte and opens no file",
               dump_hook, config.ROUTE_PREFIX + config.ROUTE_BLOCKDUMP)
+        # The spill hook's posture, said where the operator reads the boot. The
+        # pair to look for on an engine that has not been patched yet is
+        # `engine_fields: absent` with a rising `no_key_for_slot` counter: that is
+        # the wiring refusing on purpose, not a spill path that is broken.
+        level("kvtier-dev-plugin: SSD spill hook %s; posture %s. On an unpatched "
+              "engine (no store_keys on SimpleCPUOffloadMetadata) the hook refuses "
+              "and COUNTS rather than writing; arm it only over POST %s "
+              "{\"op\":\"arm\"}, which expires on its own",
+              spill_hook, disk_store.boot_note(),
+              config.ROUTE_PREFIX + config.ROUTE_DISK)
         # WHAT THE BOOT WILL DO, stated at plugin load, and what it DID stated at
         # connector creation. Guard mode has no env var of its own and never will
         # (arming a bug-masking facility from a launcher script is the thing the

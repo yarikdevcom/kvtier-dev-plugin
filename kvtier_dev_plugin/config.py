@@ -74,6 +74,13 @@ the file contract the proxy host's reader expects):
                                  NEVER zero. Neither variable ARMS the tier: the
                                  arm is `disk_spill.arm()`, which expires by
                                  itself, exactly like the raw-byte dump's.
+  THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
+  is installed in every worker whenever the plugin is on, and its per-step cost
+  while unarmed is two `os.environ.get` calls; the two switches that make it do
+  anything are the root above and the arm, which only
+  `POST /plugins/kvtier/disk {"op":"arm"}` grants. `VLLM_E2_TIER_DIAG` is the
+  channel for the verb's `spill-one` op (a worker is unreachable over the utility
+  channel), the same one the rank files and the byte dump use.
 """
 
 from __future__ import annotations
@@ -161,12 +168,16 @@ METHOD_LOOKUPS = "kvtier_dev_lookups"
 # The raw-byte dump verb. Read-only, bounded, and DISARMED until a human arms it
 # (there is no env var that arms it): see blockdump.py.
 METHOD_BLOCKDUMP = "kvtier_dev_blockdump"
+# The SSD spill tier's verb: status / arm / disarm / spill-one / ls. It can ARM a
+# facility that writes real KV bytes to disk, so it is a dev-state route; the arm
+# expires and no env var produces one. See disk_store.py.
+METHOD_DISK = "kvtier_dev_disk"
 
 # Every engine method this plugin owns, in attach order. `attach_methods` walks
 # this, so a new verb cannot be attached in one place and forgotten elsewhere.
 METHODS = (METHOD_SNAPSHOT, METHOD_RELOAD_POLICY, METHOD_KVCONFIG, METHOD_INSPECT,
            METHOD_TRACE, METHOD_GUARD, METHOD_TIER, METHOD_LOOKUPS,
-           METHOD_BLOCKDUMP)
+           METHOD_BLOCKDUMP, METHOD_DISK)
 
 # All HTTP surface lives here, never under /v1 (see docs/usage/security.md:349:
 # `--api-key` only protects the /v1, /v2, /inference, /cohere prefixes).
@@ -188,18 +199,22 @@ ROUTE_LOOKUPS = "/lookups"
 # The bounded raw-KV-byte dump. It can ARM a diagnostic that reads real KV bytes,
 # so it is a dev-state route: token required in every shape, loopback included.
 ROUTE_BLOCKDUMP = "/blockdump"
+# The SSD spill tier's control verb. It can ARM a facility that writes real KV
+# bytes to disk, and `spill-one` makes a worker write one, so it is a dev-state
+# route on the same rule as `/blockdump`: token in every shape, loopback included.
+ROUTE_DISK = "/disk"
 
 # The same routes as one tuple, in the order a reader wants them, so `status`
 # and the tests enumerate the surface from ONE place. Suffixes: the router
 # carries ROUTE_PREFIX itself.
 ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUEST,
           ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS, ROUTE_BLOCKDUMP,
-          ROUTE_RELOAD)
+          ROUTE_DISK, ROUTE_RELOAD)
 
 # The routes that can change engine dev state. Token in every shape, loopback
 # included - see endpoint.require_dev_state_token.
 DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS,
-                    ROUTE_BLOCKDUMP)
+                    ROUTE_BLOCKDUMP, ROUTE_DISK)
 
 # Name used for logs, for `VLLM_PLUGINS` allowlisting and as the entry-point
 # name in both groups. One name allowlists both halves at once.

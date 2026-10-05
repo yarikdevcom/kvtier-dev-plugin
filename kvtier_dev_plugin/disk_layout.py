@@ -177,7 +177,9 @@ UNITS_BY_NAME = {
     "arm_default_seconds": "seconds",
     "arm_seconds": "seconds",
     "bad_call": "refusals",
+    "bad_digest": "refusals",
     "bad_key": "refusals",
+    "bad_key_text": "refusals",
     "block_id": "blocks",
     "bytes_on_disk": "bytes",
     "bytes_per_file": "bytes",
@@ -195,14 +197,19 @@ UNITS_BY_NAME = {
     "entries": "files",
     "errors": "operations",
     "estimated_bytes": "bytes",
+    "events": "events",
     "evict_bytes": "bytes",
     "evict_target_fraction": "fraction",
     "evicted_bytes": "bytes",
     "evictions": "files",
+    "expired": "refusals",
     "expires_at_wallclock": "epoch_seconds",
     "files": "files",
     "files_free": "files",
+    "fingerprint": "fingerprints",
+    "fingerprint_incomplete": "refusals",
     "fingerprint_invalid": "refusals",
+    "fingerprint_mismatch": "refusals",
     "fingerprint_missing": "refusals",
     "fragment_bytes": "bytes",
     "free_bytes": "bytes",
@@ -212,6 +219,7 @@ UNITS_BY_NAME = {
     "hash_block_size": "tokens",
     "headroom_bytes": "bytes",
     "key_chars": "chars",
+    "key_count_mismatch": "refusals",
     "length_bytes": "bytes",
     "lru_files": "files",
     "malformed": "files",
@@ -222,14 +230,19 @@ UNITS_BY_NAME = {
     "min_free_bytes": "bytes",
     "mtime_ns": "nanoseconds",
     "name_chars": "chars",
+    "no_channel": "refusals",
     "no_free_space": "refusals",
     "no_key_for_slot": "refusals",
     "no_region_tensors": "refusals",
+    "no_store_event": "refusals",
+    "no_store_slots": "refusals",
     "not_armed": "refusals",
     "not_configured": "refusals",
     "not_ours": "files",
     "num_groups": "groups",
     "over_rate_window": "refusals",
+    "over_slot_cap": "refusals",
+    "over_tick_cap": "refusals",
     "path_chars": "chars",
     "peer_rank": "files",
     "planned": "files",
@@ -248,6 +261,7 @@ UNITS_BY_NAME = {
     "requests": "requests",
     "reserve_bytes": "bytes",
     "reserved_for_root_bytes": "bytes",
+    "retained_events": "events",
     "scanned": "entries",
     "scheduler_block_size": "tokens",
     "seconds_left": "seconds",
@@ -256,6 +270,7 @@ UNITS_BY_NAME = {
     "skipped": "files",
     "slot": "blocks",
     "slot_out_of_range": "refusals",
+    "slots": "slots",
     "spill_window_seconds": "seconds",
     "spilled": "slots",
     "stale_first": "files",
@@ -267,6 +282,7 @@ UNITS_BY_NAME = {
     "total_bytes_per_block": "bytes",
     "unit_size_bytes": "bytes",
     "unlinked": "files",
+    "unretained_event": "refusals",
     "used_bytes": "bytes",
     "watermark_bytes": "bytes",
     "watermark_bytes_configured": "bytes",
@@ -413,29 +429,53 @@ def _validate_token_list(name: str, value, *, allow_empty: bool) -> dict:
 
 
 def _validate_seed(name: str, value) -> dict:
-    """The NONE_HASH seed, as the engine reports it: an int or a hex string.
+    """The NONE_HASH seed, as the engine reports it: an int, hex, or opaque text.
 
-    Both shapes are accepted because the engine's `NONE_HASH` is a hash VALUE and
-    different call sites print it differently (an int, or 16 hex chars). A float,
-    a None, an empty string or a non-hex string is refused: a seed we cannot
-    render canonically is a fingerprint we cannot reproduce, which is the one
-    thing a content-addressed name cannot survive.
+    Three shapes, because the FORK has all three. `_validate_seed` used to demand
+    hex, and the live fork's own `DEFAULT_NONE_HASH_SEED` is `"vllm-none-hash"`
+    (`v1/core/kv_cache_utils.py:121`) - the value a cryptographic hash function
+    gets when `PYTHONHASHSEED` is unset, which is the normal production boot. A
+    hex-only rule therefore refused a REAL engine value, and a worker that cannot
+    render the seed cannot build a fingerprint, cannot name a file, and spills
+    nothing forever. Refusing a value the engine actually uses is not safety, it is
+    a broken feature - so an opaque string is accepted, and what stays refused is
+    anything that cannot be rendered into the digest at all: empty, absurdly long,
+    a NUL, a control character, a float, a bool, None.
 
-    The canonical form is ALWAYS `hex:<digits>`, whichever shape arrived, so the
-    engine reporting `60166` in one call site and `0xebce` in another produces ONE
-    digest - and so validation is IDEMPOTENT: `validate_fingerprint` returns a
-    normalized fingerprint, and a caller that re-validates it - which `disk_spill`
-    does on every spill, because re-deriving the digest per slot is cheaper than
-    trusting a cached one - must get the same answer instead of a spurious refusal.
+    The canonical form is always prefixed - `hex:<digits>` for a hex-shaped value
+    (whichever hex spelling arrived, and for an int), `int:` accepted as an
+    alternative spelling of the same digits, and `str:<text>` for anything else
+    kept VERBATIM, case included. Two consequences that matter: validation is
+    IDEMPOTENT (`disk_spill` re-validates on every spill, so a canonical value must
+    not be refused by the check that produced it), and an opaque seed's case is
+    part of the identity, because a secret seed's cases are different secrets.
+
+    WHY THE SEED IS IN THE FINGERPRINT AT ALL: with a non-cryptographic hash
+    function and no `PYTHONHASHSEED`, `get_none_hash_seed()` returns fresh random
+    bytes PER PROCESS (`kv_cache_utils.py:139-143`) and the fork logs that block
+    hashes are then not reproducible across processes. A boot whose seed changed
+    mid-life must not find yesterday's files, so the seed moves the digest.
     """
     if _is_plain_int(value):
         if value < 0:
             return _fail(f"{name} is negative")
         return {"ok": True, "reason": None, "value": f"hex:{value:x}"}
     if isinstance(value, str):
-        text = value.strip().lower()
+        text = value.strip()
+        if not text:
+            return _fail(f"{name} is empty")
+        if len(text) > MAX_FP_STRING_CHARS:
+            return _fail(f"{name} is {len(text)} chars; the cap is "
+                         f"{MAX_FP_STRING_CHARS}")
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            return _fail(f"{name} contains a control character")
+        if "\x00" in text:
+            return _fail(f"{name} contains a NUL byte")
+        lowered = text.lower()
+        if lowered.startswith("str:"):
+            return {"ok": True, "reason": None, "value": text}
         for kind in ("int:", "hex:"):
-            if text.startswith(kind):
+            if lowered.startswith(kind):
                 digits = text[len(kind):]
                 if not digits or len(digits) > 64:
                     return _fail(f"{name} {value!r} is not a canonical seed")
@@ -444,16 +484,18 @@ def _validate_seed(name: str, value) -> dict:
                         return _fail(f"{name} {value!r} is not a canonical seed")
                     return {"ok": True, "reason": None,
                             "value": f"hex:{int(digits):x}"}
-                if any(char not in HEX_DIGITS for char in digits):
+                if any(char not in HEX_DIGITS for char in digits.lower()):
                     return _fail(f"{name} {value!r} is not a canonical seed")
-                return {"ok": True, "reason": None, "value": f"hex:{digits}"}
-        text = text.removeprefix("0x")
-        if not text or len(text) > 64:
-            return _fail(f"{name} is an empty or implausibly long hex string")
-        if any(char not in HEX_DIGITS for char in text):
-            return _fail(f"{name} {value!r} is not a hex string or an int")
-        return {"ok": True, "reason": None, "value": f"hex:{text}"}
-    return _fail(f"{name} must be an int or a hex string, got "
+                return {"ok": True, "reason": None, "value": f"hex:{digits.lower()}"}
+        hexish = lowered.removeprefix("0x")
+        if len(hexish) <= 64 and hexish and all(
+                char in HEX_DIGITS for char in hexish):
+            return {"ok": True, "reason": None, "value": f"hex:{hexish}"}
+        # Not hex-shaped, so it is an opaque seed (the fork's `vllm-none-hash`, or
+        # an operator's own). It is still a fact about this boot, and a fact we
+        # refuse to render is a fingerprint we cannot build.
+        return {"ok": True, "reason": None, "value": f"str:{text}"}
+    return _fail(f"{name} must be an int or a string, got "
                  f"{type(value).__name__}")
 
 
@@ -669,6 +711,33 @@ def validate_root(path) -> dict:
     return {"ok": True, "reason": None, "value": text, "absolute": absolute}
 
 
+def validate_geometry_digest(digest) -> dict:
+    """Is this a 12-hex-char geometry digest? Validates and lower-cases; derives
+    nothing, ever.
+
+    THE ONE RULE THIS FUNCTION EXISTS TO KEEP: a digest that arrives from another
+    process (the scheduler's `store_fingerprint`, on the wire to a worker) is
+    VALIDATED AND USED VERBATIM. Re-deriving it worker-side would name files this
+    boot can never find, because the digest covers scheduler-only fields the
+    worker does not have - the hash seed above all. So the only legal operations
+    here are the shape check and the case normalisation `validate_key16` already
+    applies to a key (ext4 is case-sensitive: one digest owning two file names
+    halves the store).
+    """
+    if not isinstance(digest, str):
+        return _fail(f"a geometry digest must be a string of "
+                     f"{GEOMETRY_DIGEST_CHARS} hex chars, got "
+                     f"{type(digest).__name__}")
+    text = digest.strip().lower()
+    if len(text) != GEOMETRY_DIGEST_CHARS:
+        return _fail(f"the geometry digest is {len(text)} chars; it must be "
+                     f"exactly {GEOMETRY_DIGEST_CHARS} hex characters of the "
+                     "config fingerprint")
+    if any(char not in HEX_DIGITS for char in text):
+        return _fail("the geometry digest is not hexadecimal")
+    return {"ok": True, "reason": None, "value": text}
+
+
 def build_slot_name(key, geometry_digest) -> dict:
     """``kvslot-<key16>-<geodigest12>.bin``, and nothing else.
 
@@ -681,12 +750,11 @@ def build_slot_name(key, geometry_digest) -> dict:
     if not checked_key["ok"]:
         return _fail(str(checked_key["reason"]))
     key16 = checked_key["value"]
-    if (not isinstance(geometry_digest, str)
-            or len(geometry_digest) != GEOMETRY_DIGEST_CHARS
-            or any(char not in HEX_DIGITS for char in geometry_digest.lower())):
-        return _fail(f"geometry_digest {geometry_digest!r} must be exactly "
-                     f"{GEOMETRY_DIGEST_CHARS} hexadecimal characters")
-    digest = geometry_digest.lower()
+    checked_digest = validate_geometry_digest(geometry_digest)
+    if not checked_digest["ok"]:
+        return _fail(f"geometry_digest {geometry_digest!r}: "
+                     f"{checked_digest['reason']}")
+    digest = checked_digest["value"]
     name = (f"{SLOT_FILE_PREFIX}{key16}-{digest}{SUFFIX_DATA}")
     if len(name) > MAX_NAME_CHARS:
         return _fail(f"the file name is {len(name)} chars; the cap is "

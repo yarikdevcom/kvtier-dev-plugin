@@ -712,8 +712,13 @@ def test_the_status_section_is_stable_and_reports_every_counter():
     assert section["capability"] == "armed_and_ready"
     assert section["caps"]["max_bytes_per_file"] == SLOT_BYTES
     assert section["caps"]["units"]["max_queue_depth"] == "jobs"
-    # The wiring is an honest gap, said out loud in the status payload.
-    assert "NO engine hook is installed" in section["wiring"]
+    # The wiring says, in the status payload, WHO owns the engine hook and what
+    # happens on an engine that does not carry the metadata fields yet. The first
+    # version of this text read "NO engine hook is installed", which stopped being
+    # true the day `disk_store` wrapped bind_connector_metadata/get_finished; the
+    # honest statement is that the hook exists and REFUSES on an unpatched boot.
+    assert "disk_store" in section["wiring"]
+    assert "UNPATCHED engine" in section["wiring"]
     assert "cached_block_hash_to_block" in section["read_path"]
 
 

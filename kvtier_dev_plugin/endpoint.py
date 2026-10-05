@@ -19,6 +19,8 @@ it):
     POST /plugins/kvtier/lookups         arm / disarm / clear / verdict    [TOKEN]
     GET  /plugins/kvtier/blockdump       the raw-byte dump's capability state
     POST /plugins/kvtier/blockdump       arm / disarm / dump bounded ranges [TOKEN]
+    GET  /plugins/kvtier/disk            the SSD spill tier's state
+    POST /plugins/kvtier/disk            arm / disarm / spill-one / ls       [TOKEN]
     POST /plugins/kvtier/policy/reload   reload <package dir>/policy.py  [TOKEN]
 
 GET takes its arguments from query parameters, POST from a JSON object body.
@@ -388,6 +390,21 @@ ARG_SPECS: dict[str, dict] = {
                                         "max": 2 ** 31 - 1},
                              "length": {"kind": "int", "min": 1, "max": 1048576},
                              "seconds": {"kind": "int", "min": 1, "max": 7200}},
+    # THE SSD SPILL TIER. Every bound here is pinned equal to the one the engine
+    # module enforces (`disk_store.MAX_LS_FILES`, `disk_spill.ARM_MAX_SECONDS`,
+    # `disk_store.DISK_OPS`), the `ROUTE_BLOCKDUMP` rule: a wire bound looser than
+    # the engine's would only move the refusal, and a tighter one would lie about
+    # what the verb can do. `key` is 64 chars so a caller can send the hash text
+    # they have; `disk_layout.validate_key16` still demands exactly 16 hex chars,
+    # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
+    config.ROUTE_DISK: {"op": {"kind": "enum",
+                               "values": ("status", "arm", "disarm", "spill-one",
+                                          "ls")},
+                        "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
+                        "key": {"kind": "str", "max_chars": 64},
+                        "fingerprint": {"kind": "str", "max_chars": 32},
+                        "seconds": {"kind": "int", "min": 1, "max": 7200},
+                        "limit": {"kind": "int", "min": 1, "max": 200}},
 }
 
 
@@ -687,6 +704,36 @@ def status_payload(dev_state: dict | None = None) -> dict:
                      "`POST {\"op\":\"arm\"}` does, and an arm expires on its own. "
                      "Disarmed, a worker's cost is one stat per poll interval. "
                      "`not_deployed` means no VLLM_E2_TIER_DIAG, so no channel."),
+        },
+        # THE SSD SPILL TIER's route and ops. What is knowable HERE is the surface
+        # and this process's own env; the arm, the counters, the store's size and
+        # the `engine_fields` verdict all belong to the engine, and come from
+        # `GET|POST /disk` or `snapshot.disk_store`. `not_configured` there means
+        # "this boot has no disk tier", not "this verb is broken".
+        "disk": {
+            "route": config.ROUTE_PREFIX + config.ROUTE_DISK,
+            "ops": ["status", "arm", "disarm", "spill-one", "ls"],
+            "root_env": config.ENV_DISK_ROOT,
+            "ceiling_env": config.ENV_DISK_BYTES,
+            "note": ("the write side of the SSD spill tier: KV slots evicted from "
+                     "the host-RAM tier are spilled to one file each on the "
+                     "engine's own disk, named "
+                     "kvslot-<key16>-<geodigest12>.bin by the SCHEDULER's "
+                     "fingerprint digest (never re-derived worker-side). OFF twice "
+                     f"over: {config.ENV_DISK_ROOT} must name a real filesystem "
+                     "(tmpfs roots are refused) AND the tier must be armed; no env "
+                     "var arms it and an arm expires. `spill-one` is relayed to "
+                     "the workers through VLLM_E2_TIER_DIAG because a worker has "
+                     "no utility channel, and the write runs on the spill thread. "
+                     "There is deliberately no restore path yet. Read "
+                     "`engine_fields` from the engine to know whether this boot's "
+                     "metadata carries store_keys: without it the worker refuses "
+                     "and counts `no_key_for_slot` and writes zero bytes. A file "
+                     "name comes from the fingerprint the WORKER builds for itself "
+                     "(its own measured slot width and rank id), because one "
+                     "scheduler cannot broadcast one digest that is four ranks' "
+                     "digests; `fingerprint` on `spill-one` is an optional "
+                     "cross-check, and a GET will not run a mutating op."),
         },
         "tier": {
             "route": config.ROUTE_PREFIX + config.ROUTE_TIER,
@@ -1090,6 +1137,86 @@ async def route_blockdump_post(request: Request):
     args = await body_arguments(request, config.ROUTE_BLOCKDUMP)
     return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
                                      source="blockdump verb"))
+
+
+@router.get(config.ROUTE_DISK)
+async def route_disk(request: Request):
+    """The SSD spill tier's state. Token required even for this read, as for
+    `/blockdump`: the same door ARMS a facility that writes real KV bytes.
+
+    READ-ONLY BY CONSTRUCTION. The `op` is a QUERY PARAMETER here, so the URL that
+    arms the tier is as short as the URL that reads its status - and a browser
+    issues a GET with no CORS preflight and no custom header, which means a page
+    that can make the client load an image can issue it. A mutating `op` on this
+    method is therefore refused with 405 before the engine is touched, and
+    `safe_method` is passed along so the refusal holds even if someone calls the
+    engine-side verb directly (the `GET /api/config/auto-suspend` lesson: one verb,
+    two methods, and the mutating half must not answer on the safe one).
+    """
+    await _guard_dev_state_route(request)
+    args = dict(query_arguments(request, config.ROUTE_DISK))
+    from . import disk_store  # noqa: PLC0415 - the op lists live with the verb, and
+    # this module otherwise knows only `config` (no engine-side module at import).
+    op = str(args.get("op") or "status").strip().lower()
+    if op in disk_store.MUTATING_DISK_OPS:
+        raise HTTPException(
+            status_code=405,
+            detail=f"op '{op}' changes state and will not run from GET; send it as "
+                   f"POST {config.ROUTE_PREFIX + config.ROUTE_DISK} "
+                   f"(this route's GET answers op=status only)")
+    args.setdefault("op", "status")
+    args["safe_method"] = True
+    return as_json(await engine_call(request, config.METHOD_DISK, args,
+                                     source="disk spill status"))
+
+
+@router.post(config.ROUTE_DISK)
+async def route_disk_post(request: Request):
+    """THE SSD SPILL TIER - write side only, arm-gated, off by default.
+
+    `{op: status|arm|disarm|spill-one|ls, slot?, key?, fingerprint?, seconds?,
+    limit?}`. KV slots evicted from the RAM tier are spilled to
+    `<root>/<shard>/kvslot-<key16>-<geodigest12>.bin` on the engine's own disk, so
+    the RAM tier can shrink. There is no restore path yet, by design: a hit is
+    resolved in the scheduler's `cached_block_hash_to_block` and only
+    scheduler-side store-completion publishes into it, so a file is a verifiable,
+    disposable copy and nothing more.
+
+      * TOKEN-GATED like `/guard` and `/blockdump`: this route can arm a facility
+        that writes KV bytes to disk, so it is a dev-state route in every shape.
+      * OFF TWICE OVER: `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the
+        tmpfs roots are refused by the layout layer), AND the tier must be ARMED.
+        No env var arms it; `{"op":"arm"}` does, and an arm expires.
+      * `spill-one` names ONE slot (`{slot, key, fingerprint}`) so the path can be
+        proved to write real bytes without waiting for eviction pressure. It
+        requires the arm, and it is RELAYED: this process has no KV memory, so the
+        ask becomes one small file that every worker answers for its own rank
+        (`VLLM_E2_TIER_DIAG` is that channel, the same one the rank files use).
+        The write happens on the spill thread, never on an engine thread, and the
+        receipt reports where the file will be.
+      * `fingerprint` on `spill-one` is an OPTIONAL CROSS-CHECK, not the naming
+        source, and `""` (what the engine sends today) means nothing. A file name
+        comes from the fingerprint each WORKER builds for itself - its own measured
+        slot width and its own rank id - because one scheduler broadcasting one
+        digest to four ranks cannot produce four ranks' digests: `total_bytes_per_block`
+        and `rank` are rank-local. A non-empty `fingerprint` that disagrees with a
+        rank's own digest is a counted `fingerprint_mismatch` refusal for that rank,
+        never a silent override.
+      * `ls` is read-only and bounded (`limit` <= `disk_store.MAX_LS_FILES`, plus a
+        response-byte ceiling that trims and SAYS so); `status` reports this
+        process's own counters and the wiring's state, and `ls` is what walks the
+        store to measure it.
+      * A MUTATING `op` is refused with 405 on GET; the safe method answers
+        `op=status` only.
+      * `engine_fields` answers `present|absent|unknown` for this boot: whether
+        `SimpleCPUOffloadMetadata` carries `store_keys` at all. On an unpatched
+        engine the worker hook refuses and counts `no_key_for_slot` and writes
+        nothing - which is the same build being correct on both engines.
+    """
+    await _guard_dev_state_route(request)
+    args = await body_arguments(request, config.ROUTE_DISK)
+    return as_json(await engine_call(request, config.METHOD_DISK, args,
+                                     source="disk spill verb"))
 
 
 @router.post(config.ROUTE_RELOAD)

@@ -48,6 +48,7 @@ so these routes answer between requests.
 | `kvtier_dev_plugin/step_trace.py` | the two scheduler-step observers the ring reads from. Pure observers, no catching |
 | `kvtier_dev_plugin/guard_mode.py` | **development only**: the tier exception capture-and-decline, its captures, and the `guard` verb |
 | `kvtier_dev_plugin/worker_diag.py` | the worker-side per-rank JSON writer (files are how a worker reports; it has no utility channel) |
+| `kvtier_dev_plugin/disk_store.py` | **development only**: the worker half of the SSD spill tier - the fingerprint THIS rank builds, the `store_keys` resolver, the store-completion spill hook (composing over `worker_diag`/`blockdump`), and the engine half of the `/disk` verb. Drives `disk_spill.py` (the queue + writer) and `disk_layout.py` (the naming rules). Stdlib only |
 | `kvtier_dev_plugin/policy_holder.py` | late-bound holder for the policy module; trial-load + swap, rollback on failure |
 | `kvtier_dev_plugin/policy.py` | **the file you edit.** `decide(view)` observes, `decide_store(ctx)` vetoes |
 | `kvtier_dev_plugin/store_hook.py` | the runtime patch on the tier's store-decision path: idempotent, non-clobbering, fail-open |
@@ -168,7 +169,7 @@ app = FastAPI(); p = KVTierDevEndpointPlugin(); p.attach_router(app)
 print(sorted(r.path for r in app.routes if 'kvtier' in getattr(r, 'path', '')))
 "
 # ['/plugins/kvtier/block', '/plugins/kvtier/blockdump',
-#  '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+#  '/plugins/kvtier/disk', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
 #  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
 #  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
 #  '/plugins/kvtier/status', '/plugins/kvtier/tier', '/plugins/kvtier/trace']
@@ -182,7 +183,7 @@ FastAPI route-tree shape (newer FastAPI nests included routers behind an
 curl -s http://127.0.0.1:8000/openapi.json | python3 -c \
   'import json,sys; print(sorted(p for p in json.load(sys.stdin)["paths"] if "kvtier" in p))'
 # ['/plugins/kvtier/block', '/plugins/kvtier/blockdump',
-#  '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
+#  '/plugins/kvtier/disk', '/plugins/kvtier/guard', '/plugins/kvtier/kvconfig',
 #  '/plugins/kvtier/lookups', '/plugins/kvtier/policy/reload',
 #  '/plugins/kvtier/request', '/plugins/kvtier/snapshot',
 #  '/plugins/kvtier/status', '/plugins/kvtier/tier', '/plugins/kvtier/trace']
@@ -210,6 +211,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls` (see `disk_store.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -915,6 +917,69 @@ remove it) before arming another. To compare the SIBLING slots of one span inste
 of one index across regions, read the per-group slot ids from
 `GET $B/request?request_id=...` (or the live block tables) and dump each region at
 its own slot id - same command, different `block_id`.
+
+## Spilling parked KV to the engine's own disk (`disk_store.py` + `disk_spill.py`)
+
+The host-RAM tier can only grow to what the box has. The SSD tier is the write side
+of the next step down: when a store into a CPU slot **completes**, that slot's bytes
+can be written to one file on the engine's own filesystem, named so that a
+configuration change makes the old files un-findable rather than mis-readable:
+
+```
+<VLLM_E2_TIER_DISK_ROOT>/<key16[0:2]>/kvslot-<key16>-<geodigest12>.bin
+```
+
+* `key16` is the first 16 hex chars of the engine's block hash for that slot (the
+  contract's `store_keys`, index-aligned with `store_cpu_blocks`; a slot the engine
+  could not hash arrives as `""` and costs that one slot, never the batch).
+* `geodigest12` is a digest of the fingerprint **the worker builds for itself**: the
+  slot width it measures from its own region tensors and the rank it resolves, plus
+  the rank-invariant facts read off `vllm_config`/`kv_cache_config` and the fork's
+  `get_none_hash_seed()`. One scheduler cannot broadcast one digest that is four
+  ranks' digests (`total_bytes_per_block` is 11,468,800 B on PP0 and 12,902,400 B on
+  PP1), so the rank-local fields are read per rank - and that is what keeps a PP1
+  worker from being able to form a PP0 file's name. `store_fingerprint` is an
+  optional **cross-check**: `""` (what the engine sends today) means nothing, and a
+  non-empty value that disagrees with a rank's own digest is a counted refusal.
+
+**Off, twice over.** `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the tmpfs
+roots are refused by `disk_layout`) **and** the tier must be armed - no env var arms
+it, and an arm expires. Unarmed, the two wrapped methods cost two `os.environ.get`
+calls per step: no stat, no open, no copy, no queue, no writer thread.
+
+**It needs the engine patch, and says whether it has it.** A file needs a key, and
+today's `SimpleCPUOffloadMetadata` (`vllm/v1/simple_kv_offload/metadata.py`) carries
+none. Every entry point then refuses with a reason, counts it, and writes zero bytes;
+`engine_fields` in every answer says `present` / `absent` / `unknown` for this boot,
+read from the metadata **type**, so the question is answerable without generating a
+store. `no_key_for_slot` in the refusal table is that state, counted.
+
+```bash
+H="Authorization: Bearer $VLLM_E2_TIER_DEV_TOKEN"; B=http://127.0.0.1:8000/plugins/kvtier
+# what can this boot do?
+ssh llm "curl -s -H '$H' $B/disk" | python3 -m json.tool
+# arm for ten minutes, then prove the path writes real bytes for one slot
+curl -s -H "$H" -X POST -d '{"op":"arm","seconds":600}' $B/disk
+curl -s -H "$H" -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f607"}' $B/disk
+curl -s -H "$H" -X POST -d '{"op":"ls","limit":20}' $B/disk
+ssh llm "curl -s -H '$H' -X POST -d '{"op":"disarm"}' $B/disk"
+```
+
+`spill-one` is **relayed**: the EngineCore has no KV memory, so the ask becomes one
+small file under `VLLM_E2_TIER_DIAG` that every rank answers for its own slot on its
+next step, each writing its own receipt. The bytes are queued on the spill thread -
+the receipt says `queued` and names the file it will land in, and `ls` is the proof.
+`ls` is read-only and bounded (walk caps, `limit`, and a response-byte ceiling that
+trims and says so).
+
+**There is no restore path, deliberately.** A prefix hit is resolved in the
+scheduler's `cached_block_hash_to_block`, and only scheduler-side store-completion
+publishes into it (`manager.py:1017-1044`), so a file is a verifiable, disposable
+copy and nothing more. One consequence of running the write side alone: the bytes are
+read on the writer thread, so a slot recycled between completion and the write would
+be captured as its NEW contents under the OLD name - a wasted write, never a wrong
+answer, because nothing reads it. When restore lands, the spill becomes a
+copy-at-completion (`disk_spill.spill_slot`'s synchronous core is the seam).
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
@@ -1845,7 +1910,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-1218 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+1413 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
@@ -1860,7 +1925,7 @@ reload verb, holder-based reload actually changing behaviour (same-size/same-mti
 edit), rollback with the traceback as data, containment (a raising policy and a
 raising engine both come back as data, `BaseException` propagates), the 504/502/503
 answers, that every installed engine method takes exactly one optional argument and
-answers under both dispatch shapes, and that the mount point is exactly the eleven
+answers under both dispatch shapes, and that the mount point is exactly the twelve
 `/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
@@ -1889,6 +1954,42 @@ capability marker's three states are asserted in `section()`, in `snapshot` and 
 `/status`, including that `/status` says `..._unobserved` rather than inventing
 `armed: false`; and the wire bound on `length` is pinned equal to the engine's own
 `MAX_BYTES_PER_REQUEST` rather than to a second copy of the literal.
+
+The spill wiring (`tests/test_disk_store.py`) is the one that tests naming, because a
+wrong name is the failure that cannot be repaired after the fact. The worker's
+fingerprint is assembled from a fake handler that carries the fork's own names
+(`cache_config.prefix_match_unit`, `kv_cache_groups[i].kv_cache_spec
+.prefix_cacheable`, `parallel_config.decode_context_parallel_size`) and the fork's own
+`get_none_hash_seed()` - including its non-hex `DEFAULT_NONE_HASH_SEED`, the value a
+real unseeded boot returns; a field that cannot be read is refused BY NAME with the
+paths tried and never defaulted, and the rebuild is rate-limited so an unreadable
+config does not re-walk fifteen attribute paths every step. Two ranks of one
+configuration get two digests and cannot form each other's file name, a changed model
+id / hash algorithm / group layout moves the digest, and the seed moves it too. The
+pairing rules are pinned as a refusal, not a heuristic: a length mismatch refuses the
+whole step naming both numbers, while one `""` key costs its own slot and the rest of
+the batch still spills. A completed store writes the region's own bytes - read out of
+a real `ctypes` buffer by the same copy the worker performs - at the path the
+fingerprint dictates, through the fork's `bind_connector_metadata` and
+`get_finished`, with the fork's return value handed back by identity and the sibling
+`worker_diag`/`blockdump` layers still installed underneath. `store_fingerprint` is
+proved to be a cross-check and nothing else: `""` (today's engine) keeps the step, a
+disagreement refuses it naming both digests, a non-digest is a separate counted
+reason. An unpatched metadata is the AUTOUSE default of the file, so "correct on the
+engine that exists" cannot be inherited from another test by accident, and the
+no-engine-shape case reports `unknown` rather than `absent`. Every bound is asserted
+as a counted event: the per-step hand-off cap, the retention cap (oldest step evicted
+first, and completing it is an `unretained_event`, never a spill), the once-per-event
+de-duplication, the scan cap that skips a huge completed map instead of copying it.
+`spill-one` is exercised end to end across the relay - request file, rank poll, the
+receipt's `queued` verdict and its `expected_path`, and the file really present with
+the slot's bytes after a drain - with a second poll refusing to answer the same ask
+twice, a malformed or wrong-version or expired request counted and ignored, and a
+rank refusing an ask whose fingerprint is not its own. Nothing raises: every door is
+opened with a tensor whose attributes explode, a `None` config, an `op` that is an
+object; `KeyboardInterrupt` from the fork still escapes; and an AST walk asserts the
+module imports only the standard library and its own package (function-level imports
+included), so the engine is reached by NAME and never at import time.
 
 The lookup ledger (`tests/test_lookup_ledger.py`) is the one that proves the
 composition rules instead of asserting them: the cap and the monotonic `dropped`,
