@@ -309,10 +309,15 @@ def sibling_layer(fn):
     if fn is None:
         return None
     try:
-        from . import backport  # noqa: PLC0415 - lazy: backport imports us lazily
+        from . import (
+            backport,  # noqa: PLC0415 - lazy: backport imports us lazily
+            disk_restore,  # noqa: PLC0415 - lazy, for the same reason
+        )
         inner = backport._function_of(fn)
         for attr, tag, kind in ((backport.SWITCH_ATTR, backport.SWITCH_TAG, "switch"),
-                                (backport.OWNER_ATTR, backport.OWNER_TAG, "backport")):
+                                (backport.OWNER_ATTR, backport.OWNER_TAG, "backport"),
+                                (disk_restore.OWNER_ATTR, disk_restore.OWNER_TAG,
+                                 disk_restore.LAYER_KIND)):
             if getattr(inner, attr, None) == tag:
                 return kind
     except Exception as exc:  # noqa: BLE001 - "not ours" is the safe answer

@@ -531,7 +531,7 @@ def _layers_of(fn):
     """Walk one class attribute down through our own layers.
 
     Returns `(layers, bottom)`: `layers` is `[(kind, body), ...]` outermost
-    first with kind in {"switch", "backport", "guard"}; `bottom` is the first
+    first with kind in {"switch", "backport", "guard", "restore"}; `bottom` is the first
     body NOT marked as ours - normally the fork's own function, or a foreign
     plugin's body (which is then just a body we must vouch for by
     fingerprint), or None when an ORIGINAL chain is broken. The walk is
@@ -566,10 +566,17 @@ def _rewrap(name, base, layers_above):
     that layer); a `switch` layer is rebuilt by its factory; a `guard` layer
     is rebuilt by `guard_mode._make_wrapper` (same package, the same factory
     its own `install()` composes with - so guard semantics, decline table and
-    markers are unchanged under a re-install). Never touches any callable
+    markers are unchanged under a re-install); a `restore` layer is rebuilt by
+    `disk_restore.make_wrapper`, the same factory ITS install uses. The `or body`
+    fallback is unreachable by construction (a restore layer exists only on the
+    three scheduler methods `make_wrapper` has a hook for) and keeps the chain
+    callable if that ever stops being true. Never touches any callable
     that is not ours.
     """
-    from . import guard_mode  # noqa: PLC0415 - see _layer_kinds
+    from . import (
+        disk_restore,  # noqa: PLC0415 - see _layer_kinds
+        guard_mode,  # noqa: PLC0415 - see _layer_kinds
+    )
     body = base
     for kind, _wrapper in reversed(layers_above):
         if kind == "backport":
@@ -578,6 +585,8 @@ def _rewrap(name, base, layers_above):
             body = _SWITCH_FACTORIES[name](body)
         elif kind == "guard":
             body = guard_mode._make_wrapper(name, body)
+        elif kind == disk_restore.LAYER_KIND:
+            body = disk_restore.make_wrapper(name, body) or body
     return body
 
 

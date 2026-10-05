@@ -46,6 +46,7 @@ from . import (
     blockdump,
     config,
     cpu_capacity,
+    disk_restore,
     disk_store,
     evictions,
     guard_mode,
@@ -376,18 +377,20 @@ def _engine_core_class():
 
 
 def _on_worker_report(connector) -> None:
-    """The three worker-method facilities, in the ONE order that matters.
+    """The worker-side facilities, in the ONE order that matters.
 
     The handshake hook is the only moment a worker process definitely has an
-    offload handler, so it drives ALL THREE worker installs - and `worker_diag`
-    must attempt first, because all three touch the SAME method
+    offload handler, so it drives ALL FOUR worker installs - and `worker_diag`
+    must attempt first, because three of them touch the SAME method
     (`SimpleCPUOffloadWorker.get_finished`). Whichever lands last composes on top
     of the others (the `guard_mode` sibling rule), so a later ordering change
     cannot silently drop one; running the rank-file writer first is still the
     order that keeps the proxy host's reader fed, which is the facility real
-    dashboards depend on. `disk_store` goes LAST deliberately: its completion hook
-    must read `_completed_store_events` AFTER the fork's own bookkeeping has run,
-    and being outermost is what guarantees that.
+    dashboards depend on. `disk_store` goes third and `disk_restore` last:
+    the spill hook's completion read must see `_completed_store_events` AFTER the
+    fork's own bookkeeping has run, and the restore hook - outermost - is the one
+    that has to union its own `finished_recving` releases into whatever the layers
+    beneath it returned.
 
     Each call is contained on its own, so a broken first listener cannot cost the
     second one its install - and each report is LOGGED, once per process, at
@@ -399,7 +402,7 @@ def _on_worker_report(connector) -> None:
     """
     outcomes = []
     for hook in (worker_diag.ensure_installed, blockdump.ensure_installed,
-                 disk_store.ensure_installed):
+                 disk_store.ensure_installed, disk_restore.ensure_installed):
         name = getattr(hook, "__name__", "listener")
         try:
             outcomes.append(f"{name}={_brief_report(hook(connector))}")
@@ -467,6 +470,15 @@ def register() -> None:
         # every fresh boot, since no env var arms it - the wrappers' cost is two
         # `os.environ.get` calls per step: no stat, no open, no copy, no byte.
         spill_hook = disk_store.install()
+        # THE SSD RESTORE PATH, fitted after the spill hook for the reason in
+        # `_on_worker_report`, and with the same posture: installing it is NOT
+        # arming it. It needs the spill tier's root AND the spill tier's arm AND the
+        # tier's own arm, so on a fresh boot its wrappers do nothing but read two
+        # env vars and one arm file - no lookup, no allocation, no open, no byte.
+        # In the EngineCore process the manager module usually does not exist yet
+        # here, so the real fit comes later off the handshake or the snapshot verb;
+        # in a worker it lands as soon as the connector has imported its worker.
+        restore_hook = disk_restore.install()
         # THE CONNECTOR-CREATION HOOK, and it comes before anything that could
         # refuse: this is what turns "patched before the first request" from an
         # operator habit into a property of the boot order. `create_connector` is
@@ -492,6 +504,8 @@ def register() -> None:
                         blockdump.is_armed())
             logger.info("kvtier-dev-plugin: SSD spill hook %s; posture %s",
                         spill_hook, disk_store.boot_note())
+            logger.info("kvtier-dev-plugin: SSD restore hook %s; armed: %s",
+                        restore_hook, disk_restore.gate()["ok"])
             return
         report = attach_methods(cls)
         # Usually a no-op here: at this point in EngineCore.__init__ the
@@ -545,6 +559,16 @@ def register() -> None:
               "and COUNTS rather than writing; arm it only over POST %s "
               "{\"op\":\"arm\"}, which expires on its own",
               spill_hook, disk_store.boot_note(),
+              config.ROUTE_PREFIX + config.ROUTE_DISK)
+        # The restore hook's posture, in the same place. Its own proof line is
+        # `DISK[restore-witness]`, which says whether a restore ever served a
+        # request; this line only says whether the hook is fitted and gated open.
+        level("kvtier-dev-plugin: SSD restore hook %s; gate open: %s. It EXTENDS "
+              "the tier's own load with spans read back from the spill tier and "
+              "reports every failed read as a load error so the scheduler "
+              "recomputes; inert until POST %s {\"op\":\"arm\"} AND the tier arm. "
+              "Its verdict line is DISK[restore-witness]",
+              restore_hook, disk_restore.gate()["ok"],
               config.ROUTE_PREFIX + config.ROUTE_DISK)
         # WHAT THE BOOT WILL DO, stated at plugin load, and what it DID stated at
         # connector creation. Guard mode has no env var of its own and never will

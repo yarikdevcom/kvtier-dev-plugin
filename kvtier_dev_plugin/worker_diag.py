@@ -159,7 +159,8 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 
 # --- the contribution seam: ONE writer, several contributors -----------------
 # A worker-side module that has facts for the operator (today `disk_store`: the
-# SSD tier's own verdict) must NOT write a file. A second writer of
+# SSD tier's own verdict, and `disk_restore`: the SSD tier's READ-BACK verdict) must
+# NOT write a file. A second writer of
 # `rank-<rank>.json` would race the atomic `os.replace`, and a second file name
 # would be a second contract the proxy host's reader has never heard of. So other
 # modules hand this one a producer and stay silent; `worker_diag` validates and
@@ -167,10 +168,10 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 #
 # THREE LIMITS, because a contribution is a guest in someone else's file:
 #   * `CONTRIBUTION_SECTIONS` is a HARD allow-list of the top-level keys a
-#     contributor may add. It is the whole shape of the trust: `"disk"` is listed,
-#     `"arena"`/`"counters"`/`"version"` are not, so a contributor cannot overwrite
-#     a field the reader REQUIRES. An unknown section name is refused at register
-#     time, not at write time.
+#     contributor may add. It is the whole shape of the trust: `"disk"` and
+#     `"disk_restore"` are listed, `"arena"`/`"counters"`/`"version"` are not, so a
+#     contributor cannot overwrite a field the reader REQUIRES. An unknown section
+#     name is refused at register time, not at write time.
 #   * `MAX_CONTRIBUTIONS` bounds how many sections exist at all.
 #   * `MAX_CONTRIBUTION_BYTES` bounds ONE section, serialized; a section over it is
 #     REFUSED (and counted), never truncated - half a section reads as a fact with
@@ -183,7 +184,7 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 # `rank`/filename mismatch - so the byte ceiling and the required-field rule are
 # enforced here, and `epoch`/`version`/`writer` stay exactly as they were:
 # a contribution never touches them.
-CONTRIBUTION_SECTIONS = ("disk",)
+CONTRIBUTION_SECTIONS = ("disk", "disk_restore")
 MAX_CONTRIBUTIONS = 4
 MAX_CONTRIBUTION_BYTES = 4096
 MAX_CONTRIBUTION_NOTES = 4

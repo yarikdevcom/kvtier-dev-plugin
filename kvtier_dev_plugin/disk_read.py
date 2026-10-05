@@ -257,14 +257,31 @@ def _take_buffer(size: int):
         return None
 
 
+def _give_buffer_locked(buffer, size: int) -> None:
+    """Return a buffer to the pool. THE CALLER MUST HOLD `_state_lock`.
+
+    Two forms exist because `_state_lock` is a plain `threading.Lock` and NOT an
+    `RLock`: a caller that already holds it and calls a lock-taking helper blocks
+    forever on a lock it owns - a self-deadlock on the calling thread, with no error
+    and no traceback. That was real: `finish_batch` -> `_give_buffer` on the engine's
+    `start_load_kv` path, and `_settle` -> `_give_buffer` on the reader thread's, so
+    the module could never hand back a single buffer and any caller that closed a
+    batch hung. A unit test found it by hanging. Every internal call site holds the
+    lock, so this unlocked form is the default and the wrapper below exists only for
+    the two call sites that provably run outside the lock (`_handle_read`'s
+    already-cancelled path and `request_read`'s queue-full path).
+    """
+    if len(_buffers) >= MAX_BATCHES or size > MAX_BYTES_PER_READ:
+        _state["buffers_held_bytes"] = max(0, int(_state["buffers_held_bytes"])
+                                           - size)
+        return
+    _buffers.append((buffer, int(size)))
+
+
 def _give_buffer(buffer, size: int) -> None:
-    """Return a buffer to the pool. The pool shrinks rather than growing forever."""
+    """The LOCK-TAKING form, for a caller that does NOT hold `_state_lock`."""
     with _state_lock:
-        if len(_buffers) >= MAX_BATCHES or size > MAX_BYTES_PER_READ:
-            _state["buffers_held_bytes"] = max(0, int(_state["buffers_held_bytes"])
-                                               - size)
-            return
-        _buffers.append((buffer, int(size)))
+        _give_buffer_locked(buffer, size)
 
 
 def buffers_held_bytes() -> int:
@@ -428,12 +445,12 @@ def _settle(job, outcome: dict) -> None:
             # case the bounce buffer exists for.
             buffer = job.get("buffer")
             if buffer is not None:
-                _give_buffer(buffer, int(job["expect_bytes"]))
+                _give_buffer_locked(buffer, int(job["expect_bytes"]))
             return
         if entry["state"] == CANCELLED:
             buffer = job.get("buffer")
             if buffer is not None:
-                _give_buffer(buffer, int(job["expect_bytes"]))
+                _give_buffer_locked(buffer, int(job["expect_bytes"]))
             return
         if outcome.get("ok"):
             entry["state"] = DONE
@@ -444,7 +461,7 @@ def _settle(job, outcome: dict) -> None:
             entry["reason"] = str(outcome.get("reason"))[:MAX_STRING_CHARS]
             buffer = job.get("buffer")
             if buffer is not None:
-                _give_buffer(buffer, int(job["expect_bytes"]))
+                _give_buffer_locked(buffer, int(job["expect_bytes"]))
             job["buffer"] = None
 
 
@@ -668,7 +685,7 @@ def finish_batch(batch_id) -> dict:
             if buffer is None:
                 continue
             released += 1
-            _give_buffer(buffer, int(entry["job"]["expect_bytes"]))
+            _give_buffer_locked(buffer, int(entry["job"]["expect_bytes"]))
         _state["batches_closed"] += 1
         return _ok(closed=True, buffers=released, reason=None)
 
@@ -692,7 +709,7 @@ def cancel_batch(batch_id, reason: str) -> dict:
                 buffer = entry.get("job", {}).get("buffer")
                 if buffer is not None:
                     entry["job"]["buffer"] = None
-                    _give_buffer(buffer, int(entry["job"]["expect_bytes"]))
+                    _give_buffer_locked(buffer, int(entry["job"]["expect_bytes"]))
             elif entry["state"] == RUNNING:
                 running += 1
         _state["batches_cancelled"] += 1

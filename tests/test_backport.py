@@ -919,7 +919,7 @@ def test_a_freshly_imported_module_is_disarmed():
     "the tier does nothing at boot" is a claim about the first instant of a real
     process, before any test helper has touched it.
     """
-    out = subprocess.run(
+    out = subprocess.run(  # noqa: S603 - a harness running this interpreter
         [sys.executable, "-c",
          "from kvtier_dev_plugin import backport; "
          "print(backport.BOOT_ARMED, backport.is_armed(), "
