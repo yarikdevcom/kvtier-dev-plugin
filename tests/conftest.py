@@ -62,7 +62,7 @@ def reset_snapshot_state():
     snapshot._state.update(saved)
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def reset_dev_state():
     """The pieces of DEVELOPMENT state, disarmed and zeroed, then restored.
 
@@ -70,6 +70,14 @@ def reset_dev_state():
     process-wide state (a ring, a deque, a class marker). Without this a test that
     armed guard mode would leave the wrappers installed on whatever class it
     passed and leave the next test believing guard mode is off.
+
+    AUTOUSE, deliberately: an opt-in reset is a reset only the files that remember
+    it get. `snapshot._state["errors"]` is a process-wide ledger that every
+    "must not raise" test adds to, so a file that never asked for this fixture
+    handed its ledger to the next file - which made a green suite a property of
+    FILE ORDER (see tests/test_dev_state_isolation.py). Tests may still request it
+    by name to read the live state dicts it yields; requesting it does not run it
+    twice, because pytest instantiates one fixture per test.
     """
     saved = {"snapshot": dict(snapshot._state),
              "trace": dict(trace_ring._state),

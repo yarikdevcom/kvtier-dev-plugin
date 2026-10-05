@@ -275,11 +275,11 @@ def store_files(root):
 def tier(tmp_path, monkeypatch, reset_dev_state):
     """A configured, ARMED store under this test's tmp directory, with a rank.
 
-    `reset_dev_state` is requested EXPLICITLY, the way `test_disk_spill.py`'s
-    `armed_tier` does: it is not autouse, and without it this module's state -
-    including an adopted fingerprint - leaks into the next test, where the very
-    first `adopt_fingerprint` answers "already the naming authority" and a
-    fingerprint test silently tests a cache hit.
+    `reset_dev_state` is autouse in `conftest.py`, so it runs for this module
+    whether or not it is named - and it is NAMED, because this fixture's whole
+    contract rests on it: the adopted fingerprint in particular. Without a reset
+    the very first `adopt_fingerprint` answers "already the naming authority" and
+    a fingerprint test silently tests a cache hit.
 
     Deliberately NOT pre-`configure()`d: on the box nobody hands the worker a
     fingerprint, so a test that configured one would hide the very path this module

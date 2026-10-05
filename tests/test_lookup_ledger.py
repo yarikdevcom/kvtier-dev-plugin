@@ -79,9 +79,14 @@ class SimpleCPUOffloadScheduler:
 
 @pytest.fixture(autouse=True)
 def clean_ledger():
-    """The ledger's ring and counters are process-wide. A ledger-only test does not
-    ask for `reset_dev_state`, so reset here as well: without it `dropped` from one
-    test is the next test's starting point and every bound assertion is meaningless.
+    """The ledger's ring and counters are process-wide, so reset them HERE too.
+
+    `conftest.py`'s autouse `reset_dev_state` already zeroes `lookup_ledger` before
+    and after every test, so this is redundant - and deliberately kept: the bound
+    assertions below ("`dropped` is at most N") are only meaningful against a ledger
+    this module guarantees itself, not one inherited from a fixture another file
+    might stop requesting. Without a reset, `dropped` from one test is the next
+    test's starting point and every bound assertion here is meaningless.
     """
     lookup_ledger.reset_state_for_tests()
     yield
