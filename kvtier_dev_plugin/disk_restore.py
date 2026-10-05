@@ -21,6 +21,18 @@ that could corrupt OTHER requests' lookups, and it buys nothing correctness-wise
 Cross-boot adoption is likewise absent - `disk_index` indexes what THIS boot's
 ranks journalled, so a fresh boot restores nothing until it has spilled.
 
+THE MARKER DECIDES THE SPAN (0.2.22), AND THAT IS THE WHOLE READ PATH'S TESTABILITY.
+A request carrying `kv_transfer_params.kvtier_disk_restore = true` has the fork's
+host-RAM hit treated as ZERO tokens for the offer arithmetic, so the disk index - not
+whatever RAM happened to hold - decides what is offered, starting at the local
+GPU-computed boundary. Without that rule the disk could only ever fill the gap RAM
+left, so a small prompt either hit RAM wholly (nothing to offer) or hit it with a
+remainder (a refusal), and exercising one disk read cost ~1.3M tokens of eviction
+filler. A request WITHOUT the marker is unaffected: RAM first, disk second, byte for
+byte as before. `computed` is never forced to zero, because it is the offset the fork's
+own copy writes at, not an opinion - see the RESTORE_MARKER_KEY docstring for the
+exact corruption that forcing it would cause.
+
 THE THREE ENGINE FACTS THIS IS BUILT ON (all read from the deployed fork)
 ------------------------------------------------------------------------
 1. THE IDENTITY IS DERIVABLE, EXACTLY. The store path spilled
@@ -186,6 +198,13 @@ FIELD_LOAD_EVENT_TO_REQS = "load_event_to_reqs"
 # still carries it is, by construction, unreadable.
 IDENTITY_DIGEST_PLACEHOLDER = "0" * disk_layout.GEOMETRY_DIGEST_CHARS
 
+# "We never got an answer about what the fork pinned", as distinct from `None`, which
+# means "we asked and the table genuinely holds nothing for this request". The
+# difference decides whether a flagged request may be given the disk: an unreadable
+# pin table is a pin that cannot be released, and a pin that cannot be released must
+# not be walked away from.
+_PIN_UNREAD = object()
+
 # --- the proof that the WORKER half of this path is live ---------------------
 # THE ONE ASYMMETRY THIS MODULE CANNOT SEE FOR ITSELF. The scheduler and the workers
 # are different processes, and an offer is only SAFE if a worker will fill the CPU
@@ -251,6 +270,46 @@ MAX_PATHS_PER_STEP = 512             # load_paths entries one step may carry
 MIN_WITNESS_LOG_SECONDS = 30.0       # SECONDS between witness re-emissions
 MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
 MAX_RANK_COUNTER = 1_000_000_000     # ceiling on a counter read from a rank file
+MAX_SPANS_REPORT = 16                # PARTIAL SPANS one shape report may name
+
+# --- the settle wait, and the arithmetic that sizes it -----------------------
+#
+# WHY A CAP AND NOT A BUDGET. The wait has to be proportional to the work in flight,
+# because the two ends of the range are orders of magnitude apart. Measured on the live
+# box: a 9,400-token prompt recomputes in 2.4 s through the proxy, and a 32,000-token
+# offer is 10 spans x 5 groups x 11,468,800 B = ~573 MB per rank. So the recompute a
+# wait is racing is ~2.5 s for a 3-span x 5-group offer (~9,600 tokens, ~172 MB) and
+# ~8.2 s for a 10-span one (~32,000 tokens, ~573 MB), while the read that avoids it is
+# ~15 ms and ~50 ms at the store's measured 11.5 GB/s. A flat budget sized for the big
+# offer is ~3x what the small one needs; the only flat number that is ever obviously
+# safe against recompute (eight seconds) is a net loss on every offer, paid inside the
+# step by requests that never asked for disk. The rule the fields below encode is
+# therefore: WAIT ONLY WHILE THE WAIT IS CHEAPER THAN THE RECOMPUTE, and publish the
+# boundary rather than hide it.
+#
+# `SETTLE_MS_DEFAULT` is 0.0 for a reason that outlives this experiment: the plugin
+# ships into a box serving real traffic, and a step that blocks on NVMe by accident
+# is worse than a tier that never reads. Every number below is inert until an
+# operator names a cap in the environment.
+SETTLE_MS_DEFAULT = 0.0               # MILLISECONDS; 0 = never wait (today's boot)
+SETTLE_MS_MAX = 60_000.0              # a cap that is not this is a typo, not a budget
+SETTLE_MIN_MS = 0.5                   # FLOOR: a wait shorter than one scheduler
+                                      # timer tick cannot be observed, so grant the
+                                      # tick and let the poll loop leave early
+SETTLE_SAFETY_MARGIN = 2.0            # the read is the FLOOR of the budget, not the
+                                      # estimate: queue hand-off, thread wakeup and
+                                      # the bounce-buffer copy are all on top of the
+                                      # kernel's read time
+SETTLE_READ_BPS_DEFAULT = 11_500_000_000.0   # BYTES/S assumed while nobody has
+                                             # measured the READ side; see the env
+                                             # var's comment in config.py
+PREFILL_TOKENS_PER_S_DEFAULT = 9400.0 / 2.4  # TOKENS/S: the two measured samples,
+                                             # 9,400 tokens recomputed in 2.4 s
+SETTLE_POLL_SECONDS = 0.0005          # SECONDS between looks while waiting; half a
+                                      # millisecond is below every interesting read
+                                      # time and above a busy-wait's cost
+MAX_SETTLE_SAMPLES = 512              # WINDOW samples kept for a median; min/max are
+                                      # boot-wide regardless
 
 # --- the request-scoped gate --------------------------------------------------
 
@@ -270,6 +329,31 @@ STRICTNESS, spelled out because a client can send anything here: a request is
 flagged when `kv_transfer_params` is a real `dict` AND its value under this key is
 the boolean `True`. Not `"true"`, not `1`, not a nested object - a caller who means
 it sends JSON `true`. Everything else is "not flagged", counted, never raised.
+
+WHAT THE MARKER MEANS (0.2.22): THE DISK IS THE AUTHORITY FOR THAT REQUEST. It is
+not a hint that a disk offer would be welcome. A flagged request's host-RAM hit is
+treated as ZERO tokens for the offer arithmetic, so the disk index decides the span
+from the local GPU-computed boundary rather than filling the gap the RAM tier left.
+That is the only way the read path can be exercised at all: with RAM consulted, a
+small prompt either hits RAM (nothing left to offer) or hits it partially, which the
+old alignment rule refused outright - so proving the disk could serve ONE block meant
+evicting ~1.3M tokens of filler first. An UNFLAGGED request is not touched by any of
+this: it gets the fork's own answer, byte for byte, which is how the existing client
+keeps running on the RAM tier with no client-side change.
+
+WHY `computed` IS NOT ALSO FORCED TO ZERO. `update_state_after_alloc`
+(`manager.py:441-463`) places the external blocks at
+`num_computed_tokens // group_block_size + i` INTO THE REQUEST'S WHOLE BLOCK LIST
+(the scheduler passes `kv_cache_manager.get_blocks(request_id)`,
+`scheduler.py:1228-1232`). The third field of the pending tuple is therefore not an
+opinion - it is the offset the DMA writes at. Zeroing it while the scheduler still
+believes `computed` tokens are cached would aim the copy at the request's ALREADY
+CACHED, ref-counted prefix blocks (shared with every other request reading them) and
+leave the newly allocated external region unwritten: wrong KV, plus a write into
+blocks this request does not own. The scheduler's local hit is not this module's to
+un-learn, so the disk span starts where the local prefix ends. The RAM hit IS ours to
+ignore, because the fork keeps it in exactly one place, `_pending_cpu_hits`, and
+releases it through one method, `_free_pending_cpu_hit` (see `_release_fork_pin`).
 """
 
 RESTORE_SCOPE_OPTIN = "optin"
@@ -285,7 +369,8 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "no_channel", "path_build_failed", "index_refresh_failed",
                   "too_many_loads", "ram_hit_not_block_aligned",
                   "no_worker_proof", "offers_disabled", "workers_not_servicing",
-                  "skipped_no_marker", "suppressed_after_failure")
+                  "skipped_no_marker", "suppressed_after_failure",
+                  "pin_release_unavailable", "incomplete_group_set")
 
 # EVERY REFUSAL SPELLED OUT. `refused` says WHICH counter moved; this says what the
 # counter MEANS, so "why is there no restore?" is answerable from one payload read
@@ -359,13 +444,46 @@ OFFER_REFUSAL_WHY = {
                          f"disk restore (`extra_args.kv_transfer_params."
                          f"{RESTORE_MARKER_KEY} = true` in the request body): the "
                          "fork's own answer is returned untouched, which is the "
-                         "default posture for every request that does not ask",
+                         "default posture for every request that does not ask: "
+                         "no marker means the host-RAM tier answers it exactly as "
+                         "it did before this module existed",
+    "pin_release_unavailable": "the request asked to be served from disk and the "
+                               "fork had already PINNED host-RAM blocks for its "
+                               "own hit, but this build's manager exposes no "
+                               "`_free_pending_cpu_hit` to put them back: offering "
+                               "disk bytes instead would strand those pins for the "
+                               "rest of the boot, so the request keeps its RAM hit "
+                               "and the disk stays out of it",
     "suppressed_after_failure": "a disk load already failed for THIS request (or "
                                 "for the span its offer was built from), and a "
                                 "failed load must never be re-offered: the "
                                 "reschedule that follows calls "
                                 "get_num_new_matched_tokens again, and re-offering "
                                 "the same span is an infinite loop, not a retry",
+    "incomplete_group_set": "THE CLAIM-MUST-MATCH-THE-BYTES GATE (0.2.25). At "
+                            "least one group CAN be restored, but another "
+                            "prefix-cacheable group CANNOT, and offering the "
+                            "restorable subset claims every group: "
+                            "get_num_new_matched_tokens advances "
+                            "num_computed_tokens for the WHOLE model, "
+                            "update_state_after_alloc's `n_ext_g == 0 -> continue` "
+                            "is a SILENT no-op for the group we did not put in the "
+                            "tuple, and nothing recomputes the claimed range "
+                            "because a group that was never in the tuple reports "
+                            "no failure. The usual cause is a group that is "
+                            "prefix-cacheable but not positionally stable: an "
+                            "align-mode Mamba/GDN group's own hit contract is "
+                            "[null_block]*(n-1) plus ONE real boundary-state block "
+                            "(`single_type_kv_cache_manager.py:1533-1610`), so a "
+                            "claimed span costs it ONE block - not a span of KV - "
+                            "and that one block has no positional file name to "
+                            "read back, because the recurrent state is one runn"
+                            "ing value per sequence. Refusing costs one recompute; "
+                            "offering serves a wrong answer, which is what the "
+                            "live box did on 2026-10-06 at 00:08: a mechanically "
+                            "perfect read (9 of 9 applied per rank, no failures, "
+                            "18 ms) that answered garbage because the GDN "
+                            "boundary state was claimed and never filled",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -395,9 +513,63 @@ _state: dict = {
     # scheduler-side request ledger (the request-scoped gate)
     "requests_seen": 0, "flagged": 0, "skipped_no_marker": 0,
     "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
+    # THE MARKER'S AUTHORITY (0.2.22). A flagged request hands the DISK the decision
+    # about its own prefix: the fork's host-RAM hit is treated as zero tokens for the
+    # offer arithmetic. `disk_authority` counts the lookups that took that rule; the
+    # other two count the ones where a real RAM hit was thrown away and how many
+    # tokens it was, so "was this read forced from disk, or did RAM have nothing?" is
+    # one payload read and not an inference.
+    "disk_authority": 0, "local_hit_ignored": 0, "local_hit_tokens_ignored": 0,
+    "pin_release_failures": 0,
+    "last_local_hit_ignored": None,
+    # THE LAST OFFER, AS STRUCTURE: the numbers a forced read and an ordinary one
+    # disagree about, side by side. One dict, overwritten, clipped; never a ledger.
+    "last_offer": None,
+    # WHAT A CLAIM COSTS EVERY GROUP, published for the LAST priced lookup, offered or
+    # refused (0.2.25). `last_offer` can only describe an offer that happened; the
+    # 00:08 incident was an offer that should not have happened, so the requirement
+    # arithmetic is published on BOTH doors. Rows are per prefix-cacheable group: what
+    # the claimed range needs from it (`blocks_needed`/`null_blocks`), the contract that
+    # arithmetic came from, and whether the disk fills it. See `_groups_required`.
+    "last_groups_required": None,
+    # WHICH GROUPS THIS MODEL CAN EVER SERVE FROM DISK (0.2.25). Recomputed on every
+    # lookup that reaches the group arithmetic, whether it offered or refused, so the
+    # answer to "is this model un-serviceable from disk?" is one payload read and not
+    # a re-derivation of three manager predicates by hand. See `_group_serviceability`.
+    "group_serviceability": None,
+    # THE LAST LOAD THAT LEFT THE LEDGER WITHOUT A REPORT, in one sentence: which sweep
+    # door released it, whether its slots had reached a worker, whether a disk read had
+    # been applied, and how many GPU blocks it had mapped. With `last_refusal` and
+    # `last_offer` this is the third thing an incident actually asks for.
+    "last_aged_out": None,
     # scheduler-side ledger
     "lookups": 0, "offers": 0, "offered_tokens": 0, "blocks_offered": 0,
     "adopted": 0, "adopted_tokens": 0, "restorations": 0,
+    # THE LEDGER'S OWN HONESTY (0.2.25). A load can leave the ledger three ways
+    # without ever being correlated with a completion report: the fork stopped owning
+    # it (`_reqs_to_load` no longer names it - the shape of the fork's own
+    # "no external tokens but a pending CPU hit: releasing the stale pin" line), or
+    # its deadline expired. Either way a `finished_recving` that arrives afterwards
+    # used to find `_loads.get(request_id) is None` and `continue`: silently. On the
+    # live box that cost the 00:08 investigation its only evidence - 36 reads applied,
+    # `loads_released=1`, `restorations=0`, and nothing in the payload saying the
+    # report had arrived too late rather than never. `restorations` keeps its exact
+    # meaning ("reported while the ledger held it"); these count the OTHER case.
+    "aged_out_loads": 0,             # ledger releases with no report correlated
+    "aged_out_with_applied_reads": 0,  # ...of those, ones a read WAS applied for:
+                                       # bytes landed, the report came too late
+    "late_finished_reports": 0,      # a `finished_recving` whose ledger entry was
+                                     # already gone, matched to its release
+    "restored_after_release": 0,     # ...of those, ones whose release showed an
+                                     # adopted load with bytes applied behind it
+    # THE ONLY FIELD THAT COUPLES OUR CLAIM TO THE FORK'S DMA (0.2.25). "We offered
+    # these GPU blocks" and "the fork finished these GPU blocks" are two facts that
+    # meet in exactly one place: a `finished_recving` id matching a ledger record that
+    # names the GPU blocks our emitted paths wrote into. Counted in GPU BLOCKS, not
+    # requests, so a 9-block offer that finishes adds 9.
+    "disk_gpu_blocks_dma_verified": 0,
+    "disk_gpu_blocks_released_unreported": 0,  # ...mapped for a disk span, released
+                                               # by the ledger, never reported
     "refused": {r: 0 for r in OFFER_REFUSALS},
     "refusals_total": 0, "last_refusal": None, "last_reason": None,
     "paths_emitted_steps": 0, "path_entries": 0, "path_entries_empty": 0,
@@ -412,6 +584,54 @@ _state: dict = {
     # worker-side ledger
     "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
     "bytes_applied": 0, "dma_unsettled_entries": 0,
+    # THE RACE, AS A MEASUREMENT AND NOT AN INFERENCE. `dma_unsettled_entries` says
+    # how many entries lost the race; these say HOW FAR they lost it by, which is the
+    # only thing that decides whether waiting can fix it at all. The distinction
+    # between "the job never started" and "the job was mid-flight" is the difference
+    # between a thread that never got the CPU and a disk that was too slow, and until
+    # 0.2.23 both were counted as `not_settled`.
+    "apply_observations": 0,          # batches seen at the apply point
+    "apply_settled_on_arrival": 0,    # ...of those, already settled (the race, won)
+    "applied_settled_immediately": 0,  # ENTRIES applied without any wait
+    "dropped_queued": 0,              # ENTRIES dropped whose read had not started
+    "dropped_running": 0,             # ENTRIES dropped whose read was mid-flight
+    "dropped_unattributed": 0,        # ...dropped unsettled, state unreadable
+    "bind_to_apply_total_ms": 0.0,    # sums for the averages; min/median/max are
+    "bind_to_apply_min_ms": None,     # recomputed from the bounded samples plus a
+    "bind_to_apply_max_ms": None,     # boot-wide running min/max
+    "apply_elapsed_total_ms": 0.0,
+    "apply_elapsed_min_ms": None,
+    "apply_elapsed_max_ms": None,
+    # THE SETTLE WAIT (0.2.23), all of it inert while the cap is 0.
+    "settle_waits_granted": 0,        # batches given a non-zero budget
+    "settle_ms_total": 0.0,           # ms actually waited (sum -> avg)
+    "settle_ms_max": None,            # the worst single wait this boot
+    "settle_budget_total_ms": 0.0,
+    "settle_budget_max_ms": None,
+    "settled_after_wait": 0,          # batches that settled during their wait
+    "dropped_after_wait": 0,          # ...still unsettled when the wait expired
+    "settle_bytes_waited": 0,         # bytes the waits were waiting for
+    "settle_bound_min": 0,            # which bound decided the budget, per the
+    "settle_bound_proportional": 0,   #   three-way rule in `settle_budget`
+    "settle_bound_cap": 0,
+    "settle_bound_deadline": 0,
+    "settle_budget_over_recompute": 0,  # batches whose budget exceeded the recompute
+    "last_apply_window": None,        # the most recent batch's full window
+    "settle_notice": None,            # the once-per-boot line, as data
+    # THE SHAPE OF A PARTIAL RESTORE (0.2.24), measured and not decided. A span needs
+    # EVERY group to be worth anything; with one reader an interrupted batch was
+    # always missing a suffix of spans, and with N readers it can be missing one in
+    # the middle. Whether a partial restore may have its tokens counted as computed is
+    # NOT decided here - these are the numbers that question gets asked with.
+    "spans_observed": 0,              # spans seen at the apply point
+    "span_entries_observed": 0,       # disk entries those spans were made of
+    "spans_whole": 0,                 # ...every group applied
+    "spans_partial": 0,               # ...some groups applied (the new shape)
+    "spans_empty": 0,                 # ...nothing applied
+    "spans_hole_in_the_middle": 0,    # batches whose applied spans are NOT a prefix:
+                                      # impossible with one reader, so this counter
+                                      # rising IS the concurrency finding
+    "last_span_shape": None,          # the most recent batch's shape, as data
     "reads_failed": {r: 0 for r in WORKER_FAILURES},
     "invalid_reports": 0, "finished_released": 0, "worker_watchdog_fires": 0,
     "phantom_guard_trips": 0, "region_plan_errors": 0, "worker_errors": 0,
@@ -432,10 +652,22 @@ _slot_paths: dict = {}
 # of the request. A load that failed and is re-offered is an infinite loop (see
 # `suppress_load`), so the answer has to be remembered, not re-derived.
 _suppressed: dict = {}
+# Scheduler side: request id -> why its load BURNED (a failure report), kept after the
+# ledger entry is gone so a later `finished_recving` for the same request can be
+# counted as `no_read` instead of vanishing. Same bound as the fuse: a request that
+# burns and then never reports is one short string.
+_burned: dict = {}
 # Scheduler side: the same for a disk SPAN (first block's key:group of the offered
 # run), because a request the engine reset comes back with the same hashes and a
 # span that failed once will fail for whoever asks for it next.
 _suppressed_spans: dict = {}
+# Scheduler side: request id -> how its load LEFT THE LEDGER without a report (which
+# sweep branch, whether the slots had reached a worker, whether a disk read had been
+# applied, and how many GPU blocks it had mapped). The `_burned` idiom applied to the
+# releases that are not failures: a `finished_recving` that arrives after a release is
+# not nothing, and without this tombstone it is `continue`d away. Same bound as the
+# fuse: one short record per request that aged out.
+_aged_out: dict = {}
 # Scheduler side: request id -> computed tokens at the moment we last offered it disk
 # tokens. A request that returns at or before that point made no progress, which is
 # what a failed load looks like from the scheduler's seat.
@@ -449,12 +681,44 @@ _invalid: dict = {}
 _logged_lines: list = []
 _witness_state: dict = {"line": None, "emitted_mono": None, "key": None}
 
+# The window's samples. A median needs the population, min/max do not, so min/max
+# are boot-wide running values in `_state` while the median is computed over the last
+# `MAX_SETTLE_SAMPLES` observations and published AS that (with the count it covers,
+# so a median over 512 of 40,000 observations can never be misread as the boot's).
+_apply_samples: dict = {"bind_to_apply_ms": [], "apply_elapsed_ms": [],
+                        "settle_ms": [], "settle_budget_ms": []}
+# Once-per-boot notices, the `miss_attribution.notice_once` idiom: a wait that is on
+# has to be said out loud once, and saying it at the apply point every step would be
+# the flood that already cost this module its log.
+_notices: set = set()
+
+
+def notice_once(key: str, message: str) -> bool:
+    """Log `message` at most once per key per process. Bounded, never raises.
+
+    The repo's own idiom (`disk_index.notice_once`, `miss_attribution.notice_once`):
+    a line on the engine path is printed once per episode, because the alternative -
+    one line per step - is how a diagnostic stops being read. Returns True when it
+    actually logged, so the caller can count the episode and not the call.
+    """
+    try:
+        if key in _notices:
+            return False
+        if len(_notices) >= 64:
+            _notices.clear()
+        _notices.add(key)
+        _logger.warning("kvtier-dev-plugin: %s", str(message)[:640])
+        return True
+    except Exception as exc:  # noqa: BLE001 - a log line is never worth a fault
+        snapshot._error(exc, "disk_restore notice")
+        return False
+
 
 def reset_state_for_tests() -> None:
     """Back to a fresh boot: no ledgers, no counters, no installed layer."""
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
     global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
-    global _offered_at
+    global _offered_at, _burned, _aged_out
     _loads = {}
     _slot_paths = {}
     _wloads = {}
@@ -462,10 +726,15 @@ def reset_state_for_tests() -> None:
     _invalid = {}
     _suppressed = {}
     _suppressed_spans = {}
+    _burned = {}
+    _aged_out = {}
     _offered_at = {}
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
+    for samples in _apply_samples.values():
+        del samples[:]
+    _notices.clear()
     _witness_state.update({"line": None, "emitted_mono": None, "key": None})
     _proof_cache.update({"mono": None, "result": None})
     _deferred_finished.clear()
@@ -490,6 +759,23 @@ def reset_state_for_tests() -> None:
             "finished_released": 0, "worker_watchdog_fires": 0,
             "phantom_guard_trips": 0, "region_plan_errors": 0,
             "worker_errors": 0, "load_error_installs": 0,
+            "apply_observations": 0, "apply_settled_on_arrival": 0,
+            "applied_settled_immediately": 0, "dropped_queued": 0,
+            "dropped_running": 0, "dropped_unattributed": 0,
+            "bind_to_apply_total_ms": 0.0, "bind_to_apply_min_ms": None,
+            "bind_to_apply_max_ms": None, "apply_elapsed_total_ms": 0.0,
+            "apply_elapsed_min_ms": None, "apply_elapsed_max_ms": None,
+            "settle_waits_granted": 0, "settle_ms_total": 0.0,
+            "settle_ms_max": None, "settle_budget_total_ms": 0.0,
+            "settle_budget_max_ms": None, "settled_after_wait": 0,
+            "dropped_after_wait": 0, "settle_bytes_waited": 0,
+            "settle_bound_min": 0, "settle_bound_proportional": 0,
+            "settle_bound_cap": 0, "settle_bound_deadline": 0,
+            "settle_budget_over_recompute": 0, "last_apply_window": None,
+            "settle_notice": None,
+            "spans_observed": 0, "span_entries_observed": 0, "spans_whole": 0,
+            "spans_partial": 0, "spans_empty": 0, "spans_hole_in_the_middle": 0,
+            "last_span_shape": None,
             "witness_verdict": None, "witness_reason": None,
             "witness_kind": None, "witness_emissions": 0,
             "witness_suppressed": 0,
@@ -497,10 +783,330 @@ def reset_state_for_tests() -> None:
             "scope_changes": 0, "offer_switch_changes": 0, "ranks_seen": 0,
             "requests_seen": 0,
             "flagged": 0, "skipped_no_marker": 0, "suppressed_hits": 0,
-            "suppressed_spans": 0, "suppressions": 0}.items():
+            "suppressed_spans": 0, "suppressions": 0,
+            "disk_authority": 0, "local_hit_ignored": 0,
+            "local_hit_tokens_ignored": 0, "pin_release_failures": 0,
+            "last_local_hit_ignored": None, "last_offer": None,
+            "last_groups_required": None,
+            "group_serviceability": None, "last_aged_out": None,
+            "aged_out_loads": 0,
+            "aged_out_with_applied_reads": 0, "late_finished_reports": 0,
+            "restored_after_release": 0, "disk_gpu_blocks_dma_verified": 0,
+            "disk_gpu_blocks_released_unreported": 0}.items():
         _state[key] = value
     _state["refused"] = {name: 0 for name in OFFER_REFUSALS}
     _state["reads_failed"] = {name: 0 for name in WORKER_FAILURES}
+
+
+def settle_budget(bytes_at_stake: int, offered_tokens: int | None = None,
+                  seconds_left: float | None = None) -> dict:
+    """How long ONE apply point may wait, and what that wait is racing.
+
+    THE FORMULA, as it reads in code:
+
+        proportional_ms = bytes_at_stake / read_bytes_per_s * 1000 * SAFETY_MARGIN
+        budget_ms       = clamp(proportional_ms, SETTLE_MIN_MS, cap_ms)
+
+    then clamped again by the batch's own deadline (`seconds_left`, which
+    `disk_read.begin_batch` set from `LOAD_DEADLINE_SECONDS`) - a wait that outlives
+    the deadline it is waiting under is not a wait, it is a second bug.
+
+    `bytes_at_stake` is the bytes STILL IN FLIGHT at the apply point, not the size of
+    the offer: a batch that has delivered nine of ten slots is waiting for one slot, and
+    sizing its budget on ten would make the budget a function of the offer instead of a
+    function of the wait.
+
+    WHY PROPORTIONAL. The read is the floor of the budget and bytes are the only
+    quantity that scales with it: the measured offer is 11,468,800 B per (span,
+    group) per rank, so a 3-span x 5-group offer is ~172 MB and a 10-span offer is
+    ~573 MB, while the recompute they avoid is ~2.5 s (9,600 tokens) and ~8.2 s
+    (32,000 tokens) at the measured 3,917 tokens/s. A flat budget sized for the 573 MB
+    case is about three times what a 3-span offer needs, and the only FLAT number that
+    is ever obviously safe against recompute - eight seconds - is a net loss on every
+    offer, paid inside the step by requests that never asked for disk. Bytes-per-second
+    is a guess until this release measures it (the 11.5 GB/s figure is the WRITE rate);
+    `SAFETY_MARGIN` covers the parts the estimate omits - queue hand-off, thread wakeup,
+    the bounce-buffer copy - and the env var replaces the guess with a measurement once
+    there is one.
+
+    WHICH BOUND APPLIED is published, because the three answers mean three
+    different things to the operator: `off` = the cap is 0, this boot never waits (the
+    shipped default); `min` = a batch too small to measure, the floor is what it got;
+    `proportional` = the arithmetic decided, which is the intended regime; `cap` = the
+    operator's ceiling bound it, so a `dropped_after_wait` here is a cap that is too
+    small; `deadline` = the read's own expiry decided, i.e. the wait was told to stop by
+    the same clock that cancels the read.
+
+    The recompute side is published as `recompute_ms` with `budget_over_recompute`
+    set when the granted wait is MORE than the recompute it avoids - a wait there is
+    a regression by construction even when it wins the race, and batches like that are
+    counted (`settle_budget_over_recompute`) instead of being left for a human to
+    notice at 3 a.m.
+    """
+    env = config.settle_env()
+    raw_cap = env["cap_ms"] if env["cap_ms"] is not None else SETTLE_MS_DEFAULT
+    cap_ms = max(0.0, min(float(raw_cap), SETTLE_MS_MAX))
+    read_bps = (env["read_bytes_per_s"] if env["read_bytes_per_s"]
+                else SETTLE_READ_BPS_DEFAULT)
+    prefill_tps = (env["prefill_tokens_per_s"] if env["prefill_tokens_per_s"]
+                   else PREFILL_TOKENS_PER_S_DEFAULT)
+    payload = max(0, int(bytes_at_stake or 0))
+    proportional_ms = (payload / read_bps) * 1000.0 * SETTLE_SAFETY_MARGIN
+    if cap_ms <= 0.0:
+        granted, bound = 0.0, "off"
+    elif proportional_ms >= cap_ms:
+        granted, bound = cap_ms, "cap"
+    elif proportional_ms <= SETTLE_MIN_MS:
+        granted, bound = SETTLE_MIN_MS, "min"
+    else:
+        granted, bound = proportional_ms, "proportional"
+    deadline_ms = None
+    if seconds_left is not None:
+        try:
+            deadline_ms = max(0.0, float(seconds_left)) * 1000.0
+        except (TypeError, ValueError):
+            deadline_ms = None
+        if deadline_ms < granted:
+            granted, bound = deadline_ms, "deadline"
+    recompute_ms = None
+    if offered_tokens:
+        recompute_ms = (int(offered_tokens) / prefill_tps) * 1000.0
+    return {"enabled": cap_ms > 0.0, "cap_ms": round(cap_ms, 3),
+            # Named, not swallowed: an absurd cap is clamped and the reader is told a
+            # ceiling did it, so a typo in a systemd drop-in is a visible clamp and not
+            # a mystery wait at 3 a.m.
+            "ceiling_clamped": float(raw_cap) > SETTLE_MS_MAX,
+            "bytes_at_stake": payload, "read_bytes_per_s": read_bps,
+            "safety_margin": SETTLE_SAFETY_MARGIN, "min_ms": SETTLE_MIN_MS,
+            "proportional_ms": round(proportional_ms, 3),
+            "budget_ms": round(granted, 3), "bound": bound,
+            "deadline_ms": None if deadline_ms is None else round(deadline_ms, 3),
+            "offered_tokens_estimate": None if not offered_tokens
+                                      else int(offered_tokens),
+            "prefill_tokens_per_s": round(prefill_tps, 1),
+            "recompute_ms": None if recompute_ms is None else round(recompute_ms, 1),
+            "budget_over_recompute": (None if recompute_ms is None or granted <= 0
+                                      else granted > recompute_ms),
+            "env_problems": list(env["problems"])}
+
+
+def _settle_wait(batch_id, status: dict, budget_ms: float) -> tuple[dict, float]:
+    """Poll `batch_id` until it settles, expires, or the budget is gone.
+
+    A POLL, not a condition wait, and deliberately so: `disk_read`'s reader thread
+    finishes jobs on its own and publishes them under its lock, and the apply point
+    runs on the engine's step thread - a `Condition.wait` here would put the engine's
+    step behind a lock held by a thread doing kernel reads, which is the same
+    mistake in a new costume. `time.sleep` yields the GIL, so the reader runs between
+    looks; `SETTLE_POLL_SECONDS` (0.5 ms) is far below the ~10 ms the smallest offer
+    reads in and far above the cost of one context switch.
+
+    BOUNDED THREE WAYS BY CONSTRUCTION, because an unbounded wait inside an engine
+    step is a hang wearing a performance patch: the granted budget, the batch's own
+    `seconds_left`, and `disk_read`'s deadline expiry - whichever ends the loop first.
+    Never wait with the state lock held; the caller must not hold it.
+    """
+    started = time.monotonic()
+    ceiling = max(0.0, float(budget_ms)) / 1000.0
+    while True:
+        if (status.get("settled") or status.get("incomplete")
+                or status.get("deadline_expired") or not status.get("known", True)):
+            break
+        left = ceiling - (time.monotonic() - started)
+        seconds_left = status.get("seconds_left")
+        if isinstance(seconds_left, (int, float)):
+            left = min(left, float(seconds_left))
+        if left <= 0:
+            break
+        time.sleep(min(SETTLE_POLL_SECONDS, left))
+        status = disk_read.batch_status(batch_id)
+    return status, (time.monotonic() - started) * 1000.0
+
+
+def _offered_tokens_estimate(batch: dict) -> tuple[int | None, str]:
+    """Tokens this batch is offering, from what a WORKER rank is able to see.
+
+    The offered-token count is a scheduler-side fact (`_loads[rid]["tokens"]`) and
+    the scheduler is a different PROCESS - the number cannot be handed over without
+    widening the metadata the fork owns, which this release does not do. What a rank
+    CAN see is the batch's own shape: one disk entry per (span, group), so
+
+        spans  = entries / distinct groups in the batch
+        tokens = spans * scheduler_block_size        (from the store fingerprint)
+
+    which is an ESTIMATE and is published named as such. It is exact for the uniform
+    case the loader builds today (every span carries every cacheable group) and drifts
+    only where the scheduler truncated a span - and the direction is published with
+    it, so a reader can tell `derived` from `unknown` and never from a guess.
+    """
+    jobs = batch.get("jobs") or {}
+    if not jobs:
+        return None, "no disk entries in the batch"
+    groups = {int(job.get("group") or 0) for job in jobs.values()}
+    try:
+        fingerprint = disk_store.counters().get("fingerprint") or {}
+        block_tokens = int(fingerprint.get("scheduler_block_size") or 0)
+    except Exception:        # noqa: BLE001 - an estimate is never worth a fault
+        block_tokens = 0
+    if block_tokens <= 0:
+        return None, "scheduler_block_size is not in the store fingerprint"
+    spans = len(jobs) // max(1, len(groups))
+    return spans * block_tokens, (
+        f"{len(jobs)} entries / {len(groups)} groups x {block_tokens} tokens/block")
+
+
+def _note_apply_window(window: dict) -> None:
+    """Fold one completed apply-point observation into the counters.
+
+    Kept separate from the observation so the MEASUREMENT is not gated on the wait:
+    the numbers that decide whether waiting is worth anything are exactly the numbers
+    a default boot (cap 0, never waiting) produces. Every field is a copy of
+    something already read, the sample lists are bounded, and nothing here can raise
+    or wait - it runs on the engine's step thread.
+
+    NO LOCK, deliberately, in common with every other counter in this module: the
+    apply point runs on the worker's step thread and nothing else writes these keys,
+    so a lock here would only add the re-entry hazard `test_no_nonreentrant_lock_
+    reentry` exists to catch.
+    """
+    gap = window.get("bind_to_apply_ms")
+    elapsed = window.get("elapsed_ms")
+    wait_granted = bool(window.get("wait_granted"))
+    _state["apply_observations"] += 1
+    if window.get("settled_on_arrival"):
+        _state["apply_settled_on_arrival"] += 1
+    _state["last_apply_window"] = {key: value for key, value in window.items()
+                                   if key not in ("status", "job_states")}
+    for key, value in (("bind_to_apply", gap), ("apply_elapsed", elapsed)):
+        if value is None:
+            continue
+        _state[f"{key}_total_ms"] += float(value)
+        low = _state[f"{key}_min_ms"]
+        high = _state[f"{key}_max_ms"]
+        if low is None or value < low:
+            _state[f"{key}_min_ms"] = float(value)
+        if high is None or value > high:
+            _state[f"{key}_max_ms"] = float(value)
+    waited = window.get("waited_ms") or 0.0
+    if waited:
+        _state["settle_ms_total"] += float(waited)
+        if _state["settle_ms_max"] is None or waited > _state["settle_ms_max"]:
+            _state["settle_ms_max"] = float(waited)
+    budget = window.get("budget_ms")
+    if wait_granted:
+        _state["settle_waits_granted"] += 1
+        _state["settle_budget_total_ms"] += float(budget or 0.0)
+        if (budget
+                and (_state["settle_budget_max_ms"] is None
+                     or budget > _state["settle_budget_max_ms"])):
+            _state["settle_budget_max_ms"] = float(budget)
+    if window.get("settled_after_wait"):
+        _state["settled_after_wait"] += 1
+    if window.get("dropped_after_wait"):
+        _state["dropped_after_wait"] += 1
+    if wait_granted:
+        # Bytes the arithmetic was actually asked to wait for. Not counted when the
+        # wait was off or the batch had already settled: a default boot has bytes in
+        # flight on every disk step, and summing them into a "waited" field would
+        # report waiting that never happened.
+        _state["settle_bytes_waited"] += int(window.get("bytes_at_stake") or 0)
+    bound = window.get("bound")
+    if bound in ("min", "proportional", "cap", "deadline"):
+        _state[f"settle_bound_{bound}"] += 1
+    if window.get("budget_over_recompute"):
+        _state["settle_budget_over_recompute"] += 1
+    for name, value in (("bind_to_apply_ms", gap), ("apply_elapsed_ms", elapsed),
+                        ("settle_ms", window.get("waited_ms")),
+                        ("settle_budget_ms", window.get("budget_ms"))):
+        if value is None:
+            continue
+        samples = _apply_samples[name]
+        if len(samples) < MAX_SETTLE_SAMPLES:
+            samples.append(float(value))
+
+
+def _median(values: list) -> float | None:
+    """The median of the retained samples, or None when nothing was retained."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(ordered[mid], 3)
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 3)
+
+
+def apply_window() -> dict:
+    """The bind-to-apply window, and every wait this boot spent, as one dict.
+
+    THE QUESTION THIS EXISTS TO ANSWER, stated once so the fields have a referent:
+    the fork calls `bind_connector_metadata` and `start_load_kv` in the same step
+    (`kv_connector_model_runner_mixin.py:80-93`), and because every disk hit is
+    offered with `load_kv_async=True` the fork defers `start_load_kv` to after the
+    forward LAUNCH - so the gap is one CPU-side forward launch, NOT one forward pass.
+    Whether the reads win that gap has been an inference from one counter
+    (`dma_unsettled_entries`) and a `read_seconds_max` of 0.0 that was read as "no
+    read ever ran" when it actually means "no read that reached the kernel ever
+    finished". These are the measurements.
+
+    `min`/`max` are BOOT-WIDE. `median` is over the last `MAX_SETTLE_SAMPLES`
+    observations and says so in `median_samples` - a median silently truncated to the
+    first 512 steps would be a number that changes meaning without changing its name.
+    """
+    state = dict(_state)
+    samples = {name: list(values) for name, values in _apply_samples.items()}
+    out = {"observations": state["apply_observations"],
+           "settled_on_arrival": state["apply_settled_on_arrival"],
+           "samples_retained": MAX_SETTLE_SAMPLES, "windows": {}}
+    for key, label in (("bind_to_apply", "bind_to_apply_ms"),
+                       ("apply_elapsed", "apply_elapsed_ms")):
+        count = state["apply_observations"] or 1
+        held = samples[f"{key}_ms"]
+        out["windows"][label] = {
+            "min_ms": (None if state[f"{key}_min_ms"] is None
+                       else round(state[f"{key}_min_ms"], 3)),
+            "max_ms": (None if state[f"{key}_max_ms"] is None
+                       else round(state[f"{key}_max_ms"], 3)),
+            "avg_ms": round(state[f"{key}_total_ms"] / count, 3),
+            "median_ms": _median(held),
+            "median_samples": len(held)}
+    held = samples["settle_ms"]
+    budgets = samples["settle_budget_ms"]
+    granted = state["settle_waits_granted"] or 0
+    posture = settle_budget(0)
+    out["wait"] = {
+        # THE POSTURE, before any batch: what the environment says today, so a reader
+        # can tell "the wait is off" from "the wait is on and nothing needed it".
+        "posture": {key: posture[key] for key in
+                    ("enabled", "cap_ms", "ceiling_clamped", "min_ms",
+                     "safety_margin", "read_bytes_per_s", "prefill_tokens_per_s",
+                     "env_problems")},
+        "waits_granted": granted,
+        "settled_after_wait": state["settled_after_wait"],
+        "dropped_after_wait": state["dropped_after_wait"],
+        "bytes_waited": state["settle_bytes_waited"],
+        "waited_ms": {"avg": (None if not granted else
+                              round(state["settle_ms_total"] / granted, 3)),
+                      "max": (None if state["settle_ms_max"] is None
+                              else round(state["settle_ms_max"], 3)),
+                      "median": _median(held), "median_samples": len(held)},
+        "budget_ms": {"avg": (None if not granted else
+                              round(state["settle_budget_total_ms"] / granted, 3)),
+                      "max": (None if state["settle_budget_max_ms"] is None
+                              else round(state["settle_budget_max_ms"], 3)),
+                      "median": _median(budgets), "median_samples": len(budgets)},
+        "bound": {"min": state["settle_bound_min"],
+                  "proportional": state["settle_bound_proportional"],
+                  "cap": state["settle_bound_cap"],
+                  "deadline": state["settle_bound_deadline"]},
+        "budget_over_recompute": state["settle_budget_over_recompute"],
+        "last": state["last_apply_window"],
+        "notice": state["settle_notice"]}
+    out["recompute"] = {"applied_bytes": state["bytes_applied"],
+                        "dma_unsettled_entries": state["dma_unsettled_entries"],
+                        "read_seconds_avg": read_latency()[0],
+                        "read_seconds_max": read_latency()[1]}
+    return out
 
 
 def counters() -> dict:
@@ -549,6 +1155,61 @@ def counters_view(out: dict) -> dict:
         "no_read": "finished load reports with NO applied disk read behind them "
                    "(an adopted offer that no worker filled): refusals of the "
                    "counter, never restorations",
+        "aged_out_loads": "loads the LEDGER released without ever correlating a "
+                          "`finished_recving` for them - the fork stopped owning the "
+                          "request (its own stale-pin release), the deadline expired, "
+                          "or a cap eviction forgot it. A release is a statement about "
+                          "the ledger, not about the bytes (unit: loads)",
+        "aged_out_with_applied_reads": "of those releases, the ones whose slots had "
+                                       "reached a worker AND a disk read had been "
+                                       "applied in this boot: bytes were on their way "
+                                       "when the ledger let go, so a later report is "
+                                       "expected and is counted by name (unit: loads)",
+        "late_finished_reports": "`finished_recving` ids that arrived for a load the "
+                                 "ledger had already released and were MATCHED to that "
+                                 "release. Before 0.2.25 this exact case was the bare "
+                                 "`continue` that made 36 applied reads look like "
+                                 "`restorations=0` with nothing to explain it (unit: "
+                                 "reports)",
+        "restored_after_release": "of those late reports, the ones whose "
+                                  "release showed an adopted load with an applied "
+                                  "disk read behind it: a restoration the ledger "
+                                  "could not count as one, counted here instead of "
+                                  "in `restorations`, which keeps meaning 'reported "
+                                  "while the ledger held it' (unit: loads)",
+        "disk_gpu_blocks_dma_verified": "GPU BLOCKS this module mapped for a disk span "
+                                        "(their CPU slots carried our emitted paths) "
+                                        "and the fork then reported DMA-complete. THE "
+                                        "ONLY FIELD THAT COUPLES OUR CLAIM TO THE "
+                                        "FORK'S COPY: an offer cannot move it, only an "
+                                        "adopted load reported finished can (unit: GPU "
+                                        "blocks, not requests)",
+        "disk_gpu_blocks_released_unreported": "GPU blocks that were mapped for a disk "
+                                               "span and left the ledger with no "
+                                               "report either way - the complement of "
+                                               "`disk_gpu_blocks_dma_verified`, and "
+                                               "the honest half of 'were the blocks "
+                                               "written?' (unit: GPU blocks)",
+        "last_aged_out": "the last report-less ledger release in one sentence: which "
+                         "door released it, whether it was adopted, whether a read was "
+                         "applied, and how many GPU blocks it had mapped",
+        "last_groups_required": "WHAT A CLAIM COSTS EVERY CACHEABLE GROUP (0.2.25), "
+                                "priced on the offer door AND the refusal door: the "
+                                "claimed range, `offered`, and a row per "
+                                "prefix-cacheable group (`blocks_needed`, "
+                                "`null_blocks`, `contract`, `restored`). Derived only "
+                                "from `group_serviceability` and the claim's geometry, "
+                                "so it reads no manager and knows no model",
+        "group_serviceability": "THE GROUP ARITHMETIC OF THE LAST LOOKUP, as data: "
+                                "which groups are prefix-cacheable, which are "
+                                "positionally stable, which are restorable, which "
+                                "BLOCKED THE OFFER AND WHY, and `complete` - whether "
+                                "every prefix-cacheable group can be restored at all. "
+                                "`complete: false` means this model can NEVER be "
+                                "served from disk (a hybrid GDN + full-attention model "
+                                "in align mode is the live case) and an operator "
+                                "learning that from the payload need not read the "
+                                "source or know the architecture",
         "disk_reads_applied": "scheduler-side applied disk reads (0 in a "
                               "scheduler-only process by construction)",
         "ranks_reads_applied": "applied disk reads attested by live worker rank "
@@ -568,9 +1229,33 @@ def counters_view(out: dict) -> dict:
         "flagged": "requests carrying the kvtier_disk_restore marker",
         "skipped_no_marker": "requests left exactly as the fork would have left "
                              "them because they did not ask for a disk restore",
+        "disk_authority": "flagged lookups where the DISK was made the authority "
+                          "for the request's own prefix, so the host-RAM hit did "
+                          "not decide the span (0.2.22: the marker's meaning)",
+        "local_hit_ignored": "OFFERS committed on a flagged request whose host-RAM "
+                             "hit was non-zero and was discarded to let the disk "
+                             "span start at the local prefix instead. A refusal "
+                             "counts here NEVER: a refused offer leaves the RAM hit "
+                             "exactly where the fork put it",
+        "local_hit_tokens_ignored": "tokens of host-RAM hit discarded by those "
+                                    "offers: what the request gave up to exercise "
+                                    "the disk path (unit: tokens)",
+        "pin_release_failures": "times the fork's pinned host-RAM blocks could not "
+                                "be released when a flagged request chose disk over "
+                                "them: each one is a pin that may outlive the "
+                                "request, so it must stay 0 (an unavailable "
+                                "`_free_pending_cpu_hit` refuses up front instead)",
+        "last_local_hit_ignored": "the last discarded host-RAM hit in the words an "
+                                  "operator reads: request id, the tokens the fork "
+                                  "reported, the block the disk span starts at",
         "witness_kind": "the stable name of the last verdict: the emission key is "
                        "(verdict, kind) and never the sentence, because the sentence "
-                       "quotes counters",
+                       "quotes counters. AS OF THE LAST EMISSION, NOT NOW: it is the "
+                       "name the logged line carried, and a counter can move without "
+                       "changing the verdict, so read `witness_kind_now` for the same "
+                       "arithmetic on today's numbers (0.2.25: "
+                       "`witness_kind=offers_not_adopted` was published beside "
+                       "`adopted=1` on the live box)",
         "witness_verdict": "the last restore-posture verdict this process spoke "
                            "(CONFIRMED / NO READ / ...): a verdict, never a count, "
                            "and read beside `reads_applied` rather than instead of "
@@ -610,6 +1295,61 @@ def counters_view(out: dict) -> dict:
         "binds": "worker binds observed", "disk_binds": "binds carrying disk work",
         "reads_started": "file reads queued", "reads_applied": "reads memmoved",
         "bytes_applied": "bytes", "dma_unsettled_entries": "load entries not DMA'd",
+        # THE RACE, MEASURED (0.2.23). Averages are recomputed from the sums in
+        # `apply_window()`; only whole things are listed here as ints.
+        "apply_observations": "batches seen at the apply point (`start_load_kv`)",
+        "apply_settled_on_arrival": "of those, batches already settled when the apply "
+                                    "point looked: the restore race, WON",
+        "applied_settled_immediately": "disk entries memmoved at an apply point that "
+                                       "found the batch settled and waited nothing",
+        "dropped_queued": "disk entries dropped unsettled whose read had NOT STARTED "
+                          "(the job sat in the queue): a thread-scheduling loss, and "
+                          "the kind a wait can fix",
+        "dropped_running": "disk entries dropped unsettled whose read was RUNNING "
+                           "(mid-kernel when the engine arrived): a device-speed loss, "
+                           "which a wait only fixes if the budget exceeds the read",
+        "dropped_unattributed": "disk entries dropped unsettled whose per-job state "
+                                "could not be read: unknown, and kept separate so the "
+                                "other two stay a claim they can be trusted to make",
+        "spans_observed": "spans seen at the apply point (a span is one scheduler "
+                          "block across every cacheable group, so it restores whole "
+                          "or is worth nothing to the engine)",
+        "span_entries_observed": "disk entries those spans were made of (unit: "
+                                 "entries; entries_observed >= spans_observed)",
+        "spans_whole": "spans whose EVERY group had bytes applied",
+        "spans_partial": "spans where SOME groups applied and others did not: the "
+                         "shape a partial restore takes once readers are concurrent",
+        "spans_empty": "spans where nothing at all applied (the harmless shape: the "
+                       "engine recomputes the block and nothing claims it was read)",
+        "spans_hole_in_the_middle": "batches whose applied spans are NOT a prefix of "
+                                    "the offer. With one reader thread this is "
+                                    "arithmetically impossible (submission order is "
+                                    "span-major and completions followed it), so a "
+                                    "rising count IS the measurement that N readers "
+                                    "changed the SHAPE of an interrupted restore and "
+                                    "not only its speed. Counted, never acted on",
+        "last_span_shape": "the most recent batch's span shape as data: spans, whole, "
+                           "partial, empty, `applied_is_prefix`, and which span "
+                           "indices came away partial (bounded by MAX_SPANS_REPORT "
+                           "with `truncated` naming the rest)",
+        "settle_waits_granted": "batches given a non-zero settle budget",
+        "settled_after_wait": "batches that settled during their wait: the waits that "
+                              "bought bytes",
+        "dropped_after_wait": "batches still unsettled when their wait expired: the "
+                              "waits that were spent for nothing",
+        "settle_bytes_waited": "bytes a settle wait was waiting for, summed over "
+                               "batches (the quantity the budget is proportional to)",
+        "settle_bound_min": "budgets decided by the floor (`SETTLE_MIN_MS`): batches "
+                            "too small for the arithmetic to say anything",
+        "settle_bound_proportional": "budgets decided by bytes-over-throughput: the "
+                                     "intended regime",
+        "settle_bound_cap": "budgets clamped by the operator's cap: an unsettled batch "
+                            "counted here is a cap that is too small",
+        "settle_bound_deadline": "budgets clamped by the read's own deadline: the wait "
+                                 "was stopped by the clock that cancels the read",
+        "settle_budget_over_recompute": "batches granted a wait LONGER than the "
+                                        "recompute it avoids: a loss by construction "
+                                        "even when the read lands",
         "invalid_reports": "GPU block ids reported as load errors",
         "finished_released": "requests released without a DMA",
         "witness_emissions": "witness lines logged in this boot",
@@ -1185,19 +1925,210 @@ def _key_helpers() -> dict:
     return _ok(pack=pack, resolve=resolve)
 
 
-def _eligible_groups(manager, block_size: int) -> dict:
-    """The groups a disk span can be restored for, and the ones that veto it.
+def _group_serviceability(manager, block_size: int, sizes: list,
+                          wanted: list) -> dict:
+    """THE WHOLE GROUP ARITHMETIC, as data, for one payload read (0.2.25).
+
+    Three predicates decide whether a model can be served from disk at all -
+    `prefix_cacheable_group_ids`, `group_block_sizes` against the scheduler block
+    size, and `has_positionally_stable_blocks` per group - and until now a reader had
+    to re-derive all three from a live manager to answer "why does the disk offer
+    nothing?". This publishes the derivation instead: which groups the RAM tier says
+    are prefix-cacheable, which groups are positionally stable, which are restorable,
+    and WHICH BLOCKED THE OFFER AND WHY.
+
+    Every group in the table gets a stability read, not just the cacheable ones, so
+    the payload shows the shape of the model (a stable-but-scratch group is exactly
+    the fact that distinguishes "nothing is stable" from "the stable ones are not
+    cacheable"). Each predicate is read ONCE per group per call: an exception inside
+    `_group_positionally_stable` is an error line, and reading the same flag twice
+    would report a failure that happened once as two.
+
+    `complete` is the property the gate is built on: every prefix-cacheable group is
+    restorable. A pure-attention model satisfies it and is offered at exactly as
+    before; a hybrid GDN + full-attention model does not, and cannot be, because a
+    recurrent state has no per-block name.
+    """
+    stable: list = []
+    for group in range(len(sizes)):
+        if _group_positionally_stable(manager, group):
+            stable.append(group)
+    restorable: list = []
+    blocked: dict = {}
+    kinds: dict = {}
+    for group in wanted:
+        if group < 0 or group >= len(sizes):
+            blocked[group] = "outside the group table"
+            kinds[group] = "outside"
+        elif _int(sizes[group]) != block_size:
+            blocked[group] = (f"block_size {sizes[group]} != the scheduler "
+                              f"block_size {block_size}, so a slot for it would "
+                              "land at the wrong GPU offset")
+            kinds[group] = "geometry"
+        elif group not in stable:
+            blocked[group] = ("has no positionally stable blocks, so a claimed "
+                              "span costs it ONE boundary-state block and that "
+                              "block has no per-block file name to read back (an "
+                              "align-mode Mamba/GDN group keeps ONE running state "
+                              "per sequence, not a per-block array, and no token "
+                              "hash can address it)")
+            kinds[group] = "unstable"
+        else:
+            restorable.append(group)
+    unstable = [group for group in wanted if group not in stable]
+    return _ok(prefix_cacheable_group_ids=list(wanted)[:16],
+               positionally_stable_group_ids=stable[:16],
+               unrestorable_cacheable_group_ids=unstable[:16],
+               restorable_group_ids=restorable[:16],
+               blocked_group_ids=sorted(blocked)[:16],
+               blocked_kinds={str(group): kinds[group]
+                              for group in sorted(blocked)[:16]},
+               blocked_why={str(group): _clip(text, 200)
+                            for group, text in sorted(blocked.items())[:8]},
+               scheduler_block_size=int(block_size),
+               group_block_sizes=[_int(item) for item in sizes[:16]],
+               complete=not blocked,
+               disk_offers_possible=bool(restorable) and not blocked)
+
+
+def _groups_required(serviceability: dict, blocks: int) -> dict:
+    """What a claim of `blocks` scheduler blocks COSTS every prefix-cacheable group.
+
+    THE INSTRUMENT THAT WOULD HAVE FOUND THE 00:08 INCIDENT BY ITSELF (item 7 of that
+    investigation, and the reason it is permanent): "the claimed 32,000 tokens need 10
+    blocks in g5 and 1 real boundary-state block in each of g0-g3, and this restore
+    filled g5 only" is ONE JSON object, readable without an agent investigation.
+
+    THE ARITHMETIC IS THE ENGINE'S, NOT OURS. Every number here comes out of
+    `group_serviceability` - which is `prefix_cacheable_group_ids`,
+    `group_block_sizes`, the scheduler block size and `has_positionally_stable_blocks`
+    - so this reads NO manager a second time and knows no model. The one contract that
+    is not pure geometry is the align-mode state group's, and it is the engine's own:
+    `MambaManager.find_longest_cache_hit` (`single_type_kv_cache_manager.py:1533-1610`)
+    answers a hit with `computed.extend([block_pool.null_block] * i); computed.append(
+    cached)` - NULLS for every interior block and ONE real state block at the boundary,
+    early-stopping on the last match (`:1578-1582`, `:1601-1607`). That is why the row
+    for a non-positional group says `blocks_needed: 1, null_blocks: blocks - 1`: the
+    claim needs one block from it, not a span of KV. A group whose row cannot be
+    derived says `contract: "unknown"` and `blocks_needed: null` rather than a guess.
+
+    Bounded: at most 16 rows, and `blocks` is capped by the caller at the offer's own
+    ceiling, so the numbers in here are always smaller than the offer's.
+    """
+    blocks = max(1, min(_int(blocks) or 1, MAX_RESTORE_BLOCKS_PER_OFFER))
+    if not isinstance(serviceability, dict):
+        # A caller with no arithmetic to price (no lookup has reached the predicate yet)
+        # gets an empty table, not an exception on the offer path: this is a published
+        # field, and a missing field is better than a refused offer.
+        return {"claimed_blocks": int(blocks), "claimed_tokens": 0, "rows": [],
+                "unfilled_group_ids": [], "blocks_needed_total": 0,
+                "blocks_filled_total": 0}
+    block_size = _int(serviceability.get("scheduler_block_size")) or 0
+    sizes = serviceability.get("group_block_sizes") or []
+    restorable = set(serviceability.get("restorable_group_ids") or ())
+    kinds = serviceability.get("blocked_kinds") or {}
+    rows: list = []
+    unfilled: list = []
+    for group in (serviceability.get("prefix_cacheable_group_ids") or [])[:16]:
+        group_size = (sizes[group]
+                      if 0 <= group < len(sizes) else None)
+        kind = ("positional" if group in restorable
+                else str(kinds.get(str(group)) or "unknown"))
+        needed: int | None
+        nulls: int | None
+        if kind == "positional" and group_size:
+            needed = max(1, (blocks * block_size) // int(group_size))
+            nulls = 0
+        elif kind == "geometry" and group_size:
+            # Position-addressable in principle, at a block size this offer cannot
+            # express: it still needs its blocks per the same arithmetic, and the
+            # disk fills none of them.
+            needed = max(1, (blocks * block_size) // int(group_size))
+            nulls = 0
+        elif kind == "unstable":
+            needed = 1
+            nulls = max(0, blocks - 1)
+        else:
+            needed = None
+            nulls = None
+        filled = needed if (group in restorable and needed) else 0
+        if not filled:
+            unfilled.append(group)
+        rows.append({"group": int(group), "block_size": group_size,
+                     "contract": _clip(kind, 24),
+                     "blocks_needed": needed, "null_blocks": nulls,
+                     "restored": bool(group in restorable),
+                     "blocks_filled": int(filled)})
+    return {"claimed_blocks": int(blocks),
+            "claimed_tokens": int(blocks * block_size),
+            "rows": rows,
+            "unfilled_group_ids": unfilled[:16],
+            "blocks_needed_total": sum(int(row["blocks_needed"] or 0)
+                                       for row in rows),
+            "blocks_filled_total": sum(int(row["blocks_filled"] or 0)
+                                       for row in rows)}
+
+
+def _eligible_groups(manager, block_size: int,
+                     claim_blocks: int | None = None) -> dict:
+    """The groups a disk span can be restored for - and the veto that needs ALL of them.
 
     A group qualifies when it is prefix-cacheable AND its block size IS the
-    scheduler block size. Both halves are load-bearing. Prefix-cacheable, because
-    `update_state_after_alloc` (`manager.py:440-446`) discards every other group's
-    CPU hit before pairing, so a slot offered for a scratch group is a slot the
-    fork never pairs and never frees. Equal to the scheduler block size, because the
-    merged tuple's entries are consumed in ORDER, one whole group block each: a
-    group whose blocks are smaller than the scheduler block would put our slots at
-    the wrong GPU offsets while the offer arithmetic stayed a whole number of
-    scheduler blocks. That is a geometry this module refuses rather than reasons
-    about.
+    scheduler block size AND it is positionally stable. All three halves are
+    load-bearing. Prefix-cacheable, because `update_state_after_alloc`
+    (`manager.py:440-446`) discards every other group's CPU hit before pairing, so a
+    slot offered for a scratch group is a slot the fork never pairs and never frees.
+    Equal to the scheduler block size, because the merged tuple's entries are consumed
+    in ORDER, one whole group block each: a group whose blocks are smaller than the
+    scheduler block would put our slots at the wrong GPU offsets while the offer
+    arithmetic stayed a whole number of scheduler blocks. Positionally stable, because
+    a spilled file is named after a hash derived from the request's tokens at a fixed
+    position, so a group whose blocks have no positional name has nothing to read
+    back from (`_group_positionally_stable`).
+
+    THEN THE GATE, WHICH IS THE POINT OF THIS FUNCTION (0.2.25). Qualifying was
+    treated as sufficient when it is only necessary. The number this function's
+    output feeds is the one `get_num_new_matched_tokens` returns to the scheduler
+    (`manager.py:372`), and that return advances `num_computed_tokens` for the WHOLE
+    model - the engine skips prefill of every group across the claimed tokens, not
+    just the ones we can name. `update_state_after_alloc` then builds load entries
+    only for the groups with non-null CPU blocks (`manager.py:452-459`), so a group
+    outside the eligible set is CLAIMED AND NEVER LOADED. A span held by a full-
+    attention group while a recurrent group is not restorable is therefore not a
+    partial restore: it is a correct read of some layers feeding a model whose other
+    layers are being asked to continue from whatever their slots happened to hold,
+    and at `temperature=0` it answers confidently and wrongly.
+
+    So a non-empty eligible set is not enough: the offer must be COMPLETE over the
+    groups the RAM tier itself considers prefix-cacheable, or it must claim nothing.
+    On the live hybrid box (`Qwen3.8-Flash-Next-W4A16-Merlin`, groups 0-3 GDN in
+    align mode, group 4 a non-cacheable QSA ring, group 5 full attention, cacheable
+    `[0,1,2,3,5]`) that means the disk tier offers NOTHING, forever, on this model -
+    which is the correct answer and is stated as one in `incomplete_group_set`, not
+    hedged. A pure-attention model has nothing blocked, so nothing changes for it.
+
+    THIS MODULE ALREADY KNEW THE RULE. `_disk_run`'s docstring says it plainly: "A
+    block is restorable only when EVERY eligible group has a file for it: the fork
+    pairs per group, so one missing group's slot would be a load entry with no bytes
+    behind it - a whole-request recompute for a partially-restored span." The bug was
+    never the rule; it was the SET the rule was applied to. With the eligible set
+    narrowed to `{5}` first, that safeguard is VACUOUS - there is only one group left
+    to check, and it always has a file. This gate is the same invariant applied to the
+    set the CLAIM actually covers.
+
+    AND IT IS THE RAM TIER'S RULE TOO. The live lookup ledger's verdicts say the joint
+    CPU lookup is clamped by exactly these groups: 190 of 256 lookups returned a hit
+    and only 4 were adopted, with the typical record `local=134400 hit=1000 adopted=0`
+    attributed `partial_hit_clamp_suspected` - "a state group clamped at a length this
+    lookup cannot see". The RAM path will not claim more than every group can supply;
+    the disk path claimed 28,800 tokens because it asked about one group. This gate is
+    the disk path agreeing with the RAM path, not a new restriction on the box.
+
+    `claim_blocks` is the number of scheduler blocks the caller was about to offer, so
+    the refusal can publish what those tokens WOULD have required of every group
+    (`_groups_required`). It is an upper bound the caller clips to the offer cap; None
+    means a caller that is only asking the predicate, which gets the arithmetic with a
+    one-block claim.
     """
     try:
         sizes = list(getattr(manager, "group_block_sizes", ()) or ())
@@ -1215,9 +2146,13 @@ def _eligible_groups(manager, block_size: int) -> dict:
         snapshot._error(exc, "disk_restore prefix_cacheable_group_ids")
         return _fail(f"prefix_cacheable_group_ids is unreadable: "
                      f"{type(exc).__name__}", reason_kind="no_eligible_group")
-    groups = [group for group in wanted
-              if 0 <= group < len(sizes) and _int(sizes[group]) == block_size
-              and _group_positionally_stable(manager, group)]
+    serviceability = _group_serviceability(manager, block_size, sizes, wanted)
+    # THE ARITHMETIC, PUBLISHED. Written on every lookup that gets this far, offered
+    # or refused, so the payload describes the LAST LOOKUP'S model rather than the
+    # last successful one. A manager whose inputs are unreadable never reaches this
+    # line and leaves the previous read standing.
+    _state["group_serviceability"] = serviceability
+    groups = serviceability["restorable_group_ids"]
     if not groups:
         return _fail(f"no prefix-cacheable group has block_size == the scheduler "
                      f"block_size {block_size} (group sizes are {sizes[:8]}, "
@@ -1226,6 +2161,72 @@ def _eligible_groups(manager, block_size: int) -> dict:
                      reason_kind="no_eligible_group",
                      group_block_sizes=sizes[:8],
                      prefix_cacheable_group_ids=wanted[:8])
+    blocked = serviceability["blocked_group_ids"]
+    if blocked:
+        # THE GATE. Named, countable, and self-explanatory: the blocked ids come FIRST
+        # in the sentence because `last_refusal` is clipped, and the structured
+        # arithmetic goes out as extras so a caller that wants the lists does not read
+        # them out of prose. Blocked groups are named BEFORE the restorable ones for
+        # the same reason.
+        #
+        # DO NOT "OPTIMISE" THIS INTO A CLAMP. The tempting change is to offer the
+        # intersection instead - clamp the span down to what the joint group set can
+        # supply, the way the CPU lookup does. It is the same nothing, twice paid: the
+        # live box's clamped external hits are 1,000-3,000 tokens, which is below the
+        # point where a disk read earns anything (about 0.3 s of prefill saved against
+        # ~20 ms of read plus the whole claim risk), and it is still a claim whose
+        # align-mode boundary state nobody produced - `update_state_after_alloc`'s
+        # `n_ext_g == 0 -> continue` is a SILENT no-op, and the only lever back to
+        # recompute is someone reporting a load error for a group that was never in the
+        # tuple, which nobody does. Clamp-to-nothing and refuse-because-nothing end up
+        # in the same place; only the refusal says why in the witness. The per-group
+        # requirement table below is what a future reader needs to re-derive that.
+        required = _groups_required(serviceability, claim_blocks or 1)
+        required["offered"] = False
+        required["refused_as"] = "incomplete_group_set"
+        _state["last_groups_required"] = required
+        kinds = set((serviceability.get("blocked_kinds") or {}).values())
+        why_bits = []
+        if "unstable" in kinds:
+            # KEPT SHORT ON PURPOSE: the whole sentence is clipped at 160 characters
+            # and this clause carries the mechanism, so it has to fit before the cut.
+            # The long form lives in `blocked_why` and in `OFFER_REFUSAL_WHY`.
+            why_bits.append("no positional name: each span costs ONE boundary-state "
+                            "block and the disk has none")
+        if "geometry" in kinds:
+            why_bits.append("its block_size is not the scheduler's")
+        if "outside" in kinds:
+            why_bits.append("it is outside the group table")
+        short = "; ".join(why_bits) or "not restorable"
+        listed = ", ".join(str(item) for item in blocked)
+        notice_once(
+            "incomplete_group_set",
+            f"DISK[restore] this model cannot be served from disk: "
+            f"prefix-cacheable groups {blocked} are not restorable while only "
+            f"{groups} are, and an offer claims EVERY prefix-cacheable group "
+            "because get_num_new_matched_tokens skips prefill model-wide while "
+            "update_state_after_alloc silently skips the group that has no entry. "
+            "Refusing every disk offer on this geometry; recompute is the only "
+            "correct answer here, and a clamp to the restorable subset would be the "
+            "same nothing with the risk still taken.")
+        # THE CONCLUSION FIRST, BECAUSE THE SENTENCE IS CLIPPED. `last_refusal` carries
+        # 160 characters, so the part a reader must not miss is the verdict itself and
+        # the groups that caused it - both land inside the clip - while the clause that
+        # explains WHY they block it, and the restorable subset, are the part allowed to
+        # fall off the end. `group_serviceability` and `last_groups_required` publish
+        # the same facts uncut for anyone who wants the arithmetic.
+        return _fail(f"the disk offers NOTHING on this model: prefix-cacheable "
+                     f"group(s) {listed} cannot be restored ({short}), so offering "
+                     f"the restorable subset {groups} alone would claim them as "
+                     "computed",
+                     reason_kind="incomplete_group_set",
+                     blocked_group_ids=blocked[:16],
+                     blocked_kinds=dict(serviceability.get("blocked_kinds") or {}),
+                     blocked_why=dict(serviceability.get("blocked_why") or {}),
+                     restorable_group_ids=groups[:16],
+                     prefix_cacheable_group_ids=wanted[:8],
+                     groups_required=required["rows"][:16],
+                     unfilled_group_ids=required["unfilled_group_ids"][:16])
     return _ok(groups=groups, num_groups=len(sizes),
                group_block_sizes=[int(sizes[group]) for group in groups])
 
@@ -1244,6 +2245,20 @@ def _group_positionally_stable(manager, group: int) -> bool:
     Reading such a group back would paste bytes computed for different positions
     into the KV, which no recompute policy can undo. Unreadable counts as unstable:
     a restore we cannot justify is a restore we do not do.
+
+    THE CONCLUSION THE OLDER CODE DREW FROM THIS, WRITTEN DOWN SO IT CANNOT BE DRAWN
+    AGAIN (0.2.25). This flag was used as a FILTER - "offer on the groups that pass"
+    - and the fork's own skip at `manager.py:874-876` looked like company for that.
+    It is not: the fork is deciding what it may SPILL, where dropping a group costs a
+    file that was never written. Here the same flag decides what may be CLAIMED, and a
+    claim is not per group - `get_num_new_matched_tokens` returning a hit length makes
+    the engine skip prefill for EVERY group at once. So a stable group is a necessary
+    condition (a name to read by) and never a sufficient one, and a model with any
+    prefix-cacheable group this function answers False for has no complete disk offer
+    available at all. That is what `_eligible_groups`'s `incomplete_group_set` veto
+    enforces; on the live hybrid box (`MambaManager` in `align` mode for groups 0-3)
+    it means the disk tier offers nothing, which is the truth about the architecture
+    and not a bug to route around.
     """
     try:
         coordinator = getattr(manager, "cpu_coordinator", None)
@@ -1497,6 +2512,50 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if not _plain_int(ram_tokens) or ram_tokens < 0:
         _refuse("bad_result", f"the fork reported {ram_tokens!r} matched tokens")
         return ram_result
+    # THE MARKER IS THE AUTHORITY OVER THIS REQUEST'S OWN PREFIX (0.2.22). A flagged
+    # request does not get "whatever the RAM tier left over": its host-RAM hit is
+    # treated as ZERO for the offer arithmetic, so the disk index decides the span
+    # from the local GPU-computed boundary. Everything downstream reads `ram_tokens`,
+    # so this one assignment is the whole change of authority - and `computed` is
+    # deliberately NOT touched, because it is the offset the fork's DMA writes at
+    # (see the RESTORE_MARKER_KEY docstring: zeroing it would aim the copy at the
+    # request's already-cached, shared prefix blocks).
+    #
+    # The fork keeps its side of a RAM hit in exactly one place, so ignoring the hit
+    # means releasing exactly one thing (`_release_fork_pin`, below). Until that
+    # release happens NOTHING here has consumed the fork's answer: every refusal
+    # below still `return ram_result`, and a request that gets no disk offer keeps
+    # the RAM hit the fork gave it.
+    ram_tokens_reported = int(ram_tokens)
+    disk_authority = request_flagged(request)
+    fork_pending: object = _PIN_UNREAD
+    if disk_authority:
+        _state["disk_authority"] += 1
+        if ram_tokens_reported > 0:
+            if not callable(getattr(manager, "_free_pending_cpu_hit", None)):
+                # Refuse BEFORE any allocation, index read or state write: without
+                # the fork's own release path, taking the disk's word would strand
+                # a pin on every one of those CPU blocks for the rest of the boot.
+                _state["pin_release_failures"] += 1
+                _refuse("pin_release_unavailable",
+                        f"the fork reported {ram_tokens_reported} host-RAM tokens "
+                        "and this manager has no _free_pending_cpu_hit() to put "
+                        "them back, so the disk cannot be made the authority here "
+                        "without leaking the pin")
+                return ram_result
+            try:
+                table = getattr(manager, "_pending_cpu_hits", None)
+                fork_pending = (table.get(request_id) if table is not None
+                                else None)
+            except Exception as exc:  # noqa: BLE001 - unknown pins are not ours
+                snapshot._error(exc, "disk_restore read pinned hit")
+                _state["pin_release_failures"] += 1
+                _refuse("pin_release_unavailable",
+                        f"the fork's pinned host-RAM hit could not be read "
+                        f"({type(exc).__name__}), and a pin that cannot be read "
+                        "cannot be released")
+                return ram_result
+        ram_tokens = 0
     block_size = _int(getattr(manager, "block_size", None))
     hash_block_size = _int(getattr(manager, "hash_block_size", None))
     computed = _int(num_computed_tokens)
@@ -1530,7 +2589,10 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if ram_tokens % block_size != 0:
         # A fine-grained (hash-aligned) RAM hit would interleave with our blocks
         # inside a group block, so the merged list's ORDER would no longer mean
-        # "one whole block per entry". Decline rather than mis-pair.
+        # "one whole block per entry". Decline rather than mis-pair. Under disk
+        # authority `ram_tokens` is already the 0 this cannot refuse, which is the
+        # whole point: a partial RAM hit used to be a refusal that made the disk
+        # path untestable on any prompt that was not a whole number of blocks.
         _refuse("ram_hit_not_block_aligned", f"the host-RAM hit is {ram_tokens} "
                                              f"tokens, not a multiple of the "
                                              f"{block_size}-token scheduler block")
@@ -1545,13 +2607,20 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         _refuse("bad_call", "the request carries no usable num_tokens")
         return ram_result
     max_hit_len = num_tokens - 1 - computed
+    # THE CEILING THE REFUSAL HAS TO PRICE. `_eligible_groups` answers a question about
+    # the MODEL, but its refusal is worth reading only if it says what the tokens this
+    # request was about to be offered would have cost every group, so the offer's own
+    # bound travels into the call. An upper bound, clipped to the same caps the offer
+    # itself obeys; the real offer re-prices it with its final `blocks` below.
+    claim_blocks = max(1, min(max_hit_len // block_size,
+                              MAX_RESTORE_BLOCKS_PER_OFFER))
     if max_hit_len <= 0:
         # The fork's own rule (`manager.py:353-357`): at least one token must be
         # recomputed, or the sampler has nothing to sample.
         _refuse("no_tokens_left", f"{computed} computed of {num_tokens} tokens "
                                   "leaves nothing to restore")
         return ram_result
-    groups = _eligible_groups(manager, block_size)
+    groups = _eligible_groups(manager, block_size, claim_blocks)
     if not groups["ok"]:
         _refuse(groups.get("reason_kind") or "no_eligible_group", groups["reason"])
         return ram_result
@@ -1674,6 +2743,39 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         _refuse("ram_shape", f"_pending_cpu_hits could not be written: "
                              f"{type(exc).__name__}")
         return ram_result
+    # THE ENTRY IS OURS NOW, so the fork's pinned hit is the one thing left to put
+    # back, and this is the only place it can be put back. The ordering is the whole
+    # safety argument for the authority rule: BEFORE this write the fork's tuple is
+    # still in the table and every failure path above returns the fork's own answer
+    # with its pin intact (no leak, no double free, the request keeps its RAM hit);
+    # AFTER it, nothing else in the fork will ever release those blocks, so releasing
+    # here is the difference between an ignored hit and a leaked one.
+    if disk_authority and ram_tokens_reported > 0:
+        if isinstance(fork_pending, tuple) and fork_pending:
+            released = _release_fork_pin(manager, fork_pending)
+            if not released["ok"]:
+                # The offer already stands: the fork holds OUR tuple and will free
+                # our slots in its own time. Unwinding a committed offer to undo one
+                # failed release is the worse error, so this is a counted, shouted
+                # leak and not a refusal.
+                _state["pin_release_failures"] += 1
+                _logger.warning(
+                    "kvtier-dev-plugin: DISK[restore] LEAKED host-RAM pin for %s: "
+                    "the fork's %d-token hit could not be released (%s); those CPU "
+                    "blocks stay pinned for the boot",
+                    request_id[:48], ram_tokens_reported,
+                    released.get("reason"))
+        _state["local_hit_ignored"] += 1
+        _state["local_hit_tokens_ignored"] += ram_tokens_reported
+        _state["last_local_hit_ignored"] = _clip(
+            f"{request_id[:48]}: the fork's {ram_tokens_reported}-token host-RAM "
+            f"hit was treated as 0 (disk is the authority), so the disk span starts "
+            f"at block {computed // block_size}")
+        _logger.warning("kvtier-dev-plugin: DISK[restore] serving %s from DISK "
+                        "against a %d-token host-RAM hit: computed=%d start_block=%d "
+                        "offered=%d blocks=%d",
+                        request_id[:48], ram_tokens_reported, computed,
+                        computed // block_size, disk_tokens, blocks)
     _register_load(request_id, merged, disk_tokens, span=span)
     # Remember where this offer left the request, so a re-ask at the SAME point can
     # be recognised as a reschedule rather than progress (see the loop fuse below).
@@ -1684,8 +2786,35 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     _state["offered_tokens"] += disk_tokens
     _state["blocks_offered"] += blocks
     _state["slots_allocated"] += needed
+    # WHAT THE CLAIM COSTS EVERY CACHEABLE GROUP (item 7, 0.2.25). Priced with the
+    # offer's FINAL `blocks`, after every clamp, so the table cannot describe a span
+    # bigger than the one being made. On a model the gate lets through this is a list
+    # of `restored: true` rows and reads as a receipt; the 00:08 shape - "g5 filled, a
+    # boundary state block needed in each of g0-g3 and filled by nobody" - is what the
+    # refusal path publishes now that the offer cannot happen here at all.
+    required = _groups_required(_state["group_serviceability"], blocks)
+    required["offered"] = True
+    _state["last_groups_required"] = required
+    # THE OFFER, AS STRUCTURE: a forced-from-disk read and an ordinary one disagree
+    # about exactly these numbers, so `last_offer` is what tells them apart in a
+    # payload without reading the log.
+    _state["last_offer"] = {
+        "request_id": _clip(request_id, 48),
+        "disk_authority": bool(disk_authority),
+        "computed_tokens": int(computed),
+        "ram_tokens_reported": int(ram_tokens_reported),
+        "ram_tokens_used": int(ram_tokens),
+        "start_block": int(start_block),
+        "blocks": int(blocks),
+        "disk_tokens": int(disk_tokens),
+        "groups": list(groups["groups"])[:8],
+        "groups_required": required["rows"][:16],
+        "groups_unfilled": required["unfilled_group_ids"][:16],
+    }
     _note(f"offered {disk_tokens} disk tokens for {request_id[:48]} in {blocks} "
-          f"span(s) across {per_block} group(s)")
+          f"span(s) across {per_block} group(s)"
+          + (f" [disk authority: local hit of {ram_tokens_reported} tokens "
+             "not consulted]" if disk_authority else ""))
     emit_witness()
     return (int(ram_tokens) + disk_tokens, True)
 
@@ -1748,6 +2877,38 @@ def _release(pool, blocks) -> None:
     except Exception as exc:  # noqa: BLE001 - a failed undo is counted, not fatal
         _state["errors"] += 1
         snapshot._error(exc, "disk_restore release")
+
+
+def _release_fork_pin(manager, pending) -> dict:
+    """Put back the host-RAM blocks the fork pinned for a hit we are discarding.
+
+    WHY THIS IS NECESSARY, NOT OPTIONAL. `get_num_new_matched_tokens`
+    (`manager.py:360-372`) does not merely return a number: on a hit it `touch()`es
+    every CPU block it found and leaves the tuple in `_pending_cpu_hits[request_id]`.
+    Exactly three things ever free it - `update_state_after_alloc`,
+    `request_finished`, and the stale-pop at the top of the next lookup for the same
+    id. A disk-authority offer OVERWRITES that entry with our own slots, so without
+    this release those refs are never returned: one pinned span of CPU blocks per
+    flagged request, forever, which is a slow way to empty the pool the restore path
+    itself allocates its destinations from.
+
+    The release goes through the FORK's own method, and the plugin never calls
+    `free_blocks` on blocks it did not allocate - the rule `_allocate` states for the
+    other direction. A manager without the method, or a release that raises, is a
+    refusal at the door that has committed nothing yet; from the commit site below it
+    can only be a counted, logged line, because the offer is already the fork's.
+    """
+    releaser = getattr(manager, "_free_pending_cpu_hit", None)
+    if not callable(releaser):
+        return _fail("this manager exposes no _free_pending_cpu_hit()", reason_kind=(
+            "pin_release_unavailable"))
+    try:
+        releaser(pending)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised at the fork
+        snapshot._error(exc, "disk_restore release fork pin")
+        return _fail(f"_free_pending_cpu_hit raised {type(exc).__name__}",
+                     reason_kind="pin_release_unavailable")
+    return _ok()
 
 
 def _identity_path(root: str, key_hex: str) -> dict:
@@ -1869,6 +3030,13 @@ def _register_load(request_id: str, merged: dict, disk_tokens: int,
                                + RESTORE_DEADLINE_SECONDS, 6),
         "adopted": False,
         "emitted": False,
+        # THE GPU SIDE OF OUR OWN CLAIM (0.2.25). Filled in by `_build_load_paths`,
+        # which is the one moment the scheduler sees a CPU slot we allocated paired
+        # with the GPU block the fork will DMA it into. Until now the ledger knew only
+        # the CPU half, so "were the GPU blocks actually written?" had no answer at
+        # all: the fork's completion report names a REQUEST, and this is the only
+        # place that couples it to block ids.
+        "gpu_block_ids": [],
     }
     for item in merged["identities"]:
         if len(_slot_paths) >= MAX_TRACKED_SLOTS:
@@ -1883,7 +3051,12 @@ def _evict_oldest_load() -> None:
     """Drop the oldest tracked load (a dropped ledger entry costs a restore)."""
     if not _loads:
         return
-    _drop_load(next(iter(_loads)), "the ledger is at its cap")
+    oldest = next(iter(_loads))
+    # Remembered like every other report-less release: a cap eviction is the ledger
+    # giving up on a load, and a `finished_recving` that arrives for it afterwards
+    # still deserves a name rather than a silent `continue`.
+    _remember_release(oldest, _loads[oldest], "the ledger is at its cap")
+    _drop_load(oldest, "the ledger is at its cap")
 
 
 def _drop_load(request_id: str, why: str) -> None:
@@ -1896,6 +3069,96 @@ def _drop_load(request_id: str, why: str) -> None:
             _slot_paths.pop(int(cpu_block_id), None)
     _state["loads_released"] += 1
     _note(f"{request_id[:48]}: {why}")
+
+
+def _remember_release(request_id: str, record: dict, how: str) -> None:
+    """Record HOW a load left the ledger without a report, so a late report has a
+    witness.
+
+    A ledger release is not a judgement about whether the bytes landed, and two of the
+    doors out of the ledger are decisions about the LEDGER and not about the data: the
+    fork stopped owning the request (`_reqs_to_load` no longer names it - which is
+    exactly the shape of the fork's own `update_state_after_alloc ... no external
+    tokens but get_num_new_matched_tokens() unexpectedly recorded a pending CPU hit;
+    releasing the stale pin` line, logged by the live engine in 10 of every 100 of its
+    lines), and our own deadline expired. In both cases the worker may ALREADY have
+    read the files, and the fork may call the load finished afterwards - and until
+    0.2.25 that report reached `note_reported`, found `_loads.get(request_id) is None`
+    and was `continue`d away with no counter moved at all. That is how a boot with 36
+    applied reads reported `loads_released=1, restorations=0` and left the on-call
+    reader to INFER that the report had arrived late rather than never.
+
+    The evidence stored is the strongest available AT RELEASE: `adopted` (our CPU slots
+    reached a worker's `load_cpu_blocks`) and whether any disk read had been applied in
+    this boot (`_a_read_was_applied`, boot-wide because no channel could make it
+    per-request). That is deliberately NOT a claim that this load's bytes landed; it is
+    the same evidence `restorations` is allowed to use, recorded while it was still
+    readable. Bounded oldest-first, like every other table here.
+    """
+    try:
+        adopted = bool(record.get("adopted"))
+        with_reads = adopted and _a_read_was_applied()
+        gpu_blocks = len(record.get("gpu_block_ids") or ())
+        if len(_aged_out) >= MAX_SUPPRESSED_REQUESTS:
+            _aged_out.pop(next(iter(_aged_out)), None)      # oldest first
+        _aged_out[request_id] = {
+            "how": _clip(how, 160),
+            "adopted": adopted,
+            "reads_applied": with_reads,
+            "tokens": _int(record.get("tokens")) or 0,
+            "gpu_blocks": gpu_blocks,
+            "released_mono": round(time.monotonic(), 6),
+        }
+        _state["aged_out_loads"] += 1
+        if with_reads:
+            _state["aged_out_with_applied_reads"] += 1
+        _state["disk_gpu_blocks_released_unreported"] += gpu_blocks
+        _state["last_aged_out"] = _clip(
+            f"{request_id[:48]}: released because {how}; "
+            f"adopted={str(adopted).lower()} "
+            f"disk_reads_applied={str(with_reads).lower()} "
+            f"gpu_blocks_mapped={gpu_blocks}", 240)
+    except Exception as exc:  # noqa: BLE001 - a tombstone never breaks a sweep
+        _state["errors"] += 1
+        snapshot._error(exc, "disk_restore remember release")
+
+
+def _note_late_report(request_id: str) -> bool:
+    """A completion report for a load the ledger already released: name it, don't
+    drop it.
+
+    THE REPORTING BUG THIS EXISTS TO FIX (0.2.25). The measured window says it is not a
+    deadline that is too short: a disk read on the live box completes in 9-30 ms
+    (`read_seconds_max` 0.018 at 00:08, 9-12 ms waited of a 139 ms settle budget) while
+    `RESTORE_DEADLINE_SECONDS` is 45 - about fifteen hundred times the read it is
+    guarding. So an expiry means the REPORT never arrived inside 45 s, and the
+    protective answer is to lengthen nothing: the fuse has to stay fast, because a load
+    that does not report IS the shape of the loop that starved the box on 2026-10-05.
+    What was wrong is only that the late truth was thrown away.
+
+    A tombstone that says "adopted, and a disk read had been applied" plus a late
+    `finished_recving` is as close to "the bytes were on those GPU blocks" as this
+    module is ever going to get for a load it already released, so it counts
+    `restored_after_release` and its mapped GPU blocks join
+    `disk_gpu_blocks_dma_verified` (the fork DID report them complete). It never
+    touches `restorations`, which keeps meaning "reported while the ledger held it".
+    """
+    tombstone = _aged_out.pop(request_id, None)
+    if tombstone is None:
+        return False
+    _state["late_finished_reports"] += 1
+    gpu_blocks = int(tombstone.get("gpu_blocks") or 0)
+    if tombstone.get("reads_applied"):
+        _state["restored_after_release"] += 1
+        _state["disk_gpu_blocks_dma_verified"] += gpu_blocks
+    _logger.warning(
+        "kvtier-dev-plugin: DISK[restore] late finished report for %s: the ledger "
+        "released it (aged_out=%s, adopted=%s, reads_applied=%s, gpu_blocks=%d, "
+        "tokens=%d) - a restoration the ledger could not count, now counted by name",
+        request_id[:48], _clip(tombstone.get("how"), 80),
+        tombstone.get("adopted"), tombstone.get("reads_applied"), gpu_blocks,
+        int(tombstone.get("tokens") or 0))
+    return True
 
 
 def _sweep_loads(manager) -> int:
@@ -1920,6 +3183,17 @@ def _sweep_loads(manager) -> int:
         if record is None:
             continue
         if live is not None and request_id not in live:
+            # THE FORK RELEASED THE CLAIM UNDERNEATH US. `update_state_after_alloc`
+            # returns early (releasing its own pin) whenever it is handed no external
+            # tokens, and then `_reqs_to_load` never holds this request - so the load
+            # state is gone, ours is stale, and the mapping has to go with it. The
+            # tombstone is what keeps a later `finished_recving` from vanishing; the
+            # gate in `_eligible_groups` is what stops us MAKING this claim at all on
+            # a model whose groups cannot all be restored.
+            _remember_release(request_id, record,
+                              "the fork no longer has a load state for it "
+                              "(aborted, never adopted, or its own stale-pin "
+                              "release)")
             _drop_load(request_id, "the fork no longer has a load state for it "
                                    "(aborted, or never adopted)")
             dropped += 1
@@ -1928,9 +3202,20 @@ def _sweep_loads(manager) -> int:
             # A load that never reported inside its deadline is a failed load: the
             # fork has no timeout of its own for WAITING_FOR_REMOTE_KVS, so the only
             # thing standing between this request and another offer is this fuse.
+            #
+            # THE DEADLINE VALUE IS NOT THE BUG (0.2.25). A read completes in 9-30 ms
+            # on this box and the budget is 45 s, so this branch cannot be firing
+            # because the disk is slow; it fires because no report arrives. Lengthening
+            # it would only slow the fuse that stops the re-offer loop, so the value
+            # stays and the REPORTING is what changed: the release is remembered by
+            # `_remember_release`, so a `finished_recving` that turns up afterwards is
+            # counted as `late_finished_reports` / `restored_after_release` instead of
+            # being dropped in silence.
             suppress_load(request_id, "its load outlived the restore deadline "
                                       "without a report",
                           span=_span_key_of(record))
+            _remember_release(request_id, record,
+                              "its ledger deadline expired without a report")
             _drop_load(request_id, "its ledger deadline expired without a report")
             dropped += 1
     if dropped:
@@ -1977,6 +3262,15 @@ def _build_load_paths(metadata) -> dict:
         _note(f"a step carried {len(cpu_blocks)} load entries; the cap is "
               f"{MAX_PATHS_PER_STEP}, so nothing was attributed")
     elif _slot_paths:
+        # THE GPU HALF, read alongside the CPU half of the same index. The fork's own
+        # two lists are index-aligned by construction (the worker's `bind_connector_
+        # metadata` refuses a step where they are not: "load_cpu_blocks has N and
+        # load_gpu_blocks has M"), so a step whose lists disagree says NOTHING about
+        # block ids and is skipped rather than guessed at - a wrong pairing here would
+        # attribute a finished DMA to a block this module never wrote.
+        gpu_blocks = getattr(metadata, FIELD_LOAD_GPU, None)
+        gpu_aligned = (isinstance(gpu_blocks, (list, tuple))
+                       and len(gpu_blocks) == len(cpu_blocks))
         for index, value in enumerate(cpu_blocks):
             cpu_block_id = _int(value)
             if cpu_block_id is None:
@@ -1989,6 +3283,12 @@ def _build_load_paths(metadata) -> dict:
             record = _loads.get(held[0])
             if record is not None:
                 record["emitted"] = True
+                if gpu_aligned:
+                    gpu_id = _int(gpu_blocks[index])
+                    mapped = record.get("gpu_block_ids")
+                    if (gpu_id is not None and isinstance(mapped, list)
+                            and gpu_id not in mapped):
+                        mapped.append(gpu_id)
     if len(paths) != len(cpu_blocks):
         # Unreachable by construction; counted rather than trusted.
         _state["path_length_violations"] += 1
@@ -2065,7 +3365,16 @@ def note_reported(manager, connector_output) -> dict:
             suppress_load(request_id, "the engine reported this request's KV load "
                                       "failed",
                           span=_span_key_of(record))
-            _loads.pop(request_id, None)
+            # THE LEDGER MUST CLOSE. Until 0.2.23 this line was `_loads.pop(...)`, a
+            # hand-rolled duplicate of `_drop_load` that skipped its two side
+            # effects: the `loads_released` counter and the release of this load's
+            # `_slot_paths` entries. On a box where EVERY failure arrives in this
+            # shape, `loads_released` sat at 0 forever while the fork's `_reqs_to_load`
+            # drained - which is exactly the on-call reading "the load was never
+            # registered at all" instead of "it was registered and burned", and it
+            # left slot->path mappings naming a request that no longer had a load.
+            _burn_load(request_id, "the engine reported this request's KV load "
+                                   "failed")
             out["failures"] += 1
         if invalid and not failed:
             # The block-id-only shape: we own the load-error report, so on a step
@@ -2078,11 +3387,39 @@ def note_reported(manager, connector_output) -> dict:
                                               "back as load errors on a step that "
                                               "carried this request's disk slots",
                                   span=_span_key_of(_loads.get(request_id)))
-                    _loads.pop(request_id, None)
+                    # The live box's whole failure signature: 66 requests with
+                    # `invalid_block_ids=1..3` and an empty `failed_recving`, so this
+                    # is the path that decided the run - and the path whose
+                    # `_loads.pop` meant `loads_released` never moved by one. The
+                    # suppression decision is unchanged; only the bookkeeping is.
+                    _burn_load(request_id, f"{invalid} GPU block id(s) reported as "
+                                           "load errors on a step carrying this "
+                                           "request's disk slots")
                     out["failures"] += 1
         for request_id in sorted(reported):
+            if request_id in _burned:
+                # A report that arrives AFTER the load was burned. Nothing can undo
+                # the burn (the request is fused, so no re-offer can follow it), but
+                # the report is not nothing either: it is the fork calling a load
+                # finished whose bytes this plugin knows it never delivered. That is
+                # `no_read`'s definition, and dropping it silently would leave
+                # `no_read` under-counting the one shape of lie this counter exists
+                # to catch. It is NOT a release - the load was already released when
+                # it burned - so `released` stays untouched.
+                _state["no_read"] += 1
+                out["no_read"] += 1
+                _burned.pop(request_id, None)
+                continue
             record = _loads.get(request_id)
             if record is None:
+                # THE VANISH, CLOSED (0.2.25). This branch used to be a bare
+                # `continue`, which is how 36 applied reads and one finished report
+                # produced `restorations=0` and nothing else in the payload: the
+                # ledger entry had already been released (by the fork's own stale-pin
+                # release, or by the deadline) and the report that proved the bytes
+                # were there arrived after it. `_note_late_report` matches the id to
+                # the tombstone the release left and counts the outcome by name.
+                _note_late_report(request_id)
                 continue
             if request_id in failed:
                 _drop_load(request_id, "the worker reported it failed")
@@ -2107,6 +3444,15 @@ def note_reported(manager, connector_output) -> dict:
                 continue
             _state["restorations"] += 1
             out["restorations"] += 1
+            # THE BLOCKS, NOT JUST THE REQUEST (0.2.25). This is the one place the
+            # plugin's own claim ("these GPU blocks are the ones our disk span
+            # feeds") and the fork's own verdict ("this request's load is DMA'd")
+            # are in the same hand, so it is the only place that can count them
+            # together. A load that was never emitted to a step has no gpu ids
+            # mapped and adds nothing, which is the point: an offer cannot inflate
+            # it, only an adopted load reported complete can.
+            _state["disk_gpu_blocks_dma_verified"] += len(
+                record.get("gpu_block_ids") or ())
             _drop_load(request_id, "the worker reported its load finished")
             out["released"] += 1
         _sweep_loads(manager)
@@ -2269,6 +3615,10 @@ def worker_bind(worker, metadata) -> dict:
 
 
 def _worker_bind(worker, metadata) -> dict:
+    # Stamped BEFORE anything else this function does, so the bind-to-apply gap the
+    # apply point reports is the gap between the fork's two call sites and not the
+    # time our own bookkeeping took.
+    bind_mono = time.monotonic()
     paths = _metadata_paths(metadata)
     if not paths or not any(paths):
         return _ok(queued=0, reason="no load entry on this step names a file")
@@ -2334,7 +3684,17 @@ def _worker_bind(worker, metadata) -> dict:
     _wbatches[batch_id] = {"batch_id": batch_id, "jobs": jobs,
                            "failures": failures, "event": event,
                            "req_ids": _event_req_ids(metadata, event),
-                           "deadline_mono": deadline}
+                           "deadline_mono": deadline,
+                           # THE OTHER END OF THE WINDOW. `start_load_kv` runs one
+                           # CPU-side forward launch after this call in the same step
+                           # (`kv_connector_model_runner_mixin.py:80-93`, and our
+                           # loads are all `load_kv_async=True` so
+                           # `has_sync_kv_loads` is False), so this timestamp is what
+                           # makes "did the read have time?" a measured number
+                           # instead of an inference from a dropped-by-default
+                           # counter. Monotonic, because a wall clock that steps
+                           # would be reported as a race the box never had.
+                           "bind_mono": bind_mono}
     while len(_wbatches) > disk_read.MAX_BATCHES:
         _evict_oldest_batch()
     for request_id in _wbatches[batch_id]["req_ids"]:
@@ -2521,7 +3881,279 @@ def worker_before_load(worker) -> dict:
         return _fail(f"the load prep raised {type(exc).__name__}")
 
 
+def _burn_load(request_id: str, why: str) -> None:
+    """Retire a load the engine said failed, THROUGH THE LEDGER, and remember it.
+
+    Two jobs, one of which is a bug fix and one of which is honesty:
+
+    1. `_drop_load` is the only door out of `_loads`. The failure paths used to call
+       `_loads.pop()` directly, which skipped both side effects of the door - the
+       `loads_released` counter and the release of this load's `_slot_paths` entries.
+       A slot still mapped to a request that has no load is a slot the next
+       `build_load_paths` will happily emit a path for, and bytes read into a CPU
+       block the fork is using as a RAM-tier source are how a wrong byte reaches a
+       GPU block. The mapping did not survive forever (`_sweep_loads` frees it once
+       the request leaves the fork's `_reqs_to_load`), but "until the sweep notices"
+       is a window, and this module does not have windows.
+    2. The request is now in `_burned`, so if a `finished_recving` for the same id
+       arrives later it is counted as `no_read` instead of being dropped on the
+       floor: the fork called a load finished whose bytes we know did not land, and
+       that is exactly the claim this counter exists to refuse.
+    """
+    if request_id not in _burned:
+        if len(_burned) >= MAX_SUPPRESSED_REQUESTS:
+            _burned.pop(next(iter(_burned)), None)      # oldest first
+        _burned[request_id] = why[:240]
+    _drop_load(request_id, why)
+
+
+def _observe_apply_point(batch_id, batch: dict, status: dict,
+                         apply_mono: float) -> tuple[dict, dict]:
+    """Measure the window, wait if the operator asked to, and say what happened.
+
+    Returns `(status, window)`, where `status` is the batch's state as of AFTER any
+    wait, so the caller's classification is always the freshest answer and never a
+    stale one. With the cap at its default 0 nothing is waited, nothing is slept, no
+    extra lock is taken beyond the one `batch_status` already takes, and the returned
+    `status` is the same object that came in - the observation is arithmetic over
+    numbers the apply point already had.
+    """
+    bind_mono = batch.get("bind_mono")
+    gap_ms = None
+    if isinstance(bind_mono, (int, float)) and bind_mono > 0:
+        gap_ms = round(max(0.0, apply_mono - float(bind_mono)) * 1000.0, 3)
+    elapsed = status.get("elapsed_seconds")
+    tokens, tokens_basis = _offered_tokens_estimate(batch)
+    jobs = batch.get("jobs") or {}
+    bytes_asked = sum(int(job.get("bytes") or 0) for job in jobs.values())
+    # WHAT THE WAIT IS WAITING FOR. The budget is sized on the bytes STILL IN FLIGHT,
+    # not the whole batch: a batch that has delivered nine of ten slots does not get a
+    # ten-slot budget, and a batch that has delivered all of them gets nothing at all.
+    # Every entry in one batch is the same width (the store's slot width for this
+    # fingerprint), so the outstanding bytes are exact rather than estimated - and
+    # `bytes_asked` is published next to it so a reader can see both numbers.
+    pending = int(status.get("pending") or 0)
+    per_entry = (bytes_asked / len(jobs)) if jobs else 0.0
+    bytes_at_stake = int(round(per_entry * min(pending, len(jobs))))
+    budget = settle_budget(bytes_at_stake, tokens, status.get("seconds_left"))
+    settled_on_arrival = bool(status.get("settled"))
+    window = {"settled_on_arrival": settled_on_arrival,
+              "bind_to_apply_ms": gap_ms,
+              "elapsed_ms": (None if elapsed is None
+                             else round(float(elapsed) * 1000.0, 3)),
+              "known": bool(status.get("known", True)),
+              "accepted": status.get("accepted"), "expected": status.get("expected"),
+              "running": status.get("running"), "queued": status.get("queued"),
+              "settled": settled_on_arrival,
+              "bytes_asked": bytes_asked,
+              "offered_tokens_estimate": tokens, "tokens_basis": tokens_basis}
+    window.update({key: value for key, value in budget.items()
+                   if key != "enabled"})
+    if budget["env_problems"]:
+        # A typo in the cap is reported once, because "the wait did not happen"
+        # silently is how a mis-set drop-in becomes a week of confusion.
+        if notice_once(f"settle-env-{'; '.join(budget['env_problems'])[:120]}",
+                       f"DISK[settle] IGNORED: "
+                       f"{'; '.join(budget['env_problems'])[:300]}"):
+            _state["settle_notice"] = ("ignored: "
+                                       + "; ".join(budget["env_problems"]))[:300]
+    elif budget["enabled"]:
+        key = (f"settle-on-{budget['cap_ms']}-{budget['read_bytes_per_s']}"
+               f"-{budget['safety_margin']}")
+        line = (f"DISK[settle] wait=ON cap_ms={budget['cap_ms']} "
+                f"min_ms={budget['min_ms']} margin=x{budget['safety_margin']} "
+                f"read_bps={budget['read_bytes_per_s']:.0f} "
+                f"prefill_tokens_per_s={budget['prefill_tokens_per_s']} "
+                f"(one line per distinct setting; the apply point waits inside the "
+                f"engine step)")
+        if notice_once(key, line):
+            _state["settle_notice"] = line
+    waited_ms = 0.0
+    settled_after_wait = False
+    # ONE CONDITION DECIDES THE WAIT, and the same condition is published as
+    # `wait_granted` so the counter and the behaviour cannot drift apart: a batch
+    # counted as granted a wait is a batch the code actually sat in front of.
+    # Never wait on a batch that cannot settle - nothing pending means the loop would
+    # spend the budget for nothing, and an expired deadline means the reader has
+    # already given these bytes up.
+    granted = bool(budget["enabled"] and budget["budget_ms"] > 0
+                   and status.get("known", True) and not settled_on_arrival
+                   and pending > 0 and not status.get("deadline_expired"))
+    window["wait_granted"] = granted
+    if granted:
+        status, waited_ms = _settle_wait(batch_id, status, budget["budget_ms"])
+        waited_ms = round(waited_ms, 3)
+        settled_after_wait = bool(status.get("settled"))
+    window["waited_ms"] = waited_ms
+    window["settled_after_wait"] = settled_after_wait
+    window["dropped_after_wait"] = bool(budget["enabled"] and waited_ms > 0
+                                        and not status.get("settled"))
+    window["settled_now"] = bool(status.get("settled"))
+    states = ({} if not status.get("known", True) or not status.get("pending")
+              else disk_read.job_states(batch_id))
+    window["job_states"] = states.get("states") or {}
+    window["job_states_truncated"] = bool(states.get("truncated"))
+    _note_apply_window(window)
+    return status, window
+
+
+def _classify_dropped_entry(window: dict, job_id: int) -> str:
+    """Which kind of "too late" this entry is, from the batch's own state table.
+
+    `not_settled` covered two different bugs and told the operator neither: a job
+    still QUEUED means the reader thread never got to it (a scheduling problem on the
+    proxy host - fixable by waiting, which is what the settle wait is for), while a
+    job RUNNING means the kernel read was in flight and lost (a device that is slower
+    than the engine's step - only a bigger budget or a faster disk fixes it). An
+    unreadable state table is reported as `dropped_unattributed` rather than guessed
+    into one of the two, because a counter that silently absorbs the unknown case is
+    how a measurement becomes a story.
+    """
+    state = (window.get("job_states") or {}).get(int(job_id))
+    if state == disk_read.QUEUED:
+        _state["dropped_queued"] += 1
+        return "dropped_queued"
+    if state == disk_read.RUNNING:
+        _state["dropped_running"] += 1
+        return "dropped_running"
+    _state["dropped_unattributed"] += 1
+    return "dropped_unattributed"
+
+
+def span_shape(batch: dict, failed) -> dict:
+    """Group one batch's disk entries into SPANS and say which spans came whole.
+
+    WHY THIS IS PUBLISHED AND WHY IT CHANGES NOTHING. A restore only feeds the engine
+    a usable prefix when a span is complete ACROSS its groups, and the apply point
+    prunes per ENTRY - so "what survived" has a shape, and that shape is now an
+    input to a live investigation into whether a partial restore may have its tokens
+    counted as computed. Until 0.2.24 the shape was implicitly known: reads were
+    issued and completed in submission order by one thread, and submission order is
+    span-major / group-minor (`_merge_pending_hit` walks `for span: for group:`), so
+    an interrupted batch could only ever be missing a SUFFIX of spans. With N reader
+    threads the answers interleave and the missing piece can be a span in the middle.
+
+    This function MEASURES that. It decides nothing, prunes nothing, and touches no
+    token count and no control flow - the all-or-nothing question belongs to another
+    change and must stay there.
+
+    SPAN RECOGNITION, spelled out because the job id is a step-wide index and not a
+    span number: entries arrive in order and a span is a maximal run of STRICTLY
+    INCREASING group ids, so the run ends where the group id stops advancing. That is
+    why a request's RAM entries (empty paths, so no job) and a second request sharing
+    the step cannot confuse it, while `job_id // groups` would.
+
+    Bounded: the walk is over this batch's jobs, which `disk_read.MAX_JOBS_PER_BATCH`
+    caps, and `partial_spans` names at most `MAX_SPANS_REPORT` of them.
+
+    ONE INTERPRETIVE CAVEAT, because this number will be read by someone deciding
+    whether a partial restore may be counted: the batch this is called with is the
+    RESTORE-side one, whose `jobs` hold only entries that were ACCEPTED at bind. An
+    entry refused at bind (`buffer_cap`, `bad_path`, a stale key) is ABSENT rather
+    than failed - the scheduler was told at bind and the DMA never asked for it - so
+    it does not make its span partial. `failed` is the apply-time set: bytes that were
+    asked for and did not arrive. That is the distinction the token question needs.
+    """
+    jobs = batch.get("jobs") or {}
+    refused = {int(item) for item in (failed or {}) if _is_int_like(item)}
+    if not jobs:
+        return {"spans": 0, "entries": 0, "entries_applied": 0, "spans_whole": 0,
+                "spans_partial": 0, "spans_empty": 0, "applied_is_prefix": None,
+                "partial_spans": [], "truncated": False, "reason":
+                    "no disk entries in this batch"}
+    # ONE int-keyed copy, so the walk below is a linear pass over a bounded batch
+    # rather than a lookup per entry (a hand-built batch with string keys would
+    # otherwise turn this into a scan per job, on the step thread).
+    by_id: dict = {}
+    for key, value in jobs.items():
+        if _is_int_like(key):
+            by_id[int(key)] = value
+        else:
+            continue
+    spans: list = []
+    current: list = []
+    last_group: int | None = None
+    ungrouped = 0
+    for job_id in sorted(by_id):
+        group = _int((by_id.get(job_id) or {}).get("group"))
+        if group is None:
+            ungrouped += 1
+            group = 0
+        if last_group is not None and group <= last_group:
+            spans.append(current)
+            current = []
+        current.append(job_id)
+        last_group = group
+    if current:
+        spans.append(current)
+    whole = partial = empty = applied_entries = 0
+    partial_spans: list = []
+    prefix_broken = False
+    applied_is_prefix = True
+    for index, members in enumerate(spans):
+        hit = [job_id for job_id in members if job_id not in refused]
+        applied_entries += len(hit)
+        if not hit:
+            empty += 1
+            prefix_broken = True
+        elif len(hit) == len(members):
+            whole += 1
+            if prefix_broken:
+                applied_is_prefix = False
+        else:
+            partial += 1
+            # A partial span AFTER a break is as much a hole as a whole one is: the
+            # applied bytes are not a prefix of the span sequence either way, and a
+            # caller that treated this as a prefix would count tokens for a middle.
+            if prefix_broken:
+                applied_is_prefix = False
+            prefix_broken = True
+            if len(partial_spans) < MAX_SPANS_REPORT:
+                partial_spans.append(int(index))
+    return {"spans": len(spans), "entries": len(by_id),
+            "entries_applied": int(applied_entries),
+            "spans_whole": int(whole), "spans_partial": int(partial),
+            "spans_empty": int(empty),
+            # True when every span that got anything is followed by nothing but
+            # empty spans: the shape ONE reader produced for free, because a batch
+            # interrupted mid-flight was always missing a SUFFIX. False is the new
+            # shape - a hole in the middle - and it can only appear with N readers.
+            "applied_is_prefix": bool(applied_is_prefix),
+            "partial_spans": partial_spans,
+            "truncated": bool(partial > len(partial_spans)),
+            "reason": (f"{ungrouped} entries named no group and were counted as "
+                       "group 0" if ungrouped else None)}
+
+
+def _is_int_like(value) -> bool:
+    try:
+        int(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _note_span_shape(shape: dict) -> None:
+    """Fold one span-shape observation into the counters. Counting ONLY.
+
+    No lock, in common with every other counter here, and nothing that can wait or
+    raise; it runs on the worker's step thread at the apply point.
+    """
+    spans = int(shape.get("spans") or 0)
+    if not spans:
+        return
+    _state["spans_observed"] += spans
+    _state["span_entries_observed"] += int(shape.get("entries") or 0)
+    _state["spans_whole"] += int(shape.get("spans_whole") or 0)
+    _state["spans_partial"] += int(shape.get("spans_partial") or 0)
+    _state["spans_empty"] += int(shape.get("spans_empty") or 0)
+    if not shape.get("applied_is_prefix", True):
+        _state["spans_hole_in_the_middle"] += 1
+    _state["last_span_shape"] = dict(shape)
+
+
 def _worker_before_load(worker) -> dict:
+    apply_mono = time.monotonic()
     metadata = getattr(worker, "_connector_metadata", None)
     if metadata is None:
         return _ok(applied=0, reason="no connector metadata on this step")
@@ -2531,6 +4163,10 @@ def _worker_before_load(worker) -> dict:
     event = _int(getattr(metadata, FIELD_LOAD_EVENT, None))
     batch_id = _batch_id(event) if event is not None else None
     batch = _wbatches.pop(batch_id, None) if batch_id else None
+    # A batch we never bound has no window to report, and an empty one must never
+    # make the classification below crash or guess: `_classify_dropped_entry` reads
+    # it for the per-entry state and finds "unattributed", which is the truth.
+    window: dict = {"job_states": {}, "job_states_truncated": False}
     cpu_blocks = list(getattr(metadata, FIELD_LOAD_CPU, None) or [])
     gpu_blocks = list(getattr(metadata, FIELD_LOAD_GPU, None) or [])
     disk_indices = [index for index, path in enumerate(paths) if path]
@@ -2546,6 +4182,13 @@ def _worker_before_load(worker) -> dict:
         status = {}
     else:
         status = disk_read.batch_status(batch_id)
+        # THE WINDOW, MEASURED. This is where a read either has its bytes or does
+        # not, so it is the only place the bind-to-apply gap can be observed from;
+        # `batch` carries the timestamp `_worker_bind` stamped when it queued them.
+        # With the settle cap at its default the call rewrites nothing about the
+        # control flow below - same status object, no sleep - and the whole effect
+        # on the boot is a handful of counters and one dict.
+        status, window = _observe_apply_point(batch_id, batch, status, apply_mono)
         failed = dict(batch["failures"])
         # `disk_read` classified the failure on its own ledger (`file_missing`,
         # `size_mismatch`, `short_read`, `read_error`, `not_ours`). Carry the NAME
@@ -2588,12 +4231,16 @@ def _worker_before_load(worker) -> dict:
                     continue
                 buffer = disk_read.batch_buffer(batch_id, job_id)
                 if buffer is None:
-                    # Not DONE: still in flight, or failed. Both mean "these bytes
-                    # do not exist", and waiting for the difference would put an
-                    # NVMe read in the engine loop's critical path.
+                    # Not DONE: still in flight, or failed. Both mean "these bytes do
+                    # not exist". WHICH of them they are is the whole finding of
+                    # 0.2.23: a job still QUEUED lost to thread scheduling (a wait
+                    # fixes it), a job RUNNING lost to a device slower than the step
+                    # (only a bigger budget or a faster disk fixes it), and until now
+                    # both were the same `not_settled` line.
                     if status.get("pending"):
                         failed[job_id] = "not_settled"
                         _state["dma_unsettled_entries"] += 1
+                        _classify_dropped_entry(window, job_id)
                     else:
                         reason_kind = classified.get(job_id)
                         failed[job_id] = (reason_kind
@@ -2606,6 +4253,11 @@ def _worker_before_load(worker) -> dict:
                     failed[job_id] = (kind if kind in _state["reads_failed"]
                                       else "copy_failed")
                     continue
+                if window.get("settled_on_arrival") and not window.get("waited_ms"):
+                    # The counter the settle-wait decision is made against: these are
+                    # the entries the box already wins for free, and the ratio of
+                    # `settled_after_wait` to this number is the wait's hit rate.
+                    _state["applied_settled_immediately"] += 1
                 _state["reads_applied"] += 1
                 _state["bytes_applied"] += int(outcome["bytes"])
         if status.get("incomplete"):
@@ -2618,6 +4270,12 @@ def _worker_before_load(worker) -> dict:
                 failed.setdefault(job_id, "deadline_expired")
     drop = sorted({int(job_id) for job_id in failed
                    if 0 <= int(job_id) < len(cpu_blocks)})
+    # THE SHAPE OF WHAT SURVIVED, counted and nothing else. `failed` is final here and
+    # the prune below has not run yet, so this is exactly the set the DMA will see.
+    # It cannot change the outcome: `span_shape` reads, `_note_span_shape` counts.
+    shape = span_shape(batch, failed)
+    _note_span_shape(shape)
+    window["span_shape"] = shape
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
     for job_id in drop:
@@ -2972,16 +4630,11 @@ def witness_verdict() -> dict:
                if count}
     reads = applied_reads_evidence()
     restorations = int(_state["restorations"])
-    verdict = "CONFIRMED" if restorations >= 1 and reads["reads_applied"] >= 1 \
-        else "REFUTED"
-    reason = "-"
-    if verdict == "REFUTED":
-        reason = _refuted_reason(refused, reads)
+    verdict, reason, kind = _verdict_and_kind(refused, reads, restorations)
     # The stable NAME of a verdict is everything before the first colon:
     # `offers_not_adopted: 3 offer(s) ...` and `... 4 offer(s) ...` are the same thing
     # to say. Keying an emission on the sentence is exactly the 1,048-lines-a-second
     # flood - the sentence quotes counters, and counters move every step.
-    kind = "CONFIRMED" if verdict == "CONFIRMED" else reason.split(":", 1)[0]
     _state["witness_verdict"] = verdict
     _state["witness_reason"] = reason
     _state["witness_kind"] = kind
@@ -2995,6 +4648,59 @@ def witness_verdict() -> dict:
             "adopted_tokens": int(_state["adopted_tokens"]),
             "no_read": int(_state["no_read"]),
             "refused": refused}
+
+
+def _verdict_and_kind(refused: dict, reads: dict, restorations: int) -> tuple:
+    """THE VERDICT ARITHMETIC, in one place, for a caller that stores it and one that
+    only looks. `(verdict, reason, kind)`.
+
+    Split out of `witness_verdict` for `witness_now()`: a payload read must be able to
+    ask "what would the witness say THIS instant?" without writing the three
+    as-of-emission fields that `emit_witness()` dedupes on. A read path that mutated
+    them would both rewrite history and change what the next emission decides to log.
+    """
+    verdict = "CONFIRMED" if restorations >= 1 and reads["reads_applied"] >= 1 \
+        else "REFUTED"
+    reason = "-"
+    if verdict == "REFUTED":
+        reason = _refuted_reason(refused, reads)
+    kind = "CONFIRMED" if verdict == "CONFIRMED" else reason.split(":", 1)[0]
+    return verdict, reason, kind
+
+
+def witness_now() -> dict:
+    """What the witness WOULD say this instant, touching no state (0.2.25).
+
+    WHY THIS EXISTS. `witness_verdict`/`witness_kind` are frozen at the last emission,
+    which dedupes on `(verdict, kind)` and only speaks when one of them changes - and
+    on the live box at 00:08 that published `witness_kind=offers_not_adopted` next to
+    `adopted=1`. The kind was TRUE when it was spoken (the offer had not been adopted
+    yet) and FALSE by the time anyone read it, because `_mark_adopted` had since run
+    and no verdict change had followed to overwrite the sentence. The verdict itself
+    (`REFUTED`) was right; the kind read as a live claim and was not one.
+
+    So the payload carries both: the as-of-emission kind, which is the line that was
+    logged, and this, which is the same arithmetic on the counters as they stand.
+    Neither is allowed to mutate the other.
+    """
+    try:
+        refused = {name: int(count) for name, count in _state["refused"].items()
+                   if count}
+        reads = applied_reads_evidence()
+        restorations = int(_state["restorations"])
+        verdict, reason, kind = _verdict_and_kind(refused, reads, restorations)
+        return {"verdict": verdict, "kind": kind, "reason": reason,
+                "restorations": restorations,
+                "reads_applied": int(reads["reads_applied"]),
+                "adopted": int(_state["adopted"]),
+                "stale_as_of_emission": bool(
+                    _state["witness_kind"] is not None
+                    and _state["witness_kind"] != kind)}
+    except Exception as exc:  # noqa: BLE001 - a payload field never breaks a poll
+        snapshot._error(exc, "disk_restore witness_now")
+        return {"verdict": None, "kind": None, "reason": None,
+                "restorations": 0, "reads_applied": 0, "adopted": 0,
+                "stale_as_of_emission": False}
 
 
 def applied_reads_evidence() -> dict:
@@ -3284,15 +4990,81 @@ def worker_report() -> dict:
                   "deadline_seconds": RESTORE_DEADLINE_SECONDS,
                   "read_seconds_avg": read_latency()[0],
                   "read_seconds_max": read_latency()[1],
+                  # THE RACE AND THE WAIT, in the one place an operator reads worker
+                  # state. `waited_ms` sits next to `read_seconds_avg` on purpose: a
+                  # wait is only interpretable against how long the reads actually
+                  # take, and the pair is the finding either way it goes. Kept
+                  # deliberately compact - this section is a guest in a byte-capped
+                  # file (`worker_diag.MAX_CONTRIBUTION_BYTES`) and the full
+                  # distribution, per-batch record and token estimate live in
+                  # `apply_window()` on the snapshot/verb side.
+                  "race": {"obs": int(_state["apply_observations"]),
+                           "settled_on_arrival":
+                               int(_state["apply_settled_on_arrival"]),
+                           "gap_ms": {"min": _state["bind_to_apply_min_ms"],
+                                      "max": _state["bind_to_apply_max_ms"]},
+                           "elapsed_ms": {"min": _state["apply_elapsed_min_ms"],
+                                          "max": _state["apply_elapsed_max_ms"]},
+                           "applied_now": int(_state["applied_settled_immediately"]),
+                           "drop_queued": int(_state["dropped_queued"]),
+                           "drop_running": int(_state["dropped_running"]),
+                           "drop_unknown": int(_state["dropped_unattributed"])},
                   "reason": _clip(_state["last_reason"], 100),
                   "note": ("restores READ the SSD tier. armed is this rank's own "
                            "answer to 'will I service a disk load' and the scheduler "
                            "refuses every offer while any live rank says no; "
                            "reads_applied counts slots whose bytes reached a CPU "
                            "slot; dma_unsettled counts those that arrived too late "
-                           "and were recomputed. phantom_trips must stay 0: a trip "
-                           "means a load event that was never submitted was about to "
-                           "be reported as loaded.")}
+                           "and were recomputed. race splits that last number into "
+                           "drop_queued (the read never started) and drop_running (it "
+                           "was mid-kernel); phantom_trips must stay 0: a trip means "
+                           "a load event that was never submitted was about to be "
+                           "reported as loaded.")}
+        waited = int(_state["settle_waits_granted"])
+        # The wait lives in its own key rather than inside the literal above because its
+        # average needs a division that would have to be inlined at eight characters of
+        # indentation, and a per-batch record only exists once a batch has been seen.
+        report["settle"] = {
+            "waits": waited,
+            "settled_after_wait": int(_state["settled_after_wait"]),
+            "dropped_after_wait": int(_state["dropped_after_wait"]),
+            "waited_ms_avg": (None if not waited else
+                              round(_state["settle_ms_total"] / waited, 3)),
+            "waited_ms_max": _state["settle_ms_max"],
+            "budget_ms_max": _state["settle_budget_max_ms"],
+            "over_recompute": int(_state["settle_budget_over_recompute"]),
+            "last": ({key: value for key, value in
+                      (_state["last_apply_window"] or {}).items()
+                      if key in ("bytes_asked", "budget_ms", "waited_ms", "bound",
+                                 "settled", "settled_after_wait", "recompute_ms")}
+                     or None)}
+        # THE CONCURRENCY AND THE SHAPE, in the rank file because a WORKER is the only
+        # process that reads, and both are worker-side facts. A handful of ints on
+        # purpose: this section is a guest in a byte-capped file, and the per-thread
+        # table, the throughput rates and the span-by-span record live in
+        # `disk_read.section()` / `apply_window()` on the snapshot and verb side.
+        #   * readers.configured vs alive tells an operator whether the threads they
+        #     asked for exist; peak_units == 1 with configured > 1 says the reads were
+        #     never actually concurrent; starved_polls and buffer_refusals name WHICH
+        #     side starved (queue/pool vs disk).
+        #   * spans.hole_in_middle is the concurrency finding about PARTIAL restores,
+        #     in the place a rank can report it: impossible for one reader, so a
+        #     non-zero count next to configured > 1 is the measurement.
+        read_state = disk_read.counters()
+        report["readers"] = {
+            "configured": int(read_state["threads_configured"]),
+            "alive": int(read_state["threads_alive"]),
+            "peak_units": int(read_state["units_in_flight_peak"]),
+            "starved_polls": int(read_state["reader_starved_polls"]),
+            "buffer_refusals": int((read_state["refused"] or {})
+                                   .get("buffer_cap") or 0),
+            "out_of_order": int(read_state["completions_out_of_order"])}
+        report["spans"] = {"seen": int(_state["spans_observed"]),
+                           "whole": int(_state["spans_whole"]),
+                           "partial": int(_state["spans_partial"]),
+                           "empty": int(_state["spans_empty"]),
+                           "hole_in_middle": int(
+                               _state["spans_hole_in_the_middle"])}
         if len(json.dumps(report, default=str)) > worker_diag.MAX_CONTRIBUTION_BYTES:
             return {"section": "disk_restore", "writer": OWNER_TAG,
                     "truncated": True,
@@ -3916,6 +5688,27 @@ def section() -> dict:
     }
     average, maximum = read_latency()
     view["read_latency_seconds"] = {"avg": average, "max": maximum}
+    # THE SHAPE OF A PARTIAL RESTORE, beside the read latency and the wait that
+    # produce it. Counting only: `span_shape` decides nothing about tokens or pruning,
+    # and the all-or-nothing question belongs to a different change.
+    view["spans"] = {
+        "observed": int(_state["spans_observed"]),
+        "entries_observed": int(_state["span_entries_observed"]),
+        "whole": int(_state["spans_whole"]),
+        "partial": int(_state["spans_partial"]),
+        "empty": int(_state["spans_empty"]),
+        "hole_in_the_middle": int(_state["spans_hole_in_the_middle"]),
+        "last": _state["last_span_shape"],
+        "note": ("a span is one scheduler block across every cacheable group, so it "
+                 "is either restored whole or worth nothing to the engine. "
+                 "`hole_in_the_middle` counts batches whose applied spans are NOT a "
+                 "prefix of the offer: with one reader thread that is arithmetically "
+                 "impossible, so a rising count is direct evidence that N readers "
+                 "changed the shape of an interrupted restore, not only its speed.")}
+    # THE WINDOW AND THE WAIT, next to the read latency they are measured against:
+    # `waited_ms` without `read_seconds` beside it is a number with no unit of
+    # comparison, and the whole point of the settle-wait fields is to be comparable.
+    view["apply_window"] = apply_window()
     view["witness"] = witness_verdict()
     view["witness_line"] = witness_line()
     view["index"] = disk_index.section()
@@ -3960,6 +5753,10 @@ def scheduler_section() -> dict:
     # recomputes nothing, so a payload and a verb can never disagree about a posture.
     posture = offer_posture()
     tally = counters()
+    # THE VERDICT AS OF THIS INSTANT, for `witness_*_now`. Computed here, not stored "
+    # anywhere: `witness_now()` writes nothing, so a payload poll cannot rewrite the "
+    # as-of-emission fields the log dedupe depends on.
+    now = witness_now()
     offers = int(state["offers"])
     entries = int(index.get("entries") or 0)
     # From the PROOF, not only from the counter: `worker_proof()` publishes the
@@ -4009,6 +5806,42 @@ def scheduler_section() -> dict:
                "offer has been made. Read `refused`: the per-request refusals "
                "(usually `no_disk_run`: the spilled spans do not continue the "
                "prefix this request asked for)")
+        # THE ANSWER BEHIND THE ANSWER. A span spilled minutes ago is invisible to
+        # an index that has not read its journal's tail, and `no_disk_run` cannot
+        # tell "never spilled" apart from "spilled, unread". Say which this is.
+        lag = int(index.get("lag_bytes") or 0)
+        if lag:
+            why += (f" The index is {lag} byte(s) of journal BEHIND the newest "
+                    "spill lines, so a span spilled since the last refresh is not "
+                    "knowable here yet (catch_up_jumps: "
+                    f"{int(index.get('catch_up_jumps') or 0)}, bytes_skipped: "
+                    f"{int(index.get('bytes_skipped') or 0)}).")
+        # THE ARCHITECTURAL ANSWER, IN THE FIRST SENTENCE (0.2.25). An operator who
+        # reads `why_no_restore` at 3 a.m. should not have to know what a MambaSpec is,
+        # let alone that its recurrent state has no per-block file name: say that the
+        # MODEL is un-serviceable, name the groups that decided it, and name the
+        # refusal that will be counting every lookup.
+        service = state["group_serviceability"]
+        if service and not service.get("complete", True):
+            why += (f" THIS MODEL CANNOT BE SERVED FROM DISK AT ALL: "
+                    f"prefix-cacheable group(s) "
+                    f"{service.get('blocked_group_ids')} cannot be restored while "
+                    f"{service.get('restorable_group_ids')} can, and a disk offer "
+                    "claims EVERY prefix-cacheable group because "
+                    "get_num_new_matched_tokens skips prefill model-wide. Every "
+                    "lookup here is refused as `incomplete_group_set` and recompute "
+                    "is the only correct answer on this architecture.")
+            needed = state["last_groups_required"] or {}
+            if needed.get("unfilled_group_ids"):
+                why += (f" What the refused claim needs: "
+                        f"{needed.get('claimed_blocks')} block(s) "
+                        f"({needed.get('claimed_tokens')} tokens) would need "
+                        f"{needed.get('blocks_needed_total')} block(s) across the "
+                        f"cacheable groups and fills none of "
+                        f"{needed.get('unfilled_group_ids')} - see "
+                        "`last_groups_required.rows` for the per-group arithmetic "
+                        "(align-mode state groups need ONE boundary block each, the "
+                        "rest of the span is null blocks in that group anyway).")
     else:
         why = (f"restore is live in this process: {offers} offer(s), "
                f"{int(state['offered_tokens'])} tokens, "
@@ -4093,9 +5926,63 @@ def scheduler_section() -> dict:
         "flagged": int(tally["flagged"]),
         "requests_seen": int(tally["requests_seen"]),
         "lookups": int(tally["lookups"]),
+        # WHAT THE MARKER DID (0.2.22). A flagged request hands the disk the decision
+        # about its own prefix; these four say whether that rule fired, whether it
+        # cost a real host-RAM hit, and how many tokens that was. `last_offer` is the
+        # structured proof a forced read and an ordinary one disagree about: a real
+        # restore has `ram_tokens_reported` at or below what it used, a forced one
+        # shows the hit the disk overrode.
+        "disk_authority": int(tally["disk_authority"]),
+        "local_hit_ignored": int(tally["local_hit_ignored"]),
+        "local_hit_tokens_ignored": int(tally["local_hit_tokens_ignored"]),
+        "pin_release_failures": int(tally["pin_release_failures"]),
+        "last_local_hit_ignored": tally["last_local_hit_ignored"],
+        "last_offer": tally["last_offer"],
+        # WHAT THE LAST PRICED CLAIM COSTS EVERY CACHEABLE GROUP (item 7, 0.2.25), on
+        # the refusal door as well as the offer door: `last_offer` cannot describe an
+        # offer that correctly never happened, and this can. `offered: false` plus rows
+        # with `restored: false` IS the 00:08 failure, in one object.
+        "last_groups_required": tally["last_groups_required"],
+        # WHICH GROUPS THIS MODEL CAN EVER SERVE FROM DISK (0.2.25). The one object
+        # that answers "is the disk tier un-serviceable on this architecture, and how "
+        # do you know?" without re-deriving three manager predicates by hand: the "
+        # cacheable set, the stable set, the restorable set, and which groups blocked "
+        # the offer with a reason each. Beside `last_refusal` because `refused." "
+        # incomplete_group_set` is the counter this arithmetic explains.
+        "group_serviceability": tally["group_serviceability"],
+        "last_aged_out": tally["last_aged_out"],
+        # THE LEDGER'S OWN HONESTY, PUBLISHED (0.2.25). `no_read` and `watchdog_fires`
+        # existed in `counters()` and were never sent, so the release-without-
+        # restoration branch had to be INFERRED from `suppressions`/`loads_released` on
+        # the 00:08 incident instead of read. Same rule as every field here: pass-
+        # through from `counters()`, recomputed nowhere.
+        "no_read": int(tally["no_read"]),
+        "watchdog_fires": int(tally["watchdog_fires"]),
+        "invalid_reports": int(tally["invalid_reports"]),
+        "aged_out_loads": int(tally["aged_out_loads"]),
+        "aged_out_with_applied_reads": int(tally["aged_out_with_applied_reads"]),
+        "late_finished_reports": int(tally["late_finished_reports"]),
+        "restored_after_release": int(tally["restored_after_release"]),
+        # THE ONLY COUPLING BETWEEN OUR CLAIM AND THE FORK'S DMA (0.2.25), in GPU
+        # BLOCKS: the blocks our emitted paths fed, that the fork then reported
+        # complete. `restorations` counts requests; this counts the blocks that were
+        # actually written, which is the question a KV-tier experiment is really asking.
+        "disk_gpu_blocks_dma_verified": int(
+            tally["disk_gpu_blocks_dma_verified"]),
+        "disk_gpu_blocks_released_unreported": int(
+            tally["disk_gpu_blocks_released_unreported"]),
         "witness_verdict": tally["witness_verdict"],
         "witness_reason": tally["witness_reason"],
         "witness_kind": tally["witness_kind"],
+        # THE SAME VERDICT, COMPUTED FROM THE COUNTERS AS THEY STAND (0.2.25). The two "
+        # above are AS OF THE LAST EMISSION (that is what the log-line dedupe keys on) "
+        # and can name a state the boot has already left: on the live box "
+        # `witness_kind=offers_not_adopted` was published while `adopted=1`. Both are "
+        # published now, labelled for what they are, and neither mutates the other.
+        "witness_verdict_now": now["verdict"],
+        "witness_kind_now": now["kind"],
+        "witness_reason_now": now["reason"],
+        "witness_kind_is_stale": now["stale_as_of_emission"],
         "refused": {name: int(state["refused"].get(name) or 0)
                     for name in OFFER_REFUSALS},
         "refusal_reasons": {name: OFFER_REFUSAL_WHY.get(
@@ -4118,6 +6005,15 @@ def scheduler_section() -> dict:
                   "journal_last_error": index.get("journal_last_error"),
                   "journal_directory_writable": index.get(
                       "journal_directory_writable"),
+                  # HOW MUCH OF THE JOURNAL THIS INDEX HAS NOT READ. While
+                  # `lag_bytes` is non-zero a `not_present` from the index is a
+                  # statement about the READER, not about the store - the shape that
+                  # made 36 of 36 just-spilled identities look absent on 2026-10-05.
+                  "lag_bytes": int(index.get("lag_bytes") or 0),
+                  "lag_journals": int(index.get("lag_journals") or 0),
+                  "catch_up_jumps": int(index.get("catch_up_jumps") or 0),
+                  "bytes_skipped": int(index.get("bytes_skipped") or 0),
+                  "lines_skipped": int(index.get("lines_skipped") or 0),
                   "last_reason": index.get("last_reason")},
         "ranks_proven": ranks,
         "digests_expected": ranks,
@@ -4153,6 +6049,17 @@ def scheduler_section() -> dict:
                                           "never told about, so they cannot be "
                                           "offered (never a wrong claim, always a "
                                           "recompute)",
+            "index.lag_bytes": "bytes of journal this process has NOT read behind "
+                               "its cursor. While it is non-zero the index cannot "
+                               "name the newest spills, so a `not_present` describes "
+                               "the reader and not the store",
+            "index.lag_journals": "rank journals still carrying unread bytes",
+            "index.catch_up_jumps": "times a journal was too deep for one refresh "
+                                    "to reach its tail, so the older bytes were "
+                                    "forfeited and that rank's entries forgotten",
+            "index.bytes_skipped": "journal bytes forfeited to reach the tail (unit: "
+                                   "bytes, never a guessed line count)",
+            "index.lines_skipped": "journal lines passed over without being applied",
             "ranks_proven": "rank files attesting a fitted worker half",
             "digests_expected": "distinct geometry digests a restore must satisfy "
                                 "(one per proven rank: the WORKER names the file "
@@ -4179,6 +6086,115 @@ def scheduler_section() -> dict:
                                  "restore (`optin` scope without the marker), from "
                                  "counters(): the nothing-was-offered-because-nobody-"
                                  "asked case, kept apart from a refusal",
+            "disk_authority": "flagged lookups where the disk, not the host-RAM "
+                              "tier, decided the span (0.2.22). Every one of these "
+                              "was offered at `computed // block_size`, i.e. the "
+                              "disk span starts where the LOCAL GPU prefix ends - "
+                              "the local hit is the one thing the marker cannot "
+                              "un-learn, because the scheduler placed those blocks "
+                              "before it ever asked us",
+            "local_hit_ignored": "offers committed on a flagged request whose "
+                                 "host-RAM hit was non-zero and was discarded; a "
+                                 "refusal never moves this, because a refused offer "
+                                 "leaves the fork's hit exactly where the fork put "
+                                 "it (unit: offers)",
+            "local_hit_tokens_ignored": "host-RAM tokens those offers gave up to "
+                                        "let the disk serve the span (unit: tokens)",
+            "pin_release_failures": "times the fork's pinned host-RAM blocks could "
+                                    "not be released after a disk-authority offer: "
+                                    "pinned CPU blocks that may outlive the request, "
+                                    "so this must stay 0 (unit: failures)",
+            "last_local_hit_ignored": "the last discarded host-RAM hit in one "
+                                      "sentence (request id, the tokens the fork "
+                                      "reported, the block the disk span starts at)",
+            "last_offer": "THE LAST OFFER AS STRUCTURE: `disk_authority`, "
+                          "`computed_tokens`, `ram_tokens_reported` (what the fork "
+                          "found), `ram_tokens_used` (what the offer used), "
+                          "`start_block`, `blocks`, `disk_tokens`, `groups`, and "
+                          "`groups_required` - one row per prefix-cacheable group "
+                          "saying what the claimed range costs THAT group and "
+                          "whether the disk fills it. How a read forced from disk is "
+                          "told apart from one the disk had to supply anyway, and how "
+                          "a claim that only half-covers the model would have shown "
+                          "itself",
+            "group_serviceability": "THE GROUP ARITHMETIC OF THE LAST LOOKUP (0.2.25), "
+                                    "from counters(): the prefix-cacheable set, the "
+                                    "positionally stable set, the restorable set, "
+                                    "`blocked_group_ids` with a `blocked_why` for "
+                                    "each, and `complete`. `complete: false` means a "
+                                    "prefix-cacheable group can NEVER be restored for "
+                                    "any token on this model, so a disk offer would "
+                                    "claim more than it delivers and the tier refuses "
+                                    "to make one: the whole of "
+                                    "`refused.incomplete_group_set`, readable without "
+                                    "knowing what a MambaSpec is",
+            "last_aged_out": "the last load the ledger released with no report "
+                             "correlated, in one sentence (which door, adopted or "
+                             "not, reads applied or not, GPU blocks mapped)",
+            "last_groups_required": "THE REQUIREMENT ARITHMETIC OF THE LAST PRICED "
+                                    "CLAIM, offered OR refused (0.2.25): "
+                                    "`claimed_blocks`/`claimed_tokens`, `offered`, and "
+                                    "one row per prefix-cacheable group - "
+                                    "`blocks_needed`, `null_blocks`, the `contract` "
+                                    "that arithmetic came from, and `restored`. A "
+                                    "state group's row says `blocks_needed: 1` with "
+                                    "`null_blocks: claimed-1` because "
+                                    "`MambaManager.find_longest_cache_hit` answers a "
+                                    "hit as nulls plus ONE boundary state block "
+                                    "(`single_type_kv_cache_manager.py:1533-1610`) - "
+                                    "the claim needs one block from it, not a span of "
+                                    "KV. This is the object that shows a half-covering "
+                                    "claim without anyone reading the source",
+            "no_read": "finished reports with no applied disk read behind them, from "
+                       "counters(): the counter that keeps a finished report from "
+                       "being mistaken for a restoration, and the reason "
+                       "`restorations: 0` next to a nonzero `adopted` is an answer "
+                       "and not a mystery",
+            "watchdog_fires": "scheduler-side ledger expiries, from counters(): the "
+                              "deadline branch of the sweep. Read beside "
+                              "`invalid_reports` and `no_read`, it tells an operator "
+                              "WHICH report-less release happened instead of leaving "
+                              "them to infer one from `loads_released`",
+            "invalid_reports": "GPU block ids DRAINED as load errors by this "
+                               "process, from counters(). The drain lives on the "
+                               "WORKER side (`take_invalid_block_ids`, called by the "
+                               "model runner), so a scheduler process reports 0 here "
+                               "BY CONSTRUCTION and the live rank file's "
+                               "`disk_restore.invalid_reports` is the number that "
+                               "moved - published in this section so a reader sees the "
+                               "zero and the explanation together, not a gap (unit: "
+                               "block ids)",
+            "aged_out_loads": "loads released by the ledger with no report "
+                              "correlated (fork release, deadline, or cap eviction), "
+                              "from counters(): a release describes the LEDGER, not "
+                              "the bytes (unit: loads)",
+            "aged_out_with_applied_reads": "of those, releases whose slots had "
+                                           "reached a worker and a disk read had been "
+                                           "applied: bytes were in flight when the "
+                                           "ledger let go (unit: loads)",
+            "late_finished_reports": "finished reports that arrived for a load the "
+                                     "ledger had already released, MATCHED to that "
+                                     "release instead of dropped, from counters(). "
+                                     "Before 0.2.25 this branch moved no counter at "
+                                     "all, which is how 36 applied reads presented as "
+                                     "`restorations=0` and nothing else (unit: "
+                                     "reports)",
+            "restored_after_release": "late reports whose release showed an adopted "
+                                      "load with bytes applied behind it: a "
+                                      "restoration the ledger could not count in "
+                                      "`restorations`, counted here (unit: loads)",
+            "disk_gpu_blocks_dma_verified": "GPU BLOCKS this module mapped for a disk "
+                                            "span and the fork then reported "
+                                            "DMA-complete, from counters(): the only "
+                                            "field coupling our claim to the fork's "
+                                            "copy. An offer cannot move it; only an "
+                                            "adopted load reported finished can "
+                                            "(unit: GPU blocks)",
+            "disk_gpu_blocks_released_unreported": "GPU blocks mapped for a disk span "
+                                                   "and released with no report "
+                                                   "either way - the complement of "
+                                                   "`disk_gpu_blocks_dma_verified` "
+                                                   "(unit: GPU blocks)",
             "flagged": "requests that reached the offer path CARRYING the "
                        "kvtier_disk_restore marker, from counters(): the evidence a "
                        "marker survived the engine's own field-folding and arrived - "
@@ -4199,7 +6215,28 @@ def scheduler_section() -> dict:
             "witness_reason": "the sentence the witness last gave for its verdict: "
                               "prose for a human, never a number to aggregate",
             "witness_kind": "the stable name of the last verdict (the emission key is "
-                            "(verdict, kind), never the sentence), from counters()",
+                            "(verdict, kind), never the sentence), from counters(). "
+                            "AS OF THE LAST EMISSION and NOT as of now: it is the "
+                            "name the logged line carried. Read `witness_kind_now` "
+                            "beside it",
+            "witness_verdict_now": "the verdict the same arithmetic gives on the "
+                                   "counters AS THEY STAND (0.2.25): a payload read "
+                                   "that writes nothing, so polling cannot rewrite "
+                                   "the as-of-emission fields the log dedupes on",
+            "witness_kind_now": "`witness_kind`'s question answered now: the kind "
+                                "`_refuted_reason` names against the CURRENT "
+                                "`offers`/`adopted`/`restorations`/`no_read`. On the "
+                                "live box at 00:08 the as-of-emission kind said "
+                                "`offers_not_adopted` while `adopted=1` - true when "
+                                "spoken, false when read, and this field is what "
+                                "makes the two impossible to confuse",
+            "witness_reason_now": "the sentence behind `witness_verdict_now`, for "
+                                  "this instant",
+            "witness_kind_is_stale": "true when the as-of-emission kind no longer "
+                                     "matches the kind the current counters would "
+                                     "give: a flag saying 'read the `_now` pair, the "
+                                     "frozen one is history' (a verdict that has since "
+                                     "been re-emitted clears it by itself)",
             "deadline_seconds": "SECONDS an unreported load may live before the "
                                 "watchdog reports it as a failure",
             "methods_here": "scheduler methods our layer is on in this process",

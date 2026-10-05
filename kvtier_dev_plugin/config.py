@@ -86,6 +86,26 @@ the file contract the proxy host's reader expects):
                                  dies at boot, on purpose. A journal directory on
                                  tmpfs is warned about once and reported as
                                  `journal_dir=tmpfs` on the boot line.
+  THE READER THREADS AND THE BOUNCE-BUFFER POOL (`disk_read.py`) -- both inert by
+  default, both bytes-identical to the single-thread release when unset:
+
+  VLLM_E2_TIER_DISK_READ_THREADS      how many threads issue spill reads at once.
+                                      UNSET or `1` = ONE thread, exactly the
+                                      behaviour of every release before 0.2.24.
+                                      Clamped to [1, 16]; a value that is not a
+                                      positive integer means "the operator said
+                                      nothing", i.e. one thread, and is reported in
+                                      `read.threads.env_problems`.
+  VLLM_E2_TIER_DISK_READ_BUFFER_BYTES the bounce-buffer pool's byte ceiling. UNSET
+                                      = `disk_read.MAX_BUFFERS_BYTES` (96 MiB),
+                                      today's value. INCREASING IT COSTS HOST RAM
+                                      PER WORKER PROCESS: the pool is per-process
+                                      and every engine rank is its own process, so
+                                      +64 MiB here is +64 MiB x rank count of
+                                      pinned-adjacent anonymous memory. See
+                                      `disk_read_env` and README's
+                                      *Reading the spill in parallel*.
+
   THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
   is installed in every worker whenever the plugin is on, and its per-step cost
   while unarmed is two `os.environ.get` calls; the two switches that make it do
@@ -177,6 +197,84 @@ ENV_DISK_BYTES = "VLLM_E2_TIER_DISK_BYTES"
 # directory's filesystem under `journal.fs`, and the boot line carries
 # `journal_dir=tmpfs` when it lands on a filesystem that dies at reboot.
 ENV_DISK_JOURNAL_DIR = "VLLM_E2_TIER_DISK_JOURNAL_DIR"
+
+# THE RESTORE SETTLE WAIT (`disk_restore.py`) ---------------------------------
+# THE CAP on how long one apply point (`start_load_kv`) may wait for its disk
+# reads, in MILLISECONDS. **Default 0 = never wait**, which is the behaviour every
+# release before 0.2.23 had on every boot, and the reason the read path loses its
+# race: reads are queued at `bind_connector_metadata` and applied one step later, so
+# an unsettled read was dropped and recomputed.
+#
+# It is a CAP and not a budget, deliberately: the budget a batch is actually granted
+# is proportional to the bytes it is waiting for (`disk_restore.settle_budget`), and
+# this is the ceiling on that. The arithmetic that makes a flat budget wrong is the
+# operator's, and it is worth spelling out because it is the whole reason this is
+# capped rather than set generously: a 32,000-token offer is ~573 MB per rank and
+# ~8.2 s of recompute at the measured prefill rate, while a 9,400-token prompt measured
+# 2.4 s of recompute for ~172 MB of spilled KV. The budgets those reads deserve at the
+# store's measured write rate are ~100 ms and ~30 ms - milliseconds, both - so a cap
+# sized in seconds is not "generous", it is permission to lose the trade: a wait that
+# costs more than the recompute it avoids is a net loss paid inside the step by every
+# other request sharing it.
+#
+# This is NOT an arm and it arms nothing: the restore path still needs the disk
+# root, the spill tier's arm file, the tier's arm, this boot's offer switch and a
+# proven worker rank before it reads one byte. With those up and this at 0 the
+# engine thread waits exactly as long as it did in 0.2.22: not at all. A value that
+# cannot be parsed means OFF, never a default wait, because the safe failure of a
+# typo in a systemd drop-in is the behaviour that has been running all along.
+ENV_DISK_SETTLE_MS = "VLLM_E2_TIER_DISK_SETTLE_MS"
+# The assumed SEQUENTIAL READ throughput of the spill store in BYTES PER SECOND,
+# which is what turns "bytes still in flight" into "milliseconds worth waiting
+# for". The default is the WRITE-side figure this repo already measured (11.5 GB/s,
+# see `disk_restore`'s recompute arithmetic) because that is the only number on this
+# box measured on the same RAID array - the READ side has never been measured, which
+# is exactly what the settle-wait fields exist to measure. Set this from the first
+# run's `settle.read_seconds_max` and the budget tracks the hardware.
+ENV_DISK_SETTLE_READ_BPS = "VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S"
+# The engine's PREFILL rate in TOKENS PER SECOND, used for one published number and
+# nothing else: the recompute cost a wait is racing (`recompute_ms`). Default
+# derives from the two measured samples the operator supplied: 9,400 tokens
+# recomputed in 2.4 s through the proxy.
+ENV_DISK_PREFILL_TOKENS_PER_S = "VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S"
+
+# THE PARALLEL READER (`disk_read.py`, 0.2.24) --------------------------------
+# How many threads issue spill reads at once. ONE is today: a single
+# `kvtier-disk-read` thread draining one bounded queue, which the box measures at
+# 1.32 GB/s per reader against 5.14 GB/s for four concurrent readers on the same
+# spill array (dd iflag=direct, 50 files, 610.7 MiB). The engine already has four
+# ranks reading at once; WITHIN a rank the units were serialized, and a 10-span
+# offer on the live boot (one eligible group, g5) is 10 of those serialised reads.
+#
+# It is a THREAD COUNT and nothing else: which job goes to which thread is the
+# queue's business, and the queue stays FIFO. FIFO dispatch means a job never STARTS
+# while an earlier-submitted job is still unstarted, so it can only ever COMPLETE
+# ahead of the jobs already inside the kernel when it started - at most
+# (threads - 1) of them. Default 1, and 1 is pinned by a test as byte-identical to
+# the single-thread release.
+ENV_DISK_READ_THREADS = "VLLM_E2_TIER_DISK_READ_THREADS"
+# The BOUNCE-BUFFER POOL, in bytes, per process. This is the constraint the thread
+# count runs INTO: in-flight bytes are bounded by the pool no matter how many
+# threads there are, and a buffer is taken at ISSUE time and only returned at the
+# apply point (`finish_batch`), so one offer needs the pool to hold the WHOLE offer
+# at once. Two numbers decide whether it does:
+#   * units per offer per rank = spans x eligible groups, and the live boot's
+#     `per_block` (disk_restore.py:2260) is 1 - only g5 is eligible, so a 10-span
+#     offer (the MAX_OFFER_TOKENS_PER_OFFER cap) is 10 units, not 50;
+#   * bytes per unit = one rank's CPU slot: 11,468,800 B on the live narrow width,
+#     12,902,400 B on the wide one.
+# At the default 96 MiB the pool holds 8 of the narrow unit and 7 of the wide one, so
+# the 10-unit big-prompt offer misses by TWO units and loses them to `buffer_cap` at
+# issue - which is why raising threads WITHOUT raising this buys nothing on a big
+# prompt. 128 MiB (11 narrow / 10 wide) is the smallest setting that holds a whole
+# 10-unit offer on both widths.
+#
+# HOST-RAM COST, stated because it is the operator's to size deliberately: the pool
+# is per-process and every engine rank is a process, so the boot pays
+# `increase x rank_count` in resident bytes (4 ranks: +512 MiB of pool = +2 GiB).
+# Unset = `disk_read.MAX_BUFFERS_BYTES` exactly, so the default boot allocates the
+# same bytes it allocated in 0.2.23.
+ENV_DISK_READ_BUFFER_BYTES = "VLLM_E2_TIER_DISK_READ_BUFFER_BYTES"
 
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
@@ -463,6 +561,90 @@ def diagnostics_rank() -> str | None:
     if not raw or len(raw) > MAX_DIAG_RANK_CHARS:
         return None
     return raw
+
+
+def settle_env() -> dict:
+    """The three settle-wait env vars, parsed and NOT interpreted.
+
+    The split is deliberate: the env grammar ("what did the operator write") lives
+    here with every other env var, and the arithmetic that spends those numbers
+    (`disk_restore.settle_budget`) lives with the policy it belongs to. A number read
+    here has already been rejected if it cannot be a number, so a typo cannot reach
+    the arithmetic at all.
+
+    A value that will not parse is reported in `problems` and left as None, which the
+    consumer reads as "the operator said nothing" - the conservative reading. The
+    alternative, a default wait, would make a typo in a systemd drop-in a behaviour
+    change nobody asked for, and this plugin has a standing rule that the safe
+    failure of a bad setting is the setting being OFF.
+    """
+    problems: list = []
+
+    def number(name: str, floor: float) -> float | None:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            problems.append(f"{name}={raw!r} is not a number and was ignored")
+            return None
+        if value != value or value < floor:
+            problems.append(f"{name}={raw!r} is not a finite number at or above "
+                            f"{floor} and was ignored")
+            return None
+        return value
+
+    # SYNTAX, not policy: each value is checked for "is this the number the operator
+    # meant" and nothing else. The ceilings on them are policy and live with the
+    # policy (`disk_restore.SETTLE_MS_MAX`), which reports when it clamps one - so an
+    # absurd value is visibly clamped in a published field instead of being silently
+    # discarded here and reading as "the operator never set it".
+    return {"cap_ms": number(ENV_DISK_SETTLE_MS, 0.0),
+            "read_bytes_per_s": number(ENV_DISK_SETTLE_READ_BPS, 1.0),
+            "prefill_tokens_per_s": number(ENV_DISK_PREFILL_TOKENS_PER_S, 1.0),
+            "problems": problems}
+
+
+def disk_read_env() -> dict:
+    """The two parallel-reader env vars, parsed and NOT interpreted.
+
+    The same split as `settle_env`: the grammar lives here, the policy that spends
+    the numbers (`disk_read`'s clamp and its defaults) lives with the reader. Two
+    consequences worth stating because they are the whole safety argument:
+
+    * A value that is not a positive integer / not a positive byte count is left as
+      None and reported in `problems`, which the consumer reads as "the operator
+      said nothing" - so a typo in a systemd drop-in gives today's single-thread
+      behaviour, never a surprise. There is no default thread count here and no
+      default pool size here, precisely so this module cannot become the place a
+      boot's behaviour is decided.
+    * The ceilings are NOT applied here (they are policy, and `disk_read` publishes
+      when it clamps), so an absurd value is a VISIBLE clamp in a payload rather
+      than a silently-ignored setting that reads as "never set".
+
+    The buffer ceiling is deliberately NOT multiplied by anything: it is the pool of
+    ONE process, and the engine runs one such process per rank.
+    """
+    problems: list = []
+
+    def integer(name: str) -> int | None:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            problems.append(f"{name}={raw!r} is not an integer and was ignored")
+            return None
+        if value < 1:
+            problems.append(f"{name}={raw!r} is below 1 and was ignored")
+            return None
+        return value
+
+    return {"threads": integer(ENV_DISK_READ_THREADS),
+            "buffer_bytes": integer(ENV_DISK_READ_BUFFER_BYTES),
+            "problems": problems}
 
 
 def canonical_policy_path() -> Path:

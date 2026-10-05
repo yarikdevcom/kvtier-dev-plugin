@@ -1218,6 +1218,14 @@ def _all_disk_payloads():
         yield disk_layout.space_check(root / "missing", watermark_bytes=1024)
         yield disk_layout.space_check(root, watermark_percent=50,
                                       extra_bytes=SLOT_BYTES)
+        # The capacity walk's own payloads, including the counting pass behind it:
+        # the sample-and-scale witness (`estimated_total_bytes`, `total_files`,
+        # `entries_examined`) is a published contract now, and an undeclared number
+        # in it is the same bug in a new place.
+        yield disk_spill._walk_store(root)
+        yield disk_spill._walk_store(root / "missing")
+        yield disk_spill._count_store(root, cap_dirs=disk_spill.MAX_SHARD_DIRS,
+                                      max_entries=disk_spill.MAX_WALK_ENTRIES)
         for payload in _verify_and_plan_payloads():
             yield payload
         yield disk_spill.section()

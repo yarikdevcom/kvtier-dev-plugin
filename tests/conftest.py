@@ -37,7 +37,17 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             config.ENV_ALLOW, config.ENV_DIAG_DIR, config.ENV_DIAG_EPOCH,
             config.ENV_DIAG_INTERVAL, config.ENV_DIAG_MIN_INTERVAL,
             config.ENV_DIAG_RANK, config.ENV_BOOT_INERT,
-            config.ENV_MISS_LOG, config.ENV_DISK_ROOT, config.ENV_DISK_BYTES)
+            config.ENV_MISS_LOG, config.ENV_DISK_ROOT, config.ENV_DISK_BYTES,
+            # The settle wait's three knobs. Listed so no test can inherit a cap from
+            # the environment it runs in: a suite that silently waits inside the apply
+            # point is a suite whose timings mean nothing.
+            config.ENV_DISK_SETTLE_MS, config.ENV_DISK_SETTLE_READ_BPS,
+            config.ENV_DISK_PREFILL_TOKENS_PER_S,
+            # The reader-thread count and the bounce-buffer pool. Listed for the same
+            # reason, and more sharply: the DEFAULT of both is the claim that this
+            # release changes nothing, so a test that inherited `=4` from the shell it
+            # ran in would be measuring a boot the plugin does not ship.
+            config.ENV_DISK_READ_THREADS, config.ENV_DISK_READ_BUFFER_BYTES)
 
 
 @pytest.fixture(autouse=True)

@@ -1324,6 +1324,41 @@ async def route_disk_post(request: Request):
     `restore.why_no_restore` names the first link that is missing (layer not fitted
     here / gate closed / index empty / no worker proof / no offer made).
 
+      THE MARKER MAKES THE DISK THE AUTHORITY FOR THAT REQUEST (0.2.22), and there is
+      no second field to set. A marked request's host-RAM hit is treated as ZERO for
+      the offer arithmetic, so the disk index decides the span from the local
+      GPU-computed boundary - which is the only way the read path can be exercised on
+      an ordinary small prompt. Before this, a small prompt either hit RAM entirely
+      (nothing left to offer) or hit it partially (`ram_hit_not_block_aligned`), so
+      one disk read cost ~1.3M tokens of eviction filler. An UNMARKED request is
+      unchanged: RAM first, the disk filling the gap. `scope=all` does NOT grant
+      authority, it only widens who may be offered, so no request becomes
+      disk-forced without sending the marker.
+
+      WHAT THE MARKER CANNOT DO. It does not zero `num_computed_tokens`: that number
+      is the offset the fork's own DMA writes at, so zeroing it would put disk bytes
+      into the request's already-cached, shared GPU prefix blocks. A marked request
+      with a full GPU prefix hit therefore has nothing to restore and recomputes, like
+      any other. And a marked request the disk cannot serve is a silent, cheap
+      fallback: the fork's own answer, no allocation left behind, `refused.no_disk_run`
+      counted. To tell a forced read from a real one, read
+      `restore.last_offer` (`ram_tokens_reported` vs `ram_tokens_used`),
+      `restore.local_hit_ignored` and `restore.local_hit_tokens_ignored`.
+
+      **On a model where a disk claim cannot be complete, there is no offer
+      to read.** Since 0.2.25 a prefix-cacheable group with no positionally
+      stable name (an align-mode Mamba/GDN group: one claimed span costs it
+      ONE boundary-state block, and that block has no per-block name to read
+      back) makes the whole offer refused as
+      `refused.incomplete_group_set`, so `last_offer` stays **None** and
+      anything indexing `last_offer["groups"]` must guard for it. Read
+      `restore.group_serviceability` instead - which groups are cacheable,
+      stable, restorable, blocked, and why - and
+      `restore.last_groups_required` (per group: `blocks_needed`,
+      `null_blocks`, `restored`, `blocks_filled`). Both are published on the
+      refusal door. The fallback stays silent and cheap: the fork's own
+      answer.
+
       * TOKEN-GATED like `/guard` and `/blockdump`: this route can arm a facility
         that writes KV bytes to disk, so it is a dev-state route in every shape.
       * OFF TWICE OVER: `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the

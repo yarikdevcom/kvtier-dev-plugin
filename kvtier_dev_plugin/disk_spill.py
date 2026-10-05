@@ -69,6 +69,42 @@ consulting it there would disarm a healthy tier. A surviving arm file is therefo
 harmless wherever it lives, and the journal can be moved to persistent storage
 without arming anything (`VLLM_E2_TIER_DISK_JOURNAL_DIR`, `disk_index`).
 
+WHAT CHANGED IN 0.2.25: the capacity ceiling stopped being able to relax itself.
+The store reached 334.9 GiB under a 192 GiB ceiling (29,532 files, ~145 GiB grown in
+the hour after boot and ~4 GiB/min - 240 GiB/hour - in the burst measured as `/home`
+fell 80 GiB -> 60 GiB in five minutes, with 122 GiB of `/home` left) because ONE
+bounded walk was being read as a measurement twice over: it stat-ed at most
+`MAX_WALK_FILES` files, and it took that sample DEPTH-FIRST - the file counter was
+never reset per shard and `truncated`
+broke the shard loop - so it measured the first shard directories and stopped. The
+byte total handed to `_enforce_ceiling` was then a FLOOR taken from ~2/3 of the key
+space (218.7 GiB reported for a 326.2 GiB store), which does not delay the trigger so
+much as RESCALE it: the ceiling actually enforced was `ceiling / sample_rate` = 286
+GiB, and the divisor grows as the store does. And a file the walk never opened cannot
+enter `lru_eviction_plan`, so the third of the key space it never reached became a
+sink that took spills forever and shed nothing - eviction running (oldest surviving
+file 2.8 h) and structurally blind at the same time. The walk now runs TWO bounded
+passes: `_count_store` counts the store's files with readdir only (no `stat`), and the
+measuring pass stats a PROPORTIONAL sample - the same fraction of every shard - so the
+ceiling decides on `estimated_total_bytes` (the sample scaled to the store; identical
+to `used_bytes` for any store inside the caps, byte for byte) and a plan can name a
+file in any shard. A truncated plan is PARTIAL by design and converges over the
+passes that follow, because enforcement runs after every committed write. What the
+measurement was is published, not implied: `ceiling_measurement.basis`,
+`sampled_files`/`total_files`, `measured_bytes`, `entries_examined`, `skipped_files`,
+`plan_truncated`, `ceiling_checks`. And the more important fix: `estimated_bytes` is
+a PER-PROCESS counter of this process's own writes, starting at 0, and the walk that
+could correct it only ran once that counter ALONE reached the ceiling - so a rank
+booting into a store somebody else filled had to spill 192 GiB of NEW files (17,384
+of them, ~48 min at 4 GiB/min) before it was allowed to LOOK at a 335 GiB store with
+60 GiB of `/home` left - and the store has since grown to 396 GiB with 61 GiB free. The
+filesystem fills long before the ceiling wakes up, and an
+honest walk buys nothing when it never runs. The first committed spill of a (root,
+ceiling) pair now takes ONE bounded walk and adopts its answer (`_maybe_seed_estimate`,
+writer thread only, once per configuration, published as
+`ceiling_measurement.seed_walks`). See `disk_spill._walk_store` and README
+*The ceiling walk, the sample, and the store that grew past its ceiling*.
+
 WHAT CHANGED IN 0.2.14: a lookup does not have to hit for a restore to happen.
 `disk_restore` reads these files back WITHOUT touching that hash index, by extending
 the fork's own `get_num_new_matched_tokens` answer with spans whose bytes it puts
@@ -189,6 +225,17 @@ WHAT IS CAPPED, AND IN WHAT UNIT
     it, and bounded by `disk_layout.MAX_BLOCK_BYTES` (1 GiB).
   * `MIN_FREE_BYTES` (bytes)             - the `statvfs` floor: refuse rather than
     fill the filesystem, reserving the slot we are about to write.
+  * `MAX_SHARD_DIRS` (shard DIRECTORIES), `MAX_WALK_FILES` (FILES `stat`-ed) and
+    `MAX_WALK_ENTRIES` (directory entries READ, no `stat`) - the three bounds of
+    ONE capacity walk, in three currencies, because the walk does two jobs: it
+    COUNTS the store's files (readdir only) and MEASURES a bounded SAMPLE of them
+    (one `stat` each). When a bound stops it the walk says so AND scales the sample
+    by `total_files / sampled_files`, so the ceiling is decided against an estimate
+    of the whole store and not against a floor taken from whatever the walk happened
+    to reach. A truncated walk that reports only its floor is the defect this bound
+    set exists to prevent (see `_enforce_ceiling`), and the bound stays small on
+    purpose: this walk runs inside the spill writer's enforcement path, and a walk
+    that stats hundreds of thousands of files is its own I/O storm.
   * the capacity ceiling (bytes, configured) - LRU by `st_mtime`; `st_atime` is
     NOT usable because `/home` is mounted `relatime` here.
 
@@ -221,6 +268,18 @@ MAX_REGIONS = 64                     # REGION TENSORS making up one slot
 MAX_STRING_CHARS = 160
 MAX_SHARD_DIRS = 288                 # shard directories a capacity walk will open
 MAX_WALK_FILES = 20_000              # FILES a capacity walk will stat
+# Directory ENTRIES a capacity walk may read, PER PASS (the walk has two passes, so
+# a whole walk reads at most twice this many entries). Five times the `stat` cap,
+# because reading an entry is readdir - which the walk pays for anyway, and which
+# hands back the `d_type` byte that answers `is_file()` without a syscall - while
+# stat-ing one is a syscall. The bound is deliberately NOT expressed in files: it
+# bounds the WORK, and a store stuffed with entries this tier will not measure is
+# exactly the store whose walk would otherwise run to the end of the directory (the
+# `stat` cap counts MEASURED files only, so before this bound the iteration itself
+# was unbounded). Five times the stat cap also makes the count EXACT for every store
+# this box can physically hold: 100,000 files at the widest slot measured here
+# (12.9 MB) is 1.2 TiB, and past that the count extrapolates and says so.
+MAX_WALK_ENTRIES = 100_000           # directory entries a capacity walk will read
 EVICT_TARGET_FRACTION = 0.9          # FRACTION of the ceiling eviction aims under
 
 # The group-collision witness: which group ids this process has seen spill each
@@ -300,6 +359,33 @@ _state: dict = {
     "evicted_bytes": 0,
     "estimated_bytes": 0,
     "walk_truncated": False,
+    # THE HONESTY OF THE MEASUREMENT THE CEILING WAS DECIDED ON. `estimated_bytes`
+    # alone cannot distinguish "the store IS this big" from "I stat-ed 20,000 files
+    # and multiplied by 1.48". On the production box a 192 GiB ceiling faced a
+    # 326 GiB store while the walk reported 218.7 GiB - a floor taken from a
+    # depth-first sample of the FIRST shards - which rescaled the ceiling this module
+    # enforced to 192/0.671 = 286 GiB, and left the shards it never opened unable to
+    # be evicted at all. The distinction is the whole point of the witness.
+    # `walk_*` describes the LAST walk the ceiling logic ran; `ceiling_checks` counts
+    # how many enforcement passes it took.
+    "walk_sampled_files": 0,
+    "walk_total_files": 0,
+    "walk_measured_bytes": 0,
+    "walk_entries_examined": 0,
+    "walk_skipped_files": 0,
+    "walk_count_truncated": False,
+    "walk_basis": None,
+    "plan_truncated": False,
+    "ceiling_checks": 0,
+    # A FRESH PROCESS DOES NOT KNOW THE STORE IT BOOTED INTO. `estimated_bytes` is a
+    # per-process counter of THIS process's own committed writes and starts at 0, and
+    # the walk that could correct it only runs once that counter alone reaches the
+    # ceiling. The seed breaks that circle: the first committed spill of a boot takes
+    # ONE bounded walk and adopts its answer. `estimate_seed_key` is the (root,
+    # ceiling) pair already seeded, so a reconfigure re-seeds and a steady boot does
+    # not walk twice; `estimate_seed_walks` is how many times it has.
+    "estimate_seed_key": None,
+    "estimate_seed_walks": 0,
     "errors": 0,
     # the group-collision witness (see MAX_TRACKED_DIGESTS) and the journal
     "group_collisions": 0,
@@ -350,6 +436,13 @@ def reset_state_for_tests() -> None:
         "drops": 0, "refused": {reason: 0 for reason in REFUSAL_REASONS},
         "evictions": 0, "evicted_bytes": 0, "estimated_bytes": 0,
         "walk_truncated": False, "errors": 0,
+        # The measurement-honesty witness: a reset that left one of these behind
+        # would let one test's walk be read as another test's ceiling decision.
+        "walk_sampled_files": 0, "walk_total_files": 0,
+        "walk_measured_bytes": 0, "walk_entries_examined": 0,
+        "walk_skipped_files": 0, "walk_count_truncated": False,
+        "walk_basis": None, "plan_truncated": False, "ceiling_checks": 0,
+        "estimate_seed_key": None, "estimate_seed_walks": 0,
         "group_collisions": 0, "group_collision_samples": [],
         "digest_groups": {}, "digest_groups_dropped": 0,
         "digest_group_overflow": 0, "sibling_probe_failures": 0,
@@ -1323,18 +1416,120 @@ def _handle_job(job) -> None:
     _state["estimated_bytes"] = int(_state["estimated_bytes"]) + int(
         result["bytes_written"])
     _state["last_path"] = result["path"]
+    # A fresh process knows nothing about the store it booted into; give the ceiling
+    # that knowledge ONCE before it decides, or it cannot see a store it did not fill.
+    _maybe_seed_estimate()
     _enforce_ceiling()
+
+
+def _publish_walk(walk: dict) -> None:
+    """Record the shape of the walk the ceiling logic just ran, so the decision that
+    came out of it can be read back afterwards. ONE place, used by the seed walk and
+    by the enforcement walk alike: a witness that only described half the walks would
+    be the same trap as a payload that cannot tell a sample from a measurement.
+    """
+    _state["walk_truncated"] = bool(walk["truncated"])
+    _state["walk_count_truncated"] = bool(walk["count_truncated"])
+    _state["walk_sampled_files"] = int(walk["files"])
+    _state["walk_total_files"] = int(walk["total_files"])
+    _state["walk_measured_bytes"] = int(walk["used_bytes"])
+    _state["walk_entries_examined"] = int(walk["entries_examined"])
+    _state["walk_skipped_files"] = int(walk["skipped_files"])
+    _state["walk_basis"] = str(walk["measurement_basis"])
+
+
+def _maybe_seed_estimate() -> None:
+    """Adopt the store's own size once per configuration, from ONE bounded walk.
+
+    WHY THIS IS LOAD-BEARING AND NOT A REFINEMENT. `estimated_bytes` is a per-process
+    counter of THIS process's own committed writes and starts at 0, and the walk that
+    could correct it only ran once that counter ALONE reached the ceiling. So a rank
+    booting into a store someone else filled was blind to it in proportion to how
+    full it already was: on the box tonight a fresh boot had to spill 192 GiB of NEW
+    files (17,384 of them, ~48 minutes at the measured ~4 GiB/min) before it was
+    allowed to LOOK at a 335 GiB store with only 60 GiB of `/home` left to grow into
+    (the store reached 396 GiB with 61 GiB free before this shipped). The filesystem
+    fills long before the ceiling wakes up, and no amount of honest
+    scaling inside the walk changes that, because the walk never runs. The trigger
+    being a write counter is the reason the ceiling could not rescue the store it was
+    armed to protect.
+
+    THE COST IS ONE WALK. It happens on the first committed spill of a (root, ceiling)
+    pair - 0.224 s measured replaying the live 34,896-file store, on the writer thread,
+    where the walk's whole cost model already lives - and after that the fast path is
+    exactly what it was: no walk, no plan, no unlink until the estimate crosses the
+    ceiling. A reconfigure (a different root or ceiling) re-seeds; a steady boot does
+    not walk twice. A walk that could not measure anything (a missing store, or the
+    entry-bound starved `sample_unmeasured`) leaves the running estimate alone rather
+    than writing a 0 into it - the same rule `_enforce_ceiling` applies to its own walk.
+    """
+    root = _state["root"]
+    ceiling = _state["ceiling_bytes"]
+    if not root or not ceiling:
+        return
+    key = f"{root}|{ceiling}"
+    if _state["estimate_seed_key"] == key:
+        return
+    # Claim the seed BEFORE the walk: one attempt per configuration, so a store that
+    # cannot be read does not buy a walk on every spill of the boot.
+    _state["estimate_seed_key"] = key
+    _state["estimate_seed_walks"] = int(_state["estimate_seed_walks"]) + 1
+    walk = _walk_store(root)
+    if not walk["ok"]:
+        _state["last_reason"] = (f"the estimate could not be seeded: "
+                                 f"{str(walk['reason'])[:96]}")
+        return
+    _publish_walk(walk)
+    if walk["truncated"] and int(walk["files"]) == 0:
+        return
+    _state["estimated_bytes"] = int(walk["estimated_total_bytes"])
 
 
 def _enforce_ceiling() -> None:
     """Shed files, oldest mtime first, when the estimate crosses the ceiling.
+
+    THE NUMBER THIS DECIDES ON IS AN ESTIMATE OF THE WHOLE STORE, not the bytes the
+    walk happened to `stat`. A walk that hits `MAX_WALK_FILES` reports `truncated`
+    and a `used_bytes` that is a FLOOR, and the first version of this function wrote
+    that floor straight back into `estimated_bytes`. Both halves of the ceiling then
+    break together, in the direction that fills the disk.
+
+    Measured on the live shape (29,532 files, 326.2 GiB of slot bytes, a 192 GiB
+    ceiling): the old walk stat-ed 19,804 files and reported **218.7 GiB** - a floor
+    1/3 under the truth, because it read the FIRST shard directories and stopped. A
+    floor does not just delay the trigger, it RESCALES it: the ceiling this function
+    actually enforced was `192 GiB / 0.671` = **286 GiB**, and the divisor grows as
+    the store does (at 40,000 files it is 2x, at 100,000 it is 5x), so the bigger the
+    store got the more headroom the ceiling quietly gave it. And the second half is
+    worse than a late trigger: a file the walk never opened cannot enter an eviction
+    plan, so the ~1/3 of the key space it never reached was an UNREACHABLE SINK - it
+    took spills forever and shed nothing, which is why the oldest surviving file was
+    2.8 hours old while the store grew 145 GiB an hour. Two rules follow, and both
+    are load-bearing:
+
+      1. the decision uses `walk["estimated_total_bytes"]` - the sample scaled by
+         `total_files / files`. It is identical to `used_bytes`, byte for byte, for
+         any walk that saw every file, which is every store inside the caps; and
+      2. a truncated walk's plan is allowed to be PARTIAL. It sheds the oldest files
+         it COULD see toward the target and returns; enforcement runs after every
+         committed write, the next pass samples a store whose directory slots were
+         just freed by the deletes, and the passes converge. One pass was never
+         going to be enough on a store this far over, and pretending otherwise is
+         what made the trigger silent rather than merely slow.
 
     The estimate is per-process and monotonic-increasing until a walk replaces it
     with a measurement, so the walk only happens at the moment capacity actually
     matters. `disk_layout.lru_eviction_plan` owns the ORDER (foreign digests, then
     oldest mtime); executing it here is the only destructive action in this module,
     and deleting a file is always safe: the cost is a recompute, never a wrong
-    answer - there is no read path that could serve a file we deleted.
+    answer - there is no read path that could serve a file we deleted. NOTHING here
+    relaxes `execute_unlink_plan`'s guards: it still re-validates every path against
+    the CURRENT digest, still needs `for_capacity` to touch this boot's own files,
+    still caps its unlinks per directory, and still deletes only what it proved it
+    may delete. A partial plan is a SMALLER destructive set, never a wider one, and
+    every file it deletes is journalled (`_journal_write(..., removal=True)`) - an
+    un-journalled removal makes the index offer a dead file, which costs a reported
+    load failure instead of a plain recompute.
     """
     ceiling = _state["ceiling_bytes"]
     if not ceiling or int(_state["estimated_bytes"]) < int(ceiling):
@@ -1346,12 +1541,42 @@ def _enforce_ceiling() -> None:
     if not walk["ok"]:
         _state["last_reason"] = str(walk["reason"])[:MAX_STRING_CHARS]
         return
+    # THE DECISION NUMBER. `estimated_total_bytes` equals `used_bytes` whenever the
+    # walk measured the whole store, so a store inside the caps cannot tell this
+    # from the old code; on a truncated walk it is the sample scaled to the store.
+    decision_bytes = int(walk["estimated_total_bytes"])
+    if walk["truncated"] and int(walk["files"]) == 0:
+        # A bounded walk that stat-ed NOTHING is not a measurement, and the one
+        # thing it must never do is write a 0 (or a floor) into the estimate: that
+        # is how the ceiling goes quiet forever over a store it cannot see, which is
+        # the bug this function exists to fix. So: publish the walk's shape, say why
+        # in the reason, keep the estimate where it was, and plan nothing - the next
+        # spill asks again. `walk_skipped_files` is the counter that explains it when
+        # the store is full of entries this tier will not measure.
+        _publish_walk(walk)
+        _state["last_reason"] = (
+            f"the ceiling could not be measured: {walk['measurement_basis']} after "
+            f"{int(walk['entries_examined'])} entries "
+            f"({int(walk['skipped_files'])} not measurable by this tier), so the "
+            "estimate was kept and nothing was planned")
+        return
     plan = disk_layout.lru_eviction_plan(
         walk["entries"], geometry_digest=_state["geometry_digest"],
-        ceiling_bytes=int(ceiling), used_bytes=walk["used_bytes"],
+        ceiling_bytes=int(ceiling), used_bytes=decision_bytes,
         target_fraction=EVICT_TARGET_FRACTION)
-    _state["estimated_bytes"] = int(walk["used_bytes"])
-    _state["walk_truncated"] = bool(walk["truncated"])
+    _state["ceiling_checks"] = int(_state["ceiling_checks"]) + 1
+    _state["estimated_bytes"] = decision_bytes
+    # Publish HOW the decision was made, not just what it was. A reader of
+    # `estimated_bytes` must be able to tell "the store is 170 GiB" from "I stat-ed
+    # 20,000 of 29,532 files and extrapolated 170 GiB from them": see `section()`.
+    _publish_walk(walk)
+    _state["plan_truncated"] = bool(plan.get("truncated"))
+    if walk["truncated"]:
+        _state["last_reason"] = (
+            f"ceiling decided on {walk['measurement_basis']}: "
+            f"{int(walk['files'])} of {int(walk['total_files'])} file(s) stat-ed, "
+            f"{int(walk['used_bytes'])} measured bytes scaled to "
+            f"{decision_bytes}")
     if not plan["ok"] or not plan["paths"]:
         return
     by_directory: dict = {}
@@ -1376,76 +1601,328 @@ def _enforce_ceiling() -> None:
                                    removal=True)
     _state["evictions"] = int(_state["evictions"]) + int(plan["planned"])
     _state["evicted_bytes"] = int(_state["evicted_bytes"]) + freed
-    _state["estimated_bytes"] = max(0, int(walk["used_bytes"]) - freed)
+    # The estimate comes DOWN by what was really freed, off the DECISION number: on
+    # a full walk that is the measurement, exactly as it always was.
+    _state["estimated_bytes"] = max(0, decision_bytes - freed)
 
 
-def _walk_store(root, *, max_files=None, max_shard_dirs=None) -> dict:
-    """Measure the store, bounded. Every shard directory, capped files, no links.
+def _capacity_visible(parsed: dict) -> bool:
+    """Does a name that parsed this way occupy capacity this tier owns?
 
-    Two caps rather than one: shard DIRECTORIES (288 - the space is 256, so the cap
-    only fires on garbage) and FILES statted. A truncated walk reports `truncated`
-    so the ceiling logic knows its measurement is a floor, and a symlink inside
-    the store is skipped rather than followed.
-
-    `max_files` / `max_shard_dirs` TIGHTEN the caps for a caller that must be cheap
-    (the polled snapshot section stats a handful of files; the `/disk` verb's `ls`
-    uses the full caps). They may only lower them: a caller cannot widen a walk
-    this module decided was the safe size.
+    ONE definition, used by the counting pass and the measuring pass alike, because
+    those two MUST describe the same set of files: the scale factor is
+    `total_files / sampled_files`, and scaling a sample drawn from one population by
+    the size of a different one is a number, not a measurement. The rule is the one
+    the measuring pass has always applied - a committed file with our name shape
+    counts (including the pre-group `stale_key_shape`, which is ours, holds real
+    bytes and is unlinkable), while a `.part` (an in-flight write, never a committed
+    file) and a name that is not ours at all do not.
     """
-    entries: list[dict] = []
-    used = 0
-    truncated = False
+    return bool(not parsed["partial"] and (
+        parsed["ok"]
+        or parsed["classification"] == disk_layout.NAME_STALE_KEY_SHAPE))
+
+
+def _name_is_ours(name) -> bool:
+    """The cheap half of `disk_layout.parse_path`: our prefix AND our suffix.
+
+    The counting pass runs this BEFORE the full parse, because a store that has
+    collected other programs' files - or a shard of `.part` cruft - must not pay a
+    ~2.6 microsecond parse per entry to discover that none of them are ours. A name
+    that passes here can still be refused by `parse_path`: this is a filter, not a
+    verdict, and the verdict stays `parse_path`'s. It cannot be the verdict, because
+    a filter that disagrees with the parse in EITHER direction would silently move
+    the population the sample is scaled against.
+    """
+    return (isinstance(name, str) and name.startswith(disk_layout.SLOT_FILE_PREFIX)
+            and name.endswith(disk_layout.SUFFIX_DATA))
+
+
+def _count_store(root, *, cap_dirs: int, max_entries: int) -> dict:
+    """How many capacity-visible files the store holds, WITHOUT one `stat()`.
+
+    WHY A SECOND PASS EXISTS. The measuring pass stats at most `MAX_WALK_FILES`, so
+    on a big store it measures a SAMPLE - and a sample is only usable against a byte
+    ceiling if you know what it was a sample OF. Counting entries answers that at
+    readdir cost: `os.scandir` hands back the `d_type` byte from the same `getdents`
+    buffer the measuring pass reads anyway, so `is_symlink()`/`is_file()` cost no
+    syscall on ext4, XFS and tmpfs, and the only per-entry work is `_name_is_ours`
+    plus, for a name that looks like ours, one `parse_path`.
+
+    THE BOUND, AND ITS WORST CASE. `max_entries` directory ENTRIES across the whole
+    store and `cap_dirs` shard directories: at the cap, ~100,000 entry iterations,
+    `cap_dirs + 1` `opendir` calls, ZERO `stat` calls and at most `max_entries`
+    `parse_path` calls (~0.26 s of CPU at the cap; measured 0.099 s for all 29,532
+    entries of the live-shape store). It runs ONLY from `_walk_store`, which
+    `_enforce_ceiling` calls only once the estimate has crossed the ceiling - so the
+    worst case lands on the enforcement path that is already stat-ing 20,000 files
+    and unlinking up to 4,096, not on a spill. Expressing the bound in ENTRIES rather
+    than files is the point: it bounds the WORK, where the `stat` cap bounds the
+    syscalls.
+
+    A shard whose iteration raised, or that was cut short by the entry cap, is
+    reported as UNKNOWN (`None`) and never as zero - "I could not read it" must not
+    reach the ceiling as "it is empty". Unknown shards are extrapolated by the mean
+    of the shards fully counted and the result is FLAGGED (`count_truncated`), never
+    presented as a count: the shard is the first two hex chars of a block hash, so
+    the population is hash-distributed and a mean over the shards seen IS the
+    store's own estimate of the shards not seen.
+    """
+    try:
+        top = list(os.scandir(root))
+    except OSError as exc:
+        return _fail(f"the store could not be listed: {type(exc).__name__}")
+    shard_dirs = [entry for entry in top if entry.is_dir(follow_symlinks=False)]
+    shards_all = len(shard_dirs)
+    walked = shard_dirs[:cap_dirs]
+    paths = [entry.path for entry in walked]
+    counts: list = []
+    examined = 0
+    skipped = 0
+    tally = 0
+    full_shards = 0
+    counting_stopped = False
+    for shard in walked:
+        if counting_stopped:
+            counts.append(None)
+            continue
+        count = 0
+        unknown = False
+        try:
+            with os.scandir(shard.path) as children:
+                for child in children:
+                    if examined >= max_entries:
+                        unknown = True
+                        break
+                    if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                        continue
+                    examined += 1
+                    # The cheap filter first, then the parse: see `_name_is_ours`.
+                    if not _name_is_ours(child.name) or not _capacity_visible(
+                            disk_layout.parse_path(child.name)):
+                        # Not invisible: a store can hold real bytes this tier will
+                        # neither measure nor shed (a `.part` left by a killed spill,
+                        # a malformed name, someone else's file), and `skipped_files`
+                        # is the counter that says how many. The old walk promised
+                        # this number in a comment and never kept it.
+                        skipped += 1
+                        continue
+                    count += 1
+        except OSError:
+            unknown = True
+        if unknown:
+            counting_stopped = True
+            counts.append(None)
+            continue
+        full_shards += 1
+        tally += count
+        counts.append(count)
+    truncated = counting_stopped or shards_all > cap_dirs
+    if truncated:
+        # Ceiling division: an extrapolation that rounds DOWN would round the
+        # ceiling's own trigger DOWN with it.
+        mean = -(-tally // full_shards) if full_shards else 0
+        total = tally + (mean * (shards_all - full_shards))
+        total = max(total, tally)
+    else:
+        mean = 0
+        total = tally
+    return _ok(units=disk_layout._units("total_files", "entries_examined",
+                                        "skipped_files", "shard_dirs_total",
+                                        "shard_dirs_walked",
+                                        "shard_dirs_counted",
+                                        "mean_files_per_shard"),
+               shard_paths=paths, counts=counts, total_files=int(total),
+               entries_examined=int(examined), skipped_files=int(skipped),
+               shard_dirs_total=int(shards_all),
+               shard_dirs_walked=len(walked),
+               shard_dirs_counted=int(full_shards),
+               mean_files_per_shard=int(mean),
+               count_truncated=bool(truncated), reason=None)
+
+
+def _sample_quotas(count: dict, cap_files: int) -> list:
+    """A fair share of the `stat` budget for every shard directory the count saw.
+
+    THE SHAPE OF THE SAMPLE IS THE OTHER HALF OF THE FIX. "Stat until the cap, then
+    stop" walks depth-first: it measures whatever the FIRST shards hold, is blind to
+    the rest for both jobs a walk does (the byte total comes from one corner of the
+    key space and a file never seen cannot be evicted), and truncates on a store
+    whose bytes live further down the directory list. So the budget is spread as a
+    uniform RATE instead: shard `i` is asked for `cap_files * files_i / total_files`
+    of its files, which samples EVERY shard at the same fraction of itself and spends
+    the whole budget however the files are distributed. Proportional rather than
+    even-per-shard, because an even split wastes the budget on the small shards and a
+    proportional one cannot; a shard with files in it always gets at least 1, because
+    skipping a shard entirely is the same blindness in a smaller hat. A shard whose
+    count is unknown is treated as holding the mean of the shards that are known.
+
+    `None` means "no per-shard bound": the whole store is inside the budget and this
+    is a measurement, not a sample. That is the branch every store under the caps
+    takes, and the reason its numbers cannot have moved.
+    """
+    counts = count["counts"]
+    total = int(count["total_files"])
+    if not count["count_truncated"] and total <= cap_files \
+            and int(count["shard_dirs_total"]) <= int(count["shard_dirs_walked"]):
+        return [None] * len(counts)
+    mean = int(count["mean_files_per_shard"])
+    if mean <= 0:
+        mean = 1
+    quotas: list = []
+    for known in counts:
+        files = mean if known is None else int(known)
+        if files <= 0:
+            quotas.append(0)
+            continue
+        share = (cap_files * files) // total if total > 0 else files
+        quotas.append(max(1, int(share)))
+    return quotas
+
+
+def _walk_absence(reason) -> dict:
+    """The shape of a walk that could not read the store at all.
+
+    Every key present, every measurement an ABSENCE rather than a plausible zero: a
+    caller must not be able to read "0 bytes" out of a failed walk and conclude the
+    store is empty. (`ok` is False and no caller in this repository reads a number
+    from a failed walk, which is exactly what this function makes unnecessary.)
+    """
+    return _fail(reason, entries=[], used_bytes=None, files=None,
+                 total_files=None, estimated_total_bytes=None,
+                 entries_examined=None, skipped_files=None,
+                 shard_dirs_total=None, shard_dirs_walked=None,
+                 truncated=True, count_truncated=True,
+                 measurement_basis="unavailable")
+
+
+def _walk_store(root, *, max_files=None, max_shard_dirs=None,
+                max_entries=None) -> dict:
+    """Measure the store, bounded, across the WHOLE shard space. No links followed.
+
+    Three caps rather than one - shard DIRECTORIES (288; the space is 256, so the
+    cap only fires on garbage), FILES statted, and directory ENTRIES read - because
+    the walk does two jobs and they cost different currencies. Two bounded passes,
+    EACH bounded by `max_entries` entries, so the whole walk reads at most twice
+    that many directory entries and stats at most `max_files` of them:
+
+      1. `_count_store` counts the capacity-visible files with readdir only, so the
+         walk knows how big the population it is about to sample is; and
+      2. the measuring pass stats a PROPORTIONAL SAMPLE of it - the same fraction of
+         every shard, never a depth-first run into the first ones - and reports
+         `used_bytes` (the bytes it actually stat-ed, the same number it always
+         reported) AND `estimated_total_bytes` (that sample scaled by
+         `total_files / files`), which is the number a byte ceiling belongs to.
+
+    A walk that saw every file reports the two as the SAME number, so for a store
+    inside the caps nothing here moves: same bytes, same entries, same order, same
+    eviction plan. When it truncated, `truncated`, `count_truncated`, `files` and
+    `total_files` all say so and the basis names how the estimate was made - a
+    reader must never be able to mistake "I sampled 20,000 files and extrapolated"
+    for "the store is this big".
+
+    `max_files` / `max_shard_dirs` / `max_entries` TIGHTEN the caps for a caller
+    that must be cheap (the polled snapshot section stats a handful of files; the
+    `/disk` verb's `ls` uses the full caps). They may only lower them: a caller
+    cannot widen a walk this module decided was the safe size.
+    """
     cap_files = MAX_WALK_FILES if max_files is None else min(MAX_WALK_FILES,
                                                              int(max_files))
     cap_dirs = MAX_SHARD_DIRS if max_shard_dirs is None \
         else min(MAX_SHARD_DIRS, int(max_shard_dirs))
-    try:
-        top = list(os.scandir(root))
-    except OSError as exc:
-        return _fail(f"the store could not be listed: {type(exc).__name__}",
-                     entries=[], used_bytes=0, truncated=False)
-    shard_dirs = [entry for entry in top if entry.is_dir(follow_symlinks=False)]
-    if len(shard_dirs) > cap_dirs:
-        truncated = True
+    cap_entries = MAX_WALK_ENTRIES if max_entries is None \
+        else min(MAX_WALK_ENTRIES, int(max_entries))
+    count = _count_store(root, cap_dirs=cap_dirs, max_entries=cap_entries)
+    if not count["ok"]:
+        return _walk_absence(count["reason"])
+    entries: list[dict] = []
+    used = 0
     counted = 0
-    for shard in shard_dirs[:cap_dirs]:
+    measured_entries = 0
+    entries_capped = False
+    budget = cap_files
+    for path, quota in zip(count["shard_paths"], _sample_quotas(count, cap_files),
+                           strict=True):
+        share = budget if quota is None else min(int(quota), budget)
+        if share <= 0:
+            continue
+        got = 0
         try:
-            with os.scandir(shard.path) as children:
+            with os.scandir(path) as children:
                 for child in children:
-                    if counted >= cap_files:
-                        truncated = True
+                    if got >= share:
+                        break
+                    if measured_entries >= cap_entries:
+                        entries_capped = True
                         break
                     if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                        continue
+                    measured_entries += 1
+                    if not _name_is_ours(child.name):
+                        continue
+                    # Parsed BEFORE the stat, which the old walk did the other way
+                    # round: a shard of names that are not ours must not buy a
+                    # syscall each, and the accepted SET is identical either way.
+                    if not _capacity_visible(disk_layout.parse_path(child.name)):
                         continue
                     try:
                         info = child.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    parsed = disk_layout.parse_path(child.name)
-                    stale_shape = parsed["classification"] == (
-                        disk_layout.NAME_STALE_KEY_SHAPE)
-                    if parsed["partial"] or (
-                            not parsed["ok"] and not stale_shape):
-                        # Only ONE non-current shape is worth measuring and
-                        # shedding: the pre-group name, which is ours, occupies
-                        # real bytes, and is unlinkable. Anything else that does
-                        # not parse (malformed, not ours) is left alone exactly as
-                        # `parse_path` says - but it must not be invisible either,
-                        # or the ceiling logic under-counts a store it cannot read.
-                        continue
                     counted += 1
+                    got += 1
+                    budget -= 1
                     used += int(info.st_size)
-                    entries.append({"path": os.path.join(shard.path, child.name),
+                    entries.append({"path": os.path.join(path, child.name),
                                     "filename": child.name,
                                     "size_bytes": int(info.st_size),
-                                    "mtime_ns": int(info.st_mtime_ns)})
+                                    "mtime_ns": int(info.st_mtime_ns),
+                                    # The same units idiom `disk_layout`'s own sweep
+                                    # entries carry, so a walk entry dropped into any
+                                    # payload arrives with its dimensions named.
+                                    "units": disk_layout._units("size_bytes",
+                                                                "mtime_ns")})
         except OSError:
+            # Half a shard is a partial measurement, and `counted < total_files`
+            # below is what records it as one.
             continue
-        if truncated:
-            break
-    return _ok(units=disk_layout._units("used_bytes", "files"),
+    total_files = int(count["total_files"])
+    truncated = bool(count["count_truncated"]) or entries_capped \
+        or counted < total_files
+    if not truncated:
+        # The walk saw every capacity-visible file. The estimate IS the measurement,
+        # byte for byte, which is the property every store inside the caps rests on.
+        scaled = used
+        basis = "full_measurement"
+    elif counted == 0:
+        # A bounded walk that measured NOTHING. Its `used_bytes` is a floor of zero,
+        # and zero is the most dangerous number this module can emit: read as
+        # "the store is empty" it silences the ceiling forever. Report the absence
+        # and let the caller decline to act on it (see `_enforce_ceiling`).
+        scaled = used
+        basis = "sample_unmeasured"
+    else:
+        # The scaling. Uniform slot widths make this close to exact; the honest
+        # word for it is still "estimate", and `measurement_basis` says so. The
+        # population is at least the sample, so an unknown count can never scale a
+        # measurement DOWN.
+        population = max(total_files, counted)
+        scaled = max(used, used * population // counted)
+        basis = ("sample_scaled_count_extrapolated" if count["count_truncated"]
+                 else "sample_scaled")
+    return _ok(units=disk_layout._units("used_bytes", "files", "total_files",
+                                        "estimated_total_bytes",
+                                        "entries_examined", "skipped_files",
+                                        "shard_dirs_total", "shard_dirs_walked"),
                entries=entries, used_bytes=used, files=counted,
-               truncated=truncated, reason=None)
+               total_files=total_files, estimated_total_bytes=int(scaled),
+               entries_examined=int(count["entries_examined"]) + measured_entries,
+               skipped_files=int(count["skipped_files"]),
+               shard_dirs_total=int(count["shard_dirs_total"]),
+               shard_dirs_walked=int(count["shard_dirs_walked"]),
+               truncated=bool(truncated),
+               count_truncated=bool(count["count_truncated"]),
+               measurement_basis=basis, reason=None)
 
 
 def request_spill(caches=None, slot=None, key=None, *, worker=None,
@@ -1721,6 +2198,42 @@ def section() -> dict:
         "evicted_bytes": int(_state["evicted_bytes"]),
         "estimated_bytes": int(_state["estimated_bytes"]),
         "walk_truncated": bool(_state["walk_truncated"]),
+        # HOW the last ceiling decision was measured. `estimated_bytes` above is the
+        # number the ceiling was compared against, and on a store bigger than the
+        # walk's caps it is an EXTRAPOLATION from a sample - which is the right
+        # decision to have made, and a different claim from "I measured the store".
+        # Without this block a reader cannot tell "the store is 170 GiB" from "I
+        # stat-ed 20,000 of 29,532 files and scaled what I saw", and a witness that
+        # cannot make that distinction is not a witness: it is how a 334.9 GiB store
+        # sat under a 192 GiB ceiling while every payload said the estimate was fine.
+        "ceiling_measurement": {
+            # "full_measurement" | "sample_scaled"
+            # | "sample_scaled_count_extrapolated" | None (no walk yet).
+            "basis": _state["walk_basis"],
+            "measured_bytes": int(_state["walk_measured_bytes"]),
+            "sampled_files": int(_state["walk_sampled_files"]),
+            "total_files": int(_state["walk_total_files"]),
+            "entries_examined": int(_state["walk_entries_examined"]),
+            # Files in the store this tier can neither measure nor shed: a `.part`
+            # left by a killed spill, a malformed name, someone else's file. They
+            # are capacity, they are invisible to `estimated_bytes`, and this is the
+            # counter that stops them being invisible to a reader.
+            "skipped_files": int(_state["walk_skipped_files"]),
+            "walk_truncated": bool(_state["walk_truncated"]),
+            "count_truncated": bool(_state["walk_count_truncated"]),
+            # The last plan hit `disk_layout.MAX_EVICTION_PLAN`: the pass was
+            # partial by design and the next spill runs another one.
+            "plan_truncated": bool(_state["plan_truncated"]),
+            "ceiling_checks": int(_state["ceiling_checks"]),
+            # The FIRST walk of a boot, which is what lets a fresh process see a
+            # store it did not write. Zero here with a full store and a quiet
+            # `estimated_bytes` is the story of a ceiling that never woke up.
+            "seed_walks": int(_state["estimate_seed_walks"]),
+            "units": disk_layout._units("measured_bytes", "sampled_files",
+                                        "total_files", "entries_examined",
+                                        "skipped_files", "ceiling_checks",
+                                        "seed_walks"),
+        },
         "errors": int(_state["errors"]),
         # The collision witness and the journal, next to the counters they qualify:
         # `group_collisions` is the rate the tier was armed to measure, and
@@ -1763,6 +2276,13 @@ def section() -> dict:
                  "spill_window_seconds": SPILL_WINDOW_SECONDS,
                  "max_files_per_window": MAX_FILES_PER_WINDOW,
                  "min_free_bytes": MIN_FREE_BYTES,
+                 # The three bounds of one capacity walk, published next to the
+                 # ceiling they decide: `estimated_bytes` is a sample as soon as
+                 # `ceiling_measurement.total_files` passes `max_walk_files`, and an
+                 # operator reading that should be able to see the cap it hit.
+                 "max_shard_dirs": MAX_SHARD_DIRS,
+                 "max_walk_files": MAX_WALK_FILES,
+                 "max_walk_entries": MAX_WALK_ENTRIES,
                  "max_bytes_per_file": (
                      _state["fingerprint"]["total_bytes_per_block"]
                      if isinstance(_state["fingerprint"], dict) else None),
@@ -1770,7 +2290,8 @@ def section() -> dict:
                  "units": disk_layout._units(
                      "max_queue_depth", "spill_window_seconds",
                      "max_files_per_window", "min_free_bytes",
-                     "max_bytes_per_file", "evict_target_fraction")},
+                     "max_bytes_per_file", "evict_target_fraction",
+                     "max_shard_dirs", "max_walk_files", "max_walk_entries")},
         "naming": {"template": disk_layout.FILENAME_TEMPLATE,
                    "root": state["root"],
                    "shard": f"<key16[0:{disk_layout.SHARD_CHARS}]>",

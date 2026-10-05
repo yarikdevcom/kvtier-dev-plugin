@@ -69,6 +69,22 @@ logged once per episode (`notice_once`, the `miss_attribution` idiom), counted a
 `journal_tmpfs_warnings`, and published as `journal_on_tmpfs` / `journal_dir=tmpfs`
 on the boot line. It must never raise and must never refuse to spill.
 
+THE READER SPENDS ITS BUDGET ON THE NEWEST LINES, NOT THE OLDEST
+----------------------------------------------------------------
+A journal is append-only, so a cursor that walks front-to-back hands the index the
+spills the tier has ALREADY SERVED and leaves the recent ones - the ones a restore is
+waiting for - to be reached last. On 2026-10-05 that meant 0 of the 36 newest
+identities were known to the index while four journals sat ~60k lines deep and one
+refresh carried a tenth of one of them. `refresh()` now takes each journal's window
+from the END of its unread run, and gives every journal a SHARE of the byte and line
+budgets instead of letting the first rank spend it all. Whatever a pass cannot carry is
+forfeited - and forfeiting is safe ONLY because of the ordering it preserves: every
+forfeited line is older than every applied line, so the applied stream is still exactly
+the file's order (`+` then `-` still means gone), and the entries the skipped region
+taught are forgotten outright. The caps are unchanged; what was missing was an
+admission. `lag_bytes`, `lag_journals`, `catch_up_jumps`, `bytes_skipped` and
+`lines_skipped` say how far behind the reader is and what it gave up to get there.
+
 THE INDEX MAY ONLY EVER BE STALE IN THE SAFE DIRECTION
 ------------------------------------------------------
 A false ABSENCE costs a recompute. A false PRESENCE costs a load that fails -
@@ -126,6 +142,14 @@ MAX_JOURNAL_BYTES = 32 * 1024 * 1024  # BYTES one rank's journal may reach
 MAX_JOURNAL_FILES = 64              # journal FILES one refresh will open
 MAX_LINES_PER_REFRESH = 8_192       # LINES applied per refresh (bounded work)
 MAX_READ_PER_REFRESH = 512 * 1024   # BYTES read across all journals per refresh
+# THE FLOOR ON ONE JOURNAL'S SHARE of a refresh's budget. Below this a window is
+# smaller than one rank's newest spill burst and the catch-up rule below would buy
+# nothing; the TOTAL cap (`MAX_READ_PER_REFRESH`) is still what one refresh reads.
+MIN_JOURNAL_WINDOW_BYTES = 4 * 1024  # BYTES: the smallest share one journal gets
+# BYTES scanned forward from a mid-line offset to find the next line start. Bounded
+# because it is a read on the lookup path; a journal whose lines are longer than
+# this simply yields no window this pass (a missed restore, never a half-line).
+CATCHUP_ALIGN_PROBE_BYTES = 64 * 1024
 MAX_JOURNAL_RANK_CHARS = 32         # CHARS of a rank id in a journal file name
 # HOW MANY RANKS one identity may be recorded as written by. A parked span is one
 # file PER RANK (each names it with its own geometry digest), so the honest answer to
@@ -254,6 +278,19 @@ _state: dict = {
     "journal_seq_seed": 0,
     "refreshes": 0,
     "refresh_skipped": 0,
+    # HOW FAR BEHIND THIS INDEX IS, in the unit the reader can actually measure.
+    # `lag_bytes` is the unread tail summed over every journal AFTER this refresh
+    # applied what it could; it reaches 0 when every cursor is at end-of-file. It is
+    # bytes and not lines because counting lines would mean reading the very bytes
+    # the lag is made of, and this module does not guess numbers it has not read.
+    "lag_bytes": 0,
+    "lag_journals": 0,
+    # WHAT THE NEWEST-FIRST RULE FORFEITED: lines and bytes passed over without being
+    # applied, plus how many times a journal had to jump forward to reach its tail.
+    # A jump is not free - it forgets what that rank taught us - so it is counted.
+    "bytes_skipped": 0,
+    "lines_skipped": 0,
+    "catch_up_jumps": 0,
     "last_reason": None,
     "last_error": None,
     "last_journal": None,
@@ -292,6 +329,8 @@ def reset_state_for_tests() -> None:
         "journal_lines": 0, "journal_bytes": 0,
         "journal_seeded": False, "journal_seq_seed": 0,
         "refreshes": 0, "refresh_skipped": 0,
+        "lag_bytes": 0, "lag_journals": 0,
+        "bytes_skipped": 0, "lines_skipped": 0, "catch_up_jumps": 0,
         "last_reason": None, "last_error": None, "last_journal": None,
         "last_refresh_mono": None, "bytes_indexed": 0,
         "journal_fs": None, "journal_on_tmpfs": None,
@@ -948,9 +987,22 @@ def refresh(*, force: bool = False) -> dict:
 
     Called from the lookup path, so the whole refresh is bounded by
     `MAX_JOURNAL_FILES` files, `MAX_READ_PER_REFRESH` bytes and
-    `MAX_LINES_PER_REFRESH` lines, and each file's read is bounded by the same
-    budget. A refresh opens at most one `stat` per journal and reads only the
-    bytes after its cursor, so an idle store costs one stat per rank.
+    `MAX_LINES_PER_REFRESH` lines, and each file's read is bounded by its share of
+    the same budget. A refresh opens at most one `stat` per journal and reads only
+    the bytes after its cursor, so an idle store costs one stat per rank.
+
+    THE BUDGET IS SPENT ON THE NEWEST LINES, NOT THE OLDEST, and that is the whole
+    point of this function. A journal is append-only, so a front-to-back cursor hands
+    the index the SPILLS THE TIER HAS ALREADY SERVED and leaves the lines the restore
+    path is waiting for - the ones written minutes ago - to be reached last. On
+    2026-10-05 that cost 0 of 36 newest identities: four journals ~60k lines deep,
+    one refresh covering a tenth of one of them, and the offer path asking about the
+    span it had parked seconds earlier. The rule now is: read what the budget
+    carries, taking the END of the unread run; forfeit whatever that leaves behind,
+    count it, and say so. Forfeiting is the SAFE direction because every line left
+    unread is OLDER than every line applied (see `_apply_journal`), and the rank's
+    previously-learned entries are dropped when a jump forfeits them, so the index
+    never keeps a claim it did not just read.
 
     `force` ignores the age floor (a verb that wants the truth right now); the
     lookup path uses the floor so a burst of requests does not turn into a burst
@@ -959,7 +1011,8 @@ def refresh(*, force: bool = False) -> dict:
     started = time.monotonic()
     out = {"ok": True, "reason": None, "journals": 0, "lines": 0, "spills": 0,
            "removals": 0, "dropped": 0, "entries": int(len(_state["entries"])),
-           "applied": False}
+           "applied": False, "lag_bytes": 0, "lag_journals": 0,
+           "bytes_skipped": 0, "lines_skipped": 0, "jumps": 0}
     try:
         directory = journal_directory()
         if directory is None:
@@ -976,6 +1029,12 @@ def refresh(*, force: bool = False) -> dict:
             # is not a lie - the index simply has at most this much latency, and
             # a restore that races its own journal entry is a recompute.
             _state["refresh_skipped"] += 1
+            # The last MEASURED lag, not zero: a refresh that did not look must not
+            # report "caught up". `lag_measured: false` tells the reader this number
+            # is the previous pass's, which is the honest form of "we did not look".
+            out["lag_bytes"] = int(_state["lag_bytes"])
+            out["lag_journals"] = int(_state["lag_journals"])
+            out["lag_measured"] = False
             out["reason"] = (f"refreshed {round(now - float(last), 3)}s ago; the "
                              f"floor is {REFRESH_MIN_INTERVAL_SECONDS}s")
             return out
@@ -988,19 +1047,38 @@ def refresh(*, force: bool = False) -> dict:
             return out
         budget = MAX_READ_PER_REFRESH
         lines = MAX_LINES_PER_REFRESH
+        # EVERY JOURNAL GETS A SHARE, not whatever the previous one left over. One
+        # rank reading the whole budget is one rank reading NOTHING, and a span needs
+        # every rank to have journalled it: a partially-caught-up index is the one
+        # shape that turns "the file is gone" into a offered load that fails. The
+        # TOTAL caps are still what one refresh may read and apply; the share only
+        # decides how that budget is divided.
+        share_bytes = max(MIN_JOURNAL_WINDOW_BYTES,
+                          MAX_READ_PER_REFRESH // max(1, len(names)))
+        share_lines = max(1, MAX_LINES_PER_REFRESH // max(1, len(names)))
         for name in names:
             path = os.path.join(directory, name)
             out["journals"] += 1
-            if budget <= 0 or lines <= 0:
+            want_bytes = min(share_bytes, budget)
+            want_lines = min(share_lines, lines)
+            if want_bytes <= 0 or want_lines <= 0:
                 _state["dropped"]["read_cap"] += 1
                 out["dropped"] += 1
                 continue
-            read, applied, spills, removes = _apply_journal(path, budget, lines)
-            budget -= read
-            lines -= applied
-            out["lines"] += applied
-            out["spills"] += spills
-            out["removals"] += removes
+            result = _apply_journal(path, want_bytes, want_lines)
+            budget -= int(result["read"])
+            lines -= int(result["applied"])
+            out["lines"] += int(result["applied"])
+            out["spills"] += int(result["spills"])
+            out["removals"] += int(result["removals"])
+            out["lag_bytes"] += int(result["lag_bytes"])
+            out["bytes_skipped"] += int(result["bytes_skipped"])
+            out["lines_skipped"] += int(result["lines_skipped"])
+            out["jumps"] += int(result["jumps"])
+            if int(result["lag_bytes"]) > 0:
+                out["lag_journals"] += 1
+        _state["lag_bytes"] = int(out["lag_bytes"])
+        _state["lag_journals"] = int(out["lag_journals"])
         out["entries"] = int(len(_state["entries"]))
         out["applied"] = out["lines"] > 0
         out["elapsed_seconds"] = round(time.monotonic() - started, 6)
@@ -1034,29 +1112,80 @@ def _journal_names(directory) -> list:
     return names
 
 
-def _apply_journal(path, budget, line_budget) -> tuple:
-    """Replay one journal from its cursor.
+def _align_forward(path, start: int, size: int) -> int:
+    """The first line boundary at or after `start`, or `size` if there is none.
 
-    Returns ``(bytes_read, lines_applied, spills_applied, removals_applied)``.
+    WHY THIS EXISTS: a window taken from mid-file starts mid-line, and a half line
+    is a MALFORMED line - which `_apply_line` answers by stopping that journal for
+    the rest of the boot. So a tail window is worthless unless it begins on a line
+    boundary, and this is the one read that pays for the privilege: at most
+    `CATCHUP_ALIGN_PROBE_BYTES`, looking for a newline.
 
-    Only COMPLETE lines (ending in a newline) are applied, and the cursor only
-    ever advances to the last newline: a line the writer is halfway through is
-    nobody's fact yet. A file that got SMALLER was truncated by someone who is
-    not this plugin - the entries contributed by that rank are dropped, because
-    we can no longer tell what they were, and the replay starts from the top.
+    `start > 0` is checked against the byte BEFORE it, because "the byte before the
+    window is a newline" is exactly the statement "the window starts a line".
     """
-    read_spills_local = 0
-    read_removes_local = 0
+    if start <= 0:
+        return 0
+    if start >= size:
+        return size
+    probe = min(CATCHUP_ALIGN_PROBE_BYTES, max(1, size - start + 1))
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(start - 1)
+            raw = handle.read(probe)
+    except OSError as exc:
+        _note(f"{os.path.basename(path)} could not be read to align a catch-up "
+              f"window: {type(exc).__name__}")
+        return size
+    if not raw:
+        return size
+    if raw[0] == 0x0A:
+        return start
+    found = raw.find(b"\n", 1)
+    if found < 0:
+        # No line start inside the probe: the window would open mid-line, and an
+        # unread pass is better than a journal stopped by its own first half-line.
+        return size
+    return start + found
+
+
+def _apply_journal(path, budget, line_budget) -> dict:
+    """Replay the NEWEST part of one journal that `budget` can carry.
+
+    Returns `{read, applied, spills, removals, lag_bytes, bytes_skipped,
+    lines_skipped, jumps}`.
+
+    Only COMPLETE lines (ending in a newline) are applied, and the cursor only ever
+    advances to the last newline: a line the writer is halfway through is nobody's
+    fact yet. A file that got SMALLER was truncated by someone who is not this
+    plugin - the entries contributed by that rank are dropped, because we can no
+    longer tell what they were, and the replay starts from the top.
+
+    NEWEST-FIRST, AND WHY IT IS THE SAFE DIRECTION. When the unread run is bigger
+    than this pass can carry, the window is taken from the END of the file and the
+    older bytes are forfeited - and forfeiting is only safe because of the ordering
+    it preserves: every forfeited line is OLDER than every applied line, so the
+    applied stream is still exactly the file's order. A `+` we read is a file we saw
+    written; a `-` we read for an identity we never learned is a no-op; a `-` we
+    forfeit can only leave an entry we have JUST forgotten, which is why
+    `_forget_rank(path)` runs before the window is applied. Nothing this does can
+    manufacture a presence the journal did not describe in the window it read.
+
+    The same rule applies inside a window when `line_budget` binds: the OLDEST lines
+    of the window are the ones forfeited.
+    """
+    out = {"read": 0, "applied": 0, "spills": 0, "removals": 0, "lag_bytes": 0,
+           "bytes_skipped": 0, "lines_skipped": 0, "jumps": 0}
     try:
         size = os.path.getsize(path)
     except FileNotFoundError:
-        return 0, 0, 0, 0
+        return out
     except OSError as exc:
         # A stat failure is REPORTED, never counted as a data loss: the cursor
         # stays where it is, so the next refresh tries the same bytes again.
         _note(f"{os.path.basename(path)} could not be stat'ed: "
               f"{type(exc).__name__}")
-        return 0, 0, 0, 0
+        return out
     cursor = int(_state["cursors"].get(path, 0))
     if size < cursor:
         _state["dropped"]["journal_shrank"] += 1
@@ -1070,13 +1199,41 @@ def _apply_journal(path, budget, line_budget) -> tuple:
         cursor = 0
     if _state["stopped"].get(path):
         _state["dropped"]["stopped"] += 1
-        return 0, 0, 0, 0
+        return out
     if size <= cursor:
-        return 0, 0, 0, 0
-    want = min(size - cursor, max(0, budget))
-    if want <= 0:
+        return out
+    window = min(max(int(budget), 0), size)
+    if window <= 0:
         _state["dropped"]["read_cap"] += 1
-        return 0, 0, 0, 0
+        return out
+    if size - cursor > window:
+        # BURIED. Reach the tail and forget the rest of this rank's history, which
+        # is the only way the index can be honest about a claim it did not read.
+        # The sequence is deliberately NOT reset: it still increases, and a reset
+        # would let an old line be applied twice.
+        start = _align_forward(path, size - window, size)
+        if start >= size:
+            # No line start to be found inside the probe. Reading would open on a
+            # half-line and STOP this journal for the boot, so this pass reads
+            # nothing and says how far behind that leaves us.
+            out["lag_bytes"] = size - cursor
+            return out
+        if start > cursor:
+            skipped = start - cursor
+            _forget_rank(path)
+            out["bytes_skipped"] = skipped
+            out["jumps"] = 1
+            _state["bytes_skipped"] = int(_state["bytes_skipped"]) + skipped
+            _state["catch_up_jumps"] += 1
+            _note(f"{os.path.basename(path)} is {size - cursor} bytes ahead of its "
+                  f"cursor and one refresh carries {window}: reading the newest "
+                  f"{size - start} bytes and forgetting what this rank taught us "
+                  "from the skipped bytes (a forgotten entry is a missed restore, "
+                  "never a wrong one)")
+            cursor = start
+    if size <= cursor:
+        return out
+    want = min(size - cursor, window)
     try:
         with open(path, "rb") as handle:
             handle.seek(cursor)
@@ -1084,28 +1241,44 @@ def _apply_journal(path, budget, line_budget) -> tuple:
     except OSError as exc:
         _note(f"{os.path.basename(path)} could not be read: "
               f"{type(exc).__name__}")
-        return 0, 0, 0, 0
+        out["lag_bytes"] = size - cursor
+        return out
     last_newline = raw.rfind(b"\n")
     if last_newline < 0:
         # Nothing complete yet. The cursor stays, so the next refresh retries.
-        return 0, 0, 0, 0
+        out["lag_bytes"] = size - cursor
+        return out
     body = raw[:last_newline + 1]
+    lines = body.decode("utf-8", errors="replace").splitlines()
+    if len(lines) > int(line_budget):
+        # Forfeit the OLDEST lines of the window, never the newest: same ordering
+        # rule as the byte window above, applied one level down.
+        forfeit = len(lines) - int(line_budget)
+        lines = lines[forfeit:]
+        out["lines_skipped"] += forfeit
+        _state["lines_skipped"] = int(_state["lines_skipped"]) + forfeit
+        _state["dropped"]["line_cap"] += 1
     applied = 0
-    for text in body.decode("utf-8", errors="replace").splitlines():
-        if applied >= line_budget:
-            _state["dropped"]["line_cap"] += 1
-            break
-        applied += 1
+    for index, text in enumerate(lines):
         kind = _apply_line(text, path)
         if kind is None:
+            # The stream stopped being trustworthy: everything after it in this
+            # window goes unread too, and that is counted rather than silent.
+            out["lines_skipped"] += len(lines) - index
+            _state["lines_skipped"] = (int(_state["lines_skipped"])
+                                       + len(lines) - index)
             break
+        applied += 1
         if kind == SPILL_LINE:
-            read_spills_local += 1
+            out["spills"] += 1
         else:
-            read_removes_local += 1
+            out["removals"] += 1
     _state["cursors"][path] = cursor + last_newline + 1
     _state["last_journal"] = path
-    return last_newline + 1, applied, read_spills_local, read_removes_local
+    out["read"] = last_newline + 1
+    out["applied"] = applied
+    out["lag_bytes"] = max(0, size - int(_state["cursors"][path]))
+    return out
 
 
 def _forget_rank(path) -> None:
@@ -1388,7 +1561,16 @@ def membership(key) -> dict:
                 "journal_directory": directory,
                 "journal_write_errors": int(_state["journal_write_errors"]),
                 "rank_records": int(_state["rank_records"]),
-                "rank_records_dropped": int(_state["rank_records_dropped"])}
+                "rank_records_dropped": int(_state["rank_records_dropped"]),
+                # HOW FAR BEHIND THE ANSWER IS. A `not_present` from a lagging index
+                # is "this boot has not read that line yet", which is a different
+                # claim from "the file was never spilled" - and it is the claim that
+                # cost the 0-of-36 reading on 2026-10-05. Say it beside the answer.
+                "lag_bytes": int(_state["lag_bytes"]),
+                "lag_journals": int(_state["lag_journals"]),
+                "catch_up_jumps": int(_state["catch_up_jumps"]),
+                "bytes_skipped": int(_state["bytes_skipped"]),
+                "lines_skipped": int(_state["lines_skipped"])}
         blank = {"key16": None, "group_id": None, "identity": None, "shard": None,
                  "bytes": 0, "bytes_all_ranks": 0, "journal": None, "rank": None,
                  "ranks": [], "ranks_present": 0, "index": view}
@@ -1547,6 +1729,16 @@ def section() -> dict:
         "journal_fields": JOURNAL_FIELDS,
         "journal_cap_bytes": MAX_JOURNAL_BYTES,
         "refreshes": int(_state["refreshes"]),
+        # THE READER'S OWN HONESTY: how much of the journal this process has NOT read
+        # (`lag_bytes`, measured after the last refresh), how many journals that left
+        # (`lag_journals`), and what the newest-first rule had to forfeit to reach the
+        # tail at all. A non-zero lag makes every `not_present` in this payload a
+        # statement about the READER, not about the store.
+        "lag_bytes": int(_state["lag_bytes"]),
+        "lag_journals": int(_state["lag_journals"]),
+        "catch_up_jumps": int(_state["catch_up_jumps"]),
+        "bytes_skipped": int(_state["bytes_skipped"]),
+        "lines_skipped": int(_state["lines_skipped"]),
         "applied_lines": int(_state["applied"]),
         "spills_seen": int(_state["spills"]),
         "removals_seen": int(_state["removals"]),
@@ -1579,6 +1771,18 @@ def section() -> dict:
                   "journal_seq_seed": "lines", "journal_fields": "fields",
                   "journal_cap_bytes": "bytes",
                   "journal_tmpfs_warnings": "warnings",
+                  "lag_bytes": "bytes of journal this process has NOT read yet; 0 "
+                                "means every cursor is at end-of-file",
+                  "lag_journals": "journals still carrying unread bytes",
+                  "catch_up_jumps": "times a journal was deep enough that one "
+                                    "refresh could not reach its tail, so the older "
+                                    "bytes were forfeited and that rank's entries "
+                                    "were forgotten",
+                  "bytes_skipped": "journal bytes forfeited to reach the tail (unit: "
+                                   "bytes, NOT lines: this module does not guess a "
+                                   "line count it has not read)",
+                  "lines_skipped": "journal lines passed over without being applied "
+                                   "(the line cap, or a stopped stream)",
                   "refreshes": "refreshes", "applied_lines": "lines",
                   "spills_seen": "files", "removals_seen": "files",
                   "lookup_hits": "lookups", "lookup_misses": "lookups",
@@ -1597,7 +1801,10 @@ def section() -> dict:
                  "journal costs a restore, and a file evicted but not yet "
                  "un-indexed costs a reported load failure (a recompute). No path "
                  "is published: four ranks name one identity four ways, so every "
-                 "worker resolves the name IT would have written."),
+                 "worker resolves the name IT would have written. Read `lag_bytes` "
+                 "first: while it is non-zero this index has not read the newest "
+                 "spill lines, and a `not_present` is then a statement about the "
+                 "reader."),
     }
 
 

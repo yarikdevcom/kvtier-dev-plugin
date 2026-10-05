@@ -89,6 +89,11 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
 | `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
+| `VLLM_E2_TIER_DISK_SETTLE_MS` | **the cap on one settle wait, in milliseconds (0.2.23). Unset or `0` = never wait**, which is every boot before 0.2.23: an unsettled read was dropped and its tokens recomputed. It is a CAP on a budget that is proportional to the bytes still in flight (`disk_restore.settle_budget`), not the budget, and NOT an arm - the restore path still needs the disk root, both arms, this boot's offer switch and a proven worker before it reads a byte. A value that will not parse means OFF and is logged once. See *The restore race, measured*. |
+| `VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S` | the assumed sequential READ throughput of the spill store, the number that turns bytes-in-flight into milliseconds. Default `11500000000` - **the measured WRITE rate, because the read side has never been measured**; set it from a boot's `settle.read_seconds_max` and the budget tracks the hardware. |
+| `VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S` | the engine's prefill rate, used for one published number and nothing else: `recompute_ms`, the cost a wait is racing. Default `9400/2.4` ≈ `3916.7`, from the measured 9,400 tokens recomputed in 2.4 s. |
+| `VLLM_E2_TIER_DISK_READ_THREADS` | **how many threads issue spill reads at once (0.2.24). Unset or `1` = ONE thread**, which is every boot before 0.2.24, byte-identically and pinned by a test. Clamped to `[1, 16]`; anything that is not a positive integer means "the operator said nothing" and is reported in `read.env_problems`. It is a thread count and nothing else - the queue stays FIFO, so dispatch order is submission order. **Raise the pool with it or it buys nothing on a big prompt**: in-flight bytes are bounded by the pool, not by the threads. See *Reading the spill in parallel*. |
+| `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | the bounce-buffer pool's byte ceiling, PER PROCESS. **Unset = `disk_read.MAX_BUFFERS_BYTES` = 96 MiB**, today's value, which holds **8** units of 11,468,800 B (7 of the 12,902,400 B width). This is what actually bounds in-flight work: a buffer is taken at *issue* and only returned at the apply point, so **one offer needs the pool to hold the whole offer at once** - and a big-prompt offer is 10 units, so the default misses it by two. **128 MiB (134217728) is the smallest setting that holds a whole 10-unit offer on both widths.** HOST-RAM COST: the pool is per process and every engine rank is a process, so 128 MiB here is 512 MiB of resident bytes on a 4-rank boot. Clamped at 8 GiB and says so (`pool.clamped`). See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 
@@ -1189,7 +1194,646 @@ that ambiguity is what made an alignment-guard refusal look like the answer on
 before (something may parse it), and the value handed back to the scheduler is the fork's
 own tuple, unchanged - the change is bookkeeping, not behaviour.
 
+**The marker makes the disk the authority for that request (0.2.22).** One rule, no new
+field: a request carrying `kv_transfer_params.kvtier_disk_restore: true` has its
+host-RAM hit treated as **zero tokens** for the offer arithmetic, so the disk index
+decides the span from the local GPU-computed boundary. A request without the marker is
+touched by none of it - RAM first, the disk filling the gap, byte-identical to every
+earlier release, which is how a client that never sends the field keeps running on the
+RAM tier.
+
+This is what makes the read path testable at all. With RAM consulted, an ordinary small
+prompt either hit RAM completely (nothing left to offer, `disk_run_below_one_block`) or
+hit it with a remainder (`ram_hit_not_block_aligned`) - so exercising one disk read
+meant making GPU and RAM forget the prefix first, ~1.3M tokens of filler per attempt.
+A marked request now needs only that the span is in the index.
+
+Three limits, stated because they are the ones an operator will hit:
+
+* **The marker does not zero `num_computed_tokens`.** That number is the third field of
+  the fork's pending tuple and `update_state_after_alloc` (`manager.py:441-463`) uses it
+  as the *offset* into the request's whole block list - it is where the CPU-to-GPU copy
+  writes. Zeroing it while the scheduler still counts a cached local prefix would DMA
+  disk bytes into the request's already-cached, ref-counted GPU prefix blocks (shared
+  with every other request reading them) and leave the newly allocated external region
+  holding whatever was in those slots. So a marked request whose prefix the GPU already
+  computed has nothing to restore and recomputes; the disk span starts where the local
+  prefix ends, always.
+* **Ignoring the RAM hit means releasing the pin it came with.**
+  `get_num_new_matched_tokens` (`manager.py:360-372`) `touch()`es every CPU block it
+  found and leaves the tuple in `_pending_cpu_hits`; a disk-authority offer overwrites
+  that entry, so `disk_restore._release_fork_pin` calls the fork's own
+  `_free_pending_cpu_hit` at the commit point - after the write, so every earlier
+  failure path still leaves the fork's tuple intact. A manager without that method is
+  refused by name (`refused.pin_release_unavailable`) rather than allowed to leak a
+  pinned span per request. `pin_release_failures` must stay 0.
+* **No token is claimed twice.** The offer's token count is the disk's alone (never
+  `ram + disk`), and the merged tuple the fork consumes contains only our freshly
+  allocated slots - no RAM block ids appear in it. The scheduler recomputes whatever
+  neither tier covered.
+
+Read it in the payload: `restore.last_offer` carries
+`ram_tokens_reported` (what the fork found) beside `ram_tokens_used` (zero, for a marked
+request), `start_block`, `blocks`, `disk_tokens`; `restore.disk_authority` counts the
+lookups the rule fired on; `restore.local_hit_ignored` and
+`restore.local_hit_tokens_ignored` count only OFFERS - a refusal leaves the fork's hit
+exactly where the fork put it, and must not be counted as a sacrifice the request never
+made. A forced read also logs one `DISK[restore] serving ... from DISK against a
+N-token host-RAM hit` warning; a flagged request the disk cannot serve stays silent and
+leaves no allocation behind.
+
+**The index now reads the newest spill lines first, and publishes how far behind it is
+(0.2.22).** `refresh()` used to advance a per-journal cursor from byte 0, sharing one
+512 KiB / 8,192-line budget across every rank's journal. On four ~60k-line journals that
+covered about a tenth of one rank per pass, so the lines the restore path was waiting
+for - spills from the last few minutes, which is what "the GPU forgot this and RAM never
+had it" means - were the last thing it would reach, and it was reached only by a flagged
+request that was itself waiting on the answer. Measured consequence: **0 of the 36 newest
+identities in the store were in the index**, while `index.entries` sat at 6,892 claiming
+files the ceiling had long since reclaimed.
+
+The rule now: a refresh spends at most the same caps, but takes its window from the END
+of each journal's unread run, and every journal gets a *share* of the budget rather than
+whatever the previous rank left. Whatever that forfeits is older than everything it
+applies - which is what makes forfeiting safe: a `+` we read is a file we saw written, a
+`-` we read for an identity we never learned is a no-op, and a jump forgets the entries
+its skipped region taught it (`_forget_rank`), so the index claims only what it read.
+Nothing was forfeited silently: `index.lag_bytes` (unread journal bytes; 0 means every
+cursor is at end-of-file), `index.lag_journals`, `index.catch_up_jumps`,
+`index.bytes_skipped` and `index.lines_skipped` are published, a refresh skipped by the
+1 s floor re-publishes the last *measured* lag with `lag_measured: false` rather than
+claiming zero, and `restore.why_no_restore` names the lag when `no_disk_run` is the
+answer. While `lag_bytes` is non-zero, a `not_present` from `op=contains` is a statement
+about the reader and not about the store - and `op=contains` now carries those fields in
+its own `index` view for exactly that reason.
+
+**Why the offer path cannot stat the store itself.** The scheduler does not know the
+file's name: four ranks name one identity four ways (the digest half covers rank-local
+`rank` and `total_bytes_per_block`), which is why `_identity_path` sends a sentinel and
+`_resolve_worker_path` rebuilds the name per rank. So a stale entry cannot be caught by
+a `stat()` in the scheduler; it is caught where the name is known - the worker's read,
+which classifies `file_missing`/`size_mismatch` and reports the GPU block as a load
+error, and the scheduler recomputes. That is the cheap honest gate, and it costs one
+wasted load round trip per stale entry, never wrong KV.
+
+**The restore race, measured, and a wait sized in bytes rather than in optimism
+(0.2.23).** Reads are queued at `bind_connector_metadata` and applied at
+`start_load_kv`, and the fork calls **both inside one engine step**
+(`kv_connector_model_runner_mixin.py:80-93`). Because every disk hit is offered with
+`load_kv_async=True`, `has_sync_kv_loads` stays false and the fork defers
+`start_load_kv` to after the forward **launch** - so the window a read has to win is one
+CPU-side forward launch, not a forward pass. Until now the only evidence about that
+window was one counter (`dma_unsettled_entries`) plus a `read_seconds_max` of `0.0` that
+reads as "no read ever ran" and actually means "no read that reached the kernel ever
+finished" - a queued job's buffer is handed back before the reader thread dequeues it.
+
+The apply point now publishes the window itself. `restore.apply_window.last` is the most
+recent batch as the engine saw it: `elapsed_ms`, `accepted`/`expected`, `running`,
+`queued`, `settled`, the **measured bind→apply gap** (`bind_to_apply_ms`, stamped at the
+first line of `_worker_bind`), `bytes_asked` beside `bytes_at_stake` (the bytes still in
+flight, which is what a wait is waiting for), `budget_ms`, `waited_ms`, `bound`,
+`settled_after_wait`, and the recompute cost it was racing. `windows` carries
+`min`/`max` **boot-wide**, an `avg`, and a `median` over the last `MAX_SETTLE_SAMPLES`
+(512) observations that publishes `median_samples` so a truncated median can never be
+misread as the boot's. `read_seconds_avg`/`read_seconds_max` sit beside
+`waited_ms` on purpose: either number alone has no unit of comparison.
+
+A drop now says **which kind** it is. `dropped_queued` counts entries whose read had not
+started (the job sat in the queue and the engine got there first - thread scheduling on
+the proxy host, and the kind a wait fixes); `dropped_running` counts entries whose read
+was inside the kernel and still lost (a device slower than the step, which a wait only
+fixes if the budget beats the read); an unreadable per-job state table is
+`dropped_unattributed` and never folded into either. `applied_settled_immediately`
+counts the entries the box already wins for free, so `settled_after_wait` over it is the
+wait's hit rate.
+
+The wait itself is **opt-in, proportional, and bounded four ways by construction** - an
+unbounded wait inside an engine step is a hang wearing a performance patch. The rule,
+as it reads in `disk_restore.settle_budget`:
+
+```
+proportional_ms = bytes_in_flight / read_bytes_per_s * 1000 * SETTLE_SAFETY_MARGIN
+budget_ms       = clamp(proportional_ms, SETTLE_MIN_MS, VLLM_E2_TIER_DISK_SETTLE_MS)
+budget_ms       = min(budget_ms, the batch's own seconds_left)   # LOAD_DEADLINE_SECONDS
+```
+
+with `SETTLE_MIN_MS = 0.5` (one scheduler tick: a shorter wait cannot be observed),
+`SETTLE_SAFETY_MARGIN = 2.0` (the read time is the FLOOR of the budget - queue hand-off,
+thread wakeup and the bounce-buffer copy are on top of it),
+`SETTLE_READ_BPS_DEFAULT = 11.5 GB/s` (**the measured WRITE rate, because the read side
+has never been measured** - which is what these fields exist to measure; override it with
+`VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S` once a boot has told you the truth),
+`SETTLE_POLL_SECONDS = 0.0005` (a poll, never a condition wait: the reader thread owns
+those bytes and the engine thread must not queue behind its lock), and `SETTLE_MS_MAX =
+60000` (above that, a cap is a typo, and `ceiling_clamped` says the clamp happened).
+Every batch names which bound decided - `off`, `min`, `proportional`, `cap`, `deadline`
+- and the three counts are published as `wait.bound`, so "my cap is too small" and "the
+floor is all this batch was worth" are different, checkable claims.
+
+**Why proportional, with the live box's numbers.** A 9,400-token prompt was measured at
+2.4 s of recompute through the proxy, so the engine's prefill rate is
+`PREFILL_TOKENS_PER_S_DEFAULT = 9400 / 2.4 ≈ 3,917` tokens/s (overridable with
+`VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S`, used for nothing else). A spilled
+(span, group) is 11,468,800 B per rank, so a 3-span × 5-group offer is ~172 MB against
+~9,600 tokens of recompute and a 10-span offer is ~573 MB against ~32,000 tokens:
+**~2.45 s and ~8.17 s of recompute, against ~30 ms and ~100 ms of budget.** A flat
+budget generous enough for the big offer would be a several-fold loss on every small
+one, paid inside the step by requests that never asked for disk - which is why the
+published `recompute_ms` comes with `budget_over_recompute`, and why batches granted a
+wait **longer than the recompute they avoid** are counted
+(`settle_budget_over_recompute`) instead of being left for a human to notice at 3 a.m.
+
+**Default 0 means the boot does not wait, byte-identically to 0.2.22.** The cap is a cap
+and not an arm: the restore path still needs the disk root, the spill tier's arm file,
+the tier's arm, this boot's offer switch and a proven worker rank before it reads one
+byte, and a value that will not parse means OFF and is logged once as
+`DISK[settle] IGNORED: VLLM_E2_TIER_DISK_SETTLE_MS=...`. When it is on, the setting is
+announced once per boot (`DISK[settle] wait=ON cap_ms=... read_bps=...`), never once per
+step, and the same line is in `apply_window.wait.notice` for a poller.
+
+**What the counters exposed on the way.** Every failure on the live box arrived as
+`invalid_block_ids` with an EMPTY `failed_recving`, and that path retired its ledger
+entry with a hand-rolled `_loads.pop()` instead of `_drop_load` - so `loads_released`
+never moved (the honest-looking reading was "the load was never registered" rather than
+"it was registered and burned") and the load's slot→path mappings outlived it, which is
+a slot the next `build_load_paths` will emit a path for while the fork may already be
+using it as a host-RAM source. Both failure shapes now go through `_drop_load`; the
+suppression decision is unchanged, and `no_read` deliberately does **not** move at burn
+time (the load is already counted as a failure - moving both would double-book one
+release). A `finished_recving` that arrives *after* a burn is counted as `no_read`
+rather than vanishing, because it is the fork calling a load finished whose bytes this
+plugin knows it never delivered.
+
+**Running the experiment.** Boot as usual and read `apply_window.windows.bind_to_apply_ms`
+- that distribution is the answer to "how big is the window", and it is gathered by a
+boot that waits for nothing. Then set `VLLM_E2_TIER_DISK_SETTLE_MS` to a ceiling you
+would be willing to pay inside a step (200-2000 ms covers the budgets the arithmetic
+above asks for) and read `wait.settled_after_wait` against
+`wait.dropped_after_wait`, `wait.bound`, and `wait.budget_over_recompute`. Raising the
+cap only helps while the losses are `dropped_queued`; a loss that is `dropped_running`
+with the budget already above its `elapsed_ms` is a disk, not a cap.
+
+### Reading the spill in parallel: threads, the pool, and the ordering question (0.2.24)
+
+The read path used to run on exactly one thread (`kvtier-disk-read`), and the box says
+what that costs: `dd bs=4M iflag=direct` over 50 spill files (610.7 MiB, read-only)
+measured **1.32 GB/s with one reader and 5.14 GB/s with four** - 3.9x. The live engine
+agreed from the inside: `reads_started=36`, `reads_applied=36`,
+`read_seconds_max=0.0138`, i.e. 11,468,800 B / 13.8 ms ~ **0.83 GB/s per unit**,
+serialized 36 deep inside a rank before the step could proceed. There are already four
+ranks reading at once; within a rank the units were serial, and now they need not be.
+
+**Two switches, both inert.** `VLLM_E2_TIER_DISK_READ_THREADS` (default **1**) and
+`VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` (default **96 MiB**). With both unset the boot is
+the 0.2.23 boot: one thread named `kvtier-disk-read`, the same queue, the same pool,
+the same bytes - and `test_defaults_reproduce_the_single_thread_boot_exactly` pins it.
+
+**The pool, not the threads, is the constraint - do the arithmetic before the threads.**
+A job takes its bounce buffer at *issue* (`request_read`) and gives it back at the
+*apply point* (`finish_batch`), so one offer needs the pool to hold that offer's units
+**at the same time**. The arithmetic has two inputs, and both come from the code:
+
+* **units per offer per rank = spans x eligible groups.** `per_block =
+  len(groups['groups'])` (`disk_restore.py:2260`), and on the live boot that
+  is **1**, not 5: g4 fails the block-size match and g0-g3 are excluded by
+  `_group_positionally_stable`, so the offer names g5 alone (`last_offer.groups = [5]`).
+  Spans are capped by `MAX_OFFER_TOKENS_PER_OFFER = 32_000` tokens = **10 spans**, so
+  the largest offer a rank can be asked to read today is **10 units** - one file per
+  span. If g0-g3 return to positional stability, `per_block` becomes 5 and the same
+  offer becomes 50 units; everything below says which number moves.
+* **bytes per unit** = one rank's CPU slot: 11,468,800 B (the 3,200-token groups) or
+  12,902,400 B otherwise. The live `bytes_applied / reads_applied` = 412,876,800 / 36 =
+  **11,468,800 B exactly**, so the running geometry is the narrow one.
+
+The pool is a byte ceiling, so what it buys in units is `floor(pool / unit)`:
+
+| `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | units of 11,468,800 B | units of 12,902,400 B | host RAM at 4 ranks |
+|---|---|---|---|
+| 100,663,296 (96 MiB, **the default**) | **8** | 7 | 384 MiB |
+| 134,217,728 (128 MiB) | 11 | **10** | 512 MiB |
+| 201,326,592 (192 MiB) | 17 | 15 | 768 MiB |
+
+A 10-unit offer needs 114,688,000 B (109.4 MiB) on the narrow width and 129,024,000 B
+(123.0 MiB) on the wide one, so **the default pool misses the big-prompt case by two
+units - not by an order of magnitude.** That is the whole of the live failure:
+`buffer_cap = 6` is 2 refusals per rank on 3 batches, and `incomplete = 24` is those
+batches' **accepted** entries - 3 x 8 = 24 units that were read correctly and already
+memmoved into their CPU slots - forfeited because `incomplete` is a batch-level flag
+(`disk_restore.py:3674-3678`: one sibling's bind-time `buffer_cap` refusal adds
+`failed.setdefault(job_id, "incomplete")` to every job in the batch). Nothing failed to
+read; work that had already landed was discarded. **This release does not change that
+rule** - the fix is up-front offer clamping plus per-entry (not per-batch) poison
+inheritance, and that belongs in its own change with its own tests.
+
+**Maximum useful thread count, from the code.** Threads do not create units. A buffer is
+held from issue until the apply point, so the number of units that can sit in flight at
+once is `floor(pool / unit)` **per worker process, across every open batch and at any
+thread count** - and today's 96 MiB pool puts that at **8 (7 on the wide width)**. A
+ninth thread has nothing to read and only adds `reader_starved_polls`, so **8 is the
+maximum useful thread count on the default pool**. At **128 MiB** the ceiling is **11
+narrow / 10 wide**, which is the whole offer; at **192 MiB** it is **17 / 15**. The other
+ceiling is the offer itself: one request contributes 10 units, so threads above 10 only
+help when several requests bind in the same step and share the pool - which is why 4 is
+the sane first setting and 16 is a clamp, not a target.
+
+What that buys in wall time, from the live `read_seconds_max = 0.0138 s` as the
+per-unit bound: a 10-unit offer serialised is at most **138 ms**, 8 units issued at 96
+MiB is at most 110 ms of reading that the step waits through, and four readers cut that
+to about **28-35 ms** (the two refused units are lost at bind no matter how many threads
+exist, which is why the pool is the first knob and not the second).
+
+**What to set.** For the live big-prompt case, set the pool to 134,217,728 bytes
+(128 MiB) and the threads to 4: 128 MiB is the smallest
+power-of-two that holds a whole 10-unit offer on **both** widths (11 narrow, exactly 10
+wide), costs 512 MiB of resident bytes across four worker processes on a box that
+reported 99,646 MiB available with the 120 GB pinned tier already up, and the default
+stays 96 MiB - an unset environment is still the 0.2.23 boot. 192 MiB is the setting for
+a future 5-eligible-group offer (50 units needs 645,120,000 B, i.e. 640 MiB per rank,
+2.5 GiB across four). Four threads, not eight: the box's own `dd iflag=direct` sweep
+measured 3.9x at four readers, so four is where the array was still scaling; going past
+the measured point is a decision to make from `parallel_efficiency`, not from a knob.
+
+**The queue cap stays 64 and does not need to move.** The largest legal offer names 10
+units today (50 if `per_block` reaches 5), under the cap, and a 96 MiB pool refuses the
+NINTH unit long before the queue refuses the 65th - so the pool binds first in every
+case the offer path can reach. With N readers the queue drains N-at-a-time, which makes the cap strictly
+*less* likely to bind, never more; `queue_depth_peak` and `refused.queue_full` are
+published so that claim can be checked instead of asserted.
+
+**What to read on the next live run**, all of it under `restore.read`:
+
+| field | the question it answers |
+|-------|-------------------------|
+| `threads_configured` vs `threads_alive` vs `threads_requested` | are the threads the operator asked for alive, and was the request clamped? |
+| `threads[]` (`jobs_read`, `bytes_read`, `read_seconds`, `in_flight`, `peak_in_flight`, `starved_polls`) | is the queue spreading work, and did the units overlap? `peak_in_flight` can only be 1 with one thread, so it is the field that separates a parallel boot from a parallel-looking one |
+| `throughput.bytes_per_reader_second` | the **device** rate. It should stay flat as threads rise |
+| `throughput.bytes_per_second_wall` | the **wall** rate the engine step pays. It should rise, toward N x the single-reader figure |
+| `throughput.parallel_efficiency` | reader seconds over wall seconds: ~1.0 with one reader, ~N when N truly read together. **1.0 with N configured is the signature of "threads configured, parallelism absent"** |
+| `pool.held_bytes` / `peak_bytes` / `headroom_bytes` / `units_of_11468800` | was the pool the limit, and how many units could it ever hold? || `pool.measured_unit_bytes` / `units_of_measured_unit`, `concurrency.threads_useful_max` | the unit size this boot actually read and the thread count that pool could feed - `threads_configured` above this number is dead weight, and the field says so instead of a reader doing the division |
+| `refused.buffer_cap` / `reader_starved_polls` / `concurrency.starved_on` | **starved on buffers** vs **starved on queue** vs (neither) - i.e. disk-bound |
+| `units_in_flight_peak`, `queue_depth_peak` | the high-water marks for the whole boot |
+| `disk_restore.worker_report()["readers"]` (rank file) | the same five facts from the only process that actually reads: `configured`, `alive`, `peak_units`, `starved_polls`, `buffer_refusals`, `out_of_order` |
+| `disk_restore.worker_report()["spans"]` (rank file) | `seen` / `whole` / `partial` / `empty` / `hole_in_middle`, the span shape of what survived the apply point |
+
+**The lock discipline, kept with N threads.** `_state_lock` is a plain (non-reentrant)
+`Lock`, held only for dict updates - a few hundred nanoseconds - and never across a
+queue wait, a `sleep` or a file read. That is why the engine's step thread can always
+call `batch_status`/`batch_buffer`/`request_read` without queueing behind a kernel read,
+and it is the same reason `_settle_wait` in `disk_restore` polls with `time.sleep`
+instead of waiting on a condition (see `SETTLE_POLL_SECONDS`). Witness bookkeeping is
+kept out of the lock entirely by pre-growing the thread/slot tables to the ceiling once,
+so a reader thread's per-thread counters are indexed writes on pre-existing dicts. A
+second rule joins it: **a reader claims its job's buffer inside the lock and is then its
+only owner**. Before this change `_handle_read` read `job["buffer"]` *before* taking the
+lock, so a `cancel_batch` that won the race returned that buffer to the pool and the
+reader returned it a second time on the way out - the pool holding one buffer twice, and
+the next two reads sharing it. That was reachable with one reader; four make it more so.
+
+**Dead threads, cancellation, and the reading of "dead".** `_ensure_thread()` returns
+False only when **not one** reader is alive, and `begin_batch` turns that into
+`thread_dead` so a batch is never opened while nothing could read it (`reads_started`
+cannot be nonzero with no reader). Three dead slots and one live one is a degraded boot
+that still reads, so it publishes `threads_alive: 1` against `threads_configured: 4`
+instead of refusing. A dead slot is respawned at the next `begin_batch`. Cancellation is
+unchanged in meaning and safe with N: `cancel_batch`/`finish_batch` recycle QUEUED, DONE
+and FAILED buffers and leave RUNNING alone (the kernel read cannot be stopped, and its
+bytes are dropped by `_settle` because the batch is gone). `stop_reader()` now posts one
+sentinel **per live thread** - one packet frees one waiter.
+
+**The ordering question, which is a correctness question and is NOT decided here.**
+Submission order is span-major and group-minor (`_merge_pending_hit` walks
+`for span: for group:`), and a restore is only useful when a span is complete across its
+groups. With ONE reader, completions followed submission order, so a batch caught
+mid-flight was missing a **suffix** of spans - a hole at the end. With N readers the
+answers interleave and the same mid-flight batch can show span 3 whole while span 1 is
+still queued: **a hole in the middle**. Whether a partial restore may have its tokens
+counted as computed by the engine is a separate, live question and this release decides
+nothing about it - no pruning rule, no token arithmetic, no all-or-nothing logic is
+touched. What it publishes is the shape, so that question is argued with measurements:
+
+* `disk_read.batch_status(...).completion_order` - the job ids in the order they
+  answered. Equal to `[0, 1, 2, ...]` exactly when the reads behaved like the
+  single-thread boot; `out_of_order_completions` counts the answers that landed before a
+  lower-numbered job's did (boot total: `completions_out_of_order`).
+* `disk_restore.span_shape(batch, failed)` and the counters `spans_whole` /
+  `spans_partial` / `spans_empty` / **`spans_hole_in_the_middle`**. The last one counts
+  batches whose applied spans are NOT a prefix of the offer; with one reader that is
+  arithmetically impossible, so **a rising count IS the concurrency finding**.
+* The disorder is BOUNDED, and the bound is a property of the FIFO queue, not a hope.
+  Dispatch order IS submission order - no job dequeues while an earlier one is still
+  queued, so a job can only complete ahead of the earlier jobs **already in flight when
+  it started**, which is at most `threads - 1` of them. The scatter is a window of N,
+  never the whole batch. Pinned by `test_completion_order_under_four_threads_and_the_fifo_bound`,
+  which measures the over-take from inside the fake read (the job states as each read
+  begins) rather than inferring it from the completion list afterwards.
+
+**What concurrency does NOT fix, and what it shifts.** `incomplete` is decided at bind:
+`accepted < expected`, where `accepted` is fixed by `request_read` and `expected` by
+`begin_batch`. A bind-time `buffer_cap` refusal therefore makes a batch incomplete
+**whatever the thread count**, and the forfeit rule (`disk_restore.py:3674-3678`) takes
+that batch's accepted entries with it - 24 on the live boot, every one of them read and
+memmoved successfully. Threads are not the lever for that: the levers are a pool big
+enough that nothing is refused, and up-front offer clamping with per-entry (not
+per-batch) poison inheritance, which is deliberately not in this change.
+
+What N readers does change is the shape of "too late", and the prediction is derivable
+from the code rather than guessed. Readers pull eagerly, so N of them convert QUEUED to
+RUNNING N times faster: at the apply point the units that have not landed are more often
+**inside the kernel** than **still queued**. Both `dropped_queued` and `dropped_running`
+should FALL in absolute terms (the whole batch drains sooner), but the ratio between
+them moves the other way - `apply_window()`'s split is where to read it. And because the
+same drain is faster, the settle wait (`SETTLE_CAP_MS`, derived from the measured
+recompute cost and not from any thread count) should be *granted less often and for
+less time*: `settle_waits_granted` and `waited_ms_avg` are the witnesses for that, and if
+they do not move, the reads were never the thing that was late.
+
+One live shape is worth pinning because the running boot is the degenerate case: with
+`per_block = 1` (g5 only) every job in a batch names the SAME group, so the span walk
+makes each entry its own span and `spans_partial` can never fire - the only shapes left
+are whole and empty, and `applied_is_prefix` degenerates into "are the applied units a
+prefix of the offer", which is precisely the question the token-counting analysis asks.
+The multi-group shape that `spans_partial` was written for appears the day g0-g3 return
+to positional stability. `test_the_single_eligible_group_shape_is_the_live_one` pins
+both halves of that.
+
+Tests for all of this live in `tests/test_disk_read_threads.py`: the pin that the
+defaults are the old single-thread boot exactly, a barrier test that four readers really
+do sit inside four reads at once (and that one reader cannot), cancellation and
+pool-exhaustion behaviour under concurrency, the completion-order evidence above, and a
+teardown that JOINS every reader thread - because a thread parked inside one test's
+stand-in read wakes up calling the NEXT test's stand-in and charges its read to that
+boot's counters, which is how the barrier test first went red with 3 reads attributed and
+`reads_completed == 4`.
+
+### The ceiling walk, the sample, and the store that grew past its ceiling (0.2.25)
+
+The box measured this on a live boot: `du -sxb /home/user/kv-tier/disk` = **334.9 GiB**
+against `VLLM_E2_TIER_DISK_BYTES` = 206,158,430,208 (**192 GiB**), **29,532 files**, and
+the oldest surviving file **2.8 hours** old. Eviction was running, and the store was
+still growing ~145 GiB an hour into 122 GiB of free space. Both halves were true at
+once, because one bounded walk was being read as a measurement.
+
+**What the walk was, and what it silently was not.** `_walk_store` stats at most
+`MAX_WALK_FILES` (20,000) files, so on a bigger store it measures a *sample*. The old
+walk took that sample depth-first - its file counter was never reset per shard, and its
+own `truncated` flag broke the shard loop - so it measured the FIRST shard directories
+and stopped. Two failures came out of that one shape, and they point the same way: the
+byte total came from ~2/3 of the key space, so the trigger compared a floor against the
+ceiling; and a file the walk never opened could not enter `lru_eviction_plan`, so the
+`~1/3` of the key space it never reached became a sink that spilled into forever and
+could never be shed. Measured on that shape: the old decision number was **218.7 GiB**
+for a **326.2 GiB** store, which makes the *effective* ceiling **286 GiB** - and it
+rises with the store, because the sampled fraction keeps shrinking.
+
+**The fix is two bounded passes, and a sample that is honest about being a sample.**
+
+1. `_count_store` counts the capacity-visible files with readdir only - no `stat` - so
+   the walk knows the size of the population it is about to sample. Bounded by
+   `MAX_WALK_ENTRIES` directory entries (100,000, five times the `stat` cap, per pass),
+   and bounded in ENTRIES rather than files on purpose: the `stat` cap counted measured
+   files, so before this the *iteration itself* was unbounded, and a directory of
+   entries this tier will not measure walked to the end inside the spill writer's
+   enforcement path. Cost, measured on the shape above: **29,532 entries in 0.099 s**,
+   zero `stat` calls.
+2. The measuring pass then stats a **proportional** sample: shard `i` is asked for
+   `cap_files * files_i / total_files` of its files, so every shard is sampled at the
+   same fraction of itself and the whole budget is spent however the files are spread.
+   Proportional rather than even-per-shard because an even split wastes the budget on
+   the small shards. The plan built from that sample can name a file in any shard, and
+   enforcement runs after every committed write, so a partial pass is a pass and not a
+   verdict: on the shape above the estimate lands **326.2 GiB against a 326.2 GiB
+   truth (0.00% error)**, and the measured catch-down of the real store is several
+   passes, each capped by `disk_layout.MAX_EVICTION_PLAN` = 4,096 files - see the table
+   below.
+3. `_enforce_ceiling` decides on `estimated_total_bytes` - the sample scaled by
+   `total_files / files` - and never on the floor. A truncated walk that stat-ed
+   *nothing* (`sample_unmeasured`) is declined outright: the estimate is kept, nothing
+   is planned, and the reason says so, because a 0 read as "the store is empty" is the
+   most dangerous number this module can emit.
+
+**A store inside the caps is measured, not estimated, and byte-identically to before.**
+When the walk sees every file, `estimated_total_bytes` IS `used_bytes` - the same
+number, the same entries, the same eviction order. `test_a_store_inside_the_caps_is_
+measured_and_not_scaled` and `test_the_eviction_order_of_a_measured_store_is_the_oldest_
+first_order_it_always_was` pin that, because this tier is live and an eviction order
+that moved for a 19,000-file store would not be an acceptable fix.
+
+**The witness.** `spill.ceiling_measurement` (and the same fields in
+`disk_spill.counters()` as `walk_*`) publishes `basis`
+(`full_measurement` | `sample_scaled` | `sample_scaled_count_extrapolated` |
+`sample_unmeasured`), `measured_bytes`, `sampled_files`, `total_files`,
+`entries_examined`, `skipped_files`, `walk_truncated`, `count_truncated`,
+`plan_truncated` and `ceiling_checks`. "The store is 170 GiB" and "I stat-ed 20,000 of
+29,532 files and extrapolated 170 GiB" are now two different payloads. `skipped_files`
+also finally keeps a promise the old walk made in a comment and never kept: files this
+tier can neither measure nor shed - a `.part` left by a killed spill, a malformed name,
+someone else's file - are counted instead of being invisible, which matters because
+they are real bytes that the ceiling will never reclaim.
+
+**The ceiling had to be woken up first.** `estimated_bytes` is a **per-process** counter
+of this process's own committed writes and starts at 0, and the walk that could
+correct it only ran once that counter *alone* reached the ceiling. A rank booting into
+a store somebody else filled was therefore blind to it in proportion to how full it
+already was: on this box a fresh boot had to spill **192 GiB of new files (17,384 of
+them, ~48 minutes at the measured ~4 GiB/min)** before it was allowed to *look* at a
+335 GiB store with 60 GiB of `/home` left. The filesystem fills long before the
+ceiling wakes up, and honest scaling inside the walk buys nothing when the walk never
+runs. So the first committed spill of a `(root, ceiling)` pair takes **one** bounded
+walk and adopts its answer (`_maybe_seed_estimate`, writer thread only, 0.22 s once
+per configuration, published as `ceiling_measurement.seed_walks`); a store that cannot
+be read leaves the running estimate alone instead of writing a 0 into it, and is
+attempted once, not per spill. With that, the recovery the ceiling exists to perform
+actually happens: seed, then shed toward the target.
+
+**Convergence, measured by replaying the live store.** By the time the file list was
+taken the store had grown to **34,896 files / 395.8 GiB** (256 shard dirs, mean slot
+12,178,780 B). Replaying that exact list - names and per-file sizes, rebuilt sparse in
+a scratch directory - through the real `_maybe_seed_estimate` / `_walk_store` /
+`_enforce_ceiling` / `lru_eviction_plan` / `execute_unlink_plan(dry_run=False)` at the
+live 192 GiB ceiling:
+
+| | old code | 0.2.25 |
+|---|---|---|
+| decision number | 225.4 GiB (20,000 files, DFS floor) | **395.8 GiB** (+0.01% vs truth) |
+| ceiling actually enforced | 337 GiB | 192 GiB |
+| passes to get under it | never (each pass was aimed at 202 GiB from a floor) | **5** |
+| freed | - | **19,292 files / 223.0 GiB** |
+| final store | - | 172.8 GiB = the `0.9 x` target, on the nose |
+| `/home` free | 61 GiB | **284 GiB** |
+
+Each pass sheds at most `MAX_EVICTION_PLAN` = 4,096 files (~47 GiB here) and cost
+**0.456 s of writer-thread time** measured end to end (a 0.22 s walk plus the unlinks);
+the whole 5-pass catch-down was **2.28 s**. Passes are triggered by committed writes, so
+the catch-down needs 5 spills, and the steady state is one pass per ~1,700 files (~19 GiB)
+- one walk every ~5 minutes at the measured ~4 GiB/min, about 0.1% of the writer thread.
+One pass sheds ~11 minutes of growth: out-running the enforcement would take more than
+4,096 files/minute - about 47 GiB/min. Measured on that filesystem with the store's own
+layout: 4,096 `unlink()` = 0.050 s (12 us each); `disk_index` appends the removal line
+without `fsync` (~4 us), so the unlinks are not the cost. Had the journal fsync'd per
+line it would have been 1.4 ms x 4,096 = 5.6 s per pass - it does not, and that is
+load-bearing for convergence, so it is stated rather than assumed. During the
+catch-down the writer thread pays that cost per spill, which throttles the spill path
+itself while the store is over the line; that self-throttling is the point, and it holds
+at any spill rate below ~47 GiB/min.
+
+**And the ceiling only runs while the tier is armed.** Enforcement is called from the
+writer thread after a committed write, so a disarmed tier with a full store reclaims
+nothing - correct by design (the ceiling is a property of the spill path, not a janitor),
+but it means "`/home` is 99% full" and "spill is disarmed" together leave the 396 GiB
+exactly where it is until the tier is armed again. At the measured pass cost, re-arming
+reclaims 223 GiB in about 2.3 s of writer-thread time.
+
+Tests: `tests/test_disk_ceiling_walk.py`, built on a fixture store whose bytes sit in
+the LAST shard directories in `os.scandir` order - the exact shape the old walk was
+blind to - plus a fresh-boot fixture whose own writes are one slot against a full
+store. Every one of its 29 tests fails against the pre-fix code.
+
+### The claim must match the bytes: a hybrid model gets no disk offer at all (0.2.25)
+
+**A disk offer claims every prefix-cacheable group, so it must be able to restore every
+one of them.** This is a correctness fix found on live traffic, not a hardening
+exercise: at 00:08 on 2026-10-06 a flagged request on a 31,826-token prompt got a
+mechanically perfect disk read - `reads_started=9 reads_applied=9 failed={}` per rank,
+18 ms, settled on the first settle check - and answered `duct Register Register
+Register...` at `temperature=0`, where the same prompt recomputed from scratch returned
+the planted code word. Nothing failed on the way. The answer was wrong anyway.
+
+The model is `Qwen3.8-Flash-Next-W4A16-Merlin`: groups 0-3 are `MambaSpec`/GDN under
+`MambaManager` in `align` mode (7/6/6/1 layers), group 4 is a QSA ring at `block_size`
+8, group 5 is the full-attention group (12 MLA layers), and the RAM tier's own
+`prefix_cacheable_group_ids` is `[0,1,2,3,5]`. The restore path had narrowed its
+eligible set to *prefix-cacheable AND whole-scheduler-block AND
+`has_positionally_stable_blocks`*, which on this model is `{5}` - because
+`MambaManager.has_positionally_stable_blocks` is False in align mode
+(`vllm/v1/core/single_type_kv_cache_manager.py:1494`), and the fork's own spill path
+skips those groups (`vllm/v1/simple_kv_offload/manager.py:874-876`). Then:
+
+* the number that set produces is what `get_num_new_matched_tokens` returns
+  (`manager.py:372`), and that return advances `num_computed_tokens` for the **whole
+  model** - the engine skipped prefill of the GDN and QSA layers across 28,800 tokens;
+* `update_state_after_alloc` builds load entries only for groups that have non-null CPU
+  blocks, and its `n_ext_g == 0 -> continue` (`manager.py:445-470`) is a **silent
+  no-op** - so groups 0-3 were claimed and never loaded, no group reported a failure,
+  nothing came back through `get_block_ids_with_load_errors()`, and nothing recomputed
+  the claimed range;
+* what a claimed span actually needs from an align-mode GDN group is **one** block, not
+  a span of KV: `MambaManager.find_longest_cache_hit`
+  (`single_type_kv_cache_manager.py:1533-1610`) answers a hit with
+  `[null_block] * (n - 1)` plus one real boundary-state block. That one block has no
+  positional file name to read back - the recurrent state is one running value per
+  sequence - and with `num_prefill_checkpoint_blocks: 0` there is no checkpoint to
+  recover it from, so the destination block holds whatever the allocator handed out.
+
+So positional stability is a **necessary** condition (a name to read by) that was being
+read as a **sufficient** one (a complete claim). The module already had the right rule
+in the right place - `_disk_run`'s docstring: *"A block is restorable only when EVERY
+eligible group has a file for it: the fork pairs per group, so one missing group's slot
+would be a load entry with no bytes behind it - a whole-request recompute for a
+partially-restored span."* The bug was never the rule. It was the **set** the rule was
+applied to: narrow the set to `{5}` first and the safeguard is vacuous. The gate is that
+same invariant applied to the set the **claim** covers.
+
+**The gate: an incomplete group set claims nothing.** If any prefix-cacheable group
+cannot be restored, the disk refuses the offer under its own countable name,
+`refused.incomplete_group_set`, with the reason naming the blocking groups and the
+sentence beginning with the verdict (because `last_refusal` is clipped at 160
+characters). On this model the disk tier offers nothing, forever - that is the correct
+behaviour, and it is stated as one rather than hedged. The predicate is derived entirely
+from the managers (`prefix_cacheable_group_ids`, `group_block_sizes` against the
+scheduler block size, `has_positionally_stable_blocks` per group), so a pure-attention
+model has nothing blocked and is offered at **exactly as before**
+(`test_a_pure_attention_configuration_still_offers_normally`), and a model whose
+recurrent state ever becomes per-block addressable gets its disk tier back with no
+change to this file (`test_making_the_gdn_groups_stable_makes_the_whole_model_serviceable`).
+
+**Why this is a refusal and not a clamp - do not "optimise" it.** The tempting change is
+to offer the intersection, the way the joint CPU lookup clamps. It is the same nothing,
+twice paid. The live lookup ledger already shows the RAM path clamping on exactly these
+groups: over the last 256 external lookups, 190 returned a hit and **4 were adopted**,
+the typical record `local=134400 hit=1000 adopted=0` attributed
+`partial_hit_clamp_suspected` - "a state group clamped at a length this lookup cannot
+see". A clamped disk claim would be 1-3k tokens (about 0.3 s of prefill saved against
+~20 ms of read and the whole claim risk) and would still be a claim whose boundary state
+nobody produced. Refusing is the disk path agreeing with a rule the RAM path already
+enforces, and it costs production almost literally nothing.
+
+**Read it in the payload**, in the same section that carries `last_offer`:
+
+* `group_serviceability` - the whole arithmetic of the last lookup: the cacheable set,
+  the positionally stable set, the restorable set, `blocked_group_ids` with a
+  `blocked_why` per group, and `complete`. `complete: false` means this model can never
+  be served from disk, and an operator learns that from the payload without knowing what
+  a `MambaSpec` is.
+* `last_groups_required` - what a claim of `claimed_blocks` costs **each** cacheable
+  group: `blocks_needed`, `null_blocks`, the `contract` it came from, and `restored`.
+  The 00:08 claim priced this way reads "9 blocks needed in g5, 1 boundary-state block
+  needed in each of g0-g3, 0 of those 4 filled", which is the whole incident in one
+  object. It is published on the **refusal** door too (`offered: false`), because a
+  requirement is a fact about the claim, not about whether it happened. The same rows
+  ride along inside `last_offer.groups_required` on an offer that does happen.
+* `why_no_restore` now says `THIS MODEL CANNOT BE SERVED FROM DISK AT ALL` with the
+  groups that decided it, instead of leaving a reader at "no offer has been made, read
+  `refused`".
+
+**Unflagged traffic is untouched.** `scope=optin` answers the marker question before the
+gate, so a request without `kv_transfer_params.kvtier_disk_restore` never reaches the
+predicate at all - no arithmetic computed, no counter moved, the fork's own answer
+returned identically (`test_the_unflagged_request_never_reaches_the_gate_and_stays_
+untouched`).
+
+Tests: `tests/test_disk_restore_group_gate.py` (the hybrid refusal, the pure-attention
+control, the predicate-not-a-group-list proof, the requirement table on both doors) and
+`tests/test_disk_restore_ledger_reporting.py` (the four reporting faults below).
+
+### The ledger's own honesty: aged-out loads, DMA-verified blocks, and a witness kind
+that could not lie about the present (0.2.25)
+
+The same 00:08 request had a second problem: its payload could not say what happened to
+it. Four reporting faults, all fixed, none of them a change to a protective rule:
+
+* **A load that aged out erased its own evidence.** `restorations` stayed 0 while 36
+  reads were applied, because the ledger entry was released - by the fork's own *"no
+  external tokens but `get_num_new_matched_tokens()` unexpectedly recorded a pending CPU
+  hit; releasing the stale pin"* path, which the live engine logs in ~10% of its lines,
+  or by the deadline - **before** `finished_recving` arrived. The report loop then found
+  `_loads.get(request_id) is None` and `continue`d. Every report-less release now leaves
+  a tombstone (`last_aged_out` names the door), and a late report is matched to it:
+  `late_finished_reports`, `aged_out_with_applied_reads`, `restored_after_release`.
+  `restorations` keeps its exact meaning - *reported while the ledger held it* - so
+  nothing is inflated; the truth just stops being dropped. **The deadline did not move:**
+  a read completes in 9-30 ms (`read_seconds_max` 0.018) against 45 s, about fifteen
+  hundred times the read it guards, so the expiry was never a slow disk and a longer
+  deadline would only slow the fuse that stops the re-offer loop of 2026-10-05.
+* **Counters that existed and were never published.** `watchdog_fires`, `no_read`,
+  `invalid_reports` and the aged-out family are now in the scheduler section with units,
+  which is what turns "the release branch must have fired" from an inference into a
+  reading - and distinguishes the fork's release door (`watchdog_fires: 0`) from our
+  deadline door (`watchdog_fires: 1`). `invalid_reports` is drained on the **worker**
+  side, so a scheduler's 0 is correct and its units entry says so.
+* **The field that answers "were the GPU blocks actually written".**
+  `disk_gpu_blocks_dma_verified` counts GPU blocks this module mapped for a disk span
+  (their CPU slots carried our emitted paths - the one moment the scheduler sees our slot
+  paired with the fork's destination block) that the fork then reported DMA-complete, in
+  **blocks**, not requests. An offer cannot move it; only an adopted load reported
+  finished can. A step whose `load_cpu_blocks` and `load_gpu_blocks` disagree maps
+  nothing, because the worker's own bind would refuse that step.
+* **`witness_kind` was a past sentence read as a present claim.** It was published as
+  `offers_not_adopted` while `adopted=1`: emissions dedupe on `(verdict, kind)`, so a
+  kind spoken before `_mark_adopted` stayed on the page after it. The verdict (`REFUTED`)
+  was right; the kind was true at emission and false at read time. Both readings are
+  published now - `witness_kind` (as of the last emission, unchanged) and
+  `witness_kind_now` / `witness_verdict_now` (the same arithmetic on the current
+  counters), plus `witness_kind_is_stale` when they disagree. `witness_now()` writes
+  nothing, so polling cannot rewrite the record the log dedupes on.
+
+Tests: `tests/test_disk_restore_ledger_reporting.py`.
+
+**One release, two authors.** 0.2.25 also carries the ceiling-walk fix above; both
+landed in the same uncommitted working tree (HEAD is 0.2.21 and 0.2.22-0.2.24 were never
+committed), and neither change touches the other's files.
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
+
 
 The offload tier is steered by wrapping one method of the scheduler-side
 manager, `vllm/v1/simple_kv_offload/manager.py:932`:

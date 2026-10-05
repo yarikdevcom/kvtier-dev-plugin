@@ -1862,7 +1862,18 @@ def _op_status(_body: dict) -> dict:
                        "estimated_bytes", "errors", "thread_started",
                        "thread_alive", "queue_depth", "queue_depth_peak",
                        "window_files", "group_collisions", "journal_records",
-                       "journal_removals", "journal_failures")},
+                       "journal_removals", "journal_failures",
+                       # HOW the ceiling was measured, not just where it stands. An
+                       # `estimated_bytes` of 396 GiB and one of 396 GiB-extrapolated-
+                       # from-20,000-of-34,896-files are different claims, and this is
+                       # the door an operator reads when the disk is 99% full; the
+                       # witness that says "the ceiling never woke up" is
+                       # `estimate_seed_walks: 0` over a full store.
+                       "ceiling_checks", "estimate_seed_walks", "walk_basis",
+                       "walk_sampled_files", "walk_total_files",
+                       "walk_measured_bytes", "walk_entries_examined",
+                       "walk_skipped_files", "walk_truncated",
+                       "walk_count_truncated", "plan_truncated")},
             # THE JOURNAL, SAYING IT OUT LOUD. `spill.journal_failures` is this
             # process's count of refusals it was handed; `journal.write_errors` is
             # the INDEX's count of lines it never got, and `journal.writable:

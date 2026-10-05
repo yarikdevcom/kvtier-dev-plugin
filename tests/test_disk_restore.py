@@ -111,11 +111,17 @@ def key_hex(seed: int, group: int) -> str:
 # --- fakes carrying the fork's attribute names -------------------------------
 
 class Slot:
-    """A `KVCacheBlock`: the pool hands these out and only `block_id` matters here."""
+    """A `KVCacheBlock`: the pool hands these out and only `block_id` matters here.
+
+    `is_null` exists because the fork's own `_free_pending_cpu_hit` filters on it, and
+    a fake without the attribute would make the pin-release path look different from
+    what it is.
+    """
 
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_cnt = 0
+        self.is_null = False
 
 
 class CpuPool:
@@ -178,6 +184,21 @@ class Manager:
 
     def update_connector_output(self, connector_output):  # noqa: ARG002
         return None
+
+    def _free_pending_cpu_hit(self, pending):
+        """`manager.py:1255-1264`, the fork's ONLY release of a lookup pin.
+
+        The real method frees every non-null block in the tuple's per-group lists
+        through `cpu_block_pool.free_blocks`. It has to be answered here because a
+        flagged request that hands the disk the authority calls it, and a fake that
+        simply lacked the method would make the disk-authority path look like a
+        refusal forever - hiding the exact leak (a pinned CPU block per flagged
+        request, for the life of the boot) the call exists to prevent.
+        """
+        blocks = [block for group in pending[0] for block in group
+                  if not getattr(block, "is_null", False)]
+        if blocks:
+            self.cpu_block_pool.free_blocks(blocks)
 
 
 class Req:
@@ -345,6 +366,21 @@ def armed(monkeypatch, tmp_path):
     disk_restore.set_offer_switch(True)
     disk_restore.set_scope(disk_restore.RESTORE_SCOPE_OPTIN)
     return str(root)
+
+
+@pytest.fixture
+def armed_all(armed):
+    """The gate open, the switch up, and `scope=all`: EVERY request is a candidate.
+
+    This is the scope that keeps the PRE-0.2.22 meaning of a host-RAM hit alive. From
+    0.2.22 the MARKER, not the scope, is what hands the disk the authority, so a
+    request WITHOUT the marker - even a candidate one - still gets "RAM first, the
+    disk fills the gap". Every test about the merged tuple's RAM-leading shape runs
+    here with an unflagged `Req`, which pins that the old behaviour is intact for the
+    client that never asks.
+    """
+    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
+    return armed
 
 
 def fill(root, blocks=4, groups=CACHEABLE, seeds=None, write=True):
@@ -783,7 +819,7 @@ def test_offer_extends_the_forks_hit_and_parks_nothing(armed):
     assert len(manager.cpu_block_pool.allocated) == 3 * len(CACHEABLE)
 
 
-def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed):
+def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed_all):
     """(per-group lists, hit_length, num_computed), ours APPENDED after the RAM hit.
 
     `update_state_after_alloc` takes `cdiv(num_external, g_block_size)` LEADING
@@ -791,13 +827,18 @@ def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed):
     the remainder. So RAM must stay leading and our slots must follow; the third
     field is the fork's local prefix and must survive untouched, because the pairing
     offsets are computed from it.
+
+    THIS IS THE UNMARKED PATH (`armed_all`, `restore=False`), and since 0.2.22 it is
+    the ONLY path that merges a RAM hit with a disk span: a flagged request makes the
+    disk the authority and never reaches it. `test_disk_restore_authority.py` pins
+    what the marker does instead.
     """
-    fill(armed, seeds=[3, 4])
+    fill(armed_all, seeds=[3, 4])
     manager = Manager()
     ram = [[Slot(900 + group * 10 + i) for i in range(2)]
            for group in range(len(GROUP_SIZES))]
     manager._pending_cpu_hits["req-1"] = (ram, 2 * BLOCK, 0)
-    request = Req(request_id="req-1", blocks=4)
+    request = Req(request_id="req-1", blocks=4, restore=False)
     assert offer(manager, request, 0, (2 * BLOCK, False)) == (4 * BLOCK, True)
     lists, hit_length, num_computed = manager._pending_cpu_hits["req-1"]
     assert num_computed == 0, "the fork's local prefix must survive untouched"
@@ -815,19 +856,20 @@ def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed):
             assert len(lists[group]) == 2, "an ineligible group gains no slots"
 
 
-def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed):
+def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed_all):
     """A RAM tuple whose per-group length disagrees with its token count: refuse all.
 
     The merge rests on "leading entries are the RAM hit, one per whole group block".
     If that is false, our slots land at GPU offsets belonging to someone else's
     tokens - a wrong-bytes restore, the one corruption this module must never cause.
-    A refusal costs a recompute.
+    A refusal costs a recompute. Unmarked (`armed_all`): a marker would have made the
+    RAM hit irrelevant rather than a reason to refuse.
     """
-    fill(armed, seeds=[3, 4])
+    fill(armed_all, seeds=[3, 4])
     manager = Manager()
     manager._pending_cpu_hits["req-1"] = ([[Slot(700)] for _ in GROUP_SIZES],
                                           2 * BLOCK, 0)
-    assert offer(manager, Req(request_id="req-1", blocks=4), 0,
+    assert offer(manager, Req(request_id="req-1", blocks=4, restore=False), 0,
                  (2 * BLOCK, False)) == (2 * BLOCK, False), \
         "the fork's own answer, untouched"
     assert disk_restore.counters()["refused"]["ram_shape"] == 1
@@ -835,10 +877,15 @@ def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed):
     assert manager.cpu_block_pool.get_num_free_blocks() == 1024
 
 
-def test_merge_refuses_a_tuple_the_fork_left_behind(armed):
-    """Tokens claimed with no `_pending_cpu_hits` tuple: there is nothing to merge."""
-    fill(armed, seeds=[3, 4])
-    assert offer(Manager(), Req(request_id="req-1", blocks=4), 0,
+def test_merge_refuses_a_tuple_the_fork_left_behind(armed_all):
+    """Tokens claimed with no `_pending_cpu_hits` tuple: there is nothing to merge.
+
+    Unmarked (`armed_all`): with a marker there is nothing to merge EITHER, and that
+    is fine rather than fatal - see
+    `test_a_flagged_request_needs_no_fork_tuple_because_ram_is_not_consulted`.
+    """
+    fill(armed_all, seeds=[3, 4])
+    assert offer(Manager(), Req(request_id="req-1", blocks=4, restore=False), 0,
                  (2 * BLOCK, False)) == (2 * BLOCK, False)
     assert disk_restore.counters()["refused"]["ram_shape"] == 1
 
@@ -857,10 +904,17 @@ def test_a_sub_block_match_offers_nothing_through_the_real_path(armed):
     assert disk_restore.counters()["refused"]["disk_run_below_one_block"] == 1
 
 
-def test_the_offer_refuses_a_hit_that_is_not_block_aligned(armed):
-    """A hash-granular RAM hit interleaves with our blocks inside a group block."""
-    fill(armed, blocks=2)
-    assert offer(Manager(), Req(blocks=2), 0, (100, False)) == (100, False)
+def test_the_offer_refuses_a_hit_that_is_not_block_aligned(armed_all):
+    """A hash-granular RAM hit interleaves with our blocks inside a group block.
+
+    UNMARKED ONLY, and that is the 0.2.22 change the operator asked for: this refusal
+    used to be the reason a disk restore could not be tested on any prompt that was
+    not a whole number of blocks. A flagged request takes this branch never, because
+    the RAM hit it carries is not the thing that decides its span.
+    """
+    fill(armed_all, blocks=2)
+    assert offer(Manager(), Req(blocks=2, restore=False), 0,
+                 (100, False)) == (100, False)
     assert disk_restore.counters()["refused"]["ram_hit_not_block_aligned"] == 1
 
 
@@ -1404,6 +1458,32 @@ def test_before_load_moves_bytes_into_the_cpu_slot(armed):
         "a step that copied everything keeps every entry"
     assert disk_restore._wbatches == {}, \
         "the batch is closed, so a second pass cannot re-apply these bytes"
+
+
+def test_the_span_shape_comes_from_the_real_bind_path(armed):
+    """END TO END, the field `span_shape` depends on: a job bound through the real
+    `_worker_bind` carries its GROUP ID, so the span walk sees one span of three
+    groups and not three spans of one.
+
+    Why this is a separate test from the pure-function ones: those hand-build a batch
+    with a `group` key, which would keep passing if `_worker_bind` stopped recording
+    the group at all - and a batch whose every entry looked like group 0 would make
+    every span a single entry, so `spans_partial` and `spans_hole_in_the_middle`
+    would count entries and every number they produce would be a lie about the
+    ordering question.
+    """
+    fill(armed, blocks=1)
+    worker = Worker()
+    metadata = disk_meta(armed, seeds=(1,), ram=0)
+    assert bind(worker, metadata)["ok"] is True
+    settle(disk_restore._batch_id(11))
+    assert disk_restore.worker_before_load(worker)["ok"] is True
+    shape = disk_restore.counters()["last_span_shape"]
+    assert shape["entries"] == len(CACHEABLE)
+    assert shape["spans"] == 1, shape          # 3 groups, 1 block: one span
+    assert shape["spans_whole"] == 1 and shape["spans_partial"] == 0
+    assert shape["applied_is_prefix"] is True
+    assert disk_restore.counters()["spans_hole_in_the_middle"] == 0
 
 
 def test_unsettled_bytes_are_pruned_never_awaited(armed, monkeypatch):
