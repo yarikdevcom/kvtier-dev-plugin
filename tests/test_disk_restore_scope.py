@@ -262,6 +262,105 @@ def test_the_posture_is_reported_wherever_it_can_be_read(armed):
         assert key in counters["units"], key
 
 
+# --- the posture in the one-call payload, as FIELDS ---------------------------
+
+def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
+    """Every posture fact is a JSON field of `disk_restore`, in BOTH switch states.
+
+    The question the snapshot exists to answer at 3 a.m. is "what will the restore path
+    do?", and for a while it could not be answered from the payload: the section carried
+    36 keys and not one of them was the switch, the scope, the cap, the armed-rank split
+    or the fuse - all of it was reachable only as text inside `boot_line`, and a
+    dashboard cannot grep a sentence. Every value below is a pass-through from the
+    function that owns it, asserted AS that function's value, which also pins "the
+    payload and the verb cannot disagree".
+    """
+    section = disk_restore.scheduler_section()
+    posture = disk_restore.offer_posture()
+    counters = disk_restore.counters()
+    new_keys = ("offers_enabled", "scope", "marker_key", "offer_cap", "ranks_armed",
+                "ranks_seen", "suppressed_hits", "suppressed_spans",
+                "suppressed_requests", "suppressions")
+    for key in new_keys:
+        assert key in section, key
+        assert str(section["units"].get(key, "")).strip(), \
+            f"{key} has no unit: a bare number under a units map"
+    # THE VALUES, FROM THEIR OWNERS.
+    assert section["offers_enabled"] is True is posture["enabled"]
+    assert section["scope"] == posture["scope"] == disk_restore.RESTORE_SCOPE_OPTIN
+    assert section["marker_key"] == posture["marker_key"]
+    assert section["marker_key"] == disk_restore.RESTORE_MARKER_KEY
+    assert section["offer_cap"] == disk_restore.MAX_OFFER_TOKENS_PER_OFFER
+    assert section["ranks_armed"] == 1 and section["ranks_seen"] == 1
+    for key in ("suppressed_hits", "suppressed_spans", "suppressed_requests",
+                "suppressions"):
+        assert section[key] == counters[key] == 0, key
+
+    # THE OTHER SWITCH STATE. Same keys, different verdict: a payload that drops the
+    # posture when the posture is off is a payload that cannot tell "off" from "gone".
+    disk_restore.set_offer_switch(False)
+    off = disk_restore.scheduler_section()
+    assert off["offers_enabled"] is False
+    assert set(off) == set(section), "the shape must not depend on the posture"
+    # The scope is its own field, and it moves independently of the switch.
+    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
+    scoped = disk_restore.scheduler_section()
+    assert scoped["offers_enabled"] is False and scoped["scope"] == "all"
+    disk_restore.set_offer_switch(True)
+    assert disk_restore.scheduler_section()["offers_enabled"] is True
+
+
+def test_the_payload_names_the_armed_ranks_when_only_the_scheduler_is_armed(four_ranks):
+    """`ranks_armed` as data: the incident's shape, readable without reading prose.
+
+    123,474 offers went out on a boot where the scheduler was armed and FOUR ranks
+    refused to service a load. The proof has always computed the split, but the payload
+    published only `ranks_proven`, which reads as "nothing proven" rather than "4 live,
+    0 servicing" - two different diagnoses, and only one of them is the incident.
+    """
+    four_ranks({"armed": False, "reason": "the disk tier is disarmed"})
+    disk_restore.set_offer_switch(True)
+    section = disk_restore.scheduler_section()
+    assert section["ranks_armed"] == 0
+    assert section["ranks_seen"] == 4
+    assert section["ranks_proven"] == 0
+    assert section["offers_enabled"] is True, "the switch was up; the ranks were not"
+    assert disk_restore.gate()["ranks_armed"] == "0/4"
+    # Arm the same fleet: the split moves, and nothing else about the payload does.
+    four_ranks({"armed": True, "reads": 1})
+    armed = disk_restore.scheduler_section()
+    assert armed["ranks_armed"] == 4 and armed["ranks_seen"] == 4
+    assert armed["ranks_proven"] == 4
+
+
+def test_the_fuse_is_reported_as_data_in_the_payload(armed):
+    """The suppression counters reach the payload, so the loop is visible while it runs.
+
+    The livelock was invisible in the payload and visible only as a repeating log line.
+    These three counters are the difference between "nothing is happening" and "a
+    request is being re-offered and refused on a fuse" - the same offer count, with no
+    way to tell the two apart from numbers alone.
+    """
+    fill(armed, blocks=1)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    assert offer(manager, Req(request_id="req-1", blocks=1)) == (BLOCK, True)
+    failed = fakes_output(failed={"req-1"})
+    assert disk_restore.note_reported(manager, failed)["failures"] == 1
+    assert offer(Manager(reqs_to_load={"req-1": object()}),
+                 Req(request_id="req-1", blocks=1)) == (0, False)
+    counters = disk_restore.counters()
+    assert counters["suppressed_hits"] == 1
+    assert counters["suppressed_requests"] == 1
+    assert counters["suppressions"] == 1
+    section = disk_restore.scheduler_section()
+    for key in ("suppressed_hits", "suppressed_spans", "suppressed_requests",
+                "suppressions"):
+        assert section[key] == counters[key], key
+    assert section["suppressed_hits"] == 1
+    assert section["suppressed_requests"] == 1
+    assert section["suppressions"] == 1, "the lifetime total, not only the live table"
+
+
 def test_the_offer_is_capped_below_the_incident_size(armed):
     """160,000 tokens per offer is unreachable at any prompt length.
 

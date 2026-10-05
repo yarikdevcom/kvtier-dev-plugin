@@ -2854,12 +2854,29 @@ def test_a_hostile_worker_never_raises(armed):
 def test_every_counter_has_a_unit():
     """RESTORED, and it caught a real (if small) gap: `witness_emissions` had no
     unit, so the payload carried a bare number under a `units` map whose whole
-    purpose is that no number in it is ever bare."""
+    purpose is that no number in it is ever bare.
+
+    It walks BOTH views: `counters()` (the module's own numbers) and
+    `scheduler_section()` (the one-call payload), because the section publishes keys of
+    its own - `offer_cap`, `ranks_armed`, `ranks_seen`, the three `suppressed_*` - and a
+    number that reached the payload through a pass-through is exactly as bare as one
+    that came from `_state`.
+    """
     counters = disk_restore.counters()
     units = disk_restore.counters_view(dict(counters))["units"]
     for name, value in counters.items():
         if isinstance(value, int) and not isinstance(value, bool):
             assert name in units, name
+
+    view = disk_restore.scheduler_section()
+    section_units = view["units"]
+    for name, value in view.items():
+        if isinstance(value, int) and not isinstance(value, bool):
+            assert name in section_units, name
+        if name == "index":
+            for inner, field in value.items():
+                if isinstance(field, int) and not isinstance(field, bool):
+                    assert f"index.{inner}" in section_units, inner
 
 
 # --- n: THE SCHEDULER ROLE, the only role that can start a restore -----------
@@ -3086,7 +3103,14 @@ def test_the_snapshot_payload_carries_the_scheduler_restore_section():
                 "install_deferrals", "install_refusal_line", "gate", "offers",
                 "tokens_offered", "blocks_offered", "refused", "refusal_reasons",
                 "index", "ranks_proven", "digests_expected", "why_no_restore",
-                "units", "boot_line"):
+                "units", "boot_line",
+                # THE POSTURE, AS FIELDS (0.2.17's switch, scope, cap, the armed-rank
+                # split and the fuse): the section used to answer "what happened" and
+                # never "what this boot is allowed to do", which was only printed in
+                # `boot_line`.
+                "offers_enabled", "scope", "marker_key", "offer_cap", "ranks_armed",
+                "ranks_seen", "suppressed_hits", "suppressed_spans",
+                "suppressed_requests", "suppressions"):
         assert key in view, key
     # EVERY OFFER REFUSAL, counted AND spelled out: the closed vocabulary is the
     # whole answer, and a name without a sentence is a name nobody can act on.

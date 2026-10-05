@@ -33,13 +33,14 @@ gate would refuse to arm, and every test here would be proving the wrong thing.
 """
 from __future__ import annotations
 
+import re
 import types
 
 import fixtures_pr56810 as PR  # noqa: F401 - imported for its module-level setup
 import pytest
 import test_backport as TB
 
-from kvtier_dev_plugin import backport, config, guard_mode, snapshot
+from kvtier_dev_plugin import backport, config, disk_spill, guard_mode, snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -634,22 +635,36 @@ def test_the_boot_line_states_every_verdict_and_the_mode_in_one_line():
     """
     _report, boot_report, _cls, _manager = boot()
     line = boot_report["line"]
-    assert line.startswith("BOOT[auto] backport=YES guard=YES tier=ARMED faults=0")
+    # `tier=` keeps its place and its value (see `boot_line`: the restart verifier
+    # greps it as a PASS criterion), and the two named tiers are printed BEFORE it so
+    # that a `grep -oE "tier=..." | tail -1` still lands on the bare field.
+    assert line.startswith("BOOT[auto] backport=YES guard=YES ram_tier=ARMED "
+                           "disk_tier=DISARMED tier=ARMED faults=0")
     assert "guard_over=" in line and "not_covered=" in line
     assert "\n" not in line, "one line, or the grep loses it"
     assert len(line) < 2000, "bounded, or it floods the engine log"
 
-    # Each label appears EXACTLY ONCE. This caught a real bug: the guard tail was
+    # Each FIELD NAME appears EXACTLY ONCE. This caught a real bug: the guard tail was
     # emitted as `faults=POST /plugins/kvtier/guard {"op":"captures"}`, so the line
     # carried two `faults=` labels and the second was not a number - a grep for the
     # fault count could read the pointer instead. `faults=0` is the only faults label,
     # and the captures pointer is its own label.
-    for label in ("backport=", "guard=", "tier=", "faults=", "guard_over=",
-                  "not_covered=", "captures="):
-        repeat = line.count(label)
-        assert repeat <= 1, f"{label} appears {repeat}x"
-    assert line.count("faults=") == 1
+    #
+    # Field NAMES, not substrings: `ram_tier=`/`disk_tier=` legitimately end with
+    # `tier=`, so a substring count would report three `tier=` labels where there are
+    # three DIFFERENT fields. This is the trap the naming has - it is also why the
+    # bare `tier=` is printed last of the three (see `boot_line`).
+    names = [part.split("=")[0] for part in line.split(" ") if "=" in part]
+    for label in ("backport", "guard", "tier", "ram_tier", "disk_tier", "faults",
+                  "guard_over", "not_covered", "captures"):
+        repeat = names.count(label)
+        assert repeat <= 1, f"{label}= appears {repeat}x in {line}"
+    assert names.count("faults") == 1
     assert "faults=POST" not in line, "the pointer must not masquerade as a count"
+    assert names.count("tier") == 1, "the bare `tier=` field is still on the line"
+    assert "tier=ARMED ram_tier=ARMED" not in line, \
+        "`tier=` is the LAST tier-suffixed field, for a verifier that takes the " \
+        "last grep match"
 
     section = backport.section()
     assert section["boot"]["line"] == line
@@ -659,6 +674,85 @@ def test_the_boot_line_states_every_verdict_and_the_mode_in_one_line():
     cls = TB._six_group_class(drift="_select_eager_blocks_to_store")
     _r, refused, _c, _m = boot(cls, TB._production_manager(cls))
     assert "refused=" in refused["line"]
+
+
+def test_the_boot_line_names_the_two_tiers_apart_without_losing_tier():
+    """THE NAMING TRAP, pinned: `tier=ARMED` and "the disk tier is disarmed" are
+    both true.
+
+    On 2026-10-05 the boot banner and a restore refusal were read next to each other
+    and taken for a contradiction, because `tier=` never said WHICH tier. It still does
+    not - it stays exactly as it was, because the restart verifier greps it as a PASS
+    criterion - but the line now carries the same verdict under an unambiguous name and
+    adds the OTHER tier beside it. Tonight's actual state is the interesting case: the
+    RAM tier armed by the gate script, the disk spill tier's tmpfs arm file wiped by the
+    reboot, so one line must be able to say ARMED and DISARMED about two different
+    things without contradicting itself.
+    """
+    _report, boot_report, _cls, _manager = boot()
+    line = boot_report["line"]
+    assert "tier=" in line, "the legacy field is still here"
+    assert "ram_tier=ARMED" in line, "the RAM/host tier, named"
+    assert "disk_tier=DISARMED" in line, \
+        "the disk spill tier: armed by a tmpfs file, so a fresh boot is DISARMED"
+    # One window, three fields: the pair is adjacent to the field it explains.
+    assert "ram_tier=ARMED disk_tier=DISARMED tier=ARMED" in line, line
+    assert "ram_tier=ARMED disk_tier=ARMED" not in line, \
+        "they are ONE field each, not a merged verdict"
+
+
+def test_the_tier_fields_are_independent_and_tier_stays_the_last_grep_match(
+        monkeypatch):
+    """Two arms, four states, no coupling - and the verifier's grep still lands right.
+
+    The RAM tier is armed at boot by the plugin (or by `kvtier_gate_remote.sh`); the
+    disk spill tier's arm is a file in the diagnostics directory, which is tmpfs, so
+    every reboot wipes it. A line that could only carry one verdict made the second
+    tier invisible and the first one look wrong.
+
+    The second half is the ordering rule, and it is not cosmetic: the restart verifier
+    in the llm-api repo extracts the PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, i.e. the LAST `tier=`-terminated token on
+    the line. Emitting `ram_tier=`/`disk_tier=` AFTER the bare `tier=` would hand that
+    verifier `disk_tier=DISARMED` and fail a healthy boot, so the bare field is printed
+    last of the three and this test pins the extraction.
+    """
+    for ram, disk in ((True, False), (True, True), (False, True), (False, False)):
+        boot = {"mode": "auto", "backport": True, "guard": True, "tier": ram,
+                "faults_at_boot": 0, "nested": [], "refusals": [],
+                "not_covered": [], "guard_armed": False}
+        monkeypatch.setattr(disk_spill, "is_armed", lambda disk=disk: disk)
+        line = backport.boot_line(boot)
+        want_ram = "ARMED" if ram else "DISARMED"
+        want_disk = "ARMED" if disk else "DISARMED"
+        assert f"ram_tier={want_ram} disk_tier={want_disk} tier={want_ram}" in line, \
+            (ram, disk, line)
+        # What the restart verifier reads for `tier`, reproduced exactly.
+        assert re.findall(r"tier=[A-Za-z_]+", line)[-1] == f"tier={want_ram}", \
+            (ram, disk, line)
+
+
+def test_an_unreadable_disk_tier_says_unknown_rather_than_arm_or_disarm(monkeypatch):
+    """A missing verdict is a third answer, not a `DISARMED`.
+
+    `disk_spill.is_armed()` fails closed and never raises, so this is the import or a
+    future accessor breaking - the exact moment a line that exists to describe a broken
+    situation must not be the thing that breaks. The RAM verdict (the one the verifier
+    reads) stays a verdict, and the swallowed failure is counted.
+    """
+    def explode():
+        raise RuntimeError("no disk tier here")
+
+    monkeypatch.setattr(disk_spill, "is_armed", explode)
+    errors = snapshot._state["errors"]
+    line = backport.boot_line({"mode": "auto", "backport": True, "guard": True,
+                               "tier": True, "faults_at_boot": 0, "nested": [],
+                               "refusals": [], "not_covered": [],
+                               "guard_armed": False})
+    assert "disk_tier=UNKNOWN" in line, line
+    assert "ram_tier=ARMED" in line and " tier=ARMED" in line, \
+        "the RAM half is unaffected"
+    assert snapshot._state["errors"] > errors, "and the failure is not silent"
 
 
 def test_the_refusal_tails_are_bounded_and_say_how_much_was_left_out():

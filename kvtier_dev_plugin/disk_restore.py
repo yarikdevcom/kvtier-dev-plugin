@@ -3933,23 +3933,28 @@ def scheduler_section() -> dict:
     opened = gate()
     proof = worker_proof()
     index = disk_index.section()
-    counters = _state
-    offers = int(counters["offers"])
+    state = _state
+    # THE POSTURE, FROM ITS OWNERS. `offer_posture()` owns the switch/scope/marker and
+    # `counters()` owns every suppression number; this section re-publishes them and
+    # recomputes nothing, so a payload and a verb can never disagree about a posture.
+    posture = offer_posture()
+    tally = counters()
+    offers = int(state["offers"])
     entries = int(index.get("entries") or 0)
     # From the PROOF, not only from the counter: `worker_proof()` publishes the
     # count it read and a caller that patched the door (a test, or a future cached
     # verdict source) must still be reported honestly.
-    ranks = int(proof.get("count") or counters["ranks_proven"] or 0)
+    ranks = int(proof.get("count") or state["ranks_proven"] or 0)
     installed_here = bool(_state["sched_fitted"]) and not missing
-    last_refusal_line = (counters["install_refusal_line"]
-                         or counters["skip_reason"] or "none")
+    last_refusal_line = (state["install_refusal_line"]
+                         or state["skip_reason"] or "none")
     if not installed_here:
         why = ("the scheduler half of the restore layer is not fitted in THIS "
                f"process (wrapped here: {here or 'none'}; role here: "
                f"{role_here()}). No offer is possible: "
                f"{SCHED_METHODS[0]} is not ours here. Refusals this boot: "
-               f"{int(counters['install_refusals'])} "
-               f"(deferrals: {int(counters['install_deferrals'])}); last reason: "
+               f"{int(state['install_refusals'])} "
+               f"(deferrals: {int(state['install_deferrals'])}); last reason: "
                f"{last_refusal_line}")
     elif not opened["ok"]:
         why = (f"the gate is closed: {opened['reason']}")
@@ -3971,9 +3976,9 @@ def scheduler_section() -> dict:
                "prefix this request asked for)")
     else:
         why = (f"restore is live in this process: {offers} offer(s), "
-               f"{int(counters['offered_tokens'])} tokens, "
-               f"{int(counters['blocks_offered'])} scheduler blocks; "
-               f"{int(counters['restorations'])} load(s) reported disk bytes back. "
+               f"{int(state['offered_tokens'])} tokens, "
+               f"{int(state['blocks_offered'])} scheduler blocks; "
+               f"{int(state['restorations'])} load(s) reported disk bytes back. "
                "An offer that is not adopted is a scheduler decision, not this "
                "module's: see lookup_ledger.")
     return {
@@ -3988,38 +3993,57 @@ def scheduler_section() -> dict:
         "methods_expected": list(SCHED_METHODS),
         "methods_here": here,
         "methods_missing": missing,
-        "install_refusals": int(counters["install_refusals"]),
-        "install_deferrals": int(counters["install_deferrals"]),
-        "install_refusal_line": counters["install_refusal_line"],
-        "missing_methods": list(counters["missing_methods"]),
-        "installs": int(counters["installs"]),
-        "reinstalls": int(counters["reinstalls"]),
+        "install_refusals": int(state["install_refusals"]),
+        "install_deferrals": int(state["install_deferrals"]),
+        "install_refusal_line": state["install_refusal_line"],
+        "missing_methods": list(state["missing_methods"]),
+        "installs": int(state["installs"]),
+        "reinstalls": int(state["reinstalls"]),
         "gate": {"ok": bool(opened["ok"]), "reason": opened.get("reason"),
                  "reason_kind": opened.get("reason_kind")},
+        # THE POSTURE AS DATA, not as a sentence inside `boot_line`. Until now the only
+        # place any of this was printed was that line, and a dashboard cannot grep a
+        # sentence at 3 a.m.: "is the switch up, under what scope, how many ranks are
+        # armed, is anything fused" was only answerable by reading prose. Every value
+        # is a pass-through from the function that owns it - `offer_posture()`,
+        # `counters()`, `worker_proof()`, and for the cap the module constant the boot
+        # line already prints - and none of them is derived here.
+        "offers_enabled": bool(posture["enabled"]),
+        "scope": posture["scope"],
+        "marker_key": posture["marker_key"],
+        "offer_cap": int(MAX_OFFER_TOKENS_PER_OFFER),
+        "ranks_armed": int(proof.get("ranks_armed") or 0),
+        "ranks_seen": int(proof.get("ranks_seen") or 0),
+        "suppressed_hits": int(tally["suppressed_hits"]),
+        "suppressed_spans": int(tally["suppressed_spans"]),
+        "suppressed_requests": int(tally["suppressed_requests"]),
+        # The lifetime total beside the live table size: one failed load whose fuse has
+        # since aged out and a hundred of them both read as `suppressed_requests=0`.
+        "suppressions": int(tally["suppressions"]),
         "offers": offers,
-        "tokens_offered": int(counters["offered_tokens"]),
-        "blocks_offered": int(counters["blocks_offered"]),
-        "slots_allocated": int(counters["slots_allocated"]),
-        "restorations": int(counters["restorations"]),
-        "adopted": int(counters["adopted"]),
-        "adopted_tokens": int(counters["adopted_tokens"]),
-        "refused": {name: int(counters["refused"].get(name) or 0)
+        "tokens_offered": int(state["offered_tokens"]),
+        "blocks_offered": int(state["blocks_offered"]),
+        "slots_allocated": int(state["slots_allocated"]),
+        "restorations": int(state["restorations"]),
+        "adopted": int(state["adopted"]),
+        "adopted_tokens": int(state["adopted_tokens"]),
+        "refused": {name: int(state["refused"].get(name) or 0)
                     for name in OFFER_REFUSALS},
         "refusal_reasons": {name: OFFER_REFUSAL_WHY.get(
             name, "undefined reason: this refusal has no entry in "
                    "OFFER_REFUSAL_WHY") for name in OFFER_REFUSALS},
-        "last_refusal": counters["last_refusal"],
+        "last_refusal": state["last_refusal"],
         "index": {"entries": entries,
                   "source": index.get("journal_directory"),
                   "bytes_indexed": int(index.get("bytes_indexed") or 0),
                   "journals_tracked": int(index.get("journals_tracked") or 0),
-                  "refreshes": int(counters["index_refreshes"]),
-                  "refresh_errors": int(counters["index_refresh_errors"]),
+                  "refreshes": int(state["index_refreshes"]),
+                  "refresh_errors": int(state["index_refresh_errors"]),
                   "last_reason": index.get("last_reason")},
         "ranks_proven": ranks,
         "digests_expected": ranks,
         "ranks": list(proof.get("ranks") or []),
-        "proof_reads": int(counters["proof_reads"]),
+        "proof_reads": int(state["proof_reads"]),
         "proof_reason": proof.get("reason"),
         "deadline_seconds": RESTORE_DEADLINE_SECONDS,
         "boot_line": _state["boot_line"],
@@ -4055,6 +4079,36 @@ def scheduler_section() -> dict:
                                 "watchdog reports it as a failure",
             "methods_here": "scheduler methods our layer is on in this process",
             "methods_expected": "scheduler methods it must be on to offer at all",
+            "offers_enabled": "this boot's offer switch, read from "
+                              "offer_posture(): false until the dev verb raises it, "
+                              "so an armed spill tier alone cannot put a disk offer "
+                              "in front of live traffic",
+            "scope": "which requests may be offered at all, from offer_posture(): "
+                     "`optin` (only a request carrying `marker_key`) or `all`",
+            "marker_key": "the `kv_transfer_params` key an opt-in request must carry "
+                          "in `optin` scope, from offer_posture()",
+            "offer_cap": "tokens: the most one offer may carry, clamped at "
+                         "MAX_OFFER_TOKENS_PER_OFFER (the 160,000-token offers of "
+                         "2026-10-05 clamp here)",
+            "ranks_armed": "live rank files that WILL SERVICE a disk load, from the "
+                           "same worker_proof() read as `ranks_proven`: the proof is "
+                           "AND over these, so one disarmed rank closes the whole "
+                           "scheduler",
+            "ranks_seen": "live rank files that spoke about disk service at all, "
+                          "armed or not, from the same worker_proof() read",
+            "suppressed_hits": "lookups refused because the REQUEST is suppressed "
+                               "after a failed disk load (the loop that starved the "
+                               "box), from counters()",
+            "suppressed_spans": "offers refused because the disk SPAN was implicated "
+                                "in a failed load, whichever request asked for it, "
+                                "from counters()",
+            "suppressed_requests": "request ids currently black-holed for disk "
+                                   "service in this boot (the fuse table's live size, "
+                                   "not a counter), from counters()",
+            "suppressions": "requests black-holed for disk service at any point in "
+                            "this boot (the lifetime total, from counters()); read "
+                            "beside suppressed_requests, which is the table's live "
+                            "size",
         },
         "note": ("THE SCHEDULER'S OWN ANSWER: the scheduler half, the gate, the "
                  "index and the worker proof, walked in that order, with "

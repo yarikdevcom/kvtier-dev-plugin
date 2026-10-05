@@ -2053,10 +2053,34 @@ def guard_mode_faults() -> int:
         return 0
 
 
+def _disk_tier_field() -> str:
+    """`ARMED` / `DISARMED`: the DISK SPILL tier's own arm, never the RAM tier's.
+
+    A separate field because the two arms are separate facts with separate lives. The
+    RAM/host tier's arm is what `set_armed()` puts up at boot (and what
+    `kvtier_gate_remote.sh` arms); the disk spill tier's arm is a FILE in the
+    diagnostics directory - tmpfs - so a reboot wipes it while the RAM tier comes back
+    armed on its own. On 2026-10-05 a boot printed `BOOT[auto] ... tier=ARMED` next to
+    a restore refusal reading `the disk tier is disarmed`, and the two lines were read
+    as a contradiction. They are two tiers, and now the line says which is which.
+
+    `disk_spill.is_armed()` is the door (not `counters()["armed"]`) because it checks
+    the arm's expiry on every read - a lapsed arm must never answer ARMED. It fails
+    closed and never raises; the try/except is only for the import and is reported.
+    """
+    try:
+        from . import disk_spill  # noqa: PLC0415 - sibling layer, lazy by idiom
+        return "ARMED" if disk_spill.is_armed() else "DISARMED"
+    except Exception as exc:  # noqa: BLE001 - a boot line never fails because of a field
+        snapshot._error(exc, "backport boot line disk tier")
+        return "UNKNOWN"
+
+
 def boot_line(boot: dict) -> str:
     """THE boot line: one line, fixed field order, bounded.
 
-    `BOOT[mode] backport=YES|NO guard=YES|NO tier=ARMED|DISARMED faults=N ...`
+    `BOOT[mode] backport=YES|NO guard=YES|NO ram_tier=ARMED|DISARMED
+    disk_tier=ARMED|DISARMED|UNKNOWN tier=ARMED|DISARMED faults=N ...`
 
     Refusals and not-covered methods appear only when non-empty and each is
     capped - the full detail is in the payload - but the line says how many were
@@ -2072,6 +2096,21 @@ def boot_line(boot: dict) -> str:
     else:
         parts.append("backport={}".format("YES" if boot.get("backport") else "NO"))
     parts.append("guard={}".format("YES" if boot.get("guard") else "NO"))
+    # THE TWO TIERS, NAMED APART, and `tier=` UNCHANGED. Two rules here:
+    #
+    # 1. `tier=` stays, exactly as it was - same position in the field order, same
+    #    ARMED/DISARMED values. It is the field the restart verifier in the llm-api
+    #    repo (`server/kvtier_restart.sh`) treats as a PASS criterion, and the README
+    #    tells an operator to grep it; renaming or dropping it would fail a good boot.
+    # 2. `ram_tier=`/`disk_tier=` are printed BEFORE it, not after, because that
+    #    verifier pulls the field with `grep -oE "tier=[A-Za-z_]+" | tail -1` - LAST
+    #    match. Every new `*tier=` field therefore has to sit upstream of the bare one
+    #    or a `disk_tier=DISARMED` would be read as the tier verdict and a healthy boot
+    #    would be reported as broken. (It is also why `ram_tier=` carries the SAME
+    #    value as `tier=`: they are the same arm, one named ambiguously and once named
+    #    plainly, so a grep that lands on either gets the RAM tier's verdict.)
+    parts.append("ram_tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
+    parts.append("disk_tier={}".format(_disk_tier_field()))
     parts.append("tier={}".format("ARMED" if boot.get("tier") else "DISARMED"))
     parts.append("faults={}".format(int(boot.get("faults_at_boot") or 0)))
     if boot.get("nested"):

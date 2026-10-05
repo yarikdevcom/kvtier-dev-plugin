@@ -1069,7 +1069,10 @@ withheld lines so a quiet log is not mistaken for a dead module.
 `disk_restore` section of `/snapshot`) reports the SCHEDULER's own verdict - the layer
 fitted in that process, the gate and its reason, the index size and its source, the
 worker proof, and every offer refusal with its meaning - under `restore`, with
-`restore.why_no_restore` naming the first missing link. A rank file's
+`restore.why_no_restore` naming the first missing link. The boot's **posture** is in
+that section as fields, not only as text in the boot line: `offers_enabled`, `scope`,
+`marker_key`, `offer_cap`, `ranks_armed`/`ranks_seen`, and the fuse counters
+`suppressed_hits`/`suppressed_spans`/`suppressed_requests`/`suppressions`. A rank file's
 `disk_restore.installed: true` describes a WORKER and cannot start a restore; only
 the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
 is that verdict at boot.
@@ -1393,7 +1396,15 @@ nothing. Both halves are now handled at the one moment the class exists:
 * **One line says all of it.** `pr56810.boot.line`, also written to the engine log
   at WARNING so it survives without curling anything:
 
-  `BOOT[auto] backport=YES guard=YES tier=ARMED faults=0 guard_over=... not_covered=...`
+  `BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=DISARMED tier=ARMED faults=0 guard_over=... not_covered=...`
+
+  `tier=` is the **RAM/host tier** and stays exactly as it was - the restart verifier
+  greps it as a PASS criterion - while `ram_tier=` repeats that verdict under an
+  unambiguous name and `disk_tier=` reports the **disk spill tier**, whose arm file
+  lives on tmpfs and is gone after every reboot. A boot can therefore legitimately
+  print `tier=ARMED` next to a restore refusal reading "the disk tier is disarmed":
+  two tiers, two arms, one line. The two named fields are printed *before* `tier=` so
+  that a `grep -oE 'tier=[A-Za-z_]+' | tail -1` still lands on the bare field.
 
   `mode` is `auto` or `inert` and says which env posture ran; `refused=` names each
   gate that failed with its reason; `not_covered=` lists the methods the guard does
@@ -1406,7 +1417,7 @@ nothing. Both halves are now handled at the one moment the class exists:
 # 1. boot the engine (tier env set, VLLM_E2_TIER_DEV_BOOT_INERT unset). Expect
 #    BOTH lines in /tmp/vllm-serve.log:
 #    "kvtier-dev-plugin: connector-creation hook fitted on KVConnectorFactory..."
-#    "kvtier-dev-plugin: BOOT[auto] backport=YES guard=YES tier=ARMED faults=0 ..."
+#    "kvtier-dev-plugin: BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=DISARMED tier=ARMED faults=0 ..."
 #    and NOTHING else to do. `grep 'BOOT\[' /tmp/vllm-serve.log | tail -1` is the
 #    whole boot verdict.
 
