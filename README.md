@@ -2293,13 +2293,17 @@ when it bites. The shed order is now
 `stale_geometry`/`stale_key_shape` → **this boot's own files, oldest touch first** → a
 **live peer rank's** files, and a rank *learns* its siblings' digests from the store walk
 it already performs: a foreign digest with at least two committed files written inside
-`PEER_DIGEST_FRESH_SECONDS` (120 s) is a rank that is writing right now. **The fail-safe
-direction is deliberate**: if no digest qualifies, the pass behaves exactly as 0.2.28 did
-(foreign first) and counts the fact as `peer_ranks.decisions_without_peers`. Too
-conservative here can never mean *unable to release capacity*, because this boot's own
-files and the genuinely unreadable ones stay sheddable whatever the peer map says - the
-opposite bias (assume every foreign digest is a live sibling) would make a store of old
-boots' geometry unsheddable and turn the ceiling into a comment.
+`PEER_DIGEST_FRESH_SECONDS` (120 s) is a rank that is writing right now.
+
+**That protection was conditional, and 0.2.34 made it honest.** "Peers shed last" was
+only ever true for a peer the evictor could NAME. The learning is a write-freshness
+witness, not an identity: a sibling that is alive but has not written a spill in the last
+120 s is not confirmed, and with nothing confirmed every foreign digest classified
+`stale_geometry` and went FIRST. What was written at the time as "the fail-safe direction
+is deliberate: if no digest qualifies, the pass behaves exactly as 0.2.28 did (foreign
+first)" was the bug, not the safety property - on a shared root "foreign first" is four
+ranks deleting each other's live KV data. See *An unattributable name never buys
+capacity* below for the gate, the short plans it permits, and the witnesses it publishes.
 
 **3. The pass had no deadline and one hand.** Up to 100,000 directory entries read
 twice, 20,000 `stat` calls and 4,096 unlinks, serially, on the writer thread that is the
@@ -2434,6 +2438,95 @@ cache reparsing when a rank file changes), and eleven tests in `tests/test_route
 token not bypassing the allowlist, loopback needing no token, a spoofed
 `X-Forwarded-For` buying nothing, the block travelling on `/snapshot` too, and an inert
 plugin 503-ing before any fill read).
+
+### An unattributable name never buys capacity: fail-closed eviction (0.2.34)
+
+**What happened.** Four ranks share ONE spill root and tell files apart only by the
+geometry digest in the name. The persistent journal at `/home/user/kv-tier/journal/`
+carries **15,848 removal lines of size 11,468,800** - the block size of the OTHER rank
+(PP0 is 11,468,800 B, PP1 is 12,902,400 B) - recorded by ranks that were not the writer.
+A `file_missing` read then opened a hole in the middle of a restored prefix and
+everything behind it, **19,200 tokens**, was recomputed.
+
+**Why the peers were never known.** The peer map is not an identity channel, it is a
+write-freshness witness learned from the walk the ceiling pass already performs
+(`_observe_peer_digest`, one entry per foreign-digest file the sample stats). A digest is
+only believed with `PEER_DIGEST_MIN_SIGHTINGS` (2) committed files written inside
+`PEER_DIGEST_FRESH_SECONDS` (120 s), and a digest that ages out is **deleted** from the
+map (`disk_spill._live_peer_digests`). So a rank that is alive but idle - which is most
+of a serving box's life, and the normal state of three ranks while one fills the store -
+is UNCONFIRMABLE, and the next pass runs with `peer_digests=()`. That is not a boot-order
+bug: both call sites compute the tuple *after* the walk that would have fed it, so no
+reordering helps - the input cannot support the claim. And with an empty peer map
+`classify_name` has no peer to name, so a sibling's live restore answers
+`stale_geometry`, which was bucket 0: shed before this rank's own files.
+
+**The gate.** Within the ceiling/eviction path, a committed file whose name parses under
+a digest that is **not this boot's**, seen while **no peer digest is confirmed**, is
+`unattributable` and is never a candidate for unlinking (`disk_layout.attribute_name`, enforced
+in `lru_eviction_plan`, again in `_attribute_walk_bytes`, and a third time in
+`_validate_unlink` for `for_capacity=True` - nothing planned upstream is trusted at the
+point of deletion). It is the unknown case of the rule this module has always had for
+malformed names: **reported, counted, never deleted**. Still sheddable, deliberately:
+this boot's own files; the pre-group `stale_key_shape` (our lineage, unloadable by any
+group-aware reader); an in-flight `.part` (not a committed file, so nobody's restore);
+and, when the peer map IS confirmed, any digest outside it - which is exactly what a
+confirmed map means, and what keeps a store of old boots' geometry sheddable instead of
+turning the ceiling into a comment.
+
+**The consequence is a short plan, not a silent no-op.** If the ceiling cannot be met
+without shedding unattributable files, the plan sheds what it is allowed to and comes up
+**SHORT**: `short` / `short_by_bytes` / `excluded_unattributable` /
+`excluded_unattributable_bytes` on the plan, and `plan_short`, `plan_short_bytes`,
+`plan_short_reason` (one line, gate-named, not a stack trace) and the boot total
+`passes_short` on `disk_spill.section().peer_ranks`. **Exceeding the ceiling is the
+correct failure mode**: spilling back-pressures, the unchanged `statvfs` floor
+(`MIN_FREE_BYTES`, refusal `no_free_space`) still guards the filesystem, and an operator
+can act. Deleting a sibling's live restore corrupts a serving path in silence.
+
+**The witnesses, published this time.** `peer_digests_live` / `peer_digests_unconfirmed`
+/
+`peer_digests_dropped` / `peer_files_planned` used to exist only inside
+`disk_spill._state`, so the journal evidence could not be resolved into a mechanism. They
+now travel in the per-rank file under **`disk.peer_eviction`** (`disk_store
+.worker_report`), with the SAME key set on the healthy path, on a rank that never ran a
+ceiling pass, on the path where the counters raised, and through the contribution seam's
+byte-cap triage. `disk_spill.section().peer_ranks` is the full view, and
+`disk_store.rank_rollup()` sums `peer_files_removed`, `peer_files_removed_known_peer`,
+`peer_digests_unconfirmed`, `unattributable_entries_excluded` and `ceiling_passes_short`
+across ranks, so the dev route answers it in one call.
+
+**The removal is attributable.** A `-` journal line says an identity left the store; it
+cannot say whose FILE that was, and a `-` from rank A followed by a `+` for the same
+identity leaves the index offering an identity that physically exists only under another
+rank's digest. So every unlink whose name carries a digest that is not this rank's
+bumps **`peer_files_removed`** (and `peer_files_removed_bytes`), and the one that cannot
+lie - the digest belonged to a rank this walk believed LIVE - bumps
+**`peer_files_removed_known_peer`**. `last_reason` gets one sentence naming both. The
+journal's five-field wire format (`seq op key16 size group`) is deliberately untouched:
+`disk_index` parses it, it is durable shared state, and rank-aware identity is its own
+bigger change with its own review.
+
+**Two scope boundaries, pinned rather than accidental.** `execute_unlink_plan` with
+`for_capacity=False` is the boot sweep's "the operator asked me to reclaim the bytes
+nobody can read" path and keeps its old allowed set (it is not wired into production -
+the ceiling pass is the only production deleter). And the gate cannot tell a sibling's
+digest from THIS rank's own obsolete geometry: `geometry_digest` is a hash of the whole
+fingerprint, so a name carries no rank to compare. A rank that restarts under a new
+fingerprint therefore cannot shed its own pre-restart files while it cannot confirm
+peers; the fix is a small durable "digests this rank has used" history, and it is a
+follow-up, not a silent extra write on an engine path.
+
+Tests: `tests/test_unattributable_eviction_fail_closed.py` (the incident as a behaviour on
+a filesystem - a peer-blind pass leaves the sibling's files and reports the shortfall;
+a confirmed peer's files are never in the destructive set at all; a digest outside a
+confirmed map is dead capacity again; the planner's own arithmetic, and its stable key
+set; the `.part` exception, pinned explicitly; the executor refusing an unattributable
+path a caller handed it, and the sweep path keeping its own doctrine; the four paths of
+`disk.peer_eviction` shipping one key set; the dev door summing the cross-rank removals;
+and a removal under a known peer's digest being counted, not buried), plus the rewritten
+doctrine tests in `tests/test_disk_layout.py` and
+`tests/test_touch_promotion_and_peer_eviction.py`.
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 

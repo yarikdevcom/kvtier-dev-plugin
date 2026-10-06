@@ -1937,7 +1937,28 @@ RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
                        ("disk_restore", "readers", "recency_promotions"), "reads"),
                       ("recency_promotions_throttled",
                        ("disk_restore", "readers",
-                        "recency_promotions_throttled"), "reads"))
+                        "recency_promotions_throttled"), "reads"),
+                      # THE CROSS-RANK WITNESS (0.2.34). `peer_files_removed` summed
+                      # across ranks is "how many files left this store under a
+                      # digest that was NOT the remover's" - the question the journal
+                      # cannot answer from a `-` line, and the one that decides
+                      # whether an eviction storm is LRU behaviour or four ranks
+                      # deleting each other's live restores. `passes_short` is the
+                      # other half: a rank that came up SHORT because it withheld
+                      # what it could not attribute.
+                      ("peer_files_removed",
+                       ("disk", "peer_eviction", "peer_files_removed"), "files"),
+                      ("peer_files_removed_known_peer",
+                       ("disk", "peer_eviction",
+                        "peer_files_removed_known_peer"), "files"),
+                      ("unattributable_entries_excluded",
+                       ("disk", "peer_eviction",
+                        "unattributable_entries_excluded"), "files"),
+                      ("peer_digests_unconfirmed",
+                       ("disk", "peer_eviction", "peer_digests_unconfirmed"),
+                       "passes"),
+                      ("ceiling_passes_short",
+                       ("disk", "peer_eviction", "passes_short"), "passes"))
 
 RANK_ROLLUP_MEANINGS = {
     "evictions": "files THIS RANK's ceiling pass removed from the store (monotonic "
@@ -1967,6 +1988,34 @@ RANK_ROLLUP_MEANINGS = {
     "recency_promotions_throttled": "promotions skipped by the per-file throttle - the "
                                     "count that says promotion is working and bounded, "
                                     "as opposed to absent",
+    "peer_files_removed": "files this rank unlinked whose name carries a geometry "
+                          "digest that is NOT its own (0.2.34). Summed, this is the "
+                          "cross-rank removal count the journal cannot give: it "
+                          "includes this rank's OWN obsolete geometry, so read it "
+                          "with the field below, and read a rising total beside "
+                          "`ceiling_passes_short` as the peer witness failing rather "
+                          "than as LRU behaviour",
+    "peer_files_removed_known_peer": "the unambiguous half: removals of a file whose "
+                                     "digest belonged to a rank this walk believed "
+                                     "LIVE at the moment of deletion. Summed across "
+                                     "ranks, a non-zero total IS the cross-rank "
+                                     "deletion signature - the number that used to "
+                                     "mean reading 15,848 journal lines and "
+                                     "comparing block sizes by hand",
+    "unattributable_entries_excluded": "files a rank WITHHELD from its destructive "
+                                       "set because it could not attribute them - no "
+                                       "peer digest confirmed, a foreign digest on a "
+                                       "committed file. This is the fail-closed gate "
+                                       "doing its job, and the number that says how "
+                                       "much capacity the fleet declined to buy",
+    "peer_digests_unconfirmed": "ceiling decisions this rank took with NO live peer "
+                                "digest - the state that used to mean 'shed the "
+                                "foreign files first' and now means 'withhold them "
+                                "and come up short'",
+    "ceiling_passes_short": "passes this rank finished SHORT of its target, by "
+                            "design, rather than unlink a file it could not prove "
+                            "was its own to delete; the ceiling is expected to be "
+                            "exceeded while this rises",
 }
 RANK_ROLLUP_GAUGES = ("queue_depth",)
 """Fields that are INSTANTANEOUS, not monotonic-since-boot. Summing a gauge across
@@ -3148,6 +3197,12 @@ def worker_report() -> dict:
     so a report that would be refused degrades ITSELF (drops the readable detail
     first, then the field names, says `truncated`) rather than costing the worker
     its whole section. Never raises; a JSON-serialisable dict in every path.
+
+    ONE BLOCK IS STRUCTURE, NOT DETAIL: `peer_eviction` (0.2.34) ships on the
+    healthy path, on the path where no ceiling pass ever ran, on the path where the
+    counters raised, and through the byte-cap triage - the same keys every time, so
+    the cross-rank witness can be read from four files by a reader that never has to
+    ask whether a field is allowed to be missing.
     """
     try:
         state = disk_spill.counters()
@@ -3207,6 +3262,18 @@ def worker_report() -> dict:
                   "bytes_written": int(state["bytes_written"]),
                   "drops": int(state["drops"]),
                   "evictions": int(state["evictions"]),
+                  # THE PEER-ATTRIBUTION WITNESS (0.2.34), as its own nested block.
+                  # These counters existed in `disk_spill` and appeared NOWHERE a
+                  # reader could reach them - not the rank file, not the dev route -
+                  # so when the persistent journal proved cross-rank deletion was
+                  # happening (15,848 removal lines of a sibling's 11,468,800-byte
+                  # block size, recorded by ranks that were not its writer), nothing
+                  # could answer the one question that separated "a rank shed a KNOWN
+                  # peer's file because nothing else could meet its target" from "a
+                  # rank could not name its peers at all". Nested, in the same style
+                  # as `disk_restore`'s `readers` block, so one key set serves every
+                  # path. `disk_spill.section()["peer_ranks"]` is the full view.
+                  "peer_eviction": _peer_eviction_block(state),
                   "queue_depth": int(state["queue_depth"]),
                   "writer_thread_alive": bool(state["thread_alive"]),
                   "spill_errors": int(state["errors"]),
@@ -3236,7 +3303,53 @@ def worker_report() -> dict:
         snapshot._error(exc, "disk_store worker report")
         return {"section": "disk", "writer": WRITER_TAG,
                 "installed": bool(_state["installed"]),
+                # THE SAME KEY SET, on the path where the counters could not be read.
+                # A reader that walks `disk.peer_eviction` in every rank file must
+                # never get a KeyError because one rank's internals raised; every
+                # field is present at its never-happened value.
+                "peer_eviction": _peer_eviction_block(None),
                 "report_error": type(exc).__name__}
+
+
+# THE BLOCK'S FIELDS, ONE TABLE: (payload key, `disk_spill` state key, default).
+# One table so the healthy path, a rank that never ran a ceiling pass and a report
+# whose counters exploded cannot ship three different shapes of the same witness.
+_PEER_EVICTION_FIELDS = (
+    ("peer_digests_live", "peer_digests_live", 0),
+    ("peer_digests_learned", "peer_digest_learned", 0),
+    ("peer_digests_unconfirmed", "peer_digests_unconfirmed", 0),
+    ("peer_digests_dropped", "peer_digests_dropped", 0),
+    ("peer_digest_sightings", "peer_digest_sightings", 0),
+    ("peer_files_planned", "peer_files_planned", 0),
+    ("peer_files_removed", "peer_files_removed", 0),
+    ("peer_files_removed_bytes", "peer_files_removed_bytes", 0),
+    ("peer_files_removed_known_peer", "peer_files_removed_known_peer", 0),
+    ("unattributable_entries_excluded", "unattributable_entries_excluded", 0),
+    ("unattributable_entries_last_pass", "unattributable_entries_last_pass", 0),
+    ("unattributable_bytes_last_pass", "unattributable_bytes_last_pass", 0),
+    ("passes_short", "ceiling_passes_short", 0),
+)
+
+
+def _peer_eviction_block(state) -> dict:
+    """THE PEER-ATTRIBUTION WITNESS FOR THE RANK FILE. Same keys on every path.
+
+    `state` is `disk_spill.counters()` or anything that is not a dict - a rank that
+    never ran a ceiling pass, or a `counters()` that raised, gets the same keys at
+    their never-happened values rather than a thinner document. The prose lives in
+    `disk_spill.section()["peer_ranks"]`, which is the version the `/disk` door
+    serves; this is the compact cross-process copy, and the byte cap of the
+    contribution seam is why it does not carry a second copy of that paragraph.
+    """
+    source = state if isinstance(state, dict) else {}
+    block: dict = {}
+    for name, key, default in _PEER_EVICTION_FIELDS:
+        raw = source.get(key, default)
+        block[name] = int(raw) if isinstance(raw, int) and not isinstance(
+            raw, bool) else default
+    block["plan_short"] = bool(source.get("ceiling_plan_short") or False)
+    block["plan_short_bytes"] = int(source.get("ceiling_plan_short_bytes") or 0)
+    return block
 
 
 def _collision_digest_list(state: dict) -> list:
@@ -3280,6 +3393,12 @@ def _degrade_report(report: dict) -> dict:
                     "armed": report["armed"],
                     "refusals_total": report["refusals_total"],
                     "files_written": report["files_written"],
+                    # THE ONE BLOCK THE TRIAGE KEEPS. It is ~13 ints, it is the
+                    # witness for an incident that cost a serving path, and dropping
+                    # it would make the byte-cap path ship a different key set from
+                    # the healthy one - the rule this file's own tests exist to hold.
+                    "peer_eviction": report.get("peer_eviction")
+                    or _peer_eviction_block(None),
                     "note": "the report exceeded the seam's byte cap"}
     return report
 

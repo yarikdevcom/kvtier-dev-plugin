@@ -622,6 +622,28 @@ _state: dict = {
     "peer_digests_unconfirmed": 0,
     "peer_digests_dropped": 0,
     "peer_files_planned": 0,
+    # THE FAIL-CLOSED EVICTION GATE (0.2.34). An UNATTRIBUTABLE file - a committed
+    # file under a digest that is not this boot's, seen while no peer digest is
+    # confirmed - is never a candidate for unlinking, so a pass can come up SHORT of
+    # its target. Both halves must be readable: what was withheld (`unattributable_
+    # entries_excluded`, a boot total, plus the last pass's reading) and what that
+    # cost (`ceiling_passes_short` / `ceiling_plan_short*`). The alternative was the
+    # cross-rank deletion incident: 15,848 removal lines of a sibling's block size,
+    # and a `file_missing` hole 19,200 tokens deep, found in the journal hours later.
+    # `peer_files_removed` is Fix 3: files this rank unlinked whose name carries a
+    # digest that is NOT its own - legitimate only when the peer was known and the
+    # plan had reached the last bucket, and the number that says so at a glance.
+    "unattributable_entries_last_pass": 0,
+    "unattributable_bytes_last_pass": 0,
+    "unattributable_entries_excluded": 0,
+    "ceiling_passes_short": 0,
+    "ceiling_plan_short": False,
+    "ceiling_plan_short_bytes": 0,
+    "ceiling_plan_short_reason": None,
+    "peer_files_removed": 0,
+    "peer_files_removed_bytes": 0,
+    "peer_files_removed_last_pass": 0,
+    "peer_files_removed_known_peer": 0,
     # THE FAIR SHARE (0.2.30): WHOSE BYTES THIS RANK IS ACCOUNTABLE FOR. Split out of
     # the one store-wide `estimated_bytes`, because that single number is what the four
     # ranks each read as "156 GiB, over my 148 GiB ceiling" and each acted on.
@@ -745,6 +767,16 @@ def reset_state_for_tests() -> None:
         "peer_digest_sightings": 0, "peer_digest_learned": 0,
         "peer_digests_live": 0, "peer_digests_unconfirmed": 0,
         "peer_digests_dropped": 0, "peer_files_planned": 0,
+        # The fail-closed gate's witnesses (0.2.34): a reset that left these behind
+        # would hand the next test a shortfall it never caused, or a withheld count
+        # that makes a clean pass look like it could not attribute its own store.
+        "unattributable_entries_last_pass": 0,
+        "unattributable_bytes_last_pass": 0,
+        "unattributable_entries_excluded": 0, "ceiling_passes_short": 0,
+        "ceiling_plan_short": False, "ceiling_plan_short_bytes": 0,
+        "ceiling_plan_short_reason": None, "peer_files_removed": 0,
+        "peer_files_removed_bytes": 0, "peer_files_removed_last_pass": 0,
+        "peer_files_removed_known_peer": 0,
         # The fair share (0.2.30). Left behind by a reset, one test's peer count would
         # hand the next test a share of 1/N it never earned, and a share that is too
         # small over-evicts - the exact defect this release exists to remove.
@@ -2084,8 +2116,17 @@ def _attribute_walk_bytes(walk: dict, peers) -> dict:
         them here as well would make two ranks shed one file's worth of pressure, and
         leaving them in the planner's entry list would let a deliberately conservative
         scaled estimate reach into a live sibling's data.
-      * anything else (a name this tier cannot classify) -> UNATTRIBUTED: counted as
-        capacity, never handed to the planner, which would only refuse it.
+      * anything else (a name this tier cannot classify, or - since 0.2.34 - a
+        committed file under a FOREIGN digest seen while NO peer digest is confirmed)
+        -> UNATTRIBUTED: counted as capacity, never handed to the planner. The second
+        case is the fail-closed gate. Such a file is either an old boot's dead bytes
+        or a live sibling's restore, and the name cannot say which while the peer map
+        is empty; the pre-0.2.34 code counted it as DEAD and shed it first, which is
+        how four ranks on one root deleted each other's live data (15,848 removal
+        lines of the sibling's block size, and a `file_missing` hole 19,200 tokens
+        deep). Its BYTES stay in `accountable_bytes` exactly as they did - they are on
+        disk and they are this rank's problem to see - only the licence to delete
+        them is gone, so the ceiling comes up SHORT and says so.
     """
     digest = _state["geometry_digest"]
     entries = [row for row in (walk.get("entries") or []) if isinstance(row, dict)]
@@ -2100,26 +2141,42 @@ def _attribute_walk_bytes(walk: dict, peers) -> dict:
                 "peer_bytes": 0, "unattributed_bytes": scaled_total,
                 "accountable_bytes": scaled_total, "peers": tuple(peers or ()),
                 "divisor": 1, "source": SHARE_SOURCE_NO_DIGEST,
-                "sheddable_entries": entries, "peer_entries": 0}
+                "sheddable_entries": entries, "peer_entries": 0,
+                # No fingerprint means the gate has no digest to compare against, so
+                # this rank claims NOTHING about who owns any file here and the
+                # planner's own `refused` classification is what stops every unlink
+                # downstream (counted there as `skipped`). Inventing an attribution
+                # here would be the guess this branch exists to avoid.
+                "unattributable_entries": 0, "unattributable_bytes": 0}
     own = dead = peer = unattributed = 0
     sheddable: list = []
     peer_entries = 0
+    unattributable_entries = 0
     for row in entries:
         size = int(row.get("size_bytes") or 0)
         name = row.get("filename") or os.path.basename(str(row.get("path") or ""))
-        kind = disk_layout.classify_name(name, digest, peers)["classification"]
-        if kind == disk_layout.NAME_CURRENT:
+        # ONE `parse_path` per entry, shared with the classification the attribution
+        # derives: the walk can hand this loop 20,000 entries inside a 1.5 s pass
+        # budget, and a redundant parse of a name is ~80 ms of that budget spent on
+        # nothing. `attribute_name` asks `classify_name` the read-question and adds
+        # the eviction-question on top of it, so this is one call, not two verdicts
+        # that could disagree.
+        owner = disk_layout.attribute_name(
+            name, digest, peers,
+            parsed=disk_layout.parse_path(name))["attribution"]
+        if owner == disk_layout.ATTRIBUTION_OWN:
             own += size
             sheddable.append(row)
-        elif kind in (disk_layout.NAME_STALE_GEOMETRY,
-                      disk_layout.NAME_STALE_KEY_SHAPE):
+        elif owner == disk_layout.ATTRIBUTION_DEAD:
             dead += size
             sheddable.append(row)
-        elif kind == disk_layout.NAME_PEER_RANK:
+        elif owner == disk_layout.ATTRIBUTION_PEER:
             peer += size
             peer_entries += 1
         else:
+            # THE GATE'S OWN BUCKET: counted as capacity, never handed to the planner.
             unattributed += size
+            unattributable_entries += 1
     return {"attributed": True,
             "own_bytes": _scale_to_store(own, used, scaled_total),
             "dead_bytes": _scale_to_store(dead, used, scaled_total),
@@ -2129,7 +2186,15 @@ def _attribute_walk_bytes(walk: dict, peers) -> dict:
                                                  scaled_total),
             "peers": tuple(peers or ()), "divisor": 1 + len(peers or ()),
             "source": SHARE_SOURCE_PEERS if peers else SHARE_SOURCE_NO_PEERS,
-            "sheddable_entries": sheddable, "peer_entries": int(peer_entries)}
+            "sheddable_entries": sheddable, "peer_entries": int(peer_entries),
+            # THE GATE'S WITNESS, in the same scaled currency as the byte buckets
+            # above: how many files this rank could have shed and deliberately did
+            # not, and what they were worth. `unattributed_bytes` above already
+            # carries the bytes; this is the ENTRY COUNT, which is what a plan that
+            # came up short needs an operator to be able to see.
+            "unattributable_entries": int(unattributable_entries),
+            "unattributable_bytes": _scale_to_store(unattributed, used,
+                                                    scaled_total)}
 
 
 def _share_of_ceiling(ceiling, divisor: int, source: str) -> dict:
@@ -2607,12 +2672,60 @@ def _owner_of_name(path, peers) -> str:
     return "unattributed"
 
 
+def _foreign_digest_of(path):
+    """The geometry digest in this name, if it is NOT this rank's. Else None.
+
+    THE ATTRIBUTIBILITY OF ONE REMOVAL. The question a reader of the journal cannot
+    answer from a `-` line: a removal by rank A of a file whose digest is rank B's is
+    the event that leaves the index claiming an identity that physically exists only
+    under somebody else's name, and after it happens the next restore hits a
+    `file_missing` hole in the middle of a prefix. So the tier counts it, in a
+    counter, on the thread that did the deleting - not as a log line a busy fill test
+    would drown, and NOT as a change to the journal's wire format, whose five fields
+    (`seq op key16 size group`) the restore index parses and which no reader can
+    grow mid-flight. Name-only: one parse, no syscall. None means "this name is this
+    boot's, carries no digest, or could not be read" - a bookkeeping helper never
+    invents a foreign digest out of a parse it could not finish.
+    """
+    try:
+        parsed = disk_layout.parse_path(os.path.basename(str(path or "")))
+        seen = parsed.get("geometry_digest")
+        own = _state["geometry_digest"]
+    except Exception:  # noqa: BLE001 - a bookkeeping helper never breaks a pass
+        return None
+    if not isinstance(seen, str) or not seen:
+        return None
+    if not isinstance(own, str) or not own:
+        return None
+    lowered = seen.lower()
+    return None if lowered == own.lower() else lowered
+
+
+def _peer_digest_set(peers) -> set:
+    """The confirmed live peer digests, lower-cased, as a set. Never raises."""
+    try:
+        return {str(digest).lower() for digest in (peers or ())}
+    except Exception:  # noqa: BLE001 - a bookkeeping helper never breaks a pass
+        return set()
+
+
 def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     """One enforcement pass: walk, decide, shed. Deadline-aware, partial by design.
 
     Split out of `_enforce_ceiling` so the deadline bookkeeping has exactly one owner
     (the caller's `finally`) and this body reads as the three steps it performs.
     """
+    # THE LAST PASS'S GATE WITNESS starts empty. These are per-pass readings, and a
+    # value left over from the pass before would be read as this one's - including
+    # the two early returns below, which make no decision at all and so must report
+    # neither a shortfall nor a withheld set.
+    _state["peer_files_planned"] = 0
+    _state["peer_files_removed_last_pass"] = 0
+    _state["unattributable_entries_last_pass"] = 0
+    _state["unattributable_bytes_last_pass"] = 0
+    _state["ceiling_plan_short"] = False
+    _state["ceiling_plan_short_bytes"] = 0
+    _state["ceiling_plan_short_reason"] = None
     walk = _walk_store(root, deadline=deadline)
     if not walk["ok"]:
         _state["last_reason"] = str(walk["reason"])[:MAX_STRING_CHARS]
@@ -2661,6 +2774,18 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     _apply_attribution(attribution, decision_bytes, share)
     _state["peer_entries_excluded"] = int(_state["peer_entries_excluded"]) + int(
         attribution["peer_entries"])
+    # THE GATE'S OUTCOME, published before any decision is made about it: how many
+    # shed candidates this rank withheld because it could not attribute them, and what
+    # they were worth. A boot total AND a last-pass reading, because "one unlucky
+    # pass" and "this rank has been blind for an hour" are different facts and the
+    # operator has to be able to tell them apart from one read of one rank file.
+    withheld = int(attribution["unattributable_entries"])
+    withheld_bytes = int(attribution["unattributable_bytes"])
+    _state["unattributable_entries_last_pass"] = withheld
+    _state["unattributable_bytes_last_pass"] = withheld_bytes
+    if withheld:
+        _state["unattributable_entries_excluded"] = int(
+            _state["unattributable_entries_excluded"]) + withheld
     # Publish HOW the decision was made, not just what it was. A reader of
     # `estimated_bytes` must be able to tell "the store is 170 GiB" from "I stat-ed
     # 20,000 of 29,532 files and extrapolated 170 GiB from them": see `section()`.
@@ -2694,19 +2819,63 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
         ceiling_bytes=int(share["share_bytes"]), used_bytes=accountable,
         target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers)
     _state["plan_truncated"] = bool(plan.get("truncated"))
+    # The planner ran the same gate over the entries it was handed, so it normally
+    # reports nothing further to withhold (the attribution already filtered them).
+    # Adding the two is exact and never double-counts: whichever half removed an
+    # entry is the half that counted it, and a caller that handed the planner an
+    # unfiltered list would still see its exclusions here.
+    plan_excluded = int(plan.get("excluded_unattributable") or 0)
+    if plan_excluded:
+        _state["unattributable_entries_excluded"] = int(
+            _state["unattributable_entries_excluded"]) + plan_excluded
+        _state["unattributable_entries_last_pass"] = int(
+            _state["unattributable_entries_last_pass"]) + plan_excluded
     if not plan["ok"] or not plan["paths"]:
         # Over its share and nothing it is ALLOWED to shed: a different fact from the
         # decline above, and the one case where the filesystem floor (`MIN_FREE_BYTES`,
         # refusal `no_free_space`) is the control that keeps the box alive. Counted, and
         # said, because "the tier wanted to shed and could not" must never be quiet.
+        # Since 0.2.34 this is also the shape a BLIND rank takes on a store full of
+        # siblings: short by design, over the ceiling by design, and loud.
         _state["ceiling_passes_nothing_sheddable"] = (
             int(_state["ceiling_passes_nothing_sheddable"]) + 1)
         why = str(plan.get("reason") or "no evictable entry named")[:96]
+        _state["ceiling_plan_short"] = True
+        _state["ceiling_plan_short_bytes"] = max(0, accountable - target)
+        # LEADS WITH THE GATE, because this string is stored bounded: a reason whose
+        # first 150 characters are arithmetic and whose explanation is the tail is a
+        # reason that reads as "nothing was evictable" when the truth is "nothing was
+        # ALLOWED". The arithmetic follows the explanation, never precedes it.
+        # THE COUNT IS THE ATTRIBUTION'S, not the planner's: `_attribute_walk_bytes`
+        # already withheld these entries, so the plan it was handed reports none. A
+        # reason that quoted the planner here would say "0 file(s) withheld" over a
+        # payload field saying 2 - the one thing this sentence exists to prevent.
+        _state["ceiling_plan_short_reason"] = (
+            f"UNATTRIBUTABLE: {int(_state['unattributable_entries_last_pass'])} "
+            "file(s) withheld (no peer digest confirmed), so the plan named "
+            f"nothing and came up short by {max(0, accountable - target)} byte(s)"
+        )[:MAX_STRING_CHARS]
+        _state["ceiling_passes_short"] = int(_state["ceiling_passes_short"]) + 1
         _state["last_reason"] = (
             f"over the {target}-byte share by {accountable - target} byte(s) but the "
             f"plan named nothing: {why}")[:MAX_STRING_CHARS]
         return
     _state["peer_files_planned"] = int(plan.get("peer_rank") or 0)
+    if plan.get("short"):
+        # THE SHORT PLAN. It shed what it was allowed to shed and is still over its
+        # share, because the rest of the store belongs to names it cannot prove are
+        # its own to delete. That is the intended failure mode: the ceiling is
+        # exceeded, spilling back-pressures, and `last_reason` says which count was
+        # withheld and why. Not an error, not a raise, never a silent no-op.
+        _state["ceiling_plan_short"] = True
+        _state["ceiling_plan_short_bytes"] = int(plan.get("short_by_bytes") or 0)
+        _state["ceiling_plan_short_reason"] = (
+            f"UNATTRIBUTABLE: {int(_state['unattributable_entries_last_pass'])} "
+            "file(s) withheld (no peer digest confirmed), so the plan shed "
+            f"{int(plan.get('planned') or 0)} file(s) and came up short by "
+            f"{int(plan.get('short_by_bytes') or 0)} byte(s)")[:MAX_STRING_CHARS]
+        _state["ceiling_passes_short"] = int(_state["ceiling_passes_short"]) + 1
+        _state["last_reason"] = _state["ceiling_plan_short_reason"]
     by_directory: dict = {}
     for path in plan["paths"]:
         by_directory.setdefault(os.path.dirname(path), []).append(path)
@@ -2724,6 +2893,7 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # a byte shed from a live sibling (which the plan can no longer name) would show up
     # here as a fact rather than as a silent miscount.
     freed_by_owner = {"own": 0, "dead": 0, "peer": 0, "unattributed": 0}
+    peer_set = _peer_digest_set(peers)
     for directory, done in reports:
         # COLLECTION, on the spill thread, in submission order. This is where every
         # counter and every journal write happens, so the removal journal is written in
@@ -2743,15 +2913,42 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
             outcome = action.get("action")
             if outcome == "unlinked":
                 unlinked += 1
-                freed_by_owner[_owner_of_name(action.get("path"), peers)] += int(
-                    action.get("size_bytes") or 0)
+                removed_size = int(action.get("size_bytes") or 0)
+                freed_by_owner[_owner_of_name(action.get("path"), peers)] += (
+                    removed_size)
+                # FIX 3: THE REMOVAL'S OWNER, COUNTED. A `-` line in the journal says
+                # an identity left the store; it cannot say whose FILE that was, and
+                # the difference is the whole cross-rank question (rank A removing a
+                # file named under rank B's digest is what leaves the index offering
+                # an identity that exists nowhere). So the tier counts it here, per
+                # pass and per boot, instead of leaving the next reader to grep
+                # 15,848 lines and compare block sizes by hand. `peer_files_removed`
+                # with a non-zero `peer_files_planned` is the legitimate case (a
+                # KNOWN peer's bucket, reached because nothing else could meet the
+                # target); `peer_files_removed` with the plan short of its target is
+                # the case to look at.
+                foreign = _foreign_digest_of(action.get("path"))
+                if foreign is not None:
+                    _state["peer_files_removed"] = int(
+                        _state["peer_files_removed"]) + 1
+                    _state["peer_files_removed_bytes"] = int(
+                        _state["peer_files_removed_bytes"]) + removed_size
+                    _state["peer_files_removed_last_pass"] = int(
+                        _state["peer_files_removed_last_pass"]) + 1
+                    if foreign in peer_set:
+                        # THE UNAMBIGUOUS ONE. `peer_files_removed` also counts an
+                        # old boot's geometry, which may well be this same rank's own
+                        # predecessor; this counter has no such ambiguity - the digest
+                        # belonged to a rank this walk believed LIVE at the moment the
+                        # file was deleted. Non-zero is the incident signature.
+                        _state["peer_files_removed_known_peer"] = int(
+                            _state["peer_files_removed_known_peer"]) + 1
                 # EVERY file this plan actually deleted is journalled, so the
                 # scheduler's index stops offering it within one refresh. Without this
                 # half the journal the index would keep offering files whose bytes the
                 # ceiling already reclaimed - the one direction of index error that
                 # costs a reported load failure instead of a plain recompute.
-                _journal_write(action.get("path"),
-                               int(action.get("size_bytes") or 0), removal=True)
+                _journal_write(action.get("path"), removed_size, removal=True)
             elif outcome in ("refused", "gone", "error"):
                 failed += 1
     freed = sum(int(row["counts"].get("planned_bytes") or 0)
@@ -2798,6 +2995,22 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     _state["estimated_unattributed_bytes"] = max(
         0, int(_state["estimated_unattributed_bytes"])
         - freed_by_owner["unattributed"])
+    if int(_state["peer_files_removed_last_pass"]) and not _state[
+            "ceiling_plan_short"]:
+        # THE CROSS-RANK REMOVAL, IN WORDS. A legitimate pass (it reached bucket 2
+        # with its peers KNOWN and its own files gone) still deserves one sentence in
+        # `last_reason`: this is the one eviction outcome that can surprise an
+        # operator reading a single rank file, and the counter alone does not say
+        # "known peer" from "we were somehow blind". A short plan already overwrites
+        # `last_reason` with its own, more urgent sentence, which names the withheld
+        # count - so do not clobber it here.
+        _state["last_reason"] = (
+            f"this pass removed {int(_state['peer_files_removed_last_pass'])} "
+            f"file(s) whose geometry digest is NOT this rank's "
+            f"(peer_files_removed={int(_state['peer_files_removed'])} since boot, "
+            f"{int(_state['peer_files_removed_bytes'])} byte(s)); the plan had "
+            f"{int(_state['peer_files_planned'])} of them as known-peer bucket "
+            "entries")[:MAX_STRING_CHARS]
 
 
 def _capacity_visible(parsed: dict) -> bool:
@@ -3604,21 +3817,70 @@ def section() -> dict:
             "decisions_without_peers": int(_state["peer_digests_unconfirmed"]),
             "files_planned_last_pass": int(_state["peer_files_planned"]),
             "peer_digests_dropped": int(_state["peer_digests_dropped"]),
+            # THE FAIL-CLOSED GATE'S OWN OUTCOME (0.2.34), beside the peer map it
+            # depends on: what was WITHHELD because it could not be attributed, and
+            # whether the plan therefore came up SHORT of its target.
+            "unattributable_entries_last_pass": int(
+                _state["unattributable_entries_last_pass"]),
+            "unattributable_bytes_last_pass": int(
+                _state["unattributable_bytes_last_pass"]),
+            "unattributable_entries_excluded": int(
+                _state["unattributable_entries_excluded"]),
+            "plan_short": bool(_state["ceiling_plan_short"]),
+            "plan_short_bytes": int(_state["ceiling_plan_short_bytes"]),
+            "plan_short_reason": _state["ceiling_plan_short_reason"],
+            "passes_short": int(_state["ceiling_passes_short"]),
+            # FIX 3: THE ATTRIBUTIBLE REMOVAL. Files this rank unlinked whose name
+            # carries a digest that is NOT its own - the count that answers, in one
+            # read, the question a `-` journal line cannot answer at all. Named for
+            # what it means to a reader: with the gate in place this is only ever
+            # reachable through the KNOWN-peer bucket, so every one of these is a
+            # cross-rank removal.
+            "peer_files_removed": int(_state["peer_files_removed"]),
+            "peer_files_removed_bytes": int(_state["peer_files_removed_bytes"]),
+            "peer_files_removed_last_pass": int(
+                _state["peer_files_removed_last_pass"]),
+            # THE UNAMBIGUOUS CASE: the digest belonged to a rank this walk believed
+            # LIVE. `peer_files_removed` can also name this rank's OWN older geometry,
+            # which is not a cross-rank removal at all; this one cannot lie.
+            "peer_files_removed_known_peer": int(
+                _state["peer_files_removed_known_peer"]),
             "fresh_seconds": PEER_DIGEST_FRESH_SECONDS,
             "min_sightings": PEER_DIGEST_MIN_SIGHTINGS,
             "peer_digest_cap": MAX_PEER_DIGESTS,
             "note": ("`live_digests` are foreign digests whose committed files are "
                      "being written now, so their files shed LAST instead of first. "
                      "`decisions_without_peers` counts the ceiling decisions taken "
-                     "with none known, which is the pre-0.2.29 behaviour (foreign "
-                     "first) and the fail-safe direction: it never means unable to "
-                     "evict, because this rank's own files always remain sheddable."),
+                     "with none known - and since 0.2.34 that is NOT a licence to "
+                     "shed a foreign digest first: with no peer confirmed, a "
+                     "committed file under a digest that is not this rank's is "
+                     "UNATTRIBUTABLE, is withheld from the destructive set "
+                     "(`unattributable_entries_last_pass`, "
+                     "`unattributable_entries_excluded`) and the plan is allowed to "
+                     "come up SHORT (`plan_short`, `plan_short_bytes`, "
+                     "`passes_short`). Exceeding the ceiling is the intended "
+                     "consequence: spilling back-pressures and an operator can act, "
+                     "while deleting a sibling's live restore corrupts a serving path "
+                     "in silence. `peer_files_removed` is the attributable "
+                     "removal - files this rank unlinked under ANOTHER rank's digest, "
+                     "legitimate only beside a non-zero `files_planned_last_pass`. "
+                     "This rank's own files and the bytes positively claimed by no "
+                     "live rank stay sheddable whatever the map says, so a single-rank "
+                     "box never comes up short for want of a peer."),
             "units": disk_layout._units("live_digests", "learned_digests",
                                         "foreign_files_seen",
                                         "decisions_without_peers",
                                         "files_planned_last_pass",
                                         "peer_digests_dropped", "fresh_seconds",
-                                        "min_sightings", "peer_digest_cap"),
+                                        "min_sightings", "peer_digest_cap",
+                                        "unattributable_entries_last_pass",
+                                        "unattributable_bytes_last_pass",
+                                        "unattributable_entries_excluded",
+                                        "plan_short_bytes", "passes_short",
+                                        "peer_files_removed",
+                                        "peer_files_removed_bytes",
+                                        "peer_files_removed_last_pass",
+                                        "peer_files_removed_known_peer"),
         },
         "evict_pool": {
             "evict_threads_requested": _state["evict_threads_requested"],

@@ -1076,14 +1076,85 @@ def test_the_target_is_hysteresis_not_the_ceiling_itself():
     assert at_the_line["target_bytes"] == 90
 
 
-def test_a_file_this_boot_cannot_read_is_shed_before_our_own():
+def test_a_foreign_digest_with_no_peer_confirmed_is_withheld_and_the_plan_is_short():
+    """THE 0.2.34 GATE, at the planner. THE DOCTRINE THIS RENAMES.
+
+    This test used to read `test_a_file_this_boot_cannot_read_is_shed_before_our_own`
+    and to assert the foreign file was the one planned. That assertion is the bug: a
+    committed file under a digest that is not this boot's is NOT knowable as dead
+    capacity while no peer digest is confirmed, and four ranks on one root all run
+    this same plan - so the cheapest file to delete was always a sibling's live,
+    loadable restore (15,848 removal lines of 11,468,800 bytes in the persistent
+    journal, and a `file_missing` hole that cost 19,200 tokens of recompute).
+    Unattributable bytes no longer buy capacity: the plan takes this boot's own file
+    and says it came up SHORT.
+    """
     foreign = digest(total_bytes_per_block=PP1_BYTES)
     plan = dl.lru_eviction_plan(
         entries(("ours", 100, 1), ("foreign", 100, 9999, foreign)),
-        geometry_digest=digest(), ceiling_bytes=150, used_bytes=200)
+        geometry_digest=digest(), ceiling_bytes=100, used_bytes=200)
+    assert plan["peers_unconfirmed"] is True
+    assert plan["excluded_unattributable"] == 1
+    assert plan["excluded_unattributable_bytes"] == 100
+    assert plan["planned"] == 1
+    assert "ours" in plan["paths"][0], "an unattributable name is never the shed"
+    # 200 measured, a 90-byte target, 100 own bytes shed: still 10 over, because the
+    # other 100 belongs to a name this rank cannot prove is its own to delete.
+    assert plan["short"] is True and plan["short_by_bytes"] == 10
+    assert "UNATTRIBUTABLE" in (plan["reason"] or "")
+
+
+def test_a_foreign_digest_no_confirmed_peer_claims_is_still_dead_capacity():
+    """The gate is about BLINDNESS, not about foreign digests.
+
+    A non-empty `peer_digests` IS the claim "these are the live ranks on this root",
+    so a digest outside it is positively nobody's and keeps shedding FIRST. Without
+    this, a store of old boots' geometry becomes unsheddable and the ceiling becomes
+    a comment - the failure direction this gate must never open.
+    """
+    foreign = digest(total_bytes_per_block=PP1_BYTES)
+    sibling = digest(rank="PP1_TP1")
+    plan = dl.lru_eviction_plan(
+        entries(("ours", 100, 1), ("foreign", 100, 9999, foreign)),
+        geometry_digest=digest(), ceiling_bytes=150, used_bytes=200,
+        peer_digests=(sibling,))
+    assert plan["peers_unconfirmed"] is False
+    assert plan["excluded_unattributable"] == 0
     assert plan["stale_first"] == 1
     assert plan["planned"] == 1
-    assert "foreign" in plan["paths"][0] or plan["entries"][0]["mtime_ns"] == 9999
+    assert "foreign" in plan["paths"][0]
+    assert plan["short"] is False
+
+
+def test_an_unattributable_name_is_never_planned_even_when_it_is_all_there_is():
+    """A plan of nothing, named. The short plan must not read as a success."""
+    foreign = digest(total_bytes_per_block=PP1_BYTES)
+    plan = dl.lru_eviction_plan(entries(("foreign", 200, 1, foreign)),
+                                geometry_digest=digest(), ceiling_bytes=150,
+                                used_bytes=200)
+    assert plan["needed"] is True
+    assert plan["planned"] == 0 and plan["paths"] == []
+    assert plan["excluded_unattributable"] == 1
+    assert plan["short"] is True
+    assert plan["short_by_bytes"] == 65           # 200 used against a 135-byte target
+    assert "nothing is sheddable" in plan["reason"]
+
+
+def test_the_plan_ships_the_same_keys_whether_it_planned_something_or_not():
+    """The gate's fields are a stable key set, or a reader cannot read them."""
+    foreign = digest(total_bytes_per_block=PP1_BYTES)
+    rows = entries(("ours", 100, 1), ("foreign", 100, 9999, foreign))
+    under = dl.lru_eviction_plan(rows, geometry_digest=digest(),
+                                 ceiling_bytes=10_000, used_bytes=200)
+    planned = dl.lru_eviction_plan(rows, geometry_digest=digest(),
+                                   ceiling_bytes=150, used_bytes=200)
+    gate = {"excluded_unattributable", "excluded_unattributable_bytes",
+            "peers_unconfirmed", "short", "short_by_bytes"}
+    assert gate <= set(under) and gate <= set(planned)
+    assert (set(under) - {"entries"}) == (set(planned) - {"entries"})
+    for key in ("excluded_unattributable", "excluded_unattributable_bytes",
+                "short_by_bytes"):
+        assert under["units"][key] != "unknown", key
 
 
 def test_a_malformed_or_foreign_name_is_skipped_and_never_planned():

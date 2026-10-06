@@ -39,8 +39,10 @@ WHAT EACH TEST OWNS, in order of what a regression costs:
 * the operator's own request as a behaviour: an older file that was READ survives a
   newer file that was only WRITTEN. That one fails without Item 1.
 * a known peer's live file is not the first thing shed; and when the peer digest
-  cannot be confirmed, today's behaviour is preserved and COUNTED (the fail-safe
-  direction is "sheds like before", never "cannot evict").
+  cannot be confirmed the foreign file is WITHHELD as unattributable and the withheld
+  count is published (0.2.34 - the fail-safe direction used to be "sheds like
+  before", and on a shared root that meant four ranks deleting each other's live
+  restores; the ceiling is now allowed to come up SHORT instead).
 * the deadline truncates, releases bytes, marks itself, and never half-applies a
   plan or strands a deleted file without its journal record.
 * the pool changes which thread unlinks and nothing else: same files, same bytes,
@@ -461,7 +463,15 @@ def test_the_span_that_was_read_survives_the_span_that_was_only_written(tier,
 
 def test_the_planner_sheds_our_own_files_before_a_named_peer_and_says_so():
     """The comparator, as a pure function: naming a peer digest moves that digest's
-    files from "shed first" to "shed last", and the plan reports the difference."""
+    files from "shed first" to "shed last", and the plan reports the difference.
+
+    SINCE 0.2.34 the BLIND half of this test has a different answer, and the answer
+    is the fix: with no peer digest confirmed the foreign file is not the cheapest
+    thing to delete, it is UNATTRIBUTABLE and is withheld - so this boot's own cold
+    file is what pays, exactly as it does when the peer is known. The old assertion
+    (`blind["paths"] == [peer.bin]`, commented "fail-safe") is the rule that deleted
+    a sibling's live restore in production.
+    """
     rows = [
         {"path": f"/store/{SHARD}/ours.bin",
          "filename": disk_layout.build_slot_name(slot_key(21), OWN_GEO)["filename"],
@@ -473,9 +483,12 @@ def test_the_planner_sheds_our_own_files_before_a_named_peer_and_says_so():
     blind = disk_layout.lru_eviction_plan(rows, geometry_digest=OWN_GEO,
                                           ceiling_bytes=9_000, used_bytes=8_192)
     assert blind["planned"] == 1
-    assert blind["paths"] == ["/store/0a/peer.bin"], \
-        "with no peer digests the foreign one still goes first (fail-safe)"
-    assert blind["stale_first"] == 1
+    assert blind["paths"] == ["/store/0a/ours.bin"], \
+        "an unattributable foreign file is never the shed, peer-blind or not"
+    assert blind["peers_unconfirmed"] is True
+    assert blind["excluded_unattributable"] == 1
+    assert blind["excluded_unattributable_bytes"] == SLOT_BYTES
+    assert blind["stale_first"] == 0
     assert blind["peer_rank"] == 0
 
     informed = disk_layout.lru_eviction_plan(rows, geometry_digest=OWN_GEO,
@@ -484,6 +497,9 @@ def test_the_planner_sheds_our_own_files_before_a_named_peer_and_says_so():
     assert informed["planned"] == 1
     assert informed["paths"] == ["/store/0a/ours.bin"], \
         "a live sibling's file must not be preferred over this boot's own"
+    assert informed["peers_unconfirmed"] is False
+    assert informed["excluded_unattributable"] == 0, \
+        "a known peer stays attributed, and so sheddable as a last resort"
     assert informed["stale_first"] == 0
     assert informed["peer_rank"] == 0
 
@@ -527,20 +543,25 @@ def test_a_known_peers_live_file_is_not_the_first_thing_shed(tier, channel):
     assert journalled_removals(channel) == [key16_of(ours)]
 
 
-def test_a_digest_that_cannot_be_confirmed_keeps_todays_behaviour_and_is_counted(
-        tier, channel):
-    """THE FAIL-SAFE DIRECTION, pinned.
+def test_a_digest_that_cannot_be_confirmed_is_withheld_and_counted(tier, channel):
+    """THE FAIL-SAFE DIRECTION, REVERSED (0.2.34), and still COUNTED.
 
-    A foreign digest nobody can confirm is treated exactly as 0.2.28 treated it: shed
-    first. Being unable to identify a sibling must NEVER mean being unable to release
-    capacity - the store still has to come down under its ceiling - and the fact that
-    this rank was blind is COUNTED rather than left as a silence.
+    This test used to pin the opposite: "an unconfirmable foreign digest still sheds
+    first: the old behaviour", reasoned that being unable to identify a sibling must
+    never mean being unable to release capacity. On a box where four ranks share one
+    root, that reasoning is what deleted each other's live restores - the persistent
+    journal's 15,848 removal lines of 11,468,800 bytes recorded by ranks that were not
+    the writer. A direction that costs a serving path is not the fail-safe one. So:
+    this rank's own file pays for the ceiling, the stranger's files stay, the withheld
+    count is published, and a ceiling that cannot be met comes up SHORT (pinned
+    end-to-end in `tests/test_unattributable_eviction_fail_closed.py`).
     """
     root = tier["root"]
     now = time.time()
     ours = make_file(root, OWN_GEO, 41, when=now - 10_000.0)
     # Old enough that "somebody is writing this digest now" is not a claim the walk
-    # can honestly make: an hour, against a 120 s freshness window.
+    # can honestly make: an hour, against a 120 s freshness window. Since 0.2.34 the
+    # consequence of that honesty is "do not touch", not "delete first".
     dead = make_file(root, PEER_GEO, 42, when=now - 3_600.0, group=4)
     dead_b = make_file(root, PEER_GEO, 43, when=now - 3_601.0, group=5)
 
@@ -553,32 +574,45 @@ def test_a_digest_that_cannot_be_confirmed_keeps_todays_behaviour_and_is_counted
     assert peers["decisions_without_peers"] >= 1, \
         "a ceiling decision taken blind to its peers must be counted"
     assert peers["foreign_files_seen"] >= 2, peers
+    assert peers["unattributable_entries_last_pass"] == 2, peers
+    assert peers["unattributable_entries_excluded"] == 2, peers
+    assert peers["peer_files_removed"] == 0, \
+        "nothing this rank deleted may carry a digest that is not its own"
 
-    assert not os.path.exists(dead) or not os.path.exists(dead_b), \
-        "an unconfirmable foreign digest still sheds first: the old behaviour"
-    assert os.path.exists(ours), \
-        "and it is still NOT this boot's own file that pays for being blind"
+    assert os.path.exists(dead) and os.path.exists(dead_b), \
+        "an unattributable foreign digest is NEVER the thing that buys capacity"
+    assert not os.path.exists(ours), \
+        "and it is this boot's own file that pays for being blind"
+    assert journalled_removals(channel) == [key16_of(ours)]
 
 
 def test_a_single_sighting_is_not_enough_to_call_a_digest_live(tier, channel):
     """One stray recent file is an anomaly, not a fleet member.
 
-    Without the two-sighting floor a single fresh file left behind by some other boot
-    would make its whole digest un-sheddable-as-stale, which is the direction that can
-    stop a ceiling from being a ceiling.
+    The two-sighting floor still stands, and since 0.2.34 it is no longer the
+    mechanism that decides what gets DELETED: an unconfirmed digest's committed files
+    are withheld as unattributable, so refusing to believe one stray file is a live
+    sibling can no longer turn a stranger's restore into the cheapest shed. What the
+    floor still decides is whether that digest is NAMED a live peer - which is what
+    gives it its own share of the ceiling (`n_effective`) and its files' shed-last
+    position - rather than having its bytes counted with the unattributable ones.
     """
     root = tier["root"]
     now = time.time()
     ours = make_file(root, OWN_GEO, 51, when=now - 10_000.0)
     stray = make_file(root, PEER_GEO, 52, when=now - 1.0, group=4)
 
-    set_ceiling(8_500)                     # 8,192 used... under the 7,650 target? no:
-    disk_spill._state["estimated_bytes"] = 8_500   # 8,192 > 7,650, so exactly one goes
+    set_ceiling(8_500)                     # 8,192 used against a 7,650 target: one
+    disk_spill._state["estimated_bytes"] = 8_500   # file goes, and it is our own
     disk_spill._enforce_ceiling()
 
-    assert disk_spill.section()["peer_ranks"]["live_digests"] == 0
-    assert os.path.exists(ours), "the stray foreign file is still the cheapest shed"
-    assert not os.path.exists(stray)
+    peers = disk_spill.section()["peer_ranks"]
+    assert peers["live_digests"] == 0, "one sighting is not a fleet"
+    assert peers["unattributable_entries_last_pass"] == 1, peers
+    assert peers["peer_files_removed"] == 0, peers
+    assert os.path.exists(stray), \
+        "an unconfirmed digest's committed file is withheld, not shed"
+    assert not os.path.exists(ours), "and this boot's own file meets the target"
 
 
 # ===========================================================================

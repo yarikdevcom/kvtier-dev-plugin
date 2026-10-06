@@ -249,22 +249,60 @@ EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
 
 # THE SHED ORDER, as data (see `lru_eviction_plan`). LOWER SHEDS FIRST.
 #
-# 0 - bytes that are pure capacity: a digest this boot can never read (a stale
-#     geometry, including an in-flight `.part`) or the pre-group key shape whose
-#     group is unattributable. Nobody can load them; deleting them costs nothing.
+# 0 - bytes that are POSITIVELY nobody's: a digest this boot can never read AND that
+#     no live rank claims (a stale geometry, including an in-flight `.part`) or the
+#     pre-group key shape whose group is unattributable. Nobody can load them;
+#     deleting them costs nothing.
 # 1 - this boot's own committed files, oldest touch first.
 # 2 - a LIVE PEER RANK's files: readable, loadable data belonging to a sibling that
 #     shares this root. Reachable only when buckets 0 and 1 could not reach the
 #     target, because every rank on the box runs this same plan and a rule that put
 #     a peer's file first meant each rank preferred its three peers' hottest spans
 #     over its own cold ones - a mutual-destruction loop, not an LRU.
+# 3 - anything this table does not name. It used to be 0, and 0 was the bug.
 #
-# A classification absent from this table sheds FIRST (the `.get` default): the
-# unknown-digest case is the pre-0.2.29 behaviour, and the fail-safe direction of
-# this feature is "still able to release capacity", never "unable to evict".
+# THE 0.2.34 REVISION, and why the old fail-safe direction was the wrong one. This
+# comment used to read "a classification absent from this table sheds FIRST: the
+# fail-safe direction of this feature is 'still able to release capacity', never
+# 'unable to evict'". That is the sentence that deleted a sibling's live restore in
+# production. `classify_name` CANNOT distinguish "a digest nobody can read" from "a
+# digest I have not learned belongs to a live sibling" - with an empty `peer_digests`
+# the second case answers `stale_geometry`, so bucket 0 was the bucket a blind rank
+# filled first, and the fail-open default made blindness equal "delete the peers
+# first". The persistent journal holds 15,848 removal lines of 11,468,800 bytes
+# written by ranks that were not the writer of that block size; the production cost
+# was a `file_missing` hole in the middle of a restored prefix and 19,200 tokens
+# recomputed. The fail-safe direction of a SHARED store is the other way round: an
+# UNATTRIBUTABLE name must never buy you capacity (`attribute_name`, and the gate in
+# `lru_eviction_plan`). Exceeding a ceiling costs a spill refusal and a filesystem
+# that the operator can see; deleting a sibling's live data silently corrupts a
+# serving path. A name this module cannot classify is now the LAST thing in the
+# queue, consistent with the malformed-name doctrine above: reported, never deleted.
 SHED_ORDER_BY_CLASSIFICATION = {NAME_STALE_GEOMETRY: 0, NAME_STALE_KEY_SHAPE: 0,
                                 NAME_CURRENT: 1, NAME_PEER_RANK: 2}
-SHED_ORDER_UNKNOWN = 0
+SHED_ORDER_UNKNOWN = 3
+
+# WHO A NAME CAN BE POSITIVELY ATTRIBUTED TO (0.2.34). A second question, asked
+# after `classify_name`, with the peer map in hand - because `classify_name` answers
+# "could THIS BOOT read it?" and that is not the question an evictor needs. A closed
+# vocabulary, so a payload reader can enumerate it:
+#   own            - the digest is this boot's. This rank wrote it, or would write it.
+#   dead           - positively nobody's: an in-flight `.part` (never a committed
+#                    file, so never a restore), the pre-group key shape (ours by
+#                    lineage, unattributable by group, unloadable by any boot), or a
+#                    digest no live rank claims while this rank's peer map is
+#                    CONFIRMED (non-empty).
+#   peer           - positively a known live sibling's. Shed last, never first.
+#   unattributable - a committed file under a digest that is not this boot's, seen
+#                    while NO peer digest is confirmed. It is either an old boot's
+#                    dead bytes or a live sibling's hottest restore, and the name
+#                    alone cannot tell them apart. NEVER a candidate for unlinking.
+ATTRIBUTION_OWN = "own"
+ATTRIBUTION_DEAD = "dead"
+ATTRIBUTION_PEER = "peer"
+ATTRIBUTION_UNATTRIBUTABLE = "unattributable"
+ATTRIBUTIONS = (ATTRIBUTION_OWN, ATTRIBUTION_DEAD, ATTRIBUTION_PEER,
+                ATTRIBUTION_UNATTRIBUTABLE)
 
 # Directory states. A missing directory and an unreadable one are different facts
 # and are never collapsed into "no files".
@@ -407,6 +445,24 @@ UNITS_BY_NAME = {
     "min_sightings": "files",
     "peer_digest_cap": "digests",
     "files_planned_last_pass": "files",
+    # THE FAIL-CLOSED EVICTION GATE (0.2.34): what was WITHHELD because it could not
+    # be attributed, and the shortfall that buying no capacity therefore costs. Both
+    # a per-pass reading and a boot total, because "this pass came up short" and
+    # "this rank has come up short 400 times" are different facts.
+    "excluded_unattributable": "files",
+    "excluded_unattributable_bytes": "bytes",
+    "short_by_bytes": "bytes",
+    "unattributable_entries": "files",
+    "unattributable_bytes": "bytes",
+    "unattributable_entries_last_pass": "files",
+    "unattributable_entries_excluded": "files",
+    "unattributable_bytes_last_pass": "bytes",
+    "peer_files_removed": "files",
+    "peer_files_removed_bytes": "bytes",
+    "peer_files_removed_last_pass": "files",
+    "peer_files_removed_known_peer": "files",
+    "passes_short": "passes",
+    "plan_short_bytes": "bytes",
     "evict_threads_requested": "threads",
     "evict_threads_configured": "threads",
     "evict_threads_alive": "threads",
@@ -1395,7 +1451,8 @@ def _parse_group_field(text) -> dict:
     return {"ok": True, "reason": None, "value": value}
 
 
-def classify_name(name, geometry_digest, peer_digests=()) -> dict:
+def classify_name(name, geometry_digest, peer_digests=(),
+                  *, parsed=None) -> dict:
     """Is this file OURS for THIS boot? Never a load decision, always a name one.
 
     ``current`` means the digest in the name is the digest the caller computed from
@@ -1412,8 +1469,15 @@ def classify_name(name, geometry_digest, peer_digests=()) -> dict:
     A name in the pre-group SHAPE is ``stale_key_shape`` and is unlinkable BEFORE
     any digest comparison: even a byte-identical digest cannot make a name that
     does not say which group its bytes belong to into a loadable identity.
+
+    ``parsed`` lets a caller that already paid for ``parse_path`` hand the verdict
+    down. It is not a micro-optimism: the ceiling pass classifies every entry its
+    walk statted (up to 20,000), and ``parse_path`` measured ~4.6 us a name on this
+    host, so a second parse per entry is ~90 ms on a pass whose whole budget is
+    1.5 s.
     """
-    parsed = parse_path(name)
+    if not isinstance(parsed, dict):
+        parsed = parse_path(name)
     if not parsed["ok"]:
         stale_shape = parsed["classification"] == NAME_STALE_KEY_SHAPE
         return {"ok": False,
@@ -1451,6 +1515,83 @@ def classify_name(name, geometry_digest, peer_digests=()) -> dict:
                    filename=parsed["filename"], unlinkable=True)
     return _ok(units={}, reason=None, classification=NAME_CURRENT, ours=True,
                filename=parsed["filename"], unlinkable=False)
+
+
+def attribute_name(name, geometry_digest, peer_digests=(), *, classification=None,
+                   parsed=None) -> dict:
+    """Can these bytes be POSITIVELY attributed to an owner? The evictor's question.
+
+    `classify_name` answers "could this boot READ it?". An evictor needs a different
+    question - "whose capacity is this, and am I ALLOWED to buy it with an unlink?" -
+    and the two come apart exactly once: a committed file under a digest that is not
+    this boot's, seen while NO peer digest is confirmed. `classify_name` must then
+    answer `stale_geometry` (it has no peer to name), and treating that as free
+    capacity is how four ranks delete each other's live restores. This function names
+    that case `unattributable` and every destructive caller refuses it.
+
+    THE GATE, in one sentence: a name is sheddable when it is POSITIVELY this boot's
+    (`own`), or POSITIVELY nobody's (`dead` - an in-flight `.part`, the pre-group key
+    shape, or a digest no live rank claims while the peer map is CONFIRMED). A name
+    that is neither, while `peer_digests` is empty, is `unattributable` and never
+    buys capacity. Once a peer map exists, a foreign digest outside it IS dead bytes
+    again - that is what a confirmed map means, and it keeps a store of old boots'
+    geometry sheddable instead of turning the ceiling into a comment.
+
+    `classification` / `parsed` let a caller that already paid for the work hand it
+    in: the attribution loop runs over every entry a ceiling walk statted, and a
+    second parse of each name is real pass budget spent recomputing a verdict the
+    caller already holds.
+    """
+    peers = {str(digest).lower() for digest in (peer_digests or ())}
+    unconfirmed = not peers
+    info = parsed if isinstance(parsed, dict) else None
+    classified = None
+    if classification is None:
+        # Parse ONCE and share the verdict with `classify_name`: this runs over every
+        # entry a ceiling walk statted, and a redundant parse is real pass budget.
+        if info is None:
+            info = parse_path(name)
+        classified = classify_name(name, geometry_digest, peer_digests,
+                                   parsed=info)
+        classification = classified["classification"]
+    reason = None
+    if classification == NAME_CURRENT:
+        attribution = ATTRIBUTION_OWN
+    elif classification == NAME_PEER_RANK:
+        attribution = ATTRIBUTION_PEER
+    elif classification == NAME_STALE_KEY_SHAPE:
+        attribution = ATTRIBUTION_DEAD
+        reason = ("the pre-group key shape: this plugin's own lineage, and no "
+                  "group-aware reader can load it whoever wrote it")
+    elif classification == NAME_STALE_GEOMETRY:
+        if info is None:
+            info = parse_path(name)
+        if info.get("partial"):
+            # An in-flight `.part` is not a committed file, so it holds no restore
+            # for anybody: deleting one costs a sibling a wasted write, never a
+            # readable span. The capacity walk does not even count these.
+            attribution = ATTRIBUTION_DEAD
+            reason = ("an in-flight .part is not a committed file, so it is "
+                      "nobody's restore")
+        elif unconfirmed:
+            attribution = ATTRIBUTION_UNATTRIBUTABLE
+            reason = ("its digest is not this boot's and no peer digest is "
+                      "confirmed, so it is either an old boot's dead bytes or a "
+                      "live sibling's restore, and the name cannot say which")
+        else:
+            attribution = ATTRIBUTION_DEAD
+            reason = ("no live rank claims its digest, so this boot can never "
+                      "read it and no sibling can either")
+    else:
+        attribution = ATTRIBUTION_UNATTRIBUTABLE
+        reason = ((classified or {}).get("reason")
+                  or "this name is not one this tier can classify")
+    filename = (info or {}).get("filename")
+    if not filename:
+        filename = parse_path(name)["filename"]
+    return _ok(units={}, attribution=attribution, classification=classification,
+               peers_unconfirmed=bool(unconfirmed), reason=reason,
+               filename=filename)
 
 
 # --- the sweep ---------------------------------------------------------------
@@ -1646,18 +1787,32 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     Restart survival is why promotion is an mtime and not a side table: there is
     nothing to replay, and a promoted file is exactly as durable as the file is.
 
-    ORDER: shed by ``SHED_ORDER_BY_CLASSIFICATION`` - files this boot can never read
-    (and no live sibling claims) first, then this boot's own files oldest-touch first,
-    then a live PEER RANK's files. ``peer_digests`` is what moves a sibling's files
-    out of the "pure capacity" bucket: the four ranks share one root, so an evictor
-    that cannot name its siblings' digests sees their live data as foreign and sheds
-    it first. Pass them in. When they cannot be determined with confidence, pass
-    nothing and today's behaviour is exactly preserved - too-conservative here must
-    never mean unable-to-evict, and it does not: a rank always keeps its own files as
-    the capacity it can release. ``target_fraction`` (default 0.9) is the hysteresis:
-    the plan aims at ``ceiling * target_fraction`` rather than at the ceiling, because
-    a plan that targets the line it is standing on deletes nothing and the next spill
-    trips the same check again.
+    ORDER: shed by ``SHED_ORDER_BY_CLASSIFICATION`` - bytes POSITIVELY claimed by no
+    live rank first, then this boot's own files oldest-touch first, then a live PEER
+    RANK's files. ``peer_digests`` is what moves a sibling's files out of the "pure
+    capacity" bucket: the four ranks share one root, so an evictor that cannot name
+    its siblings' digests sees their live data as foreign.
+
+    THE FAIL-CLOSED GATE (0.2.34). An EMPTY ``peer_digests`` now means "I cannot tell
+    my peers' live restores from dead capacity", and an entry that cannot be
+    positively attributed (``attribute_name`` -> ``unattributable``: a committed file
+    under a digest that is not this boot's, while no peer digest is confirmed) is NOT
+    a candidate for unlinking at all. It used to be the FIRST thing shed, which is
+    how four ranks on one root deleted each other's live data: 15,848 removal journal
+    lines of the other rank's block size, and a `file_missing` hole that cost 19,200
+    tokens of recompute behind it. This rank's own files and the bytes POSITIVELY
+    nobody can read (an in-flight `.part`, the pre-group key shape, or a digest no
+    live rank claims while the peer map is CONFIRMED) stay sheddable whatever the map
+    says, so a single-rank box and a store of old boots' geometry are unaffected -
+    only the blind case changes, and it changes from "delete a stranger" to "come up
+    SHORT and say so". Exceeding the ceiling is the correct failure mode: spilling
+    back-pressures, `no_free_space` still guards the filesystem, and the plan reports
+    ``short`` / ``short_by_bytes`` / ``excluded_unattributable`` instead of a
+    corruption that shows up as a hole in somebody's prefix.
+
+    ``target_fraction`` (default 0.9) is the hysteresis: the plan aims at ``ceiling *
+    target_fraction`` rather than at the ceiling, because a plan that targets the line
+    it is standing on deletes nothing and the next spill trips the same check again.
 
     Input is a LIST of ``{"path", "size_bytes", "mtime_ns", "filename"}`` mappings
     (what a sweep or an `os.scandir` walk gives you), so this stays a pure
@@ -1684,6 +1839,8 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
 
     usable: list[dict] = []
     skipped = 0
+    excluded = 0
+    excluded_bytes = 0
     for item in entries:
         if not isinstance(item, dict):
             skipped += 1
@@ -1695,11 +1852,20 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                 or not isinstance(path, str) or not path:
             skipped += 1
             continue
-        name = classify_name(item.get("filename") or os.path.basename(path),
-                             geometry_digest, peer_digests)
-        classification = name["classification"] or NAME_REFUSED
+        name = item.get("filename") or os.path.basename(path)
+        attributed = attribute_name(name, geometry_digest, peer_digests,
+                                    parsed=parse_path(name))
+        classification = attributed["classification"] or NAME_REFUSED
         if classification not in EVICTABLE_CLASSIFICATIONS:
             skipped += 1
+            continue
+        if attributed["attribution"] == ATTRIBUTION_UNATTRIBUTABLE:
+            # THE GATE. An unattributable name must never buy you capacity: it is
+            # counted, it is reported in the plan, and it is never unlinked. See the
+            # `SHED_ORDER_BY_CLASSIFICATION` block for the incident this is the fix
+            # for.
+            excluded += 1
+            excluded_bytes += int(size)
             continue
         usable.append({"path": path, "size_bytes": int(size),
                        "mtime_ns": int(when), "classification": classification,
@@ -1707,17 +1873,28 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
 
     measured = 0 if used_bytes is None else int(used_bytes)
     if used_bytes is None:
-        measured = sum(int(item["size_bytes"]) for item in usable)
+        # A caller that handed in no measurement gets the bytes that are REALLY on
+        # disk, which INCLUDES the entries the gate withheld: they occupy the store
+        # whether or not this rank is allowed to delete them, and dropping them here
+        # would let a blind rank read its own ceiling as already met. The gate's
+        # consequence must be a SHORT plan, never a false "under target".
+        measured = sum(int(item["size_bytes"]) for item in usable) + excluded_bytes
     target = int(ceiling_bytes * float(target_fraction))
+    gate_units = ("excluded_unattributable", "excluded_unattributable_bytes",
+                  "short_by_bytes")
     verdict = _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
                                "planned_bytes", "freed_bytes", "planned",
                                "stale_first", "peer_rank", "lru_files",
-                               "skipped", "files"),
+                               "skipped", "files", *gate_units),
                   needed=False, ceiling_bytes=int(ceiling_bytes),
                   used_bytes=measured, target_bytes=target,
                   paths=[], planned=0, planned_bytes=0, freed_bytes=0,
                   stale_first=0, peer_rank=0, lru_files=0, skipped=skipped,
                   files=len(usable), truncated=False,
+                  excluded_unattributable=excluded,
+                  excluded_unattributable_bytes=excluded_bytes,
+                  peers_unconfirmed=not bool(peer_digests),
+                  short=False, short_by_bytes=0,
                   reason=("the store is under its target, so nothing is "
                           "evictable yet"))
     if measured <= target:
@@ -1727,7 +1904,8 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
         # Shed order, then oldest touch, then the path, so two boots with the same
         # directory produce the SAME plan byte for byte. See
         # `SHED_ORDER_BY_CLASSIFICATION` for why a live peer rank's file is LAST and
-        # an unrecognised digest is FIRST.
+        # why a classification this table does not name is now LAST too (it used to
+        # be FIRST, and that default is what deleted a sibling's live restore).
         return (SHED_ORDER_BY_CLASSIFICATION.get(item["classification"],
                                                  SHED_ORDER_UNKNOWN),
                 int(item["mtime_ns"]), item["path"])
@@ -1756,18 +1934,37 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     # could be shed, while a plan full of foreign files says they were never learned.
     peer_rank = sum(1 for item in planned
                     if item["classification"] == NAME_PEER_RANK)
+    # SHORT: over the target, out of sheddable candidates, and NOT stopped by the
+    # plan cap (which `truncated` already reports). This is the gate's honest
+    # consequence: the ceiling will be exceeded, the caller says why in one line, and
+    # nobody deletes a file it cannot prove is its own to delete.
+    short = bool(remaining > target and not truncated)
+    short_by = max(0, int(remaining) - target) if short else 0
     reason = None
     if planned:
         reason = (f"{len(planned)} file(s) shed the measured "
                   f"{measured} bytes toward the {target}-byte target "
                   f"({stale_first} of them under a foreign digest, "
                   f"{peer_rank} of them a live peer rank's)")
+        if short:
+            reason += (
+                f"; the plan came up SHORT by {short_by} byte(s) with "
+                f"{excluded} file(s) ({excluded_bytes} byte(s)) withheld as "
+                "UNATTRIBUTABLE because no peer digest is confirmed - the ceiling "
+                "is expected to be exceeded rather than a sibling's live restore "
+                "be deleted")
+    elif short:
+        reason = (
+            f"nothing is sheddable: over the {target}-byte target by "
+            f"{short_by} byte(s) with {excluded} file(s) ({excluded_bytes} "
+            "byte(s)) withheld as UNATTRIBUTABLE because no peer digest is "
+            "confirmed")
     elif truncated:
         reason = f"the plan cap {limit} was reached before the target was met"
     return _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
                             "planned_bytes", "freed_bytes", "planned",
                             "stale_first", "peer_rank", "lru_files", "skipped",
-                            "files"),
+                            "files", *gate_units),
                needed=True, ceiling_bytes=int(ceiling_bytes),
                used_bytes=measured, target_bytes=target,
                paths=[item["path"] for item in planned],
@@ -1775,7 +1972,11 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                freed_bytes=freed, stale_first=stale_first,
                peer_rank=peer_rank,
                lru_files=len(planned) - stale_first, skipped=skipped,
-               files=len(usable), truncated=truncated, reason=reason)
+               files=len(usable), truncated=truncated,
+               excluded_unattributable=excluded,
+               excluded_unattributable_bytes=excluded_bytes,
+               peers_unconfirmed=not bool(peer_digests),
+               short=short, short_by_bytes=short_by, reason=reason)
 
 
 # --- the commit protocol -----------------------------------------------------
@@ -1984,8 +2185,12 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
     be deleted, and the only reason that is legitimate is the byte ceiling.
     Deleting a file is always safe for correctness (there is no read path here);
     it is never safe for capacity planning unless the caller is shedding to meet a
-    ceiling it was configured with. Every refusal is counted and carries a reason;
-    a directory that is itself a symlink is refused outright.
+    ceiling it was configured with. It is also the path the FAIL-CLOSED GATE guards
+    (0.2.34): with no peer digest confirmed, a committed file under a foreign digest
+    is REFUSED here even if a caller handed it in - the executor's own copy of the
+    planner's rule, because nothing planned upstream is trusted at the point of
+    deletion. Every refusal is counted and carries a reason; a directory that is
+    itself a symlink is refused outright.
     """
     if not isinstance(paths, (list, tuple)):
         return _fail(f"paths must be a list, got {type(paths).__name__}")
@@ -2088,6 +2293,20 @@ def _validate_unlink(path, root, geometry_digest, peer_digests,
             detail = fresh["reason"] or "it is this boot's own current file"
             return _fail(f"{base} is {classification} against the current "
                          f"fingerprint: {detail}")
+        if for_capacity:
+            # THE GATE, at the last moment before an unlink. A plan that named this
+            # path already passed the same test in `lru_eviction_plan`; this is the
+            # executor's own copy of it, because nothing planned upstream is trusted
+            # here (that is why the digest is re-read too). Only the CAPACITY path is
+            # gated: the sweep path's allowed set is `UNLINKABLE_CLASSIFICATIONS`,
+            # whose doctrine is a deliberate operator request to reclaim dead bytes.
+            gate = attribute_name(base, geometry_digest, peer_digests,
+                                  classification=classification, parsed=parsed)
+            if gate["attribution"] == ATTRIBUTION_UNATTRIBUTABLE:
+                return _fail(f"{base} cannot be attributed to an owner while no "
+                             f"peer digest is confirmed: {gate['reason']}. An "
+                             "unattributable name never buys capacity - exceed the "
+                             "ceiling instead of deleting a sibling's live restore")
     target = os.path.join(root, base)
     try:
         info = os.lstat(target)
