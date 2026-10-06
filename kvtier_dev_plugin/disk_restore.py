@@ -370,7 +370,70 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "too_many_loads", "ram_hit_not_block_aligned",
                   "no_worker_proof", "offers_disabled", "workers_not_servicing",
                   "skipped_no_marker", "suppressed_after_failure",
-                  "pin_release_unavailable", "incomplete_group_set")
+                  "pin_release_unavailable", "incomplete_group_set",
+                  "no_boundary_anchor", "no_null_block")
+
+# --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
+#
+# THE TWO CONTRACTS THE FORK ACTUALLY HAS. A prefix-cache hit is a list of CPU
+# blocks per group, and how long that list is - and how many of its entries carry
+# bytes - is decided by the group's own manager class, not by this module and not
+# by the model's name:
+#
+#   `positional`      `has_positionally_stable_blocks is True` (the base answer,
+#                     `single_type_kv_cache_manager.py:62-69`). One real block per
+#                     scheduler block of the claimed run, each named by that block's
+#                     own group-qualified cumulative hash. Full attention, sliding
+#                     window, and every group the fork's own positional spill scan
+#                     (`manager.py:872-876`) is willing to walk.
+#
+#   `boundary_state`  `mamba_cache_mode == "align"`, which is EXACTLY the condition
+#                     the fork's own override uses to answer
+#                     `has_positionally_stable_blocks = False`
+#                     (`single_type_kv_cache_manager.py:1494-1497`). Such a group's
+#                     hit for a run of N blocks is
+#                     `[null_block] * (N - 1) + [cached]` (`:1591-1607`): ONE real
+#                     recurrent state at the END of the run and nothing for the
+#                     interior. It is NOT unnamed. The align hand-off publishes the
+#                     state block's own group-qualified hash (`:2051-2080`,
+#                     `:1955-1963`) and the tier's store completion registers the CPU
+#                     block under that same hash (`manager.py:1050-1078`), which is
+#                     the name a lookup computes
+#                     (`resolve_block_hashes(block_hashes, hash_block_size,
+#                     block_size)[i]`, `:1591-1601`) and the name this module already
+#                     resolves a spilled file from. The bytes exist, they are
+#                     findable, and ONE of them per run end is the whole cost.
+#
+#   `unstable`        False positional stability for a reason that is NOT the align
+#                     hand-off. No contract this module can implement: the gate
+#                     refuses, loudly, because a claim would cover a group whose
+#                     blocks nobody names.
+#
+# THE ONE RULE ALL THREE SERVE: a claim is made only for bytes this tier can NAME
+# and READ BACK for EVERY eligible group. 0.2.25 enforced it by refusing every
+# hybrid model; 0.2.27 enforces it by implementing the second contract, so the gate
+# opens BY CONSTRUCTION on a model whose cacheable groups all have a contract and
+# stays shut - with the same `incomplete_group_set` refusal, word for word - on
+# anything with a cacheable group that has none.
+CONTRACT_POSITIONAL = "positional"
+CONTRACT_BOUNDARY = "boundary_state"
+CONTRACT_UNSTABLE = "unstable"
+CONTRACT_GEOMETRY = "geometry"
+CONTRACT_OUTSIDE = "outside"
+CONTRACT_UNKNOWN = "unknown"
+CONTRACTS_IMPLEMENTABLE = (CONTRACT_POSITIONAL, CONTRACT_BOUNDARY)
+
+# The one value of `MambaSpec.mamba_cache_mode` the fork reads as "I hand off
+# boundary states" (`single_type_kv_cache_manager.py:1497`, `:1516`, `:1703`,
+# `:2051`), spelled exactly as the fork spells it.
+MAMBA_CACHE_MODE_ALIGN = "align"
+
+# The align-mode hit shape needs real null blocks between a run's start and its
+# boundary (`[null_block] * (N - 1)`), and the null block is the CPU pool's own -
+# the same object the fork's own Mamba hit puts in those slots (`BlockPool.null_block`,
+# read at `single_type_kv_cache_manager.py:142`). A pool that does not expose one
+# cannot have a boundary group restored at all.
+NULL_BLOCK_ATTR = "null_block"
 
 # EVERY REFUSAL SPELLED OUT. `refused` says WHICH counter moved; this says what the
 # counter MEANS, so "why is there no restore?" is answerable from one payload read
@@ -399,9 +462,11 @@ OFFER_REFUSAL_WHY = {
     "no_key_helpers": "vllm.v1.core.kv_cache_utils is not importable here, so the "
                       "engine's own key-packing/view functions cannot be called "
                       "(this module refuses to re-implement them)",
-    "no_eligible_group": "no prefix-cacheable, positionally-stable group has "
-                         "block_size == the scheduler block size, so a merged "
-                         "tuple cannot be extended one whole block at a time",
+    "no_eligible_group": "no prefix-cacheable group has block_size == the "
+                         "scheduler block size under a contract this tier can "
+                         "restore (positional, or an align-mode boundary state), so "
+                         "a merged tuple cannot be extended one whole block at a "
+                         "time",
     "ram_shape": "the host-RAM hit's per-group block lists do not add up to its "
                  "own token count, so the merged tuple could not be trusted",
     "no_disk_run": "the index holds no contiguous span at the next block for every "
@@ -460,30 +525,43 @@ OFFER_REFUSAL_WHY = {
                                 "reschedule that follows calls "
                                 "get_num_new_matched_tokens again, and re-offering "
                                 "the same span is an infinite loop, not a retry",
-    "incomplete_group_set": "THE CLAIM-MUST-MATCH-THE-BYTES GATE (0.2.25). At "
-                            "least one group CAN be restored, but another "
-                            "prefix-cacheable group CANNOT, and offering the "
-                            "restorable subset claims every group: "
-                            "get_num_new_matched_tokens advances "
+    "incomplete_group_set": "THE CLAIM-MUST-MATCH-THE-BYTES GATE (0.2.25; opened "
+                            "for align-mode groups by 0.2.27). At least one group "
+                            "CAN be restored, but another prefix-cacheable group "
+                            "CANNOT, and offering the restorable subset claims "
+                            "every group: get_num_new_matched_tokens advances "
                             "num_computed_tokens for the WHOLE model, "
                             "update_state_after_alloc's `n_ext_g == 0 -> continue` "
                             "is a SILENT no-op for the group we did not put in the "
                             "tuple, and nothing recomputes the claimed range "
                             "because a group that was never in the tuple reports "
-                            "no failure. The usual cause is a group that is "
-                            "prefix-cacheable but not positionally stable: an "
-                            "align-mode Mamba/GDN group's own hit contract is "
-                            "[null_block]*(n-1) plus ONE real boundary-state block "
-                            "(`single_type_kv_cache_manager.py:1533-1610`), so a "
-                            "claimed span costs it ONE block - not a span of KV - "
-                            "and that one block has no positional file name to "
-                            "read back, because the recurrent state is one runn"
-                            "ing value per sequence. Refusing costs one recompute; "
+                            "no failure. An align-mode Mamba/GDN group is NO LONGER "
+                            "a blocker: its hit contract is [null_block]*(n-1) plus "
+                            "ONE real boundary-state block "
+                            "(`single_type_kv_cache_manager.py:1591-1607`), that one "
+                            "block IS named by the align hand-off, and this tier "
+                            "spills and reads it now. What still fires this refusal "
+                            "is a cacheable group with NO implementable contract: a "
+                            "non-align group that is not positionally scannable, a "
+                            "group outside the group table, or one whose block_size "
+                            "is not the scheduler's. Refusing costs one recompute; "
                             "offering serves a wrong answer, which is what the "
                             "live box did on 2026-10-06 at 00:08: a mechanically "
                             "perfect read (9 of 9 applied per rank, no failures, "
                             "18 ms) that answered garbage because the GDN "
                             "boundary state was claimed and never filled",
+    "no_boundary_anchor": "the positional groups have files for the whole run but NO "
+                          "run end within the offer's cap has a boundary-state file "
+                          "in EVERY align-mode group, so the one state block those "
+                          "groups need does not exist at any length this offer could "
+                          "claim. A run without it is a claim on a recurrent state "
+                          "nobody wrote - the 00:08 shape - so the run is refused "
+                          "rather than shortened into a lie",
+    "no_null_block": "an align-mode group is restorable but the CPU pool exposes no "
+                     "`null_block`, so the `[null_block]*(n-1)` half of the fork's "
+                     "own hit shape cannot be built; offering the real state block "
+                     "alone would land it on the run's FIRST block instead of its "
+                     "last, which is a wrong state read back as a right one",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -1927,58 +2005,72 @@ def _key_helpers() -> dict:
 
 def _group_serviceability(manager, block_size: int, sizes: list,
                           wanted: list) -> dict:
-    """THE WHOLE GROUP ARITHMETIC, as data, for one payload read (0.2.25).
+    """THE WHOLE GROUP ARITHMETIC, as data, for one payload read (0.2.25/0.2.27).
 
     Three predicates decide whether a model can be served from disk at all -
     `prefix_cacheable_group_ids`, `group_block_sizes` against the scheduler block
-    size, and `has_positionally_stable_blocks` per group - and until now a reader had
-    to re-derive all three from a live manager to answer "why does the disk offer
-    nothing?". This publishes the derivation instead: which groups the RAM tier says
-    are prefix-cacheable, which groups are positionally stable, which are restorable,
+    size, and the per-group BLOCK CONTRACT (`_group_contract`, which reads the
+    fork's `has_positionally_stable_blocks` and `mamba_cache_mode`) - and until now a
+    reader had to re-derive all three from a live manager to answer "why does the
+    disk offer nothing?". This publishes the derivation instead: which groups the RAM
+    tier says are prefix-cacheable, which contract each one has, which are restorable,
     and WHICH BLOCKED THE OFFER AND WHY.
 
-    Every group in the table gets a stability read, not just the cacheable ones, so
-    the payload shows the shape of the model (a stable-but-scratch group is exactly
-    the fact that distinguishes "nothing is stable" from "the stable ones are not
-    cacheable"). Each predicate is read ONCE per group per call: an exception inside
-    `_group_positionally_stable` is an error line, and reading the same flag twice
-    would report a failure that happened once as two.
+    Every group in the table gets a contract read, not just the cacheable ones, so the
+    payload shows the shape of the model (a boundary-state group that is not
+    cacheable is exactly the fact that distinguishes "nothing is hashable" from "the
+    hashable ones are not cacheable"). Each predicate is read ONCE per group per
+    call: an exception inside a contract read is an error line, and reading the same
+    flag twice would report a failure that happened once as two.
 
-    `complete` is the property the gate is built on: every prefix-cacheable group is
-    restorable. A pure-attention model satisfies it and is offered at exactly as
-    before; a hybrid GDN + full-attention model does not, and cannot be, because a
-    recurrent state has no per-block name.
+    `complete` is the property the gate is built on: every prefix-cacheable group has
+    a contract this tier implements. A pure-attention model satisfies it, and always
+    did; a hybrid GDN + full-attention model satisfies it too now that the align-mode
+    contract is implemented, and a model with a group that has NO implementable
+    contract does not, and cannot be.
     """
-    stable: list = []
+    contracts: dict = {}
     for group in range(len(sizes)):
-        if _group_positionally_stable(manager, group):
-            stable.append(group)
+        contracts[group] = _group_contract(manager, group)
+    positional = [group for group in contracts
+                  if contracts[group]["contract"] == CONTRACT_POSITIONAL]
+    boundary = [group for group in contracts
+                if contracts[group]["contract"] == CONTRACT_BOUNDARY]
     restorable: list = []
     blocked: dict = {}
     kinds: dict = {}
     for group in wanted:
+        contract = (contracts[group]["contract"] if group in contracts
+                    else CONTRACT_OUTSIDE)
         if group < 0 or group >= len(sizes):
             blocked[group] = "outside the group table"
-            kinds[group] = "outside"
+            kinds[group] = CONTRACT_OUTSIDE
         elif _int(sizes[group]) != block_size:
             blocked[group] = (f"block_size {sizes[group]} != the scheduler "
                               f"block_size {block_size}, so a slot for it would "
                               "land at the wrong GPU offset")
-            kinds[group] = "geometry"
-        elif group not in stable:
-            blocked[group] = ("has no positionally stable blocks, so a claimed "
-                              "span costs it ONE boundary-state block and that "
-                              "block has no per-block file name to read back (an "
-                              "align-mode Mamba/GDN group keeps ONE running state "
-                              "per sequence, not a per-block array, and no token "
-                              "hash can address it)")
-            kinds[group] = "unstable"
+            kinds[group] = CONTRACT_GEOMETRY
+        elif contract not in CONTRACTS_IMPLEMENTABLE:
+            blocked[group] = contracts[group]["reason"]
+            kinds[group] = contract
         else:
             restorable.append(group)
-    unstable = [group for group in wanted if group not in stable]
+    unrestorable = [group for group in wanted
+                    if group >= len(sizes) or contracts[group]["contract"]
+                    not in CONTRACTS_IMPLEMENTABLE]
+    by_group = {str(group): {
+        "contract": contracts[group]["contract"] if group in contracts
+        else CONTRACT_OUTSIDE,
+        "has_positionally_stable_blocks": contracts[group]["stable"]
+        if group in contracts else None,
+        "mamba_cache_mode": contracts[group]["mamba_cache_mode"]
+        if group in contracts else None}
+        for group in list(contracts)[:16]}
     return _ok(prefix_cacheable_group_ids=list(wanted)[:16],
-               positionally_stable_group_ids=stable[:16],
-               unrestorable_cacheable_group_ids=unstable[:16],
+               group_contracts=by_group,
+               positionally_stable_group_ids=sorted(positional)[:16],
+               boundary_state_group_ids=sorted(boundary)[:16],
+               unrestorable_cacheable_group_ids=sorted(set(unrestorable))[:16],
                restorable_group_ids=restorable[:16],
                blocked_group_ids=sorted(blocked)[:16],
                blocked_kinds={str(group): kinds[group]
@@ -2026,37 +2118,53 @@ def _groups_required(serviceability: dict, blocks: int) -> dict:
     block_size = _int(serviceability.get("scheduler_block_size")) or 0
     sizes = serviceability.get("group_block_sizes") or []
     restorable = set(serviceability.get("restorable_group_ids") or ())
+    declared = serviceability.get("group_contracts") or {}
     kinds = serviceability.get("blocked_kinds") or {}
     rows: list = []
     unfilled: list = []
     for group in (serviceability.get("prefix_cacheable_group_ids") or [])[:16]:
         group_size = (sizes[group]
                       if 0 <= group < len(sizes) else None)
-        kind = ("positional" if group in restorable
-                else str(kinds.get(str(group)) or "unknown"))
+        entry = declared.get(str(group)) or {}
+        kind = str(entry.get("contract") or kinds.get(str(group))
+                   or CONTRACT_UNKNOWN)
         needed: int | None
-        nulls: int | None
-        if kind == "positional" and group_size:
+        nulls: int
+        real: int | None
+        if kind == CONTRACT_POSITIONAL and group_size:
+            # One real block per scheduler block of the run: the group's blocks may
+            # be smaller than the scheduler's (a `geometry` group is priced the same
+            # way because it would need the same number of them), and the claim
+            # cannot be satisfied without all of them.
             needed = max(1, (blocks * block_size) // int(group_size))
             nulls = 0
-        elif kind == "geometry" and group_size:
+            real = needed
+        elif kind == CONTRACT_GEOMETRY and group_size:
             # Position-addressable in principle, at a block size this offer cannot
             # express: it still needs its blocks per the same arithmetic, and the
             # disk fills none of them.
             needed = max(1, (blocks * block_size) // int(group_size))
             nulls = 0
-        elif kind == "unstable":
+            real = needed
+        elif kind == CONTRACT_BOUNDARY:
+            # ONE real state block per claimed run, not a run of KV: the align-mode
+            # contract is `[null_block] * (n - 1)` then the cached boundary state
+            # (`single_type_kv_cache_manager.py:1591-1607`), which is why the row
+            # says `blocks_needed: 1, null_blocks: blocks - 1`.
             needed = 1
             nulls = max(0, blocks - 1)
+            real = 1
         else:
             needed = None
-            nulls = None
+            nulls = 0
+            real = None
         filled = needed if (group in restorable and needed) else 0
         if not filled:
             unfilled.append(group)
         rows.append({"group": int(group), "block_size": group_size,
                      "contract": _clip(kind, 24),
                      "blocks_needed": needed, "null_blocks": nulls,
+                     "real_blocks": real,
                      "restored": bool(group in restorable),
                      "blocks_filled": int(filled)})
     return {"claimed_blocks": int(blocks),
@@ -2153,11 +2261,16 @@ def _eligible_groups(manager, block_size: int,
     # line and leaves the previous read standing.
     _state["group_serviceability"] = serviceability
     groups = serviceability["restorable_group_ids"]
+    declared = serviceability.get("group_contracts") or {}
+    contracts = {str(group): str((declared.get(str(group)) or {})
+                                 .get("contract") or CONTRACT_UNKNOWN)
+                 for group in groups}
     if not groups:
         return _fail(f"no prefix-cacheable group has block_size == the scheduler "
-                     f"block_size {block_size} (group sizes are {sizes[:8]}, "
-                     f"cacheable {wanted[:8]}): the merged CPU-hit tuple cannot be "
-                     "extended one whole block at a time for this geometry",
+                     f"block_size {block_size} under a contract this tier can "
+                     f"restore (group sizes are {sizes[:8]}, cacheable "
+                     f"{wanted[:8]}): the merged CPU-hit tuple cannot be extended "
+                     "one whole block at a time for this geometry",
                      reason_kind="no_eligible_group",
                      group_block_sizes=sizes[:8],
                      prefix_cacheable_group_ids=wanted[:8])
@@ -2187,15 +2300,18 @@ def _eligible_groups(manager, block_size: int,
         _state["last_groups_required"] = required
         kinds = set((serviceability.get("blocked_kinds") or {}).values())
         why_bits = []
-        if "unstable" in kinds:
+        if CONTRACT_UNSTABLE in kinds:
             # KEPT SHORT ON PURPOSE: the whole sentence is clipped at 160 characters
             # and this clause carries the mechanism, so it has to fit before the cut.
             # The long form lives in `blocked_why` and in `OFFER_REFUSAL_WHY`.
-            why_bits.append("no positional name: each span costs ONE boundary-state "
-                            "block and the disk has none")
-        if "geometry" in kinds:
+            why_bits.append("no contract this tier implements: not scannable and "
+                            "not an align-mode boundary hand-off")
+        if CONTRACT_UNKNOWN in kinds:
+            why_bits.append("its block shape could not be read, so it cannot be "
+                            "proved restorable")
+        if CONTRACT_GEOMETRY in kinds:
             why_bits.append("its block_size is not the scheduler's")
-        if "outside" in kinds:
+        if CONTRACT_OUTSIDE in kinds:
             why_bits.append("it is outside the group table")
         short = "; ".join(why_bits) or "not restorable"
         listed = ", ".join(str(item) for item in blocked)
@@ -2228,62 +2344,201 @@ def _eligible_groups(manager, block_size: int,
                      groups_required=required["rows"][:16],
                      unfilled_group_ids=required["unfilled_group_ids"][:16])
     return _ok(groups=groups, num_groups=len(sizes),
+               contracts=contracts,
+               boundary_group_ids=[group for group in groups
+                                   if contracts.get(str(group))
+                                   == CONTRACT_BOUNDARY],
+               positional_group_ids=[group for group in groups
+                                     if contracts.get(str(group))
+                                     == CONTRACT_POSITIONAL],
                group_block_sizes=[int(sizes[group]) for group in groups])
 
 
-def _group_positionally_stable(manager, group: int) -> bool:
-    """Can this group's blocks be addressed by a POSITIONAL hash at all?
+def _group_contract(manager, group: int) -> dict:
+    """What a claimed run COSTS this group, derived from the group's own manager.
 
-    The fork gates its own spill path on exactly this flag
-    (`manager.py:874-876` on the deployed in-tree-fixed build, `manager.py:835-836`
-    at the fork HEAD 10b8e07 this suite's fixture is generated from:
-    `single_type_managers[g].has_positionally_stable_blocks` -> `continue`), and
-    the reason carries over untouched: a spilled file is named after a hash derived
-    from the request's tokens at a fixed position, so a group
-    whose block content is not a function of position (a sliding window that
-    rewrites its own blocks, for instance) has no stable name to restore from.
-    Reading such a group back would paste bytes computed for different positions
-    into the KV, which no recompute policy can undo. Unreadable counts as unstable:
-    a restore we cannot justify is a restore we do not do.
+    THE FUNCTION THAT REPLACES THE 0.2.25 VETO, and the reason the veto was wrong is
+    worth keeping in prose because it is the exact bug the box served at 00:08 on
+    2026-10-06. The old `_group_positionally_stable` answered a yes/no question and
+    `_eligible_groups` used the answer as a FILTER - "offer on the groups that pass".
+    Its docstring's conclusion was that a group whose blocks "have no positional name"
+    "has nothing to read back from". The fork contradicts that sentence about its own
+    align-mode groups, three times over:
 
-    THE CONCLUSION THE OLDER CODE DREW FROM THIS, WRITTEN DOWN SO IT CANNOT BE DRAWN
-    AGAIN (0.2.25). This flag was used as a FILTER - "offer on the groups that pass"
-    - and the fork's own skip at `manager.py:874-876` looked like company for that.
-    It is not: the fork is deciding what it may SPILL, where dropping a group costs a
-    file that was never written. Here the same flag decides what may be CLAIMED, and a
-    claim is not per group - `get_num_new_matched_tokens` returning a hit length makes
-    the engine skip prefill for EVERY group at once. So a stable group is a necessary
-    condition (a name to read by) and never a sufficient one, and a model with any
-    prefix-cacheable group this function answers False for has no complete disk offer
-    available at all. That is what `_eligible_groups`'s `incomplete_group_set` veto
-    enforces; on the live hybrid box (`MambaManager` in `align` mode for groups 0-3)
-    it means the disk tier offers nothing, which is the truth about the architecture
-    and not a bug to route around.
+      * `has_positionally_stable_blocks` is about SCANNING, not about NAMING -
+        `single_type_kv_cache_manager.py:62-69` defines it as "whether positional
+        offload scans can follow this block table", and the align override at
+        `:1494-1497` explains why align-mode fails that test: "align-mode Mamba can
+        null interior states and relocate speculative blocks in place". Nulling and
+        relocating a block does not un-hash it.
+      * the align hand-off NAMES the state block and hands it to the connector
+        (`:2051-2080`, `:1955-1963`), with the contract at
+        `kv_cache_manager.py:907-921`: "A connector reads the referenced blocks -
+        never resolving them positionally";
+      * and the tier stores it under exactly the hash a lookup will ask for
+        (`manager.py:1050-1078` inserts under `gpu_block.block_hash` with
+        `num_tokens = block_hash_num_tokens`; `:1591-1601` looks up
+        `resolve_block_hashes(block_hashes, hash_block_size, block_size)[i]`). The
+        live store proves it: one shard directory holds `kvslot-a36ec46fe316bd0d-g0-…`,
+        `-g1-…`, `-g2-…`, `-g3-…` and `-g5-…` files for the SAME key16 - the same
+        token boundary, named per group, five groups on disk.
+
+    So the flag is not a veto, it is a SHAPE. A positional group's hit list is one
+    real block per scheduler block; an align-mode group's hit list is
+    `[null_block] * (n - 1) + [one real state block]` (`:1591-1607`). Both are named;
+    they cost different numbers of files; and a claim must be backed by the RIGHT
+    NUMBER OF FILES FOR EVERY GROUP, which is what `_disk_run` now enforces.
+
+    Everything is read from the manager, so no model name and no group id appears
+    here: `has_positionally_stable_blocks` (the fork's own predicate) plus
+    `mamba_cache_mode` (the fork's own reason for answering False, read from the
+    manager and, failing that, its `kv_cache_spec`). An unreadable manager, a renamed
+    flag or an unknown mode answers `unknown`, which is a refusal: a restore we cannot
+    justify is a restore we do not do.
     """
+    entry: object = None
     try:
         coordinator = getattr(manager, "cpu_coordinator", None)
         single = getattr(coordinator, "single_type_managers", None)
         entry = single[group] if single is not None else None
-        flag = getattr(entry, "has_positionally_stable_blocks", None)
-        return flag is True
-    except Exception as exc:  # noqa: BLE001 - an unverifiable group is not eligible
-        snapshot._error(exc, "disk_restore has_positionally_stable_blocks")
-        return False
+    except Exception as exc:  # noqa: BLE001 - an unverifiable group has no contract
+        snapshot._error(exc, "disk_restore group contract")
+        return _ok(contract=CONTRACT_UNKNOWN, stable=None, mamba_cache_mode=None,
+                   reason=f"the manager for group {group} could not be read "
+                          f"({type(exc).__name__}), so its block shape is unknown")
+    stable = getattr(entry, "has_positionally_stable_blocks", None)
+    if stable is None:
+        spec = getattr(entry, "kv_cache_spec", None)
+        stable = getattr(spec, "has_positionally_stable_blocks", None)
+    mode = getattr(entry, "mamba_cache_mode", None)
+    if not isinstance(mode, str):
+        mode = getattr(getattr(entry, "kv_cache_spec", None), "mamba_cache_mode",
+                       None)
+    if not isinstance(mode, str):
+        mode = None
+    if stable is True:
+        return _ok(contract=CONTRACT_POSITIONAL, stable=True,
+                   mamba_cache_mode=mode,
+                   reason="positionally stable: one real block per scheduler block "
+                          "of the claimed run, each named by that block's own "
+                          "group-qualified hash")
+    if stable is False and mode == MAMBA_CACHE_MODE_ALIGN:
+        return _ok(contract=CONTRACT_BOUNDARY, stable=False, mamba_cache_mode=mode,
+                   reason="align-mode Mamba/GDN group: a claimed run costs it "
+                          "[null_block]*(n-1) plus ONE real boundary-state block at "
+                          "the run's end (single_type_kv_cache_manager.py:1591-1607), "
+                          "and that block is named by the align hand-off, so the "
+                          "disk file for it exists and is findable")
+    if stable is False:
+        return _ok(contract=CONTRACT_UNSTABLE, stable=False, mamba_cache_mode=mode,
+                   reason="not positionally stable and not an align-mode boundary "
+                          "hand-off, so no name exists that a restore could read "
+                          "back: an implementation this module does not have")
+    return _ok(contract=CONTRACT_UNKNOWN, stable=stable, mamba_cache_mode=mode,
+               reason=f"has_positionally_stable_blocks is {stable!r} rather than a "
+                      "bool: the fork renamed or removed the predicate and guessing "
+                      "a block shape from it is how a claim gets made for bytes "
+                      "nobody wrote")
+
+
+def _group_block_key(resolved: dict, lengths: dict, index: int, group: int,
+                     helpers: dict) -> tuple:
+    """One (group, block) -> the identity a spilled file for it is named under.
+
+    Four answers, because "no file" and "no hash" and "the hash is the wrong shape"
+    are three different facts and only one of them is a prefix we never spilled:
+
+      `("hit", key_hex)`   the index says a file for this group's block exists;
+      `("miss", None)`     the block is addressable and simply is not on disk - a run
+                           boundary for a positional group, a non-anchor for a
+                           boundary group, and a recompute either way;
+      `("stop", None)`     this request's hash view does not reach block `index`, or
+                           reading it raised: the run cannot extend past here;
+      `("refuse", verdict)` the view holds something that is not a block hash, or the
+                           engine's own packer raised. That is a bug we must be able
+                           to SEE, so it is a named refusal rather than a quiet run
+                           end - the same distinction `disk_read` draws between a
+                           missing file and a malformed one.
+    """
+    if index >= int(lengths.get(group) or 0):
+        return "miss", None
+    try:
+        digest = resolved[group][index]
+    except Exception as exc:  # noqa: BLE001 - a hole in the view is a stop
+        snapshot._error(exc, "disk_restore hash view")
+        return "stop", None
+    if not isinstance(digest, bytes):
+        return "refuse", _fail(
+            f"the engine's block hash at index {index} is "
+            f"{type(digest).__name__}, not bytes: the group suffix can only be "
+            "packed onto raw digests", reason_kind="no_block_hashes")
+    try:
+        packed = helpers["pack"](digest, group)
+        key_hex = bytes(packed).hex()
+    except Exception as exc:  # noqa: BLE001 - a packer fault is a refusal
+        snapshot._error(exc, "disk_restore make_block_hash_with_group_id")
+        return "refuse", _fail(f"make_block_hash_with_group_id raised "
+                               f"{type(exc).__name__}",
+                               reason_kind="no_key_helpers")
+    if not disk_index.contains(key_hex):
+        return "miss", None
+    return "hit", key_hex
 
 
 def _disk_run(request, start_block: int, groups: list, block_size: int,
-              hash_block_size: int, helpers: dict) -> dict:
+              hash_block_size: int, helpers: dict, contracts: dict | None = None,
+              max_blocks: int | None = None) -> dict:
     """The contiguous span of scheduler blocks the SSD tier can supply.
 
-    A block is restorable only when EVERY eligible group has a file for it: the
-    fork pairs per group, so one missing group's slot would be a load entry with no
-    bytes behind it - a whole-request recompute for a partially-restored span. The
-    run therefore stops at the first block any group cannot name.
+    THIS FUNCTION IS WHERE THE CORRECTNESS OF A CLAIM LIVES. A run is a promise that
+    every eligible group has bytes for it, and the two block contracts (`_group_
+    contract`) make that promise cost different things, so the rule is per contract:
+
+      * a `positional` group needs a file for EVERY block of the run, because the fork
+        pairs one CPU slot per group block and each of those slots receives the KV the
+        engine will not recompute;
+      * a `boundary_state` group needs a file at the run's LAST block and nowhere
+        else, because its hit list is `[null_block] * (n - 1) + [one state block]`
+        (`single_type_kv_cache_manager.py:1591-1607`) - the interior entries carry no
+        bytes by the engine's own design. Requiring a file for every block of such a
+        group would truncate every run on this model to zero (no engine spills a state
+        per block); requiring one only at the end is exactly what the engine does
+        spill, which is why the live store holds `…-g0-…` through `…-g5-…` files at
+        the SAME key16.
+
+    So the run is: walk the positional groups to the first block any of them cannot
+    name, then SHORTEN to the longest length whose end block every boundary group CAN
+    name. If no length qualifies, there is no run: that is `no_boundary_anchor`, and
+    it is a refusal rather than a shorter claim because the shorter claim would be a
+    claim on a recurrent state nobody wrote. This is the invariant the box paid for on
+    2026-10-06 at 00:08: a run that names bytes for the attention group and none for
+    the align-mode groups is not a partial restore, it is a wrong answer at
+    temperature=0.
+
+    `max_blocks` is the caller's own ceiling (it defaults to the module's); the anchor
+    scan stays inside it so a clamped offer can never be handed a run whose boundary
+    it cannot pay for. `anchors` publishes every length that WOULD have worked, which
+    is what `_cut_run` uses when a later clamp shortens the offer further.
     """
     block_hashes = getattr(request, "block_hashes", None)
     if block_hashes is None:
         return _fail("the request carries no block_hashes",
                      reason_kind="no_block_hashes")
+    declared = contracts or {}
+    positional: list = []
+    boundary: list = []
+    for group in groups:
+        kind = declared.get(str(group)) or CONTRACT_POSITIONAL
+        if kind == CONTRACT_BOUNDARY:
+            boundary.append(group)
+        elif kind == CONTRACT_POSITIONAL:
+            positional.append(group)
+        else:
+            # `_eligible_groups` only hands out implementable contracts, so arriving
+            # here means the two readings of the model disagree - which is a refusal,
+            # not a group to guess about.
+            return _fail(f"group {group} has contract {kind!r}, which this run "
+                         "cannot price", reason_kind="incomplete_group_set")
     try:
         resolved = {}
         for group in groups:
@@ -2291,54 +2546,124 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
             # hash_block_size, block_size)` is what `block_pool.cache_block_hashes`
             # (`block_pool.py:269-271`) indexes when it publishes a block's hash, so
             # index `i` of this view is exactly the digest the spilled file for group
-            # `g`'s block `i` was named after. `_eligible_groups` has already proved
-            # every group here has this block size, so one view serves them all.
+            # `g`'s block `i` was named after - for an align-mode group too, because
+            # the hand-off publishes that block's own hash (`manager.py:1050-1078`).
+            # `_eligible_groups` has already proved every group here has this block
+            # size, so one view serves them all.
             resolved[group] = helpers["resolve"](block_hashes, hash_block_size,
                                                  block_size)
-        lengths = {}
-        for group in groups:
-            lengths[group] = len(resolved[group])
+        lengths = {group: len(resolved[group]) for group in groups}
     except Exception as exc:  # noqa: BLE001 - a view we cannot build is a refusal
         snapshot._error(exc, "disk_restore resolve_block_hashes")
         return _fail(f"resolve_block_hashes raised {type(exc).__name__}",
                      reason_kind="no_block_hashes")
-    keys: list = []
-    run = 0
-    while run < MAX_RESTORE_BLOCKS_PER_OFFER:
-        index = start_block + run
+    limit = MAX_RESTORE_BLOCKS_PER_OFFER
+    if max_blocks is not None:
+        limit = max(0, min(limit, int(max_blocks)))
+    # --- 1. the positional run: one file per block, per group ------------------
+    pos_keys: list = []
+    while len(pos_keys) < limit:
+        index = start_block + len(pos_keys)
         block_keys: list = []
         complete = True
-        for group in groups:
-            if index >= lengths[group]:
-                complete = False
-                break
-            try:
-                digest = resolved[group][index]
-            except Exception as exc:  # noqa: BLE001 - a hole in the view is a stop
-                snapshot._error(exc, "disk_restore hash view")
-                complete = False
-                break
-            if not isinstance(digest, bytes):
-                return _fail(f"the engine's block hash at index {index} is "
-                             f"{type(digest).__name__}, not bytes: the group "
-                             "suffix can only be packed onto raw digests",
-                             reason_kind="no_block_hashes")
-            try:
-                packed = helpers["pack"](digest, group)
-                key_hex = bytes(packed).hex()
-            except Exception as exc:  # noqa: BLE001 - a packer fault is a refusal
-                snapshot._error(exc, "disk_restore make_block_hash_with_group_id")
-                return _fail(f"make_block_hash_with_group_id raised "
-                             f"{type(exc).__name__}", reason_kind="no_key_helpers")
-            if not disk_index.contains(key_hex):
+        for group in positional:
+            state, key_hex = _group_block_key(resolved, lengths, index, group,
+                                              helpers)
+            if state == "refuse":
+                return key_hex
+            if state != "hit":
                 complete = False
                 break
             block_keys.append((group, key_hex))
         if not complete:
             break
-        keys.append(block_keys)
-        run += 1
-    return _ok(blocks=run, keys=keys, view_lengths=lengths)
+        pos_keys.append(block_keys)
+    # --- 2. the anchors: run ends every boundary group can pay for -------------
+    anchors: dict = {}
+    for length in range(1, len(pos_keys) + 1):
+        index = start_block + length - 1
+        pairs: list = []
+        whole = True
+        for group in boundary:
+            state, key_hex = _group_block_key(resolved, lengths, index, group,
+                                              helpers)
+            if state == "refuse":
+                return key_hex
+            if state != "hit":
+                whole = False
+                break
+            pairs.append((group, key_hex))
+        if whole:
+            anchors[str(length)] = pairs
+    # --- 3. the run, clamped to the longest anchored length --------------------
+    if boundary:
+        valid = sorted(int(length) for length in anchors)
+        blocks = valid[-1] if valid else 0
+    else:
+        blocks = len(pos_keys)
+        anchors = {}
+    if blocks <= 0:
+        return _ok(blocks=0, keys=[], view_lengths=lengths,
+                   positional_groups=positional, boundary_groups=boundary,
+                   positional_run=len(pos_keys), anchors={},
+                   clamped_to_anchor=False,
+                   no_anchor=bool(boundary) and len(pos_keys) > 0)
+    # THE TWO VIEWS, and the difference is a bug that was actually shipped once in this
+    # change: `keys` is the run AS OFFERED (the last span carrying the boundary-state
+    # pairs too), while `positional_keys` is the walk before that merge. A clamp that
+    # rebuilds a shorter span from `keys` and then appends its own anchor gets the
+    # boundary pairs TWICE - 12 named blocks for 8 allocated slots on the live
+    # geometry - which `_merge_into_pending`'s allocation check refuses, so it fails
+    # safe, but it fails. Every cut therefore rebuilds from `positional_keys`.
+    positional_keys = [list(pairs) for pairs in pos_keys[:blocks]]
+    keys = [list(pairs) for pairs in positional_keys]
+    keys[blocks - 1] = keys[blocks - 1] + list(anchors.get(str(blocks)) or [])
+    return _ok(blocks=blocks, keys=keys, positional_keys=positional_keys,
+               view_lengths=lengths,
+               positional_groups=positional, boundary_groups=boundary,
+               positional_run=len(pos_keys), anchors=anchors,
+               clamped_to_anchor=bool(boundary) and blocks != len(pos_keys),
+               no_anchor=False)
+
+
+def _cut_run(run: dict, length: int) -> dict:
+    """Shorten an offered run to at most `length` blocks, KEEPING ITS BOUNDARY.
+
+    A clamp that just truncates `run["keys"]` is the 00:08 bug in miniature: the real
+    boundary-state block sits on the run's LAST block, so cutting the tail off moves
+    the claim to a length no group has a state file for and the align-mode groups get
+    nulls over a range nobody computed. So a cut only ever lands on an ANCHOR length
+    `_disk_run` already proved complete, and when no anchor is short enough the cut
+    fails and the offer is refused. Positional-only runs (no boundary group) have no
+    anchors to keep and cut freely, exactly as they always did.
+    """
+    wanted = min(int(length), int(run.get("blocks") or 0))
+    boundary = list(run.get("boundary_groups") or [])
+    if wanted <= 0:
+        return _fail(f"a run of at most {length} blocks leaves nothing to offer",
+                     reason_kind="disk_run_below_one_block")
+    if not boundary:
+        return _ok(blocks=wanted,
+                   keys=[list(pairs) for pairs in (run.get("keys") or [])[:wanted]],
+                   clamped_from=int(run.get("blocks") or 0), cut_to=wanted)
+    valid = sorted(int(key) for key in (run.get("anchors") or {}))
+    fitting = [value for value in valid if value <= wanted]
+    if not fitting:
+        return _fail(f"the shortest run every align-mode group has a boundary state "
+                     f"for is longer than the {wanted} block(s) this offer can pay "
+                     f"for (anchored lengths: {valid[:16]})",
+                     reason_kind="no_boundary_anchor")
+    cut = fitting[-1]
+    # REBUILT, NOT TRUNCATED: the positional walk, then this length's own anchor. Taking
+    # `run["keys"]` (which already carries the anchor of the run's ORIGINAL end) and
+    # appending another anchor is what named a boundary state twice for one span.
+    walk = run.get("positional_keys")
+    if walk is None:
+        walk = [pairs for pairs in (run.get("keys") or [])]
+    keys = [list(pairs) for pairs in walk[:cut]]
+    keys[cut - 1] = keys[cut - 1] + list((run.get("anchors") or {})[str(cut)])
+    return _ok(blocks=cut, keys=keys, clamped_from=int(run.get("blocks") or 0),
+               cut_to=cut)
 
 
 # --- the scheduler's door 1: offer the SSD's continuation ---------------------
@@ -2641,12 +2966,34 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         return ram_result
 
     start_block = (computed // block_size) + (ram_tokens // block_size)
+    contracts = groups.get("contracts") or {}
+    boundary_groups = list(groups.get("boundary_group_ids") or [])
+    positional_groups = list(groups.get("positional_group_ids") or [])
+    # THE SLOT BILL, PER CONTRACT (0.2.27). A positional group costs one destination
+    # CPU slot per span; an align-mode group costs ONE real slot for the whole run -
+    # its boundary state - and `[null]*(n-1)` placeholders that cost nothing because
+    # the pool's own null block is not allocated. Pricing a boundary group per span
+    # would refuse offers the tier can pay for; pricing it per RUN and forgetting the
+    # nulls would land the state on the wrong GPU block, so both halves are here.
+    per_span = len(positional_groups)
+    boundary_slots = len(boundary_groups)
     run = _disk_run(request, start_block, groups["groups"], block_size,
-                    hash_block_size, helpers)
+                    hash_block_size, helpers, contracts=contracts)
     if not run["ok"]:
         _refuse(run.get("reason_kind") or "no_block_hashes", run["reason"])
         return ram_result
     if run["blocks"] <= 0:
+        if run.get("no_anchor"):
+            # The positional groups have the whole run and NO run end has a state
+            # file in every align-mode group. This is the 00:08 shape and it is a
+            # named refusal, not a shorter offer.
+            _refuse("no_boundary_anchor",
+                    f"groups {positional_groups} hold a contiguous run from block "
+                    f"{start_block} ({run['positional_run']} block(s)) but no run "
+                    f"end has a boundary-state file in every align-mode group "
+                    f"{boundary_groups}, so the one block those groups need for a "
+                    "claim does not exist")
+            return ram_result
         _refuse("no_disk_run", f"the SSD tier holds no contiguous span starting at "
                                f"block {start_block} for all of groups "
                                f"{groups['groups']}")
@@ -2683,15 +3030,15 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         return ram_result
 
     blocks = disk_tokens // block_size
-    per_block = len(groups["groups"])
-    needed = blocks * per_block
+    needed = blocks * per_span + boundary_slots
     if needed > MAX_SLOTS_PER_OFFER:
-        blocks = MAX_SLOTS_PER_OFFER // per_block
-        needed = blocks * per_block
+        blocks = max(0, (MAX_SLOTS_PER_OFFER - boundary_slots)) // max(1, per_span)
+        needed = blocks * per_span + boundary_slots
         disk_tokens = blocks * block_size
-    if disk_tokens <= 0:
-        _refuse("no_cpu_slots", f"one span needs {per_block} CPU slots and the cap "
-                                f"is {MAX_SLOTS_PER_OFFER}")
+    if blocks <= 0:
+        _refuse("no_cpu_slots", f"one span needs {per_span} CPU slots plus "
+                                f"{boundary_slots} boundary slot(s) and the cap is "
+                                f"{MAX_SLOTS_PER_OFFER}")
         return ram_result
     pool = getattr(manager, "cpu_block_pool", None)
     free = None
@@ -2705,21 +3052,45 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if free is None:
         _refuse("no_cpu_slots", "the CPU pool exposes no get_num_free_blocks()")
         return ram_result
-    affordable = max(0, (free - CPU_SLOT_RESERVE)) // per_block
+    affordable = max(0, (free - CPU_SLOT_RESERVE - boundary_slots)) // max(1, per_span)
     if affordable <= 0:
-        _refuse("no_cpu_slots", f"the CPU pool has {free} free blocks and "
-                                f"{CPU_SLOT_RESERVE} are reserved, so not even one "
-                                "span can be given a destination")
+        _refuse("no_cpu_slots", f"the CPU pool has {free} free blocks, "
+                                f"{CPU_SLOT_RESERVE} are reserved and "
+                                f"{boundary_slots} go to boundary states, so not "
+                                "even one span can be given a destination")
         return ram_result
     if affordable < blocks:
         blocks = affordable
-        needed = blocks * per_block
+        needed = blocks * per_span + boundary_slots
         disk_tokens = blocks * block_size
-    # Every clamp above shortens the OFFER, so the resolved key list is cut to
-    # match: merging more identities than there are slots would be an alignment
-    # failure at the door that allocates, and one fewer would silently restore a
-    # shorter span than was offered.
-    keys = run["keys"][:blocks]
+    # THE BOUNDARY-SAFE CUT. Every clamp above shortens the OFFER, and with an
+    # align-mode group in the set a shortening is not a truncation: the one real
+    # state block rides on the run's LAST block, so a cut that moves the end moves
+    # the claim to a length no group has a state for. `_cut_run` only ever lands on a
+    # length `_disk_run` proved anchored, and refuses if none is short enough. (For a
+    # positional-only model this is the plain `run["keys"][:blocks]` it always was.)
+    cut = _cut_run(run, blocks)
+    if not cut["ok"]:
+        _refuse(cut.get("reason_kind") or "no_boundary_anchor", cut["reason"])
+        return ram_result
+    if cut["blocks"] != blocks:
+        blocks = cut["blocks"]
+        needed = blocks * per_span + boundary_slots
+        disk_tokens = blocks * block_size
+    keys = cut["keys"]
+    # The null block the align-mode groups' interior entries are made of. The fork's
+    # own Mamba hit uses the CPU pool's `null_block` for exactly those slots, and
+    # `update_state_after_alloc` skips entries whose `is_null` is set while KEEPING
+    # THE INDEX, which is what lands the real state on `group_gpu_ids[start+B-1]`.
+    null_block = getattr(pool, NULL_BLOCK_ATTR, None) if boundary_groups else None
+    if boundary_groups and (
+            null_block is None or not getattr(null_block, "is_null", False)):
+        _refuse("no_null_block", "the CPU pool exposes no usable `null_block` "
+                                 f"(is_null={getattr(null_block, 'is_null', None)!r}), "
+                                 "so the align-mode groups' interior entries cannot "
+                                 "be built and their one state block would land on "
+                                 "the run's first GPU block instead of its last")
+        return ram_result
     allocated = _allocate(pool, needed)
     if not allocated["ok"]:
         _refuse("alloc_refused", allocated["reason"])
@@ -2727,7 +3098,8 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     merged = _merge_into_pending(manager, request_id, ram_tokens, computed,
                                  block_size, groups["groups"],
                                  groups["num_groups"], allocated["blocks"],
-                                 keys, opened["root"])
+                                 keys, opened["root"], contracts=contracts,
+                                 null_block=null_block)
     if not merged["ok"]:
         _release(pool, allocated["blocks"])
         _refuse(merged.get("reason_kind") or "ram_shape", merged["reason"])
@@ -2794,6 +3166,22 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     # refusal path publishes now that the offer cannot happen here at all.
     required = _groups_required(_state["group_serviceability"], blocks)
     required["offered"] = True
+    # THE LOADS ACTUALLY BUILT, per group, read off the merged tuple itself. The
+    # gate's promise is "no claim without bytes for every group", and the operator's
+    # acceptance test reads this to see it: `groups_required[].restored` says every
+    # eligible group was restorable, and `loads` says how many REAL blocks (bytes on
+    # disk behind them) and how many null entries (no bytes, by the engine's own
+    # design) each group was handed. A row whose `real_blocks` is 0 for an eligible
+    # group would be the 00:08 bug visible in one field, which is why it is published.
+    loads = merged.get("loads") or {}
+    required["loads"] = [{"group": int(group),
+                          "contract": _clip(str(contracts.get(str(group))
+                                                     or CONTRACT_POSITIONAL), 24),
+                          "real_blocks": int((loads.get(str(group))
+                                              or {}).get("real") or 0),
+                          "null_blocks": int((loads.get(str(group))
+                                              or {}).get("null") or 0)}
+                         for group in groups["groups"][:16]]
     _state["last_groups_required"] = required
     # THE OFFER, AS STRUCTURE: a forced-from-disk read and an ordinary one disagree
     # about exactly these numbers, so `last_offer` is what tells them apart in a
@@ -2808,11 +3196,27 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         "blocks": int(blocks),
         "disk_tokens": int(disk_tokens),
         "groups": list(groups["groups"])[:8],
+        "positional_groups": positional_groups[:8],
+        "boundary_groups": boundary_groups[:8],
+        "run_blocks": int(run["blocks"]),
+        # TRUE WHEN THE OFFER IS SHORTER THAN THE POSITIONAL RUN. Two ways that
+        # happens and an operator must not have to tell them apart by arithmetic:
+        # `_disk_run` walked further than every align-mode group could close (a state
+        # file is missing at the tail), or a later clamp cut the offer below an
+        # anchored end. Either way the number next to it is the length the attention
+        # group alone could have claimed, which is the number that would have been the
+        # 00:08 wrong answer.
+        "run_reanchored": bool(run.get("clamped_to_anchor")) or bool(
+            cut.get("clamped_from", 0) > cut.get("cut_to", 0)),
+        "positional_run_blocks": int(run.get("positional_run") or 0),
         "groups_required": required["rows"][:16],
         "groups_unfilled": required["unfilled_group_ids"][:16],
+        "loads": required["loads"][:16],
     }
     _note(f"offered {disk_tokens} disk tokens for {request_id[:48]} in {blocks} "
-          f"span(s) across {per_block} group(s)"
+          f"span(s) across {len(groups['groups'])} group(s) "
+          f"({len(positional_groups)} positional, {len(boundary_groups)} "
+          f"boundary-state, {needed} CPU slot(s))"
           + (f" [disk authority: local hit of {ram_tokens_reported} tokens "
              "not consulted]" if disk_authority else ""))
     emit_witness()
@@ -2927,27 +3331,64 @@ def _identity_path(root: str, key_hex: str) -> dict:
 
 
 def _merge_into_pending(manager, request_id, ram_tokens, ram_computed, block_size,
-                        groups, num_groups, allocated, keys, root) -> dict:
-    """Append our slots to the fork's per-group CPU-hit lists.
+                       groups, num_groups, allocated, keys, root,
+                       contracts: dict | None = None,
+                       null_block=None) -> dict:
+    """Append our slots to the fork's per-group CPU-hit lists, BY CONTRACT.
 
-    Shape contract with `manager.py:381-492`: element 0 is a sequence with ONE
-    entry per group (so the fork's `for g in range(num_groups)` cannot IndexError),
-    our slots go at the END of each eligible group's list (the fork consumes
-    LEADING entries, so "RAM first, then disk" is the token order it will pair),
-    and the tuple becomes `(merged_lists, ram_tokens + disk_tokens,
-    num_computed_tokens)` with the third field untouched - the fork needs that
-    local prefix to place the external blocks and must not have it re-derived.
+    Shape contract with `manager.py:381-492`: element 0 is a sequence with ONE entry
+    per group (so the fork's `for g in range(num_groups)` cannot IndexError), our
+    slots go at the END of each eligible group's list (the fork consumes LEADING
+    entries, so "RAM first, then disk" is the token order it will pair), and the tuple
+    becomes `(merged_lists, ram_tokens + disk_tokens, num_computed_tokens)` with the
+    third field untouched - the fork needs that local prefix to place the external
+    blocks and must not have it re-derived.
+
+    THE PART 0.2.27 ADDED, and it is the whole reason a GDN boundary restore is a
+    restore rather than a wrong answer. The fork pairs entries with this loop
+    (`manager.py:460-478`):
+
+        for i, cpu_blk in enumerate(cpu_blocks_g):
+            if cpu_blk.is_null:
+                continue
+            gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
+
+    so an entry is addressed by its INDEX and a null costs its index and nothing
+    else. That is what makes the align-mode hit shape land correctly: a boundary group
+    gets `[null] * (B - 1) + [one real state block]`, exactly the shape the fork's own
+    `MambaManager.find_longest_cache_hit` builds
+    (`single_type_kv_cache_manager.py:1591-1607`), and the real state is therefore
+    DMA'd into `group_gpu_ids[start + B - 1]` - the state at the END of the claimed
+    run, which is the only state that describes those tokens. Appending the state at
+    position 0 instead, or omitting the nulls, would aim a 31 MB recurrent state at
+    the wrong block and answer confidently and wrongly. So:
+
+      * `positional` group      -> B real blocks, one per span (unchanged);
+      * `boundary_state` group  -> (B - 1) of the pool's OWN `null_block`, then the
+                                   one real state block, and the real block must be
+                                   the pair `_disk_run` put on the LAST span or this
+                                   function refuses.
 
     A RAM hit whose per-group length disagrees with its own token count is REFUSED:
     the whole merge rests on "leading entries = the RAM hit, one per whole group
     block", and if that is not true the pairing would put our bytes at GPU offsets
     belonging to someone else's tokens.
     """
-    per_block = len(groups)
+    declared = contracts or {}
     ram_blocks = ram_tokens // block_size
-    needed = len(keys) * per_block
-    if len(allocated) != needed:
-        return _fail(f"{len(allocated)} slots were allocated for {needed}",
+    spans = len(keys)
+    # How many REAL (bytes-backed) entries each group is being handed, and at which
+    # span each of them belongs. Counted from `keys`, which `_disk_run` built under
+    # the contract rule, so a disagreement between the two is caught here rather than
+    # reaching the fork.
+    real_at: dict = {}
+    for position, span in enumerate(keys):
+        for group, _key_hex in span:
+            real_at.setdefault(int(group), []).append(position)
+    wanted = sum(len(positions) for positions in real_at.values())
+    if len(allocated) != wanted:
+        return _fail(f"{len(allocated)} slots were allocated for {wanted} named "
+                     f"block(s) across {spans} span(s) and {len(groups)} group(s)",
                      reason_kind="ram_shape")
     pending = None
     try:
@@ -2980,8 +3421,42 @@ def _merge_into_pending(manager, request_id, ram_tokens, ram_computed, block_siz
                          f"blocks but the offer says {ram_blocks}, so leading "
                          "entries are not the RAM hit", reason_kind="ram_shape")
     identities: list = []
+    loads: dict = {}
+    # First the boundary groups' interior entries, so the one real state block that
+    # arrives with the LAST span lands after them. The fork pairs by INDEX and skips
+    # nulls with the index preserved (`manager.py:460-478`), which is what puts that
+    # state on `group_gpu_ids[start + B - 1]`.
+    for group in groups:
+        if (declared.get(str(group)) or CONTRACT_POSITIONAL) != CONTRACT_BOUNDARY:
+            continue
+        positions = real_at.get(int(group), [])
+        if len(positions) != 1:
+            return _fail(f"group {group} is an align-mode boundary group but the run "
+                         f"named {len(positions)} state block(s) for it; the fork's "
+                         "hit shape is exactly one, so merging this run would aim "
+                         "the state at the wrong GPU block", reason_kind="ram_shape")
+        if positions[0] != spans - 1:
+            return _fail(f"group {group}'s boundary state is named for span "
+                         f"{positions[0]} of {spans}, not the last one, so the state "
+                         "would be paired with a GPU block that is not the run's "
+                         "end", reason_kind="ram_shape")
+        if null_block is None:
+            return _fail("an align-mode group needs the CPU pool's null_block for "
+                         "its interior entries and none was supplied",
+                         reason_kind="no_null_block")
+        for _ in range(max(0, spans - 1)):
+            lists[group].append(null_block)
+    for group in groups:
+        contract = declared.get(str(group)) or CONTRACT_POSITIONAL
+        loads[str(group)] = {
+            "real": len(real_at.get(int(group), [])),
+            "null": (max(0, spans - 1) if contract == CONTRACT_BOUNDARY else 0),
+            "contract": contract}
+    # Then the real blocks, SPAN-MAJOR, exactly as they were allocated: pairing an
+    # allocation with the wrong identity is the one mistake a content-addressed store
+    # cannot survive, so the order that named them is the order that pairs them.
     index = 0
-    for span in keys:
+    for position, span in enumerate(keys):
         for group, key_hex in span:
             named = _identity_path(root, key_hex)
             if not named["ok"]:
@@ -2990,16 +3465,19 @@ def _merge_into_pending(manager, request_id, ram_tokens, ram_computed, block_siz
                              reason_kind="path_build_failed")
             block = allocated[index]
             index += 1
-            lists[group].append(block)
-            identities.append({"group": group, "key": key_hex,
+            lists[int(group)].append(block)
+            identities.append({"group": int(group), "key": key_hex,
                                "cpu_block_id": int(block.block_id),
-                               "path": named["path"]})
-    if index != needed:
-        return _fail(f"{index} identities built for {needed} slots",
+                               "path": named["path"], "span": int(position),
+                               "contract": _clip(str(declared.get(str(group))
+                                                          or CONTRACT_POSITIONAL),
+                                                 24)})
+    if index != wanted:
+        return _fail(f"{index} identities built for {wanted} slots",
                      reason_kind="ram_shape")
     hit_length = ram_tokens + len(keys) * block_size
     return _ok(pending=(tuple(lists), hit_length, ram_computed),
-               identities=identities, hit_length=hit_length)
+               identities=identities, hit_length=hit_length, loads=loads)
 
 
 def _register_load(request_id: str, merged: dict, disk_tokens: int,
@@ -5825,12 +6303,15 @@ def scheduler_section() -> dict:
         if service and not service.get("complete", True):
             why += (f" THIS MODEL CANNOT BE SERVED FROM DISK AT ALL: "
                     f"prefix-cacheable group(s) "
-                    f"{service.get('blocked_group_ids')} cannot be restored while "
-                    f"{service.get('restorable_group_ids')} can, and a disk offer "
-                    "claims EVERY prefix-cacheable group because "
-                    "get_num_new_matched_tokens skips prefill model-wide. Every "
-                    "lookup here is refused as `incomplete_group_set` and recompute "
-                    "is the only correct answer on this architecture.")
+                    f"{service.get('blocked_group_ids')} have no block contract this "
+                    f"tier can price (see `group_serviceability.group_contracts`) "
+                    f"while {service.get('restorable_group_ids')} do, and a disk "
+                    "offer claims EVERY prefix-cacheable group because "
+                    "get_num_new_matched_tokens skips prefill model-wide. An "
+                    "align-mode GDN group is NOT in this list: its boundary-state "
+                    "contract is restorable (0.2.27). Every lookup here is refused "
+                    "as `incomplete_group_set` and recompute is the only correct "
+                    "answer on this architecture.")
             needed = state["last_groups_required"] or {}
             if needed.get("unfilled_group_ids"):
                 why += (f" What the refused claim needs: "

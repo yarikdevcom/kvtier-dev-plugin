@@ -261,6 +261,42 @@ from . import blockdump, config, disk_index, disk_layout, snapshot
 # --- the caps, and the unit of every one of them ----------------------------
 
 MAX_QUEUE_DEPTH = 256                # JOBS in flight; past it, a job is DROPPED
+# BYTES of snapshotted slots the queue may hold at once. THE SECOND HALF OF THE SAME
+# BOUND, and the one the copy-at-completion change made load-bearing: a job used to
+# carry a SLOT NUMBER (a few bytes) and read the bytes on the writer thread, so a deep
+# queue cost nothing. Now a job carries the bytes themselves - one rank slot,
+# 11,468,800 B on the live PP0 and 12,902,400 on PP1 - so the depth cap alone would
+# allow 256 x 12.9 MB = 3.3 GB of held host memory at exactly the moment the box is
+# already behind. So a job is admitted on BOTH currencies and a refusal is a DROP with
+# its own name (`queue_bytes_full`). 256 MiB is about twenty slots: enough to keep the
+# writer thread busy through a normal burst (the write-rate window is 200 files per
+# 60 s, and the writer drains at SSD speed) and small enough that a stalled disk costs
+# dropped spills, never growth.
+MAX_QUEUED_BYTES = 256 * 1024 * 1024
+
+# THE SPAN COST, IN BYTES, PER BLOCK CONTRACT. Why the writer publishes a cost model at
+# all, when `disk_restore` is the one that walks spans: an align-mode/boundary-state
+# group costs ONE file per RUN while a positional group costs one file per SPAN, so a
+# reader who counts files concludes a GDN group is "cheap to keep" - true per hit,
+# and false as a plan (it is cheap because the run's other spans are nulls, i.e.
+# it kept nothing at all for them).
+# Publishing both numbers side by side, in the currency the ceiling is configured in, is
+# cheaper than being asked again.
+SPAN_COST_MEANING = {
+    "positional_bytes_per_span": "ONE file of this width for EVERY block of a run: a"
+                                 " positionally stable group names every span, so a run"
+                                 " of n spans costs n files",
+    "boundary_state_bytes_per_span": "ONE file of this width for the LAST block of"
+                                     " a run ONLY: an align-mode group hands off its"
+                                     " recurrent state as a boundary-state block, so a"
+                                     " hit of n spans costs n-1 nulls and this one"
+                                     " file. Cheap per hit; NOT a cheaper capacity"
+                                     " plan, because the n-1 spans it did not buy are"
+                                     " spans it did not keep",
+    "measured_from": "this rank's fingerprint total_bytes_per_block - the width every"
+                     " spill file has here, and the width disk_read reads back",
+    "unit": "bytes",
+}
 SPILL_WINDOW_SECONDS = 60.0          # SECONDS in the write-rate window
 MAX_FILES_PER_WINDOW = 200           # FILES written per window
 MIN_FREE_BYTES = 1024 * 1024 * 1024  # BYTES the filesystem must keep free
@@ -318,7 +354,18 @@ REFUSAL_REASONS = ("not_configured", "disarmed", "no_key_for_slot",
                    "no_region_tensors", "region_not_contiguous",
                    "slot_out_of_range", "region_width_mismatch",
                    "read_failed", "no_free_space", "over_rate_window",
-                   "queue_full", "write_failed", "bad_key", "bad_call")
+                   "queue_full", "write_failed", "bad_key", "bad_call",
+                   # A job is admitted on TWO currencies now - see MAX_QUEUED_BYTES:
+                   # the depth cap (`queue_full`) and this byte cap. A reader must be
+                   # able to tell "the queue is 256 deep" from "we would have had to
+                   # slot's bytes and chose not to".
+                   "queue_bytes_full",
+                   # The snapshot could not be taken: a slot the region map cannot
+                   # answer, or a region narrower than the slot. Since the copy moved to
+                   # store completion this is reported HERE, where the slot still
+                   # exists, and not by the writer thread half a second later as
+                   # `write_failed`.
+                   "snapshot_failed")
 
 _state: dict = {
     # configuration and the arm
@@ -343,6 +390,11 @@ _state: dict = {
     "thread_alive": False,
     "queue_depth": 0,
     "queue_depth_peak": 0,
+    # Bytes of SNAPSHOTTED slots held by queued jobs. Load-bearing since the copy moved
+    # to store completion: the queue's memory is now bytes x depth, so admission is
+    # checked in both currencies (see MAX_QUEUED_BYTES).
+    "queue_bytes": 0,
+    "queue_bytes_peak": 0,
     "window_start_mono": None,
     "window_files": 0,
     # counters
@@ -430,6 +482,7 @@ def reset_state_for_tests() -> None:
         "fingerprint": None, "geometry_digest": None,
         "thread_started": 0, "thread_alive": False,
         "queue_depth": 0, "queue_depth_peak": 0,
+        "queue_bytes": 0, "queue_bytes_peak": 0,
         "window_start_mono": None, "window_files": 0,
         "requests": 0, "accepted": 0, "spilled": 0, "duplicates": 0,
         "bytes_written": 0, "write_seconds": 0.0, "read_seconds": 0.0,
@@ -503,6 +556,23 @@ def disk_root():
     if not checked["ok"]:
         return None
     return checked["absolute"]
+
+
+def _slot_width_bytes():
+    """The width ONE spill file has on this rank, or None before a fingerprint exists.
+
+    The fingerprint's `total_bytes_per_block` - the same figure `read_slot_bytes`
+    requires and `disk_read` reads back - so a cost published from here cannot drift
+    from the bytes actually written. None is returned rather than 0: a cost of zero is a
+    number a reader will multiply, and an unknown width is not.
+    """
+    fingerprint = _state.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        return None
+    width = fingerprint.get("total_bytes_per_block")
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        return None
+    return int(width)
 
 
 def capacity_ceiling_bytes():
@@ -1053,6 +1123,44 @@ def measured_slot_bytes(caches) -> dict:
                bytes_per_file=total, widths=widths, regions=names)
 
 
+def plan_slot_naming(key, fingerprint=None) -> dict:
+    """The name and the width a slot's bytes WOULD be written under - no bytes read.
+
+    Split out of `plan_slot_write` for the copy-at-completion path: the bytes are
+    snapshotted on the engine thread when the store event COMPLETES, and the name is
+    derived later, on the writer thread, from the identity carried with them. The two
+    halves must still be validated by the same code, so this is the one place the
+    fingerprint check, the digest computation and the path build live, and
+    `plan_slot_write` calls it rather than repeating it.
+
+    Same single naming mode as `plan_slot_write`: the digest comes from the fingerprint
+    THIS process was configured with, and a missing or invalid one is a refusal. No
+    "hand me a digest" door - the digest is a function of rank-local facts and a
+    second computing site is how files become un-findable.
+    """
+    adopted = fingerprint if fingerprint is not None else _state["fingerprint"]
+    if adopted is None:
+        return _fail("no fingerprint is configured: a file whose identity is "
+                     "unknown must not be written",
+                     reason_kind="fingerprint_missing")
+    configured()
+    digested = disk_layout.fingerprint_digest(adopted)
+    if not digested["ok"]:
+        return _fail(str(digested["reason"]), reason_kind="fingerprint_invalid")
+    named = disk_layout.build_slot_path(_state["root"] or "", key,
+                                        digested["geometry_digest"])
+    if not named["ok"]:
+        return _fail(str(named["reason"]), reason_kind="bad_key")
+    return _ok(units=disk_layout._units("bytes_per_file", "ceiling_bytes",
+                                        "slot", "block_id", "group_id"),
+               path=named["path"], part_path=named["part_path"],
+               directory=named["directory"], filename=named["filename"],
+               key16=named["key16"], group_id=named["group_id"],
+               group_field=named["group_field"], shard=named["shard"],
+               geometry_digest=named["geometry_digest"],
+               bytes_per_file=int(digested["total_bytes_per_block"]))
+
+
 def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
     """Everything that can be refused, checked BEFORE any byte is written.
 
@@ -1081,15 +1189,11 @@ def plan_slot_write(caches, slot, key, fingerprint=None) -> dict:
         return _fail("no fingerprint is configured: a file whose identity is "
                      "unknown must not be written",
                      reason_kind="fingerprint_missing")
-    configured()
-    digested = disk_layout.fingerprint_digest(adopted)
-    if not digested["ok"]:
-        return _fail(str(digested["reason"]), reason_kind="fingerprint_invalid")
-    named = disk_layout.build_slot_path(_state["root"] or "", key,
-                                        digested["geometry_digest"])
+    named = plan_slot_naming(key, adopted)
     if not named["ok"]:
-        return _fail(str(named["reason"]), reason_kind="bad_key")
-    read = read_slot_bytes(caches, slot, digested["total_bytes_per_block"])
+        return _fail(str(named["reason"]),
+                     reason_kind=named.get("reason_kind", "bad_key"))
+    read = read_slot_bytes(caches, slot, named["bytes_per_file"])
     if not read["ok"]:
         return _fail(str(read["reason"]),
                      reason_kind=read.get("reason_kind", "read_failed"))
@@ -1244,13 +1348,32 @@ def _journal_write(path, size_bytes, *, removal: bool = False) -> dict:
         return {"ok": False, "reason": f"journaling raised {type(exc).__name__}"}
 
 
-def spill_slot(caches, slot, key, fingerprint=None) -> dict:
+def spill_slot(caches=None, slot=None, key=None, fingerprint=None,
+               blob=None) -> dict:
     """Read one slot and commit it. The whole write path, synchronously.
 
-    Used by the writer thread and callable directly (a test, or a future
-    synchronous caller). It NEVER raises: every failure is a classified dict, and
-    `final_exists: False` on a failed write is the property `disk_layout`
-    guarantees and this function preserves.
+    Used by the writer thread and callable directly (a test, or a future synchronous
+    caller). It NEVER raises: every failure is a classified dict, and `final_exists:
+    False` on a failed write is the property `disk_layout` guarantees and this
+    function preserves.
+
+    TWO WAYS TO HAND OVER THE BYTES, and the difference between them is a race, not a
+    style choice:
+
+      * `blob=` - the bytes, already copied. THE PATH THE ENGINE HOOK USES since the
+        restore tier landed: the copy happens at store COMPLETION, on the engine
+        thread, in `disk_store.on_store_completed`. The snapshot's width is still
+        checked against the fingerprint, so bytes that are not a whole slot are
+        refused exactly as `read_slot_bytes` refuses a narrow slot.
+      * `caches=` + `slot=` - read the slot HERE, now. Correct only when the caller
+        knows the slot cannot be recycled before this call returns - true of a test and
+        of a synchronous caller, and FALSE of a queued job: a CPU slot the RAM tier has
+        finished storing into is available to the next store, so a job that carried a
+        slot NUMBER would write the NEXT block's bytes under the PREVIOUS block's NAME.
+        For an attention block that costs one wrong KV block; for an align-mode GDN
+        boundary state one wrong state produces a confident wrong answer at
+        `temperature=0`. That is why `request_spill` snapshots and never defers the
+        read.
 
     Two things happen AFTER a successful commit and neither can affect it: the group
     collision witness is updated (`group_collisions`, see
@@ -1266,7 +1389,30 @@ def spill_slot(caches, slot, key, fingerprint=None) -> dict:
     device. A reader must never treat it as a failure.
     """
     started = time.monotonic()
-    plan = plan_slot_write(caches, slot, key, fingerprint)
+    if blob is not None:
+        # COPY-AT-COMPLETION: the bytes came with the job, so what lands on disk is
+        # what the store event completed with, whatever the RAM tier has since done
+        # with the slot. The width check is the same one `read_slot_bytes` runs.
+        plan = plan_slot_naming(key, fingerprint)
+        if plan["ok"]:
+            payload = bytes(blob)
+            if len(payload) != int(plan["bytes_per_file"]):
+                return {"ok": False,
+                        "reason": f"the snapshot is {len(payload)} bytes but this "
+                                  f"rank's slot is {plan['bytes_per_file']}: these "
+                                  "bytes are not what this fingerprint describes",
+                        "reason_kind": "region_width_mismatch",
+                        "final_exists": False}
+            plan = _ok(path=plan["path"], part_path=plan["part_path"],
+                       directory=plan["directory"], filename=plan["filename"],
+                       key16=plan["key16"], group_id=plan["group_id"],
+                       group_field=plan["group_field"], shard=plan["shard"],
+                       geometry_digest=plan["geometry_digest"],
+                       bytes_per_file=plan["bytes_per_file"],
+                       sha256=hashlib.sha256(payload).hexdigest(),
+                       slot=slot, blob=payload)
+    else:
+        plan = plan_slot_write(caches, slot, key, fingerprint)
     if not plan["ok"]:
         return {"ok": False, "reason": plan["reason"],
                 "reason_kind": plan.get("reason_kind", "read_failed")}
@@ -1384,15 +1530,39 @@ def _writer_loop() -> None:
             snapshot._error(exc, "disk_spill job")
             _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
         finally:
+            # The snapshot leaves memory when the job leaves the queue - whether the
+            # write landed, failed, or the loop is draining on shutdown. It sits in the
+            # finally and not in the success branch on purpose: a byte counter that only
+            # ever grows fills the cap permanently and the tier quietly stops spilling,
+            # the same silent-failure shape that cost 25,945 watchdog cycles on the
+            # llm-api box for a latch that outlived the attempt that set it.
             _state["queue_depth"] = max(0, int(_state["queue_depth"]) - 1)
+            _state["queue_bytes"] = max(0, int(_state["queue_bytes"])
+                                        - int(job.get("bytes") or 0))
             local.task_done()
 
 
 def _handle_job(job) -> None:
-    caches = job.get("caches")
+    """One queued job, on the spill thread. The bytes arrive as `blob` - the snapshot
+    `request_spill` copied at store completion.
+
+    There is deliberately NO `caches` fallback here. A job that arrived through the
+    queue has no right to read a slot it does not own: the RAM tier reuses a CPU slot
+    as soon as its store completes, so reading it later writes the NEXT block's bytes
+    under THIS block's name. For an attention block that is one wrong KV block; for an
+    align-mode GDN boundary state, one wrong state answers confidently and wrongly at
+    `temperature=0`. A job without a snapshot is a caller bug and is reported as one.
+    """
     started = time.monotonic()
-    result = spill_slot(caches, job.get("slot"), job.get("key"),
-                        job.get("fingerprint"))
+    if job.get("blob") is None:
+        _state["refused"]["bad_call"] += 1
+        _state["last_reason"] = (
+            "the job carries no snapshot: request_spill copies the bytes at store "
+            "completion and a queued job must not read a slot it does not own"
+        )[:MAX_STRING_CHARS]
+        return
+    result = spill_slot(key=job.get("key"), fingerprint=job.get("fingerprint"),
+                        slot=job.get("slot"), blob=job.get("blob"))
     _state["read_seconds"] = round(float(_state["read_seconds"])
                                    + (time.monotonic() - started), 6)
     if not result.get("ok"):
@@ -1991,8 +2161,37 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
             return _refused("over_rate_window",
                             f"the write-rate window allows {MAX_FILES_PER_WINDOW} "
                             f"files per {SPILL_WINDOW_SECONDS}s")
-        job = {"caches": region_map, "slot": int(slot), "key": resolved,
-               "fingerprint": adopted,
+        # COPY-AT-COMPLETION. The bytes are read HERE, synchronously, by the thread the
+        # store completion arrived on - that is the whole point. A CPU slot the RAM tier
+        # has finished storing into is available to the NEXT store, so a job that
+        # deferred this read would write whatever block was stored into that slot next
+        # under the name of the block that completed. The cost is one memcpy of a rank
+        # slot on the engine thread (11,468,800 B on the live PP0, 12,902,400 on PP1);
+        # the bound on that cost is MAX_QUEUED_BYTES, checked BEFORE the copy, and every
+        # failure here is a drop with its own name rather than an exception on the
+        # engine's thread.
+        named = plan_slot_naming(resolved, adopted)
+        if not named["ok"]:
+            kind = str(named.get("reason_kind") or "bad_key")
+            if kind not in REFUSAL_REASONS:
+                kind = "bad_key"
+            _state["refused"][kind] = int(_state["refused"].get(kind, 0)) + 1
+            return _refused(kind, str(named["reason"]))
+        width = int(named["bytes_per_file"])
+        if int(_state["queue_bytes"]) + width > MAX_QUEUED_BYTES:
+            _state["drops"] = int(_state["drops"]) + 1
+            _state["refused"]["queue_bytes_full"] += 1
+            return _refused("queue_bytes_full",
+                            f"holding one more slot ({width} B) would exceed the "
+                            f"{MAX_QUEUED_BYTES} B the queue may hold; the job was "
+                            "dropped, not queued")
+        read = read_slot_bytes(region_map, int(slot), width)
+        if not read["ok"]:
+            _state["refused"]["snapshot_failed"] += 1
+            _state["last_error"] = str(read["reason"])[:MAX_STRING_CHARS]
+            return _refused("snapshot_failed", str(read["reason"]))
+        job = {"blob": read["bytes"], "slot": int(slot), "key": resolved,
+               "fingerprint": adopted, "bytes": width,
                "queued_ts": round(time.time(), 6)}
         pending = _get_queue()
         if not _ensure_thread():
@@ -2009,10 +2208,14 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
         _state["accepted"] += 1
         depth = int(_state["queue_depth"]) + 1
         _state["queue_depth"] = depth
+        _state["queue_bytes"] = int(_state["queue_bytes"]) + width
+        _state["queue_bytes_peak"] = max(int(_state["queue_bytes_peak"]),
+                                         int(_state["queue_bytes"]))
         _state["queue_depth_peak"] = max(int(_state["queue_depth_peak"]), depth)
         return {"ok": True, "queued": True, "slot": int(slot),
-                "path": None, "reason": None,
-                "note": "the bytes are read and written on the spill thread"}
+                "path": None, "reason": None, "bytes": width,
+                "note": "the bytes were copied at store completion; the file is "
+                        "written on the spill thread"}
     except Exception as exc:  # noqa: BLE001 - nothing here may reach the engine
         _state["errors"] += 1
         snapshot._error(exc, "disk_spill request")
@@ -2180,6 +2383,25 @@ def section() -> dict:
         "configured": bool(state["configured"]),
         "root": state["root"],
         "ceiling_bytes": state["ceiling_bytes"],
+        # THE COST MODEL, in bytes, next to the ceiling it feeds. See SPAN_COST_MEANING:
+        # the two per-span costs are published SEPARATELY because a single "bytes per
+        # span" number would be a lie about one of the two contracts.
+        "span_cost_bytes": ({
+            "positional_bytes_per_span": _slot_width_bytes(),
+            "boundary_state_bytes_per_span": _slot_width_bytes(),
+            "meaning": SPAN_COST_MEANING,
+            "units": disk_layout._units("positional_bytes_per_span",
+                                        "boundary_state_bytes_per_span"),
+        } if _slot_width_bytes() is not None else {
+            "positional_bytes_per_span": None,
+            "boundary_state_bytes_per_span": None,
+            "meaning": dict(SPAN_COST_MEANING,
+                            why_absent="no fingerprint is configured, so this rank "
+                                       "does not know the width of a file it would "
+                                       "write"),
+            "units": disk_layout._units("positional_bytes_per_span",
+                                        "boundary_state_bytes_per_span"),
+        }),
         "armed": bool(is_armed()),
         "arm_state": arm_state(),
         "fingerprint": disk_layout.fingerprint_section(_state["fingerprint"]),
@@ -2269,10 +2491,20 @@ def section() -> dict:
         "thread_started": int(_state["thread_started"]),
         "thread_alive": bool(_state["thread_alive"]),
         "queue_depth": int(_state["queue_depth"]),
+        # A queued job holds the slot's BYTES now (copy-at-completion), so depth alone
+        # cannot tell a reader what the queue costs. Both currencies are published, and
+        # `queue_bytes_full` in `refused` is the drop that the byte cap caused.
+        "queue_bytes": int(_state["queue_bytes"]),
+        "queue_bytes_peak": int(_state["queue_bytes_peak"]),
         "queue_depth_peak": int(_state["queue_depth_peak"]),
         "queue_max": MAX_QUEUE_DEPTH,
         "window_files": int(_state.get("window_files") or 0),
         "caps": {"max_queue_depth": MAX_QUEUE_DEPTH,
+                 # The queue's SECOND admission currency. Published as a cap because a
+                 # reader who sees `refused.queue_bytes_full` grow must be able to tell
+                 # the limit from the leak, and because since copy-at-completion the
+                 # queue's memory cost is this number, not `max_queue_depth` x nothing.
+                 "max_queued_bytes": MAX_QUEUED_BYTES,
                  "spill_window_seconds": SPILL_WINDOW_SECONDS,
                  "max_files_per_window": MAX_FILES_PER_WINDOW,
                  "min_free_bytes": MIN_FREE_BYTES,
@@ -2288,7 +2520,7 @@ def section() -> dict:
                      if isinstance(_state["fingerprint"], dict) else None),
                  "evict_target_fraction": EVICT_TARGET_FRACTION,
                  "units": disk_layout._units(
-                     "max_queue_depth", "spill_window_seconds",
+                     "max_queue_depth", "max_queued_bytes", "spill_window_seconds",
                      "max_files_per_window", "min_free_bytes",
                      "max_bytes_per_file", "evict_target_fraction",
                      "max_shard_dirs", "max_walk_files", "max_walk_entries")},
@@ -2321,7 +2553,8 @@ def section() -> dict:
                                     "read_seconds", "ceiling_bytes", "requests",
                                     "accepted", "spilled", "duplicates",
                                     "drops", "evictions", "errors", "queue_depth",
-                                    "queue_depth_peak", "queue_max", "window_files",
+                                    "queue_depth_peak", "queue_bytes",
+                                    "queue_bytes_peak", "queue_max", "window_files",
                                     "thread_started", "thread_alive",
                                     "group_collisions", "digest_groups_tracked",
                                     "digest_groups_cap",

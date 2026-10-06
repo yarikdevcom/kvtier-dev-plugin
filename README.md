@@ -1719,10 +1719,20 @@ skips those groups (`vllm/v1/simple_kv_offload/manager.py:874-876`). Then:
 * what a claimed span actually needs from an align-mode GDN group is **one** block, not
   a span of KV: `MambaManager.find_longest_cache_hit`
   (`single_type_kv_cache_manager.py:1533-1610`) answers a hit with
-  `[null_block] * (n - 1)` plus one real boundary-state block. That one block has no
-  positional file name to read back - the recurrent state is one running value per
-  sequence - and with `num_prefill_checkpoint_blocks: 0` there is no checkpoint to
-  recover it from, so the destination block holds whatever the allocator handed out.
+  `[null_block] * (n - 1)` plus one real boundary-state block.
+
+  **The sentence 0.2.25 concluded from that was wrong, and 0.2.27 is the correction.**
+  What I wrote next was "that one block has no file name to read back", reasoning from
+  the recurrent state being one running value per sequence. The fork disagrees in three
+  places: the align hand-off names that block and hands it to the connector
+  (`single_type_kv_cache_manager.py:2051-2080`, contract at `kv_cache_manager.py:907-921`),
+  the tier stores it under exactly the hash a lookup will ask for (`manager.py:1050-1078`),
+  and the store on the box proves it - one shard directory holds
+  `kvslot-a36ec46fe316bd0d-g0-…`, `-g1-…`, `-g2-…`, `-g3-…` and `-g5-…` files for the
+  SAME key16, five groups at one token boundary. `has_positionally_stable_blocks` is
+  about whether offload *scans* may follow a block table (`:62-69`, `:1494-1497`: align
+  mode "can null interior states and relocate speculative blocks in place"), not about
+  whether a block is *named*. Nulling a block does not un-hash it.
 
 So positional stability is a **necessary** condition (a name to read by) that was being
 read as a **sufficient** one (a complete claim). The module already had the right rule
@@ -1742,9 +1752,15 @@ behaviour, and it is stated as one rather than hedged. The predicate is derived 
 from the managers (`prefix_cacheable_group_ids`, `group_block_sizes` against the
 scheduler block size, `has_positionally_stable_blocks` per group), so a pure-attention
 model has nothing blocked and is offered at **exactly as before**
-(`test_a_pure_attention_configuration_still_offers_normally`), and a model whose
-recurrent state ever becomes per-block addressable gets its disk tier back with no
-change to this file (`test_making_the_gdn_groups_stable_makes_the_whole_model_serviceable`).
+(`test_a_pure_attention_configuration_still_offers_normally`).
+
+**Superseded in 0.2.27, in its diagnosis only.** The sentences here promising "on this
+model the disk tier offers nothing, forever", and the one saying the GDN groups have no
+name to read by, were wrong about the fork; the gate now opens on this geometry because
+the boundary-state contract is priced per run. What did NOT change is the invariant the
+gate exists for - an offer must have bytes for every prefix-cacheable group - and a
+group with no implementable contract still refuses under this same name. The next
+section is what replaced them.
 
 **Why this is a refusal and not a clamp - do not "optimise" it.** The tempting change is
 to offer the intersection, the way the joint CPU lookup clamps. It is the same nothing,
@@ -1784,6 +1800,121 @@ untouched`).
 Tests: `tests/test_disk_restore_group_gate.py` (the hybrid refusal, the pure-attention
 control, the predicate-not-a-group-list proof, the requirement table on both doors) and
 `tests/test_disk_restore_ledger_reporting.py` (the four reporting faults below).
+
+### The SSD tier serves the GDN groups: a second block contract (0.2.27)
+
+**The disk tier now restores a hybrid GDN + full-attention model instead of refusing
+it.** The gate of 0.2.25 was correct about the invariant and wrong about the engine, and
+this is the change the second half of that sentence asked for. Nothing about the
+invariant moved: an offer still requires bytes for **every** prefix-cacheable group, and
+a group whose block shape this tier cannot price still refuses under
+`refused.incomplete_group_set`. What changed is that an align-mode `MambaManager` group
+has a shape, so it is restorable - and the shape is what makes the offer cheap.
+
+**Two contracts, derived per group from the manager itself.** `_group_contract()` reads
+`has_positionally_stable_blocks` and `mamba_cache_mode` (from the manager, falling back
+to its `kv_cache_spec`) and answers one of `positional`, `boundary_state`, `unstable`,
+`geometry`, `outside`, `unknown`. No model name, no group id, no new switch: the same
+two attributes the fork's own `has_positionally_stable_blocks` override is computed
+from (`single_type_kv_cache_manager.py:1494-1497`), which is why the gate opens **by
+construction** rather than by an opt-in.
+
+| contract | a claimed run of `n` spans costs | where that comes from |
+|---|---|---|
+| `positional` | `n` real blocks, one file each | the fork pairs one CPU slot per group block |
+| `boundary_state` | `[null]*(n-1)` plus **one** state block at the run's END | `find_longest_cache_hit` (`:1591-1607`), the align hand-off (`:2051-2080`), the store's own `-g0-` files |
+| `unstable` | unknowable (`blocks_needed: null`) | not stable, not an align hand-off: no name to read by |
+| `unknown` | unknowable, and refused | the predicate is unreadable - a rename, not a shape |
+
+**A run is anchored, never truncated.** `_disk_run` walks the positional groups to the
+first block any of them cannot name, then SHORTENS to the longest length whose end every
+`boundary_state` group can name, and refuses with the new `no_boundary_anchor` if no
+length qualifies. On the live geometry this is the difference between a right answer and
+the 00:08 one: if group 5 holds blocks 1-4 and the GDN state files exist only at 1 and 2,
+the offer is **two**. The witness says why in one field - `last_offer.positional_run_blocks`
+is the length the attention group could have claimed alone, and `run_reanchored: true`
+says the offer is shorter than that on purpose. Every later clamp goes through
+`_cut_run`, which may only land on a length `_disk_run` proved anchored: a capacity clamp
+that took `keys[:3]` would move the state block to a span no group has a state for, which
+is the incident in miniature.
+
+**The list the fork consumes is `[null, null, null, real]`.** `_merge_into_pending` builds
+an align-mode group's entries from the CPU pool's own `null_block` - the same object the
+fork's Mamba hit uses - and puts the one real state block last, because
+`update_state_after_alloc` skips entries whose `is_null` is set **while keeping the
+index** (`manager.py:460-478`). That index-preservation is the whole mechanism: build the
+list the obvious way (real block first) and the recurrent state is paired with the run's
+FIRST GPU block, which is a wrong KV state the model then uses to answer the prompt.
+`test_the_state_block_pairs_with_the_run_s_last_gpu_block` asserts the pairing, not the
+list, and `no_null_block` is the new refusal for a pool that cannot supply the
+placeholder - the alternative is a plausible restore that is off by a whole run.
+
+**Copy-at-completion: the queue carries bytes, not slot numbers.** The spill used to read
+the CPU slot on `disk_spill`'s writer thread, and the module documented why that was
+safe: no file could be read back, so a slot the RAM tier had recycled between completion
+and the write cost a wasted write. Now a file CAN be served, and one wrong align-mode
+boundary state answers confidently and wrongly at `temperature=0`. So `request_spill`
+copies the slot synchronously, on the thread the completion arrived on, and the job
+carries the snapshot; `_handle_job` REFUSES a job that carries a slot number without one,
+so the old door cannot be reopened by accident. The cost is one memcpy of a rank slot per
+spilled slot, bounded by the new `MAX_QUEUED_BYTES` (256 MiB): the queue is admitted on
+two currencies now and the byte cap has its own drop name, `queue_bytes_full`, because
+"the queue is 256 deep" and "we would have had to hold another slot" are different
+diagnoses. `snapshot_failed` is the other new name - a slot that cannot be read is
+reported where the slot still exists, not by the thread half a second later. Both the
+race and its fix are tested (`test_the_bytes_that_land_are_the_bytes_the_store_completed_with`,
+and `test_deferring_the_read_writes_the_next_block_s_bytes` keeps the old behaviour
+provable rather than asserted).
+
+**Task 0: what `block_bytes_by_group` was, settled by the files on disk.** The rank
+diagnostics published `[80281600, 58982400, 58982400, 1638400, 82944, 132710400]` while
+the same rank's spill files are **11,468,800 B** (12,902,400 on PP1) - so the published
+per-block figure for group 0 was 7x the entire slot it described. The publisher computed
+`len(group.layer_names) * spec.page_size_bytes`, but on the worker side of a merged
+config `page_size_bytes` is already the group total: `MambaSpec.merge()` sums it across
+the merged layers and `MambaSpec.page_size_bytes` multiplies by its own `num_speces`,
+which the merge just folded in (`kv_cache_interface.py:1151-1160`, `:1135-1143`). The
+error therefore differed per group (group 5 is an attention spec, merged by MAX) and per
+PP rank - which is how two ranks published different "per-group" figures for one model.
+Fixes, all at the publisher: the field is `page_size_bytes` **alone** with
+`layer_count_by_group` beside it, `arena.bytes_per_block` publishes the rank's MEASURED
+slot width as the cross-check, and the `meaning` strings name the mistake they prevent.
+Two consequences for anyone reading the old payloads: the figures describe the merged
+group's whole block, so no I/O path is affected (nothing reads that field), and
+`MAX_BYTES_PER_READ` (64 MiB) was never the limit - the real unit is under 13 MB. The
+arithmetic is pinned by tests, not prose: `test_a_spill_file_is_the_measured_slot_width_not_layers_times_page_size`
+measures a written file against the figure, and `test_the_publisher_stops_multiplying_the_layer_count_in`
+fails if the multiplication comes back.
+
+**Capacity bookkeeping says what a span costs, per contract.** `disk_spill.section().span_cost_bytes`
+publishes `positional_bytes_per_span` and `boundary_state_bytes_per_span` in the bytes the
+ceiling is configured in, with the sentence that the two numbers being equal does not mean
+the two contracts cost the same per span. A reader who counts spilled files concludes a GDN
+group is cheap to keep: true per hit, false as a plan, because the `n-1` spans it did not
+buy are spans it did not keep.
+
+**Read it in the payload.** `last_offer` gained `positional_groups`, `boundary_groups`,
+`run_blocks`, `positional_run_blocks`, `run_reanchored` and `loads` (per group:
+`real_blocks`, `null_blocks`, `contract`); `group_serviceability` gained
+`group_contracts`, `boundary_state_group_ids` and per-group `contract` rows;
+`last_groups_required.blocks_needed` is `null` for a group with no implementable
+contract instead of a guess of 1; `why_no_restore` names the contract vocabulary and says
+outright that an align-mode GDN group is NOT in the blocked list.
+
+**What is still refused, and why that is correct.** A `boundary_state` group whose run
+end no engine ever spilled (a first-block-only chain, a request that starts at the run's
+beginning with no state at any length) gets `no_boundary_anchor` and recomputes. A fork
+that renames `has_positionally_stable_blocks` gets `unknown`, which is a refusal: a
+restore we cannot justify is a restore we do not do. A GDN group that is unstable for a
+reason that is not the align hand-off stays blocked, unchanged.
+
+Tests: `tests/test_disk_gdn_boundary_restore.py` (21 tests: the derived contracts, the
+offer end-to-end on the live geometry, the null-then-real list, the last-GPU-block
+pairing, the anchor cut, both new refusals, the named-block/slot invariant that caught a
+double-appended anchor during this change, copy-at-completion and its negative control,
+the byte cap, and the byte figure settled against a written file).
+`tests/test_disk_restore_group_gate.py` keeps the refusal, re-aimed at the
+`unstable`/`unknown` shapes, and adds `test_the_align_hybrid_groups_are_restorable_by_contract`.
 
 ### The ledger's own honesty: aged-out loads, DMA-verified blocks, and a witness kind
 that could not lie about the present (0.2.25)

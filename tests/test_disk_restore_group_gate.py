@@ -41,11 +41,29 @@ a claim would cost each group published as a table (`last_groups_required`).
 
 NOTHING HERE KNOWS A MODEL. Every predicate comes from the managers themselves
 (`prefix_cacheable_group_ids`, `group_block_sizes` against the scheduler block size,
-`has_positionally_stable_blocks` per group), so the veto is automatic: a pure-attention
-model has nothing blocked and is offered at exactly as it was -
-`test_a_pure_attention_configuration_still_offers_normally` is the proof of that, and
-it is the most important test in this file, because the gate's whole job is to refuse
-ONE shape without touching the other.
+`has_positionally_stable_blocks` and `mamba_cache_mode` per group), so the veto is
+automatic: a pure-attention model has nothing blocked and is offered at exactly as
+it was - `test_a_pure_attention_configuration_still_offers_normally` is the proof of
+that, and it is the most important test in this file, because the gate's whole job is
+to refuse ONE shape without touching the other.
+
+WHAT CHANGED IN 0.2.27, AND WHAT DID NOT. An align-mode Mamba/GDN group is no longer
+a blocker, because the reason 0.2.25 made it one was a mistake about the fork: the
+group's recurrent state is NOT unnameable. `MambaManager.find_longest_cache_hit`
+answers a hit with `[null_block]*(n-1)` plus ONE real boundary-state block
+(`single_type_kv_cache_manager.py:1591-1607`), the align hand-off publishes that
+block's own group-qualified hash (`:2051-2080`), and the tier stores it under exactly
+that hash (`manager.py:1050-1078`) - so the disk already holds those files, which is
+why the live store's shard `a3/` contains `…-g0-…` through `…-g5-…` for one key16.
+The gate therefore opens BY CONSTRUCTION on a model whose every cacheable group has
+an implementable contract, and `tests/test_disk_gdn_boundary_restore.py` is the new
+suite for the second contract. What did NOT change is the invariant the gate exists
+for: a group with NO implementable contract - a non-align group that is not
+positionally scannable - still refuses, under the same name, with the same sentence,
+and `test_the_hybrid_geometry_refuses_when_no_contract_is_implementable` is that
+proof. The 00:08 failure mode (claim the tokens, load the attention group, answer
+confidently from a stale recurrent state) is unreachable in both directions: the
+offer either has bytes for every group or it does not happen.
 """
 
 from __future__ import annotations
@@ -73,7 +91,12 @@ offer = base.offer
 # scheduler block, four GDN groups at the scheduler block size, a QSA ring at 8 tokens
 # (which is why the scheduler block is 3,200: it is the LCM), one full-attention group.
 # `block_bytes_by_group` was [80281600, 58982400, 58982400, 1638400, 82944, 132710400];
-# bytes do not enter the predicate, only which group is cacheable and which is stable.
+# bytes do not enter the predicate, only which group is cacheable, which is stable and
+# which hands off boundary states. (Those published numbers turned out to double-count
+# the layer count at the publisher - see `worker_diag` and the byte-figure test in
+# `test_disk_gdn_boundary_restore.py`; NO I/O path uses them. Every spill file on the
+# box is the rank's measured slot width: 11,468,800 B on PP0, 12,902,400 B on PP1, the
+# same size for a -g0- file and a -g5- file.)
 # The layer math behind those roles (g0=7, g1=6, g2=6 g3=1 GDN, g4=6 QSA ring, g5=12
 # MLA of 32 layers) is why a g5-only "win" was never the whole prompt anyway: it is at
 # most the attention share of prefill.
@@ -83,24 +106,37 @@ GDN_GROUPS = (0, 1, 2, 3)
 
 
 def hybrid(*, stable_by_group=None, sizes=HYBRID_SIZES,
-           cacheable=HYBRID_CACHEABLE, **kwargs):
-    """A manager answering the three predicates the live hybrid box answers.
+           cacheable=HYBRID_CACHEABLE, mode="align", **kwargs):
+    """A manager answering the predicates the live hybrid box answers.
 
     `stable_by_group` overrides `has_positionally_stable_blocks` per group; the
     default is the live answer - the four GDN groups False (MambaManager in `align`
-    mode), the QSA ring and the full-attention group True. Everything else is the
-    sibling suite's own `Manager`, so the geometry, the pool and the fork's three
-    entry points are the ones every other restore test already trusts.
+    mode), the QSA ring and the full-attention group True. `mode` is the other half of
+    the live answer and the half the BLOCK CONTRACT is derived from: "align" (what
+    `GET /plugins/kvtier/kvconfig` reports for groups 0-3) gives those groups the
+    boundary-state contract, while None says "unstable for a reason we cannot
+    implement", which is the shape the gate must still refuse.
+
+    Everything else is the sibling suite's own `Manager`, so the geometry, the pool and
+    the fork's three entry points are the ones every other restore test already trusts.
     """
     stable = {group: (group not in GDN_GROUPS) for group in range(len(sizes))}
     stable.update(stable_by_group or {})
     manager = Manager(group_sizes=sizes, cacheable=cacheable, **kwargs)
-    manager.cpu_coordinator = fakes_debug.coordinator([
-        fakes_debug.manager_item(
-            group,
-            fakes_debug.attention_spec(block_size=sizes[group]),
-            stable=bool(stable[group]))
-        for group in range(len(sizes))])
+    items = []
+    for group in range(len(sizes)):
+        if group in GDN_GROUPS and mode is not None:
+            items.append(fakes_debug.manager_item(
+                group,
+                fakes_debug.mamba_spec(block_size=sizes[group],
+                                       mamba_cache_mode=mode),
+                stable=bool(stable[group]), mamba_cache_mode=mode))
+        else:
+            items.append(fakes_debug.manager_item(
+                group,
+                fakes_debug.attention_spec(block_size=sizes[group]),
+                stable=bool(stable[group])))
+    manager.cpu_coordinator = fakes_debug.coordinator(items)
     return manager
 
 
@@ -122,14 +158,21 @@ def scheduler_here(monkeypatch):
 
 # --- 1. the gate: an incomplete claim is refused, by name ---------------------
 
-def test_the_hybrid_geometry_refuses_because_the_group_set_is_incomplete():
-    """Groups 0-3 are cacheable and not stable: `{5}` alone is NOT an offer.
+def test_the_hybrid_geometry_refuses_when_no_contract_is_implementable():
+    """A cacheable group with NO implementable contract: `{5}` alone is NOT an offer.
 
-    The refusal must be a NAMED, COUNTABLE reason (`incomplete_group_set`) and must
-    name the groups that blocked it, because the payload is the only place the next
-    on-call reader will look.
+    This is the shape the gate was built for and it still refuses after 0.2.27. The
+    manager here answers `has_positionally_stable_blocks = False` for groups 0-3 with
+    NO `mamba_cache_mode` to explain it, which is a block shape this tier cannot price
+    - not an align hand-off, not a scannable group - so claiming those tokens would be
+    the 00:08 claim with nothing behind it. The refusal must be a NAMED, COUNTABLE
+    reason (`incomplete_group_set`) and must name the groups that blocked it, because
+    the payload is the only place the next on-call reader will look.
+
+    `test_the_align_hybrid_groups_are_restorable_by_contract` is the other half: same
+    geometry, `mamba_cache_mode="align"` present, and the gate opens by construction.
     """
-    verdict = disk_restore._eligible_groups(hybrid(), BLOCK)
+    verdict = disk_restore._eligible_groups(hybrid(mode=None), BLOCK)
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == "incomplete_group_set"
     assert verdict["blocked_group_ids"] == [0, 1, 2, 3]
@@ -139,8 +182,42 @@ def test_the_hybrid_geometry_refuses_because_the_group_set_is_incomplete():
     # clipped at 160 characters and both must survive the clip.
     assert "offers NOTHING on this model" in verdict["reason"]
     assert "0, 1, 2, 3" in verdict["reason"]
-    assert "ONE boundary-state block" in verdict["reason"]
+    assert "no contract this tier implements" in verdict["reason"]
     assert len(verdict["reason"]) <= 160
+    # And the contract vocabulary is the code's own, published per group: a reader can
+    # tell "no contract" from "boundary state" without knowing what a MambaSpec is.
+    assert verdict["blocked_kinds"] == {"0": "unstable", "1": "unstable",
+                                        "2": "unstable", "3": "unstable"}
+    service = disk_restore._state["group_serviceability"]
+    assert service["group_contracts"]["0"]["contract"] == "unstable"
+    assert service["boundary_state_group_ids"] == []
+    assert service["positionally_stable_group_ids"] == [4, 5]
+
+
+def test_the_align_hybrid_groups_are_restorable_by_contract():
+    """THE GATE OPENS BY CONSTRUCTION, not by a flag: same fixture, `mode="align"`.
+
+    Groups 0-3 answer the two predicates the live box answers (`stable=False`,
+    `mamba_cache_mode="align"`), which is precisely the condition the fork's own
+    `has_positionally_stable_blocks` override derives from
+    (`single_type_kv_cache_manager.py:1494-1497`), so they are restorable and nothing
+    is blocked. `blocked` is EMPTY because nothing is left over, not because a check
+    was skipped - and `restorable_group_ids` is the whole cacheable set.
+    """
+    verdict = disk_restore._eligible_groups(hybrid(), BLOCK)
+    assert verdict["ok"] is True
+    assert verdict["groups"] == [0, 1, 2, 3, 5]
+    assert verdict["boundary_group_ids"] == [0, 1, 2, 3]
+    assert verdict["positional_group_ids"] == [5]
+    assert verdict["contracts"] == {"0": "boundary_state", "1": "boundary_state",
+                                    "2": "boundary_state", "3": "boundary_state",
+                                    "5": "positional"}
+    service = disk_restore._state["group_serviceability"]
+    assert service["complete"] is True
+    assert service["disk_offers_possible"] is True
+    assert service["blocked_group_ids"] == []
+    assert service["boundary_state_group_ids"] == [0, 1, 2, 3]
+    assert service["unrestorable_cacheable_group_ids"] == []
 
 
 def test_a_flagged_request_on_the_hybrid_model_gets_the_forks_answer_untouched(
@@ -152,7 +229,7 @@ def test_a_flagged_request_on_the_hybrid_model_gets_the_forks_answer_untouched(
     request, and the only thing that moves is a counter and a sentence.
     """
     fill(armed, seeds=[1, 2, 3, 4], groups=list(HYBRID_CACHEABLE))
-    manager = hybrid()
+    manager = hybrid(mode=None)
     ram_result = (0, False)
     assert offer(manager, Req(request_id="req-h", blocks=2), 0,
                  ram_result) is ram_result
@@ -230,7 +307,7 @@ def test_the_veto_follows_the_predicates_and_not_a_group_list():
     tier never claims it and neither do we.
     """
     one_fixed = disk_restore._eligible_groups(
-        hybrid(stable_by_group={0: True}), BLOCK)
+        hybrid(mode=None, stable_by_group={0: True}), BLOCK)
     assert one_fixed["ok"] is False
     assert one_fixed["blocked_group_ids"] == [1, 2, 3], ("the veto is per group, not "
                                                          "per model")
@@ -266,7 +343,8 @@ def test_no_eligible_group_at_all_keeps_its_own_refusal_name():
     tuple cannot express, the second is a model that must not be served from disk.
     """
     verdict = disk_restore._eligible_groups(
-        hybrid(stable_by_group={group: False for group in range(6)}), BLOCK)
+        hybrid(mode=None,
+               stable_by_group={group: False for group in range(6)}), BLOCK)
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == "no_eligible_group"
     small = disk_restore._eligible_groups(Manager(group_sizes=(100,) * 6), BLOCK)
@@ -289,7 +367,7 @@ def test_the_serviceability_arithmetic_is_published_for_one_payload_read(armed,
     offer(Manager(), Req(request_id="req-x", blocks=1), 0, (0, False))
     # The lookup above was a complete (pure-attention) model; now the hybrid one, and
     # the payload must describe the LAST LOOKUP, refused as it was.
-    offer(hybrid(), Req(request_id="req-y", blocks=1), 0, (0, False))
+    offer(hybrid(mode=None), Req(request_id="req-y", blocks=1), 0, (0, False))
     section = disk_restore.scheduler_section()
     service = section["group_serviceability"]
     assert service["ok"] is True
@@ -302,13 +380,12 @@ def test_the_serviceability_arithmetic_is_published_for_one_payload_read(armed,
     assert service["disk_offers_possible"] is False
     assert service["scheduler_block_size"] == BLOCK
     # A reader learns the REASON, not just the list.
-    assert "positionally stable" in service["blocked_why"]["0"]
-    assert "Mamba" in service["blocked_why"]["0"]
+    assert "align-mode" in service["blocked_why"]["0"]
     assert section["refused"]["incomplete_group_set"] == 1
     assert "CANNOT BE SERVED FROM DISK AT ALL" in section["why_no_restore"]
     assert "incomplete_group_set" in section["why_no_restore"]
     assert "incomplete_group_set" in section["refusal_reasons"]
-    assert "positionally stable" in section["refusal_reasons"]["incomplete_group_set"]
+    assert "boundary-state block" in section["refusal_reasons"]["incomplete_group_set"]
     # Every one of these is documented in the same payload, the section's convention.
     for key in ("group_serviceability", "last_groups_required", "last_aged_out",
                 "no_read", "watchdog_fires", "invalid_reports", "aged_out_loads",
@@ -331,7 +408,7 @@ def test_the_refusal_publishes_what_the_claimed_span_would_have_cost_each_group(
     """
     fill(armed, seeds=list(range(1, 20)), groups=list(HYBRID_CACHEABLE))
     scheduler_here(monkeypatch)
-    manager = hybrid()
+    manager = hybrid(mode=None)
     nine_blocks = 9 * BLOCK
     request = Req(request_id="req-r", blocks=9, num_tokens=nine_blocks + 900)
     offer(manager, request, 0, (0, False))
@@ -348,14 +425,18 @@ def test_the_refusal_publishes_what_the_claimed_span_would_have_cost_each_group(
     for group in GDN_GROUPS:
         row = by_group[group]
         assert row["contract"] == "unstable"
-        # ONE real state block per claimed span, not a span of KV: the align-mode
-        # contract is nulls up to the boundary, then one cached state block.
-        assert row["blocks_needed"] == 1
-        assert row["null_blocks"] == 8
+        # A group with NO implementable contract says `blocks_needed: null` rather
+        # than a guess. The 0.2.25 row for this shape claimed "1 block, 8 nulls", but
+        # that arithmetic belongs to the align-mode contract (see
+        # `test_disk_gdn_boundary_restore.py`), and pricing a group whose block shape
+        # this tier does not implement is exactly the kind of number that reads as a
+        # plan and turns out to be a wish.
+        assert row["blocks_needed"] is None
+        assert row["real_blocks"] is None
         assert row["restored"] is False
         assert row["blocks_filled"] == 0
     assert required["unfilled_group_ids"] == [0, 1, 2, 3]
-    assert required["blocks_needed_total"] == 9 + 4
+    assert required["blocks_needed_total"] == 9
     assert required["blocks_filled_total"] == 9
     # And the prose in the payload carries the same arithmetic, so `why_no_restore`
     # alone already tells the story.
@@ -419,7 +500,8 @@ def test_the_refusal_counts_every_lookup_and_logs_once(armed, caplog):
     fill(armed, seeds=[1, 2, 3, 4], groups=list(HYBRID_CACHEABLE))
     with caplog.at_level(logging.WARNING):
         for index in range(3):
-            offer(hybrid(), Req(request_id=f"req-{index}", blocks=1), 0, (0, False))
+            offer(hybrid(mode=None), Req(request_id=f"req-{index}", blocks=1),
+                  0, (0, False))
     counters = disk_restore.counters()
     assert counters["refused"]["incomplete_group_set"] == 3
     assert counters["refusals_total"] == 3

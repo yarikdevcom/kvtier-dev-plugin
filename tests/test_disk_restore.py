@@ -137,6 +137,17 @@ class CpuPool:
         self._free = [self.blocks[i] for i in (free_ids or range(num_blocks))]
         self.allocated = []
         self.freed = []
+        # `BlockPool.null_block` (`block_pool.py:190-194`): a placeholder the fork
+        # marks `is_null` and NEVER frees or allocates, used for the skipped entries
+        # of an align-mode Mamba hit. An align-mode disk restore appends exactly those
+        # objects to a group's list, because `update_state_after_alloc` skips entries
+        # whose `is_null` is set while KEEPING THE INDEX - which is what lands the one
+        # real state block on the run's LAST GPU block. It is numbered past the
+        # allocatable range so a test can tell a null from an allocation, and a pool
+        # without one cannot serve a boundary group at all.
+        self.null_block = Slot(num_blocks)
+        self.null_block.is_null = True
+        self.blocks.append(self.null_block)
 
     def get_num_free_blocks(self):
         return len(self._free)

@@ -148,16 +148,29 @@ SAFETY ENVELOPE (the `blockdump` posture, because this writes where that only re
 
 WHAT THIS DOES NOT CLAIM
 ------------------------
-Restore. There is no read path (`disk_spill`'s docstring says why: only
-scheduler-side store-completion publishes into `cached_block_hash_to_block`). One
-consequence deserves naming while the write path runs alone: the bytes are read on
-`disk_spill`'s writer thread, so a slot reused by a later store between completion
-and the write would be captured as its NEW contents under the OLD name. With no read
-path that file cannot be served, so it is a wasted write, not a wrong answer - the
-same argument that makes deleting a file safe. When restore lands, the spill must
-become a copy-at-completion (or prove the RAM tier cannot recycle that slot that
-fast); `disk_spill.spill_slot`'s synchronous core is the seam that change is made
-at.
+Nothing about restore any more - it landed in the same wheel. The two sentences that
+used to sit here were a debt note, and both halves of it are paid, so they are
+replaced by what actually holds:
+
+  * THE READ PATH IS `disk_restore.py`, and this module's `/disk` verb answers with its
+    section for exactly that reason: "it spilled 400 files and restored none" was
+    unreadable while the two halves were read from two places.
+  * THE RACE THIS NOTE WARNED ABOUT IS CLOSED, at the layer that could close it. The
+    bytes used to be read on `disk_spill`'s writer thread, so a CPU slot the RAM tier
+    recycled between completion and the write would land as its NEW contents under the
+    OLD name. With no read path that was a wasted write, not a wrong answer. Now that a
+    file CAN be served, one wrong align-mode GDN boundary state is a confident wrong
+    answer at `temperature=0`, so `request_spill` copies the slot SYNCHRONOUSLY, on the
+    thread the completion arrived on, and the queue carries bytes instead of slot
+    numbers. The cost is one memcpy of a rank slot per spilled slot, bounded by
+    `disk_spill.MAX_QUEUED_BYTES`; `disk_spill._handle_job` refuses a job that carries a
+    slot number without a snapshot rather than reading one it does not own.
+
+What remains genuinely not claimed: a file is not flushed (no fsync, by design, so a
+crash leaves a `part` file or a committed file and never a half-written one), and the
+hook never decides to spill on its own - the spill needs the armed hook AND
+`disk_spine` AND the engine's per-layer store decision, each of which answers separately
+in this payload.
 """
 
 from __future__ import annotations

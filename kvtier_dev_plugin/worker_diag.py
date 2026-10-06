@@ -72,10 +72,25 @@ Which fields the reader REQUIRES, and what this writer can honestly supply:
   `arena.num_blocks`   `handler.num_cpu_blocks` - this rank's arena slots
               (worker.py:162), which is exactly what the CPU capacity clamp in
               `cpu_capacity.py` reports through the handshake.
-  `arena.block_bytes_by_group`  per KV group, `len(group.layer_names) *
-              spec.page_size_bytes` (kv_cache_interface.py:1400 / :186) - the
-              group's bytes per block, which is what the reader's group totals
-              want. `writer.block_bytes_by_group_meaning` says how it is derived.
+  `arena.block_bytes_by_group`  per KV group, `spec.page_size_bytes` ALONE. On the
+              WORKER side of the merged `KVCacheConfig` that number is already the
+              group's whole-block total: `MambaSpec.merge()` SUMS `page_size_bytes`
+              across the merged layers (`kv_cache_interface.py:1151-1160`) and
+              `MambaSpec.page_size_bytes` multiplies by the spec's OWN `num_speces`,
+              which the merge has just folded in (`:1135-1143`). Multiplying by
+              `len(group.layer_names)` on top counted the layers twice - and it did so
+              LOUDLY WRONG in the field: the live PP0 published `[80281600, 58982400,
+              58982400, 1638400, 82944, 132710400]`, whose first entry is 7x the entire
+              spill file for that rank (11,468,800 B), and the two ranks published
+              DIFFERENT values for the same model. NO I/O path reads this field; the
+              spill width is `disk_spill.measured_slot_bytes` and the restore width is
+              `disk_read.MAX_BYTES_PER_READ`'s unit, both measured. It is published for
+              capacity arithmetic, and a capacity number that is 7x too big is worse
+              than none - which is why the fix is to stop multiplying rather than to
+              document the multiplication. `arena.layer_count_by_group` keeps the layer
+              count available separately, and `arena.bytes_per_block` is the rank's
+              MEASURED slot width (what a spill file actually is).
+              `writer.block_bytes_by_group_meaning` says all of this in the file.
   `arena.free_blocks`  DELIBERATELY ABSENT: the CPU block pool is scheduler-side
               state. The reader notes its absence rather than trusting a guess.
   `counters.stored` / `restored_hits`  blocks this rank handed to its copy
@@ -558,29 +573,42 @@ def _arena_bytes(handler) -> tuple[int | None, str]:
 
 
 def _block_bytes_by_group(handler):
-    """Per KV group, bytes per block: `len(layer_names) * page_size_bytes`.
+    """Per KV group, the group's WHOLE-BLOCK bytes, and its layer count separately.
 
-    A group's layers all share one block table by definition
-    (kv_cache_interface.py:1392), so the tier's per-block bytes for that group is
-    its layer count times the spec's page size. None (absent) rather than a
-    partial list when any term is missing: the reader would rather note a missing
-    field than fold a wrong total into a group sum.
+    `spec.page_size_bytes` ALONE, with the layer count published beside it. The
+    multiplication this function used to do (`len(layer_names) * page_size_bytes`) is
+    wrong on the worker side of a merged config and was caught by the field, not by a
+    test: `MambaSpec.merge()` returns a spec whose `page_size_bytes` is the SUM over the
+    merged layers (`vllm/v1/kv_cache_interface.py:1151-1160`, reached from
+    `merge_group_spec`'s `typical_spec.merge(duplicate_spec)`), and
+    `MambaSpec.page_size_bytes` already multiplies by its own `num_speces`
+    (`:1135-1143`). So the group total was counted `len(layer_names)` times over: on
+    the live PP0 that made group 0 read 80,281,600 B against a measured spill file of
+    11,468,800 B, and because group 5 is an attention spec whose merge takes the MAX
+    (`FullAttentionSpec.merge`, `:926-940`) the error differed per group AND per PP
+    rank - which is how two ranks came to publish different "per-group" figures.
+
+    Returns `(sizes, layers, note)`. `None` for both lists rather than a partial one
+    when any term is missing: the reader notes an absent field instead of folding a
+    wrong total into a group sum.
     """
     groups = getattr(getattr(handler, "kv_cache_config", None), "kv_cache_groups",
                      None)
     if not groups:
-        return None, None
+        return None, None, None
     sizes = []
+    layers_seen = []
     for group in list(groups)[:MAX_GROUPS]:
         spec = getattr(group, "kv_cache_spec", None)
         layers = _int(_len_or_none(getattr(group, "layer_names", None)))
         page = _int(getattr(spec, "page_size_bytes", None))
         if layers is None or page is None:
-            return None, "a group is missing layer_names or page_size_bytes"
-        sizes.append(layers * page)
+            return None, None, "a group is missing layer_names or page_size_bytes"
+        sizes.append(page)
+        layers_seen.append(layers)
     if len(list(groups)) > MAX_GROUPS:
-        return None, f"more than {MAX_GROUPS} groups"
-    return sizes, None
+        return None, None, f"more than {MAX_GROUPS} groups"
+    return sizes, layers_seen, None
 
 
 def _len_or_none(container):
@@ -619,7 +647,7 @@ def build_document(handler, rank, rank_source) -> dict:
     nothing contributes NO key - see `_contribution_sections`.
     """
     arena_bytes, bytes_source = _arena_bytes(handler)
-    block_bytes, block_bytes_note = _block_bytes_by_group(handler)
+    block_bytes, block_layers, block_bytes_note = _block_bytes_by_group(handler)
     metadata = getattr(handler, "_connector_metadata", None)
     per_block = _bytes_per_block(handler, arena_bytes)
     in_flight_blocks = None
@@ -635,6 +663,18 @@ def build_document(handler, rank, rank_source) -> dict:
                    or 0}
     if block_bytes is not None:
         arena["block_bytes_by_group"] = block_bytes
+        # The layer count is still the fact a capacity reader wants - it just must not
+        # be folded into the byte figure by the publisher that does not know whether the
+        # spec behind the byte figure already counted it.
+        arena["layer_count_by_group"] = block_layers
+    if per_block is not None:
+        # THE WIDTH EVERY SPILL FILE ACTUALLY HAS, measured off this rank's own region
+        # tensors. `block_bytes_by_group` is a per-GROUP statement read off a spec; this
+        # is the per-RANK statement read off the memory the tier copies, which is what
+        # `disk_spill.measured_slot_bytes` writes and `disk_read` reads back. Publishing
+        # both, named differently, is the point: when they disagree, the disagreement is
+        # the bug report (it is how the double-count above was found).
+        arena["bytes_per_block"] = int(per_block)
     counters = {"stored": int(_state["store_blocks_submitted"]),
                 "restored_hits": int(_state["load_blocks_submitted"]),
                 "store_events_pending": _len_or_none(
@@ -666,8 +706,22 @@ def build_document(handler, rank, rank_source) -> dict:
                 "pool's real occupancy is scheduler-side and comes from the "
                 "plugin's /snapshot."),
             "block_bytes_by_group_meaning": (
-                "per KV group: len(group.layer_names) * spec.page_size_bytes "
-                "(kv_cache_interface.py:1400, :186)"),
+                "per KV group: spec.page_size_bytes ALONE - on a merged worker "
+                "config that is already the group's whole-block total, because "
+                "MambaSpec.merge sums it over the merged layers and its "
+                "page_size_bytes multiplies by num_speces, which the merge folded in. "
+                "The layer count is published separately as layer_count_by_group and "
+                "must NOT be multiplied back in: doing so is what published "
+                "80,281,600 B for a group whose spill files are 11,468,800 B. "
+                "Cross-check against arena.bytes_per_block, this rank's measured slot "
+                "width."),
+            "bytes_per_block_meaning": (
+                f"this rank's MEASURED slot width in bytes ({per_block} B): the sum of "
+                "one row of every region tensor, i.e. exactly the size of one spill "
+                "file and exactly the size of one restore. It is a per-RANK number, so "
+                "it legitimately differs between PP stages (11,468,800 on PP0, "
+                "12,902,400 on PP1 for this model); a per-GROUP figure that differs "
+                "between ranks is a bug, not a rank fact."),
             "counter_meaning": ("stored/restored_hits are blocks HANDED TO the "
                                 "copy streams since boot (counted at "
                                 "bind_connector_metadata), not confirmed "

@@ -253,6 +253,13 @@ UNITS_BY_NAME = {
     "arm_default_seconds": "seconds",
     "arm_seconds": "seconds",
     "arm_file_boot_refusals": "refusals",
+    # A REFUSAL COUNTER whose name contains `_bytes` because the currency that
+    # refused is
+    # bytes. Declared explicitly, because the payload walker labels by NAME and would
+    # otherwise present a count of drops as a volume of memory - the same shape as the
+    # `*_event` counters, and the reason the payload unit test exists.
+    "queue_bytes_full": "refusals",
+    "snapshot_failed": "refusals",
     "bad_call": "refusals",
     "bad_digest": "refusals",
     "bad_key": "refusals",
@@ -362,6 +369,19 @@ UNITS_BY_NAME = {
     "peer_rank": "files",
     "planned": "files",
     "planned_bytes": "bytes",
+    # Queued SNAPSHOTS, in bytes: since the copy moved to store completion a queued job
+    # holds a whole slot's bytes, so the queue's cost is measured in two currencies and
+    # both are published.
+    "queue_bytes": "bytes",
+    "queue_bytes_peak": "bytes",
+    # The queue's byte cap and its held bytes: since copy-at-completion a queued job
+    # carries a whole slot, so the queue is bounded and reported in two currencies.
+    # The per-span cost of each block contract, in the bytes the ceiling is configured
+    # in. Both contracts cost the SAME width per file; what differs is how many files a
+    # span buys, which is what `meaning` says and no unit can.
+    "positional_bytes_per_span": "bytes",
+    "boundary_state_bytes_per_span": "bytes",
+    "max_queued_bytes": "bytes",
     "queue_depth": "jobs",
     "queue_depth_peak": "jobs",
     "queue_full": "refusals",

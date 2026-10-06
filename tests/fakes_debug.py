@@ -109,14 +109,14 @@ def circular_buffer_spec(block_size=1024, page_size_bytes=4096, subclass=True):
     return spec
 
 
-def mamba_spec(block_size=128, page_size_bytes=8192):
+def mamba_spec(block_size=128, page_size_bytes=8192, mamba_cache_mode="align"):
     spec = _named_class("MambaSpec")()
     spec.__dict__.update(block_size=block_size,
                page_size_bytes=page_size_bytes, prefix_cacheable=True,
                tokens_per_state=128, num_states=1,
                state_content_size_bytes=8192, shapes=[(128, 256)],
                dtypes=["torch.bfloat16"], mamba_type="gdn",
-               mamba_cache_mode="aligned", num_speculative_blocks=0,
+               mamba_cache_mode=mamba_cache_mode, num_speculative_blocks=0,
                num_prefill_checkpoint_blocks=1,
                prefill_checkpoint_alignment=128, tp_replicated=False,
                uses_slot_mapping=False)
@@ -192,9 +192,17 @@ def hash_key(num_tokens_seed: int, group_id: int = 0, size: int = 20) -> bytes:
 # --- the scheduler side -----------------------------------------------------
 
 def manager_item(group_id, spec, req_to_blocks=None, block_size=None,
-                 stable=True):
-    """One entry of `coordinator.single_type_managers`."""
-    return Obj(name="KVCacheManager",
+                 stable=True, mamba_cache_mode=None):
+    """One entry of `coordinator.single_type_managers`.
+
+    `mamba_cache_mode` is set only when the caller says so, because it is the field
+    that makes a NOT-positionally-stable group an align-mode boundary-hand-off group
+    (`single_type_kv_cache_manager.py:1494-1497` derives the flag from it) and a fake
+    that carried it on every manager would make every unstable group look
+    restorable. Leaving it off is the "this group has no contract we can implement"
+    case, which is a refusal, and both shapes are tested.
+    """
+    item = Obj(name="KVCacheManager",
                kv_cache_group_id=group_id,
                # getattr, not attribute access: a fake with a field deleted is how
                # the "the fork renamed it" case is tested.
@@ -203,6 +211,9 @@ def manager_item(group_id, spec, req_to_blocks=None, block_size=None,
                kv_cache_spec=spec,
                req_to_blocks=dict(req_to_blocks or {}),
                has_positionally_stable_blocks=stable)
+    if mamba_cache_mode is not None:
+        item.mamba_cache_mode = mamba_cache_mode
+    return item
 
 
 def coordinator(managers, **extra):

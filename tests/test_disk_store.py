@@ -1012,12 +1012,17 @@ def test_an_event_is_spilled_once_even_while_the_fork_has_not_drained_its_dict(t
     Without the de-duplication set, every one of those steps would queue the same
     slot again - the same bytes, the same name, over and over, for free bandwidth."""
     with metadata_shape(True):
-        step = metadata(store_cpu_blocks=[7, 8], store_keys=[LONG_KEY, OTHER_KEY])
+        step = metadata(store_cpu_blocks=[6, 7], store_keys=[LONG_KEY, OTHER_KEY])
         role = handler()
         disk_store.observe_bind(role, step)
         role._completed_store_events = {step.store_event: 1}
         first = disk_store.on_store_completed(role, [])
         second = disk_store.on_store_completed(role, [])
+    # Slots 6 and 7 rather than 7 and 8: the fake region is 8 blocks wide, and since the
+    # copy moved to store completion an unreadable slot is refused AT QUEUE TIME with
+    # its own name (`snapshot_failed`) instead of failing on the writer thread a moment
+    # later. What this test is about - one spill per slot across steps that keep
+    # reporting the same completed index - needs both slots to exist.
     assert first["queued"] == 2
     assert second["spilled"] == 0
     assert disk_store.counters()["spill_queued"] == 2

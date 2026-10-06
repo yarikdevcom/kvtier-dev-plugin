@@ -308,19 +308,45 @@ def test_bytes_used_is_a_proven_floor_from_the_blocks_in_flight(worker_class,
     assert "PROVEN FLOOR" in document["writer"]["bytes_used_meaning"]
 
 
-def test_per_group_block_bytes_are_the_fork_s_own_expression(worker_class,
-                                                             writes_to):
+def test_per_group_block_bytes_are_the_spec_s_page_size_and_NOT_the_layer_count_again(
+        worker_class, writes_to):
+    """`block_bytes_by_group` is `spec.page_size_bytes` ALONE. The layer count is a
+    separate field, and the multiplication that used to sit here is the bug the field
+    reported, not a convention.
+
+    THE LIVE WITNESS, from `/tmp/kv-tier-diagnostics/rank-PP0_TP0.json` on the hybrid
+    box: `[80281600, 58982400, 58982400, 1638400, 82944, 132710400]` with
+    `layer_count` [7, 6, 6, 1, 6, 12]. Group 0's real spill file on that rank is
+    11,468,800 B - the published figure is 7x the whole slot, because a merged
+    `MambaSpec.page_size_bytes` is already the sum over its layers
+    (`kv_cache_interface.py:1151-1160`, `:1135-1143`) and `len(group.layer_names)`
+    counted them a second time. Group 5 (an attention spec, merged by MAX) was wrong
+    differently, which is how one model ended up publishing two different per-group
+    figures on two PP ranks.
+
+    So: publish the spec's number, publish the layer count next to it, and let the
+    reader multiply with its eyes open. `arena.bytes_per_block` - the measured slot
+    width - is the cross-check that made the error visible.
+    """
     specs = [fake.attention_spec(page_size_bytes=16384),
              fake.mamba_spec(page_size_bytes=8192)]
     groups = [fake.group(spec, [f"l{i}" for i in range(4)]) for spec in specs]
     worker = installed_worker(worker_class, writes_to,
                               kv_cache_config=fake.kv_cache_config(groups))
     worker.get_finished(set())
-    arena = json.loads((writes_to / "rank-PP0_TP0.json").read_text())["arena"]
-    assert arena["block_bytes_by_group"] == [4 * 16384, 4 * 8192]
-    assert "page_size_bytes" in \
-        json.loads((writes_to / "rank-PP0_TP0.json").read_text())["writer"][
-            "block_bytes_by_group_meaning"]
+    document = json.loads((writes_to / "rank-PP0_TP0.json").read_text())
+    assert document["arena"]["block_bytes_by_group"] == [16384, 8192]
+    assert document["arena"]["layer_count_by_group"] == [4, 4]
+    # The two fields multiply to the OLD number, and neither of them IS it: a reader who
+    # wants the product can take it, but the publisher no longer hides a product behind
+    # a name that reads like a primitive.
+    assert document["arena"]["block_bytes_by_group"][0] != 4 * 16384
+    for field in ("block_bytes_by_group_meaning", "bytes_per_block_meaning"):
+        assert "page_size_bytes" in document["writer"][field] or \
+            "slot width" in document["writer"][field], field
+    # The meaning string must name the failure it prevents, or the next reader repeats
+    # it.
+    assert "80,281,600" in document["writer"]["block_bytes_by_group_meaning"]
 
 
 def test_a_group_missing_a_term_omits_the_list_and_says_why(worker_class,
