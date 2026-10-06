@@ -97,7 +97,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
-| `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier for the full 7,200 s and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. It is renewed while the posture stays up, and a human's `{"op":"disarm"}` latches: renewal never re-arms a box the operator just disarmed. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
+| `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
@@ -977,8 +977,9 @@ configuration change makes the old files un-findable rather than mis-readable:
 roots are refused by `disk_layout`) **and** this boot must have armed the tier. Since
 0.2.33 the boot does arm it by default (`KVTIER_DISK_BOOT_ENABLE`, ON unless the operator
 turned it off - see *The SSD tier's boot default*); what has not changed is that **no
-runtime knob reaches the arm except the `/disk` verb**, and that an arm expires on its own
-(7,200 s) whoever put it up. Unarmed, the two wrapped methods cost two `os.environ.get`
+runtime knob reaches the arm except the `/disk` verb**, and that since 0.2.35 the arm is a
+**LATCH** - it does not expire, it is lowered by `{"op":"disarm"}` and by nothing else, and
+it gates SERVING from disk as well as writing to it. Unarmed, the two wrapped methods cost two `os.environ.get`
 calls per step: no stat, no open, no copy, no queue, no writer thread.
 
 **It needs the engine patch, and says whether it has it.** A file needs a key, and
@@ -992,8 +993,10 @@ store. `no_key_for_slot` in the refusal table is that state, counted.
 H="Authorization: Bearer $VLLM_E2_TIER_DEV_TOKEN"; B=http://127.0.0.1:8000/plugins/kvtier
 # what can this boot do?
 ssh llm "curl -s -H '$H' $B/disk" | python3 -m json.tool
-# arm for ten minutes, then prove the path writes real bytes for one slot
-curl -s -H "$H" -X POST -d '{"op":"arm","seconds":600}' $B/disk
+# arm the tier, then prove the path writes real bytes for one slot. SINCE 0.2.35 THE ARM
+# IS A LATCH: `seconds` is still accepted (an existing caller must not start failing) and
+# does nothing - the verdict answers `seconds_ignored: true`. It comes down on `disarm`.
+curl -s -H "$H" -X POST -d '{"op":"arm"}' $B/disk
 # `key` is the engine's GROUP-QUALIFIED block hash: the 16-hex `key16` plus the
 # group id as 8 hex chars (`key16 + f"{group:08x}"`, so 24 hex). A bare 16-hex key is
 # refused - it cannot say which group's bytes these are. Find both halves with
@@ -1142,9 +1145,14 @@ So the marker, the `scope` argument and the fields it fed (`flagged`,
 decline it. Sending the old marker is a no-op that changes nothing.
 
 Eligibility bounds are untouched by the switch - the bounce-buffer pool budget, the
-CPU-slot reserve, the per-offer block bound (`MAX_RESTORE_BLOCKS_PER_OFFER`, 64 spans;
-the fixed 32,000-token cap that used to sit beside it was deleted in 0.2.32) and "is this
-span actually in the index" still decide how much any single request is offered. Disk
+CPU-slot reserve, the per-offer block bound (`MAX_RESTORE_BLOCKS_PER_OFFER`, **128 spans
+since 0.2.35, 64 before**; the fixed 32,000-token cap that used to sit beside it was
+deleted in 0.2.32) and "is this span actually in the index" still decide how much any
+single request is offered. The block bound is a BACKSTOP and has to stay sized above what
+the bounce-buffer pool can afford, or it stops being a bound and becomes an undisclosed
+throughput limit: the operator's 1 GiB pool affords ~93 buffers, and a 64-block cap sat
+*under* that - which is why 0.2.35 raised it. Raising it does not raise
+`MAX_SLOTS_PER_OFFER` (256 CPU slots), which still binds first for any multi-group model. Disk
 authority removes the *policy* stop, not the physical ones.
 
 **A failed disk load is not offered twice, and since 0.2.32 a raced load is.** The
@@ -1498,7 +1506,8 @@ A job takes its bounce buffer at *issue* (`request_read`) and gives it back at t
   len(groups['groups'])` (`disk_restore.py:2260`), and on the live boot that
   is **1**, not 5: g4 fails the block-size match and g0-g3 are excluded by
   `_group_positionally_stable`, so the offer names g5 alone (`last_offer.groups = [5]`).
-  Spans are bounded by `MAX_RESTORE_BLOCKS_PER_OFFER = 64` blocks (0.2.32 deleted the
+  Spans are bounded by `MAX_RESTORE_BLOCKS_PER_OFFER = 128` blocks (0.2.35 raised it from
+  64 so the backstop sits above a 1 GiB pool's ~93 buffers; 0.2.32 deleted the
   fixed `MAX_OFFER_TOKENS_PER_OFFER = 32_000`-token cap: the pool budget below is the
   bound that actually protects the engine, and the block walk is the principled one -
   how many spans one offer can name and stream inside its deadline). In practice neither
@@ -2840,8 +2849,8 @@ nothing. Both halves are now handled at the one moment the class exists:
   3. Anything else leaves the tier disarmed and puts the reason in
      `pr56810.boot.refusals` - never a silent no.
   4. **Then the disk tier's own boot default runs** (`KVTIER_DISK_BOOT_ENABLE`, ON by
-     default since 0.2.33): it arms the SSD spill tier for the full 7,200 s and raises
-     this boot's serve posture, so the box comes up `serving_as=disk_authority` with no
+     default since 0.2.33): it arms the SSD spill tier - as a LATCH since 0.2.35, with no
+     expiry - and raises this boot's serve posture, so the box comes up `serving_as=disk_authority` with no
      POST. It calls the same two functions the `/disk` verb calls - `disk_spill.arm()` and
      `disk_restore.set_disk_authority()` - invents no third way to arm, runs after the
      RAM tier's arm (a disk arm on a boot that armed no tier is refused), and rolls the
@@ -2974,10 +2983,13 @@ from this one environment variable and from the boot's own measurements, and
 `_arm_path`, no `boot_id` - which `test_the_prohibition_structurally_the_module_never_reads_an_arm_file`
 pins against the module's syntax tree, while
 `test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state` pins it behaviourally
-by planting an arm file that claims "armed, expires in hours" and naming a **different
-kernel boot id** (what a reboot actually leaves behind): the boot comes up disarmed with
-the flag `0` and armed with the flag unset, and in both cases the planted file is refused
-by `disk_spill`'s own boot fence. A surviving arm file still arms nobody; a restart is
+by planting an arm file that claims `"armed": true` and naming a **different kernel boot
+id** (what a reboot actually leaves behind): the boot comes up disarmed with the flag `0`
+and armed with the flag unset, and in both cases the planted file is refused by
+`disk_spill`'s own boot fence - and with the flag `0` the boot's fail-safe **deletes** it,
+because since 0.2.35 a fence that cannot see an engine restart is no longer enough. The
+sibling test `test_the_boot_disarms_a_file_left_by_an_earlier_boot_on_one_kernel` plants
+the file the fence CANNOT refuse (this kernel's boot id) and pins that it is gone. A surviving arm file still arms nobody; a restart is
 still a rollback.
 
 **The gates, and the fail-safe direction.** Every outcome except `ARMED` leaves this boot
@@ -2999,32 +3011,61 @@ uniformly disarmed, and `ARMED` requires **both** halves to have landed:
 Nothing here can raise an engine's boot into an exception: the whole path is wrapped, and
 an internal raise is reported as `REFUSED` with the exception type named.
 
-**Renewal, because the cap is hard.** `disk_spill.ARM_MAX_SECONDS` is 7,200 s and is
-enforced inside `disk_spill`, so a boot-default posture nobody renews goes dark two hours
-into the boot - silently, which is the failure this release chases. Renewal therefore runs
-on the scheduler's offer path, at most one look per 30 s, and re-arms when less than 3,600
-s of the cap is left. **It rides the request path because the plugin owns no timer thread**
-- inventing one inside a plugin that patches a serving engine is a worse risk than a
-renewal that needs a request - so a box that serves *nothing* for two hours lets the arm
-lapse and the **next** request re-arms it before the gate reads the arm. The first renewal
-of a boot is logged once, every failure is counted and logged once per distinct reason,
-and the cadence is in the payload (`renewal_check_seconds`, `renew_ahead_seconds`,
-`arm_max_seconds`) rather than left to be inferred.
+**THE ARM IS A LATCH (0.2.35). There is no expiry, so there is nothing to renew.** Until
+0.2.34 the arm was a timer (`ARM_DEFAULT_SECONDS` 1,800 s, `ARM_MAX_SECONDS` 7,200 s, both
+now deleted) and this module carried a `renew_if_due()` tick that rode the scheduler's
+offer path to beat the cap - a whole heartbeat mechanism whose only job was to keep a
+clock from going dark. Deleting the clock deleted the tick, its constants, its counters
+(`renewals`, `renewal_failures`, `last_renewal`) and its payload fields; `arm_state()`
+reports `latched: true` and no time, and the boot view answers `arm_expires: false` where
+it used to answer `seconds_left`.
 
-**A human always wins, and the ordering is not negotiable.** `POST /plugins/kvtier/disk
-{"op":"disarm"}` - or `{"op":"authority","enabled":false}` - latches, and renewal then
-refuses to re-arm for the rest of the boot; reports `disarmed_by_operator: true` with the reason. A manual `{"op":"arm"}` lifts the
-latch (an operator who disarmed and re-armed asked for the tier back, and leaving renewal
-dead would be the two-hour dark tier wearing a latch). A *refused* POST latches nothing, so
-a malformed curl cannot silently kill the feature. Behind the latch sits a second, stronger
-belt: **renewal never arms a box whose serve switches are both down**, latch or no latch.
+**Why the timer went.** The operator's ruling, after the live box made the case: KV
+persists until the LRU sheds it under the ceiling, and the ceiling eviction that sheds it
+**runs from the spill writer path** - so an arm that expired froze *shedding* along with
+growth, which is the opposite of the product: a tier that cannot shed is a tier that
+refuses spills forever. The timer was not buying a bound either. At the live 11,468,800 B
+slot and 200 files / 60 s one rank writes ~38.2 MB/s, which fills a 192 GiB ceiling in
+about 90 minutes: a 7,200 s arm permits ~1.34 ceiling-fills and the 1,800 s default ~0.33.
+Capacity is bounded independently of the arm - by the byte ceiling, the per-rank fair
+share, LRU-by-touch, the `MIN_FREE_BYTES` free-space floor and the write-rate window - and
+two of those mechanisms run **only while the arm is up**. The 2026-10-05 livelock the
+expiry was partly credited with preventing is closed by six mechanisms that read no arm
+expiry (the AND-over-ranks proof with per-rank service facts, the arm read live from one
+authoritative file, the request and span fuses, the forward-progress fuse, the
+contiguous-run offer bound, and a CONFIRMED witness that cannot be reached without proof).
+
+**What the latch does not survive is a decision nobody made.** The boot fence in
+`disk_spill._arm_boot_fence` still refuses an arm file naming a different **kernel** boot,
+but `/proc/sys/kernel/random/boot_id` cannot see an ENGINE RESTART inside one long uptime
+- four boots in a 2w3d uptime all look like "this boot" - and while the arm had a TTL, the
+TTL is what made a file from boot #1 harmless to boot #2. The rule that replaces it is
+**THE ONLY THING THAT ARMS A PROCESS IS THAT PROCESS'S OWN BOOT DECISION**: `boot_enable()`
+calls `disk_spill.disarm()` on every outcome except `ARMED`, and `disarm()` deletes the
+file. A boot that did not choose to arm leaves nothing behind to be misread.
+
+**A human always wins, and the ordering is not negotiable - and since 0.2.35 it is the
+veto that enforces it.** `POST /plugins/kvtier/disk {"op":"disarm"}` - or
+`{"op":"authority","enabled":false}` - latches `disarmed_by_operator: true` with the
+reason, and the boot decision **refuses to arm while it stands**. That is the veto's new
+job: it used to gate `renew_if_due()` and nothing else, so when renewal was deleted it
+guarded an empty set and could have gone with it. It is kept, for a stronger reason - with
+a latch the path that can still re-arm a box behind its operator is `boot_enable()`
+itself, and a second connector boot inside one process (which a re-instantiated engine
+does) would otherwise raise an arm that, with no timer, would never come down. A manual
+`{"op":"arm"}` lifts the veto: only a human at the verb does, and only because that human
+asked for the tier back. A *refused* POST latches nothing, so a malformed curl cannot
+silently kill the feature. And because the latch gates **both** directions, disarming
+closes serving from disk as well as writing to it - `gate()` answers
+`reason_kind: "disarmed"`, and `boot_enable`'s fail-safe and `_may_restore_worker` read
+the same verdict.
 
 **One line, at boot, naming how to turn it off.** It is WARNING-level, printed once per
 process, and it is the answer to "what did this boot decide and how do I change it?"
 without opening a source file. Verbatim, on a default boot:
 
 ```
-kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset -> default ON): HONOURED: armed the spill path for 7200.0 s and set this boot's serve posture, so it comes up serving_as=disk_authority with NO POST. Renewal keeps it up while the posture stays up (>= 3600 s of the 7200 s cap left, checked at most once every 30 s on the request path). to stop every future boot doing this: set KVTIER_DISK_BOOT_ENABLE=0 in the engine's environment and restart (VLLM_E2_TIER_DEV_BOOT_INERT=1 turns off the whole auto-boot, not just the disk tier); to stop THIS boot right now: POST /plugins/kvtier/disk {"op":"authority","enabled":false} and then POST /plugins/kvtier/disk {"op":"disarm"} - a manual disarm latches, and renewal never re-arms a box the operator just disarmed
+kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset -> default ON): HONOURED: armed the spill path and set this boot's serve posture, so it comes up serving_as=disk_authority with NO POST. The arm is a LATCH (0.2.35): it has no expiry, there is nothing to renew, and it comes down on a POST that disarms it and not on a clock. It gates SERVING from disk as well as writing to it, so the same POST stops both. to stop every future boot doing this: set KVTIER_DISK_BOOT_ENABLE=0 in the engine's environment and restart (VLLM_E2_TIER_DEV_BOOT_INERT=1 turns off the whole auto-boot, not just the disk tier); to stop THIS boot right now: POST /plugins/kvtier/disk {"op":"authority","enabled":false} and then POST /plugins/kvtier/disk {"op":"disarm"} - the arm is a LATCH, so that holds until someone arms again, and a manual disarm vetoes this module's own boot decision for the rest of the process too
 ```
 
 ```bash
@@ -3033,7 +3074,7 @@ kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset ->
 # `disk_restore.boot_default`, and `/disk`'s own `disk_boot_default`.
 grep 'disk boot default' /tmp/vllm-serve.log | tail -1
 curl -s -H "x-kvtier-dev-token: $TOK" $B/snapshot | python3 -c \
-  'import sys,json;b=json.load(sys.stdin)["disk_restore"]["boot_default"];print(b["outcome"],b["honoured"],b["armed_now"],b["renewals"],b["disarmed_by_operator"])'
+  'import sys,json;b=json.load(sys.stdin)["disk_restore"]["boot_default"];print(b["outcome"],b["honoured"],b["armed_now"],b["arm_expires"],b["disarmed_by_operator"])'
 curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"status"}' $B/disk | python3 -c \
   'import sys,json;print(json.load(sys.stdin)["disk_boot_default"]["reason"])'
 
@@ -3660,11 +3701,18 @@ previous boot (a different kernel boot id, which is what a reboot leaves) is pla
 claiming hours of life, and the boot's decision is shown to come from the flag and not
 from the file - behaviourally, and structurally, by walking `disk_boot.py`'s syntax tree
 for any name, attribute, string constant or call that could read persisted arm state.
-Between them: a manual disarm beats the boot default (driven through the verb, with the
-arm then expired so renewal is forced to answer), renewal runs and logs once, renewal
-never arms a box that is not serving, every failed gate leaves the boot uniformly disarmed
-and prints exactly one line naming the gate, and the status payload carries the same key
-set on every path including the one where the arm cannot be read.
+Between them: a manual disarm beats the boot default - driven through the VERB and proved
+against the only path that can still re-arm a latched tier, a SECOND `boot_enable()` in the
+same process - the veto survives until a human lifts it by arming, an arm survives ten hours
+of advanced clock (the inversion of the deleted expiry test), an old-format arm file with a
+past `expires_ts` still arms (the upgrade path), `{"op":"arm","seconds":7200}` still arms and
+reports the number `seconds_ignored`, a file planted with THIS kernel's boot id by an earlier
+engine boot is deleted by a boot that did not arm, every exit of `boot_enable` that is not
+`ARMED` provably routes through the fail-safe (an AST check on the function's `return`s),
+every failed gate leaves the boot uniformly disarmed and prints exactly one line naming the
+gate, and the status payload carries the same key set on every path including the one where
+the arm cannot be read. The deleted renewal suite's seven tests went with the tick they
+tested.
 
 The spill wiring (`tests/test_disk_store.py`) is the one that tests naming, because a
 wrong name is the failure that cannot be repaired after the fact. The worker's

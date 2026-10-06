@@ -338,7 +338,9 @@ def _make_disk_method():
     kvtier_dev_disk.__doc__ = (
         "kvtier-dev-plugin: the SSD spill tier's control verb "
         "(status/arm/disarm/spill-one/ls/contains/offers). DISARMED at every boot, no "
-        "env var arms it, and an arm expires. `spill-one` is relayed to the workers by "
+        "env var arms it, and the arm is a LATCH (0.2.35): no expiry, no renewal, and "
+        "a disarm stops serving from disk as well as writing to it. `spill-one` is "
+        "relayed to the workers by "
         "a file because a worker has no utility channel; the write itself happens on "
         "the spill thread. `contains` answers ONE identity from the replayed "
         "journals (per rank, and with a `present: null` verdict when the index "
@@ -577,7 +579,8 @@ def register() -> None:
         level("kvtier-dev-plugin: SSD spill hook %s; posture %s. On an unpatched "
               "engine (no store_keys on SimpleCPUOffloadMetadata) the hook refuses "
               "and COUNTS rather than writing; arm it only over POST %s "
-              "{\"op\":\"arm\"}, which expires on its own",
+              "{\"op\":\"arm\"}: the arm is a LATCH (0.2.35), so a disarm is "
+              "then the only thing that takes it back down",
               spill_hook, disk_store.boot_note(),
               config.ROUTE_PREFIX + config.ROUTE_DISK)
         # The restore hook's posture, in the same place. Its own proof line is

@@ -48,9 +48,31 @@ build, at `manager.py:988-992` at the fork HEAD 10b8e07 this suite's fixture is
 generated from; the method itself starts at `manager.py:1009` there and its
 `cpu_block_pool._insert_block_hash` calls are at `manager.py:1026-1043`).
 
-AN ARM MUST DIE AT A REBOOT, BY ITS OWN CONTENTS
--------------------------------------------------
-The arm crosses the process boundary as one small file in the diagnostics directory
+AN ARM IS A LATCH (0.2.35), AND IT MUST DIE AT A REBOOT, BY ITS OWN CONTENTS
+----------------------------------------------------------------------------
+THE ARM IS A LATCH, NOT A TIMER. It is raised by a decision and lowered by a
+decision, and no clock lowers it. The operator's ruling, after the live box proved
+the point: KV persists until the LRU sheds it under the ceiling - and the ceiling
+eviction that sheds it runs from the SPILL WRITER PATH (`_enforce_ceiling` after a
+committed write), so an arm that EXPIRED froze shedding as well as growth, which is
+the opposite of the product. The timer could not bound the store at any setting
+either: 200 files / 60 s at the live 11,468,800 B slot is ~38.2 MB/s per rank against
+a 192 GiB ceiling, so ONE rank fills the store in ~90 minutes - a 7,200 s arm permits
+~1.34 ceiling-fills and the 1,800 s default ~0.33. Capacity IS bounded, arm-
+independently, by the ceiling, the fair share, LRU-by-touch, the `MIN_FREE_BYTES`
+statvfs floor and the write-rate window. And the 2026-10-05 livelock the expiry was
+partly credited with preventing is dead by six mechanisms that read no arm expiry:
+the AND-over-ranks proof with per-rank service facts, the arm read live from ONE
+authoritative file, the request/span fuses, the forward-progress fuse, the
+contiguous-run offer bound, and a CONFIRMED witness that is unreachable without
+proof. A lapse also closed every gate through the SAME `_read_arm_file` read, so it
+could never have produced the scheduler-armed/workers-disarmed skew that caused the
+loop; a latch cannot produce it either, and the latch's own truth is that
+DISARMING STOPS SERVING FROM DISK, not only writing (spill write, `gate()`, the
+rank proof's tier arm and `_may_restore_worker` all read the same verdict).
+
+WHAT THE LATCH DOES NOT SURVIVE is a decision nobody made. The arm crosses the
+process boundary as one small file in the diagnostics directory
 (`ARM_FILE`), because the verb that arms runs in the EngineCore and the spill happens
 in a worker. That file used to be checked for `armed` + a wallclock `expires_ts`
 alone, so a file that survived a reboot armed the NEW boot for the rest of its life -
@@ -68,6 +90,17 @@ with `epoch_scope: "process"` two workers of ONE boot legitimately disagree, and
 consulting it there would disarm a healthy tier. A surviving arm file is therefore
 harmless wherever it lives, and the journal can be moved to persistent storage
 without arming anything (`VLLM_E2_TIER_DISK_JOURNAL_DIR`, `disk_index`).
+
+THE FENCE SEPARATES REBOOTS, NOT ENGINE RESTARTS - AND THAT GAP IS CLOSED BY A
+DECISION NOW THAT THE TTL IS GONE. `BOOT_ID_PATH` is one UUID per KERNEL boot, so
+four EngineCore boots inside one 2w3d uptime all carry the same boot id, and an arm
+file that survives an ENGINE RESTART names a boot the fence cannot tell from this
+one. While the arm had a TTL, the TTL is what killed such a file; it has none now,
+so the rule is: THE ONLY THING THAT ARMS A PROCESS IS THAT PROCESS'S OWN BOOT
+DECISION. `disk_boot.boot_enable()` calls `disarm()` on EVERY outcome except `ARMED`,
+and `disarm()` removes the file (`_remove_arm_file`, which already did), so a boot
+that did not choose to arm leaves no file behind to arm anybody. Pinned by
+`test_the_boot_disarms_an_arm_file_left_by_an_earlier_engine_boot_on_the_same_kernel`.
 
 WHAT CHANGED IN 0.2.30: the ceiling stopped being able to be spent four times. The
 store is ONE directory shared by every rank whose geometry digest appears in its file
@@ -452,10 +485,11 @@ MAX_COLLISION_SCAN = 4_096           # directory entries a sibling probe will re
 
 # The arm. In-process here (a worker's truth is the arm FILE, the `blockdump`
 # one-way-per-process problem again), with a bounded, stat-first read so an armed
-# worker's gate costs nothing.
-ARM_DEFAULT_SECONDS = 1800.0
-ARM_MIN_SECONDS = 5.0
-ARM_MAX_SECONDS = 7200.0
+# worker's gate costs nothing. SINCE 0.2.35 THE ARM IS A LATCH: there is no TTL
+# constant left to validate, because nothing about the arm is measured in time -
+# `ARM_DEFAULT_SECONDS` / `ARM_MIN_SECONDS` / `ARM_MAX_SECONDS` are deleted, and
+# `disk_boot`'s renewal path went with them (see the module docstring for the
+# ruling and the arithmetic).
 ARM_FILE = "disk-spill-arm.json"
 MAX_ARM_FILE_BYTES = 4096
 ARM_FILE_POLL_SECONDS = 1.0          # SECONDS a cached file verdict is trusted
@@ -537,9 +571,6 @@ _state: dict = {
     "root": None,
     "ceiling_bytes": None,
     "armed": False,
-    "arm_expires_mono": None,
-    "arm_expires_wall": None,
-    "arm_seconds": None,
     "arm_file_verdict": None,
     "arm_file_checked_mono": None,
     # How often an arm file was refused for belonging to another boot: the number
@@ -740,8 +771,7 @@ def reset_state_for_tests() -> None:
     _writer_thread = None
     _state.update({
         "configured": False, "root": None, "ceiling_bytes": None,
-        "armed": False, "arm_expires_mono": None, "arm_expires_wall": None,
-        "arm_seconds": None, "arm_file_verdict": None,
+        "armed": False, "arm_file_verdict": None,
         "arm_file_checked_mono": None, "arm_file_boot_refusals": 0,
         "fingerprint": None, "geometry_digest": None,
         "thread_started": 0, "thread_alive": False,
@@ -927,7 +957,8 @@ def capability() -> str:
 
     `not_configured`     - no root: nothing this module does can ever become work.
     `configured_disarmed`- the root exists, no arm: still zero disk work.
-    `armed_and_ready`    - armed and inside its lifetime: accepted jobs spill.
+    `armed_and_ready`    - armed (the latch is up, and nothing lowers it but a
+                           decision): accepted jobs spill.
     """
     if not configured()["configured"]:
         return "not_configured"
@@ -942,20 +973,24 @@ def _arm_path():
 
 
 def is_armed() -> bool:
-    """This process's arm: in-process, expired lazily, then the arm FILE.
+    """This process's arm: the in-process latch first, then the arm FILE.
 
-    The expiry is checked on EVERY read (the `intentional_stop_active()` lesson -
-    a lapsed arm must never answer `True` because nobody swept). The file is the
-    `blockdump` one-way-per-process problem again: the verb that arms runs in the
-    EngineCore, and the spill happens in a worker, so the arm crosses as one small
-    bounded file. Its verdict is cached for `ARM_FILE_POLL_SECONDS` because this is
-    consulted per spill request, not per diagnostic poll.
+    SINCE 0.2.35 THIS IS A LATCH AND NOT A TIMER. Nothing here reads a clock: the
+    arm is raised by `arm()` and lowered by `disarm()`, and it stays exactly where a
+    decision left it. What that means operationally, stated where a reader cannot
+    miss it: THE ARM GATES BOTH DIRECTIONS, so `disarm()` stops SERVING from disk as
+    well as writing to it (`request_spill` refuses, `disk_restore.gate()` refuses,
+    the rank proof's tier arm refuses, `_may_restore_worker` refuses). It is the
+    master switch, not a write-only knob.
+
+    The file is the `blockdump` one-way-per-process problem again: the verb that
+    arms runs in the EngineCore, and the spill happens in a worker, so the arm
+    crosses as one small bounded file. Its verdict is cached for
+    `ARM_FILE_POLL_SECONDS` because this is consulted per spill request, not per
+    diagnostic poll. The file's OWN lifetime rule is not a timer either: what the
+    reader refuses is a file that provably belongs to a different BOOT
+    (`_arm_boot_fence`), never a file that has simply been sitting there.
     """
-    deadline = _state["arm_expires_mono"]
-    if _state["armed"] and isinstance(deadline, (int, float)) \
-            and time.monotonic() >= deadline:
-        _state["armed"] = False
-        _state["last_reason"] = "the arm expired"
     if _state["armed"]:
         return True
     now = time.monotonic()
@@ -1042,11 +1077,22 @@ def _arm_boot_fence(document) -> str | None:
 def _read_arm_file(path):
     """(armed, reason) from the arm file. Fail CLOSED: any doubt is disarmed.
 
-    `armed` and `expires_ts` are the two checks the first versions had. THE THIRD IS
-    THE BOOT: `_arm_boot_fence` refuses an arm written by a boot that is not this one
-    (a reboot must not arm a cold box), and its reason NAMES the mismatch, because
-    "disarmed and I do not know why" is how an armed-looking box ends up quietly
-    doing nothing.
+    SINCE 0.2.35 THE FILE CARRIES NO EXPIRY AND THIS READER READS NO CLOCK. The
+    version that had one refused a file whose wallclock `expires_ts` had passed; that
+    check is deleted, along with the requirement that the field exist at all, because
+    the arm is a latch (see the module docstring: an expired arm froze LRU shedding
+    as well as growth, and no setting of the timer bounded the store). A file that
+    still carries `expires_ts` - one written by an older build - parses and is
+    believed on the same terms as any other, and its timestamp is not consulted.
+
+    THE ONE LIFETIME RULE THAT REMAINS IS THE BOOT: `_arm_boot_fence` refuses an arm
+    written by a boot that is not this one (a reboot must not arm a cold box), and
+    its reason NAMES the mismatch, because "disarmed and I do not know why" is how an
+    armed-looking box ends up quietly doing nothing. The fence is load-bearing and
+    unrelated to the timer: it separates REBOOTS. It does NOT separate engine
+    restarts inside one kernel boot, and with the timer gone nothing in this reader
+    does either - what closes that gap is the boot's own decision calling `disarm()`
+    (`disk_boot.boot_enable`), which removes the file.
     """
     if path is None:
         return False, (f"{config.ENV_DIAG_DIR} is not set, so no arm file can "
@@ -1068,11 +1114,6 @@ def _read_arm_file(path):
         return False, f"the arm file did not parse: {type(exc).__name__}"
     if not isinstance(document, dict) or document.get("armed") is not True:
         return False, "the arm file does not say armed"
-    expires = document.get("expires_ts")
-    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
-        return False, "the arm file has no numeric expires_ts"
-    if time.time() >= float(expires):
-        return False, "the arm expired"
     stale = _arm_boot_fence(document)
     if stale:
         _state["arm_file_boot_refusals"] += 1
@@ -1081,34 +1122,39 @@ def _read_arm_file(path):
 
 
 def arm(seconds=None) -> dict:
-    """Arm the spill path here, and (when a diagnostics dir exists) by file.
+    """Raise the latch here, and (when a diagnostics dir exists) by file.
+
+    THE ARM IS A LATCH (0.2.35): it stays up until `disarm()` takes it down or the
+    process exits. Nothing about it expires, and nothing in this module reads a
+    clock to decide it.
 
     Refused when nothing is configured: an armed tier with no root is a knob that
     lies, so the arm requires the root, exactly as `blockdump.arm` requires a
     channel. There is NO env var that arms this - the same rule as guard mode and
     the byte dump: a launcher script must not be able to turn a facility that
     writes real KV bytes to disk on.
+
+    `seconds` IS STILL ACCEPTED AND NOW DOES NOTHING. It stays in the signature
+    because the call an operator already makes (`POST {"op":"arm","seconds":7200}`)
+    must not start failing on the day this ships - the countdown that used to read
+    the number is a separate, sequenced removal in the proxy repo. The verdict says
+    `seconds_ignored: true` rather than pretending the value meant something, and the
+    validation that existed only to bound it is gone with the TTL.
     """
-    wanted = ARM_DEFAULT_SECONDS
-    if seconds is not None:
-        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
-            return {"armed": False, "reason": "seconds must be a number"}
-        wanted = max(ARM_MIN_SECONDS, min(ARM_MAX_SECONDS, float(seconds)))
     state = configured()
     if not state["configured"]:
         _state["refused"]["not_configured"] += 1
         return {"armed": False, "capability": "not_configured",
+                "latched": True, "seconds_ignored": seconds is not None,
                 "reason": f"{config.ENV_DISK_ROOT} is not set (or names a refused "
                           "path), so there is nowhere to write and arming would "
                           "only be a lie"}
     now = time.time()
     _state["armed"] = True
-    _state["arm_expires_mono"] = time.monotonic() + wanted
-    _state["arm_expires_wall"] = now + wanted
-    _state["arm_seconds"] = wanted
     _state["arm_file_checked_mono"] = None
-    written = _write_arm_file(now, wanted)
-    return {"armed": True, "seconds": wanted, "capability": "armed_and_ready",
+    written = _write_arm_file(now)
+    return {"armed": True, "capability": "armed_and_ready",
+            "latched": True, "seconds_ignored": seconds is not None,
             "arm_file": written.get("path"),
             "arm_file_written": bool(written.get("written")),
             "arm_file_reason": written.get("reason"),
@@ -1116,33 +1162,37 @@ def arm(seconds=None) -> dict:
 
 
 def disarm() -> dict:
+    """Lower the latch here AND delete the file the ranks read.
+
+    TOTAL, AND TOTAL IN BOTH DIRECTIONS: with the latch down nothing spills AND
+    nothing is served from disk, because the spill writer, `disk_restore.gate()`, the
+    rank proof's tier arm and `_may_restore_worker` all read this one verdict. There
+    is no expiry left to lapse and no renewal left to undo it, so this is the only way
+    an arm comes down short of a process exit - and because it removes the file, an
+    operator who has disarmed leaves NOTHING behind for a later boot or a later
+    process to resurrect (`_remove_arm_file`).
+    """
     was = bool(_state["armed"])
     _state["armed"] = False
-    _state["arm_expires_mono"] = None
-    _state["arm_expires_wall"] = None
-    _state["arm_seconds"] = None
     _state["arm_file_verdict"] = None
     _state["arm_file_checked_mono"] = None
     removed = _remove_arm_file()
     return {"armed": False, "was_armed": was, "capability": capability(),
             "arm_file_removed": removed,
-            "reason": "spills are refused again; a queued job still lands, so "
-                      "drain before trusting a zero"}
+            "reason": "spills are refused again, AND serving from disk is refused "
+                      "(one latch gates both); a queued job still lands, so drain "
+                      "before trusting a zero"}
 
 
 def arm_state() -> dict:
+    """The arm as one stable-key view. It reports a LATCH, so it has no time left to
+    report: `seconds_left`, `expires_at_wallclock`, `default_seconds` and
+    `max_seconds` went out with the timer, and the reader that counted them down (the
+    proxy's countdown) is a separate, sequenced removal.
+    """
     armed = is_armed()
-    remaining = None
-    deadline = _state["arm_expires_wall"]
-    if armed and isinstance(deadline, (int, float)):
-        remaining = round(max(0.0, deadline - time.time()), 3)
     return {"armed": armed, "capability": capability(),
-            "seconds_left": remaining,
-            "expires_at_wallclock": (round(float(deadline), 6)
-                                     if isinstance(deadline, (int, float))
-                                     and armed else None),
-            "default_seconds": ARM_DEFAULT_SECONDS,
-            "max_seconds": ARM_MAX_SECONDS,
+            "latched": True,
             # THE BOOT FENCE, in the view an operator reads when the tier is quiet:
             # how many arm files were refused for naming another boot, and the last
             # reason the file verdict said no - which names the epoch or boot-id
@@ -1150,18 +1200,25 @@ def arm_state() -> dict:
             "arm_file_boot_refusals": int(_state["arm_file_boot_refusals"]),
             "arm_file_reason": _state["last_reason"],
             "boot_id": _boot_id(),
-            "units": disk_layout._units("seconds_left", "default_seconds",
-                                        "max_seconds", "expires_at_wallclock",
-                                        "arm_file_boot_refusals"),
-            "note": ("an arm expires on its own; no env var arms this facility, "
-                     "and a fresh boot does zero disk work. An arm file must also "
-                     "name THIS boot (the kernel boot id, and the per-boot epoch "
-                     "when the operator sets one), so a reboot disarms a surviving "
-                     "file instead of arming a cold box with the restore path "
-                     "open to live traffic")}
+            "units": disk_layout._units("arm_file_boot_refusals"),
+            "note": ("an arm is a LATCH: a decision raises it and a decision lowers "
+                     "it, and no clock does either (0.2.35 retired the TTL, the "
+                     "default, the cap and the renewal that existed only to beat "
+                     "them). The store is bounded by the byte ceiling, the per-rank "
+                     "fair share, LRU-by-touch, the free-space floor and the "
+                     "write-rate window - all of which work with the arm UP, and two "
+                     "of which run ONLY while it is up. No env var arms this "
+                     "facility; disarming stops SERVING from disk as well as writing "
+                     "to it; and an arm file must also name THIS boot (the kernel "
+                     "boot id, and the per-boot epoch when the operator sets one), so "
+                     "a reboot disarms a surviving file instead of arming a cold box "
+                     "with the restore path open to live traffic. An engine RESTART "
+                     "inside one kernel boot is invisible to that fence, so a boot "
+                     "that did not choose to arm deletes the file it did not ask "
+                     "for: see disk_boot.boot_enable")}
 
 
-def _write_arm_file(now: float, seconds: float) -> dict:
+def _write_arm_file(now: float) -> dict:
     path = _arm_path()
     if path is None:
         return {"written": False, "reason": "no diagnostics directory"}
@@ -1169,26 +1226,24 @@ def _write_arm_file(now: float, seconds: float) -> dict:
     # `epoch` is the OPERATOR's per-boot value when they set one and this process's
     # token otherwise, and `epoch_scope` says which - without the scope the reader
     # cannot tell "a different boot" apart from "a different worker of this boot",
-    # and a false refusal would disarm a healthy tier.
+    # and a false refusal would disarm a healthy tier. NO `expires_ts` AND NO
+    # `seconds`: the arm is a latch, and a reader that silently ignored a lifetime
+    # field would be worse than one that never had it.
     epoch, scope = config.diagnostics_epoch()
     document = {"version": PROTOCOL_VERSION, "writer": WRITER_TAG,
                 "armed": True, "armed_ts": round(now, 6),
-                "expires_ts": round(now + seconds, 6),
-                "seconds": round(seconds, 3), "root": _state["root"],
+                "latched": True, "root": _state["root"],
                 "epoch": str(epoch), "epoch_scope": scope, "pid": os.getpid(),
                 "boot_id": _boot_id()}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        raw = json.dumps(document, separators=(",", ":")).encode("utf-8")
-        with open(tmp, "wb") as handle:
-            handle.write(raw)
-        os.replace(tmp, path)
-        return {"written": True, "path": path, "bytes": len(raw)}
-    except Exception as exc:  # noqa: BLE001 - an unpublished arm is data
-        snapshot._error(exc, "disk_spill arm file")
+        with open(path + ".tmp", "wb") as handle:
+            handle.write(json.dumps(document).encode("utf-8"))
+        os.replace(path + ".tmp", path)
+    except OSError as exc:
         return {"written": False, "path": path,
-                "reason": f"{type(exc).__name__}: {exc}"[:MAX_STRING_CHARS]}
+                "reason": f"the arm file could not be written: {exc}"}
+    return {"written": True, "path": path, "reason": None}
 
 
 def _remove_arm_file() -> bool:
@@ -3396,7 +3451,8 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
         if not is_armed():
             _state["refused"]["disarmed"] += 1
             return _refused("disarmed",
-                            "the spill path is disarmed (arm expires by itself)")
+                            "the spill path is disarmed: the arm is a LATCH and "
+                            "stays disarmed until someone arms it")
         adopted = fingerprint if fingerprint is not None else _state["fingerprint"]
         if adopted is None:
             _state["refused"]["fingerprint_missing"] += 1

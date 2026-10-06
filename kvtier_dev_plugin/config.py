@@ -74,8 +74,12 @@ the file contract the proxy host's reader expects):
                                  0.2.29 (a write, or a restore read that produced
                                  usable bytes). Unset = no ceiling, NEVER zero.
                                  Neither variable ARMS the tier: the arm is
-                                 `disk_spill.arm()`, which expires by itself,
-                                 exactly like the raw-byte dump's.
+                                 `disk_spill.arm()`. Since 0.2.35 that arm is a
+                                 LATCH - no expiry and nothing that renews it, so
+                                 it comes down on a disarm POST and not on a
+                                 clock, which is unlike the raw-byte dump's
+                                 (still a TTL). Disarming stops serving from disk
+                                 as well as writing to it.
   VLLM_E2_TIER_DISK_JOURNAL_DIR  where the spill JOURNAL lives, apart from the rest
                                  of the diagnostics directory. UNSET = fall back to
                                  VLLM_E2_TIER_DIAG (the pre-0.2.19 behaviour).

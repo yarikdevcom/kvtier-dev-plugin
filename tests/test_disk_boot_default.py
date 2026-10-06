@@ -7,17 +7,21 @@ crash - it is a boot that serves nothing while reporting that truth honestly.
 1. **The default boot arms and serves with NO POST.** The headline: run the real boot
    (install, guard, tier arm, restore fit, arena verdict, then the disk default) against
    a configured disk tier and the box comes up `serving_as=disk_authority` with an armed
-   spill path at the maximum legal TTL. Nobody POSTed anything.
+   spill path that is LATCHED (0.2.35: no expiry) at the maximum legal TTL. Nobody
+   POSTed anything.
 2. **`KVTIER_DISK_BOOT_ENABLE=0` is today's boot, exactly.** Disarmed spill, posture
    down, `serving_as=off`, no refusal recorded against the disk default, and the two dev
    verbs still the only lever. A test that inherited the flag from a developer's shell
    would be testing the wrong product, which is why `conftest.ENV_VARS` deletes it.
 3. **A manual disarm always beats the boot default.** A human's `{"op":"disarm"}` (or
-   `{"op":"authority","enabled":false}`) latches, and renewal then refuses to re-arm -
-   the property the brief makes non-negotiable, tested through the VERB and not by
-   poking the latch.
-4. **Renewal runs, logs once, and never arms a box that is not serving.** The two-hour
-   arm cap is why renewal exists at all.
+   `{"op":"authority","enabled":false}`) latches a VETO, and the boot decision then
+   refuses to re-arm - the property the brief makes non-negotiable, tested through the
+   VERB and not by poking the latch. Since 0.2.35 the veto guards the boot decision
+   rather than a renewal tick, which makes it stronger: with the arm a latch, a
+   re-arm would be forever instead of two hours.
+4. **THE ARM IS A LATCH (0.2.35).** No expiry, no renewal, and an engine restart inside
+   one kernel uptime cannot inherit an arm file from an earlier boot - the boot's own
+   decision deletes it. This is where the deleted renewal suite used to live.
 5. **Every failure leaves the boot disarmed and says so once.** A failed enable must
    never fail an engine boot and never leave a partially-armed fleet.
 6. **THE PROHIBITION (`test_the_prohibition_...`).** A boot-time re-arm from a persisted
@@ -278,12 +282,11 @@ def test_the_default_boot_comes_up_arming_and_serving_with_no_post(tier, caplog)
     """THE HEADLINE: the real boot, a configured tier, and not one POST.
 
     Everything asserted here is reached without calling the dev verb at all: the spill
-    path is armed at the hard cap, the serve posture is up, the payload's `serving_as`
-    says so, the boot line's `disk_boot=` token agrees with the payload, and the arm
-    file
-    the worker ranks read is on disk naming THIS boot. That last one is the fleet's
-    door:
-    an EngineCore-only arm arms the one process that has no KV memory.
+    path is armed - as a LATCH since 0.2.35, so there is no "maximum legal TTL" left to
+    arm AT - the serve posture is up, the payload's `serving_as` says so, the boot
+    line's `disk_boot=` token agrees with the payload, and the arm file the worker
+    ranks read is on disk naming THIS boot and carrying no expiry. That last one is the
+    fleet's door: an EngineCore-only arm arms the one process that has no KV memory.
     """
     with caplog.at_level(logging.WARNING):
         _cls, _manager, boot_report = run_engine_boot()
@@ -293,15 +296,17 @@ def test_the_default_boot_comes_up_arming_and_serving_with_no_post(tier, caplog)
     assert verdict["outcome"] == disk_boot.OUTCOME_ARMED, verdict["reason"]
     assert verdict["honoured"] is True
     assert verdict["requested"] is True and verdict["source"] == "default"
-    # THE ARM: the maximum legal TTL, here and in the file the ranks obey.
+    # THE ARM: a latch, here and in the file the ranks obey, with no time on either.
     assert disk_spill.is_armed() is True
-    assert verdict["arm_seconds"] == disk_spill.ARM_MAX_SECONDS == 7200.0
+    assert verdict["arm_expires"] is False, "the boot view still promises an expiry"
     assert disk_spill.arm_state()["armed"] is True
+    assert disk_spill.arm_state()["latched"] is True
     assert verdict["arm_file_written"] is True
     with open(arm_path(tier), encoding="utf-8") as handle:
         published = json.load(handle)
     assert published["armed"] is True
-    assert published["seconds"] == disk_spill.ARM_MAX_SECONDS
+    assert "expires_ts" not in published and "seconds" not in published, \
+        "an arm file written with a TTL by a boot default arms nobody at 02:00"
     assert published["boot_id"] == disk_spill._boot_id(), \
         "an arm file naming another boot is refused by the ranks - this one must not be"
     # THE POSTURE: disk authority, with no second switch and no POST.
@@ -423,52 +428,18 @@ def test_an_engine_with_no_disk_tier_is_not_reported_as_a_failure(tier, monkeypa
 
 # --- 4. a manual disarm always beats the boot default -------------------------
 
-def test_a_manual_disarm_after_a_boot_default_arm_is_not_re_armed(tier, arm_boot):
-    """THE NON-NEGOTIABLE ORDERING, driven through the VERB, not by poking a latch.
+# THE NON-NEGOTIABLE ORDERING LIVES IN SECTION 5 NOW
+# (`test_the_operator_veto_outlives_a_second_boot_in_one_process`). What used to be here
+# drove the property through `renew_if_due()`, which no longer exists; the new test
+# drives it through the thing that can still re-arm a latched tier - `boot_enable()`
+# itself - and keeps the two assertions that mattered: the tier is shut in the GATE (a
+# disarm stops serving from disk, not only writing to it), and the refusal names the
+# operator.
 
-    Sequence: the boot default comes up serving; a human POSTs `{"op":"disarm"}`; the
-    arm
-    is then EXPIRED (the state renewal exists to fix); renewal runs. It must refuse, the
-    tier must stay disarmed, and the refusal must name the operator as the reason. If a
-    future change ever re-arms here, this fails.
-    """
-    arm_boot()
-    assert disk_spill.is_armed() is True
-    verdict = disk_store.disk_for_engine(None, {"op": "disarm"})
-    assert verdict["armed"] is False
-    expire_arm()
-
-    out = disk_boot.renew_if_due()
-    assert out["renewed"] is False
-    assert "disarm" in out["reason"]
-    assert disk_spill.is_armed() is False, \
-        "renewal re-armed a box the operator disarmed"
-    view = disk_boot.view()
-    assert view["disarmed_by_operator"] is True
-    assert view["renewal_would_run"] is False
-    assert '"op":"disarm"' in view["latch_reason"]
-    # The tier is genuinely shut, not merely unarmed-looking: the offer gate refuses
-    # on the arm, which is the gate `serving_as` never bypasses - the posture switches
-    # and the arm are separate facts, so the GATE is the assertion that a disarm
-    # actually stopped serving from disk.
-    assert disk_restore.gate()["reason_kind"] == "disarmed"
-
-def test_lowering_the_posture_from_the_verb_latches_too(tier, arm_boot):
-    """`{"op":"authority","enabled":false}` is a human taking the box out of service.
-
-    The cheaper way to say "stop serving from disk" must latch exactly as `disarm` does,
-    or the boot default's renewal would keep the arm alive under an operator who has
-    just
-    turned the posture off - and then the tier would be armed, serving nothing, and
-    looking like a fault in the read path.
-    """
-    arm_boot()
-    disk_store.disk_for_engine(None, {"op": "authority", "enabled": False})
-    expire_arm()
-    assert disk_boot.renew_if_due()["renewed"] is False
-    assert disk_spill.is_armed() is False
-    assert disk_boot.view()["disarmed_by_operator"] is True
-    assert '"enabled":false' in disk_boot.view()["latch_reason"]
+# SUPERSEDED BY SECTION 5
+# (`test_lowering_the_posture_from_the_verb_vetoes_a_second_boot_too`), which proves the
+# same latch against the path that can still re-arm a latched tier - a second
+# `boot_enable()` - instead of against the deleted renewal tick.
 
 
 def test_a_refused_authority_change_does_not_latch(tier, arm_boot):
@@ -486,23 +457,28 @@ def test_a_refused_authority_change_does_not_latch(tier, arm_boot):
     assert disk_restore.disk_posture()["disk_authority"] is True
 
 
-def test_a_hand_arm_lifts_the_latch(tier, arm_boot):
+def test_a_hand_arm_lifts_the_veto_and_the_verb_still_reports_its_ttl_as_ignored(
+        tier, arm_boot):
     """An operator who disarms and then arms by hand has asked for the tier back.
 
-    Leaving the latch set would switch renewal off for the rest of the boot on a box he
-    just chose to serve from disk - the two-hour dark tier again, wearing a latch. Only
-    a
-    human at the verb lifts it: `boot_enable`'s own rollback calls `disarm()` directly
-    and
-    must NOT latch (a rollback is not an instruction).
+    Leaving the veto set would have a later boot in this process REFUSE to arm a box he
+    just chose to serve from disk - and with the arm a latch, that refusal is forever
+    rather than two hours. Only a human at the verb lifts it: `boot_enable`'s own
+    fail-safe calls `disarm()` directly and must NOT latch (a rollback is not an
+    instruction, and this is the test that keeps it that way).
+
+    The `seconds` the call carries is asserted as IGNORED in the same breath, because
+    this is the shape of the call the proxy makes today: it must keep arming, and it
+    must not be allowed to look like it bought a lifetime.
     """
     arm_boot()
     disk_store.disk_for_engine(None, {"op": "disarm"})
     assert disk_boot.view()["disarmed_by_operator"] is True
-    disk_store.disk_for_engine(None, {"op": "arm", "seconds": 600})
+    verdict = disk_store.disk_for_engine(None, {"op": "arm", "seconds": 600})
+    assert verdict["armed"] is True and verdict["seconds_ignored"] is True
     assert disk_boot.view()["disarmed_by_operator"] is False
-    expire_arm()
-    assert disk_boot.renew_if_due()["renewed"] is True
+    assert disk_spill.is_armed() is True
+    assert arm_boot()["outcome"] == disk_boot.OUTCOME_ARMED
 
 
 def test_the_boot_default_rollback_does_not_latch(tier, arm_boot):
@@ -517,144 +493,267 @@ def test_the_boot_default_rollback_does_not_latch(tier, arm_boot):
     assert disk_boot.view()["disarmed_by_operator"] is False
 
 
-# --- 5. renewal ---------------------------------------------------------------
+# --- 5. THE ARM IS A LATCH (0.2.35): no expiry, nothing re-arms it --------------
+#
+# UNTIL 0.2.34 THIS SECTION WAS "RENEWAL": seven tests for a tick that beat the arm's
+# 7,200 s cap, plus an `expire_arm()` fixture that faked the lapse the tick existed to
+# fix. All of it is DELETED, because the arm stopped being a timer - the operator's
+# ruling is in `disk_spill`'s module docstring (an expired arm froze the LRU shedding
+# that runs from the spill writer, and no setting of the timer bounded the store: one
+# rank at ~38 MB/s fills a 192 GiB ceiling in ~90 minutes, so even the 1,800 s default
+# permitted a third of a ceiling-fill). What replaces the section is the other side of
+# the same worry: with no timer, WHAT ELSE COULD ARM A BOX BEHIND AN OPERATOR'S BACK,
+# and what stops a file from an earlier boot doing it. Those are the questions below,
+# and they are the questions `disk_boot.py`'s fail-safe and operator veto exist to
+# answer.
 
-def test_renewal_runs_while_enabled_and_logs_once(tier, arm_boot, caplog):
-    """Renewal exists because `ARM_MAX_SECONDS` is a hard cap: 7200 s, then dark.
+def test_an_arm_lands_as_a_latch_with_no_expiry_anywhere(tier, arm_boot):
+    """The arm, the view and the FILE all say the same thing: nothing lowers it.
 
-    Two things are pinned: that it RUNS (the arm comes back at the cap after an expiry),
-    and that it says so exactly ONCE per boot - the tick rides the request path, and a
-    line per request is a line nobody reads. The first-renewal line is also the only
-    evidence in the log that a 0.2.33 boot will not go dark at the two-hour mark.
+    Three surfaces carried a time and all three are checked, because a reader reaches
+    the arm through any of them: `is_armed()` (this process), `arm_state()` (the
+    payload, and until this release the proxy's countdown column), and the arm FILE the
+    worker ranks read. A leftover `expires_ts` in the file would be worse than no field
+    at all - a reader that honoured it would disarm a serving tier at an arbitrary hour,
+    which is the bug being removed.
     """
-    arm_boot()
-    expire_arm()
-    with caplog.at_level(logging.WARNING):
-        first = disk_boot.renew_if_due()
-    assert first["renewed"] is True, first
+    verdict = disk_spill.arm()
+    assert verdict["armed"] is True and verdict["latched"] is True
     assert disk_spill.is_armed() is True
-    assert disk_spill.arm_state()["seconds_left"] > disk_boot.RENEW_AHEAD_SECONDS
-    renewals = [r for r in caplog.records if "first renewal" in r.getMessage()]
-    assert len(renewals) == 1
 
-    # A second expiry, renewed: the counter moves, the line does not repeat.
-    expire_arm()
-    disk_boot._state["last_renewal_check_mono"] = None
-    with caplog.at_level(logging.WARNING):
-        assert disk_boot.renew_if_due()["renewed"] is True
-    assert disk_boot.view()["renewals"] == 2
-    renewals = [r for r in caplog.records if "first renewal" in r.getMessage()]
-    assert len(renewals) == 1, "one renewal line per boot, not one per tick"
-    assert disk_boot.view()["last_renewal"].startswith("renewal #2")
+    state = disk_spill.arm_state()
+    for gone in ("seconds_left", "expires_at_wallclock", "default_seconds",
+                 "max_seconds"):
+        assert gone not in state, f"the view still reports {gone}: the TTL is back"
+    assert state["latched"] is True
+    assert "LATCH" in state["note"]
+
+    with open(arm_path(tier), encoding="utf-8") as handle:
+        published = json.load(handle)
+    assert published["armed"] is True and published["latched"] is True
+    for gone in ("expires_ts", "seconds"):
+        assert gone not in published, f"the file the RANKS read still carries {gone}"
 
 
-def test_the_renewal_tick_is_bounded_and_rides_the_request_path(tier, arm_boot):
-    """The tick is cheap per lookup and cannot run twice inside its own floor.
+def test_an_arm_survives_ten_hours_of_clock(monkeypatch, tier, arm_boot):
+    """THE INVERSION OF THE DELETED `test_an_arm_expires_on_its_own_clock`.
 
-    The plugin has no timer thread and will not grow one, so the tick hangs off the
-    scheduler's offer path. That makes two properties load-bearing: the per-lookup cost
-    while not due is a monotonic comparison (asserted by the "not due" verdict and the
-    unchanged renewal count), and the FIRST LOOKUP AFTER AN EXPIRY re-arms BEFORE the
-    gate reads the arm - so the request that arrives after a two-hour idle is served,
-    not refused.
+    The old test advanced the clock an hour and asserted the arm had lapsed. The same
+    manoeuvre now has to prove the opposite, against BOTH clocks the expired version
+    read (the monotonic one `is_armed()` consulted and the wall-clock one the FILE was
+    checked against), because a reader that still had a deadline anywhere would fail
+    here. Advancing a clock is not a simulation of a long boot - it is exactly what a
+    two-hour idle box looks like to the code that used to expire under it, and the
+    request that arrived after that idle is the one the renewal tick existed to save.
+    """
+    disk_spill.arm()
+    real_wall, real_mono = time.time, time.monotonic
+    monkeypatch.setattr(time, "time", lambda: real_wall() + 10 * 3600.0)
+    monkeypatch.setattr(time, "monotonic", lambda: real_mono() + 10 * 3600.0)
+    disk_spill._state["arm_file_checked_mono"] = None   # force a file re-read
+    assert disk_spill.is_armed() is True, "the arm still expires on a clock"
+    assert disk_spill.arm_state()["armed"] is True
+    assert disk_restore.gate()["reason_kind"] != "disarmed"
+
+
+def test_arm_still_accepts_a_seconds_argument_and_says_it_ignored_it(tier,
+                                                                     arm_boot):
+    """WIRE COMPATIBILITY, not a knob: `{"op":"arm","seconds":7200}` still arms.
+
+    The proxy the operator drives sends a TTL today, and its countdown column is removed
+    in a separate, sequenced change in the sibling repo. So the argument must keep being
+    ACCEPTED - a 400 or a `seconds must be a number` refusal on the day this ships would
+    break the one call an operator actually makes. What it does is nothing, and the
+    verdict says `seconds_ignored: true` rather than letting the number look meaningful.
+    A non-numeric value, which the TTL version refused, is ignored too: there is no
+    bound left to violate, and refusing it would be a refusal of a value that cannot
+    matter.
+    """
+    for body in ({"op": "arm", "seconds": 7200}, {"op": "arm", "seconds": 999999},
+                 {"op": "arm"}, {"op": "arm", "seconds": "7200"}):
+        disk_spill.disarm()
+        verdict = disk_store.disk_for_engine(None, dict(body))
+        assert verdict["armed"] is True, verdict
+        assert verdict["seconds_ignored"] is (body.get("seconds") is not None), verdict
+        assert "seconds" not in verdict, "the verdict still reports a TTL"
+    with open(arm_path(tier), encoding="utf-8") as handle:
+        assert "expires_ts" not in json.load(handle)
+
+
+def test_the_operator_veto_outlives_a_second_boot_in_one_process(tier, arm_boot):
+    """THE VETO'S NEW JOB, and the reason the latch survived renewal's deletion.
+
+    `note_operator_disarm` used to gate `renew_if_due()` and nothing else, so with
+    renewal gone it guarded an empty set and could have been deleted. It is kept because
+    with a LATCH there is a path worse than a renewal: `boot_enable()` ITSELF. A second
+    connector boot inside one process - which a re-instantiated engine does, and which
+    `test_a_second_boot_in_one_process_prints_one_line_and_counts_two` does on purpose -
+    would otherwise re-arm a box an operator had just disarmed, and with no timer that
+    re-arm would be FOREVER rather than two hours. So the veto is now a gate on the boot
+    decision, and this test is what stands between a future refactor and that bug.
+
+    The gate the whole feature is about is asserted too: a disarm closes SERVING from
+    disk, not only writing to it, which is what `gate()`'s `disarmed` kind means.
     """
     arm_boot()
-    expire_arm()
-    # The tick has not run since the boot: it is due, so an offer re-arms before gating.
-    disk_boot._state["last_renewal_check_mono"] = None
-    disk_restore.offer(base.Manager(), base.Req(request_id="after-idle", blocks=4), 0,
-                       (0, False))
-    assert disk_spill.is_armed() is True, "the tick must precede the gate"
-    assert disk_boot.view()["renewals"] == 1
-    # Now inside the floor: further lookups report "not due" and renew nothing.
-    expire_arm()
-    out = disk_boot.renew_if_due()
-    assert out["renewed"] is False and out["reason"] == "not due"
-    assert disk_boot.view()["renewals"] == 1
+    assert disk_spill.is_armed() is True
+    verdict = disk_store.disk_for_engine(None, {"op": "disarm"})
+    assert verdict["armed"] is False
+    assert not os.path.exists(arm_path(tier)), \
+        "disarm left the file the ranks read: a half-disarmed fleet"
+    assert disk_restore.gate()["reason_kind"] == "disarmed", \
+        "a disarm must stop SERVING from disk, not only writing to it"
 
+    second = arm_boot()
+    assert second["outcome"] == disk_boot.OUTCOME_REFUSED, second
+    assert "operator has disarmed" in second["reason"], second["reason"]
+    assert disk_spill.is_armed() is False, \
+        "a second boot re-armed a box the operator disarmed"
+    assert disk_boot.view()["disarmed_by_operator"] is True
+    assert '"op":"disarm"' in disk_boot.view()["latch_reason"]
 
-def test_renewal_never_arms_a_boot_that_is_not_serving(tier, arm_boot):
-    """THE BELT OVER THE LATCH: no posture, no renewal - latch or no latch.
-
-    The latch is set by the verbs, and this test deliberately bypasses them (it lowers
-    the switch with the setter directly) to prove renewal has its own second condition.
-    Renewal must never put an arm on a box that is not serving: "the plugin armed the
-    spill tier by itself and nothing is served" is the state that has cost whole
-    evenings, and it must be unreachable from here even with the latch missing.
-    """
-    arm_boot()
-    disk_restore.set_disk_authority(False)      # NOT through the verb: no latch
+    # The veto is the operator's to lift, and lifting it restores the boot default.
+    disk_store.disk_for_engine(None, {"op": "arm"})
     assert disk_boot.view()["disarmed_by_operator"] is False
-    expire_arm()
-    out = disk_boot.renew_if_due()
-    assert out["renewed"] is False
-    assert "switch is up" in out["reason"]
+    third = arm_boot()
+    assert third["outcome"] == disk_boot.OUTCOME_ARMED, third["reason"]
+    assert disk_spill.is_armed() is True
+
+
+def test_lowering_the_posture_from_the_verb_vetoes_a_second_boot_too(tier,
+                                                                     arm_boot):
+    """The cheaper "stop serving from disk" POST vetoes exactly as `disarm` does.
+
+    `{"op":"authority","enabled":false}` is the switch an operator reaches for first, so
+    if it did not latch, a later boot in the same process would put the arm back under
+    him and the tier would be armed, serving nothing, and looking like a fault in the
+    read path - the shape this suite keeps being written to catch.
+    """
+    arm_boot()
+    disk_store.disk_for_engine(None, {"op": "authority", "enabled": False})
+    assert disk_boot.view()["disarmed_by_operator"] is True
+    assert '"enabled":false' in disk_boot.view()["latch_reason"]
+    assert arm_boot()["outcome"] == disk_boot.OUTCOME_REFUSED
     assert disk_spill.is_armed() is False
 
 
-def test_renewal_does_not_touch_a_boot_the_default_never_raised(tier, monkeypatch):
-    """Renewal is not a way to arm a boot that never had the posture.
+def test_the_boot_disarms_a_file_left_by_an_earlier_boot_on_one_kernel(
+        tier, monkeypatch, caplog):
+    """THE INVARIANT THE LATCH DEPENDS ON, planted as the exact file that breaks it.
 
-    A boot that came up OFF, NO_STORE or INERT has `honoured: false`, and renewal must
-    be
-    a no-op there forever. Without this, renewal would be the second arm path in the
-    package - and the second arm path is exactly what the 2026-10-03 prohibition is
-    about.
+    A `disk-spill-arm.json` from an EARLIER ENGINE BOOT, naming THIS kernel's boot id
+    and claiming `armed: true`. The boot fence cannot refuse it: `BOOT_ID_PATH` is per
+    KERNEL boot, so four EngineCore boots inside one 2w3d uptime all carry the same id,
+    and this file is a perfect lookalike of a live arm. While the arm had a TTL the TTL
+    is what made it harmless; a latch never expires, so the rule is now THE ONLY THING
+    THAT ARMS A PROCESS IS THAT PROCESS'S OWN BOOT DECISION, and the mechanism is
+    `boot_enable()`'s fail-safe calling `disarm()`, which deletes the file
+    (`_remove_arm_file`).
+
+    Both halves are asserted, because they are different bugs: (a) the boot does not
+    become armed, and (b) the file is GONE afterwards, so no later reader in this
+    process - `disk_restore.gate()`, a worker's `_may_restore_worker`, the rank proof -
+    can be fooled by a decision that was never made. (b) is the half a "just don't read
+    it in that one place" fix would fail, and it is why the fail-safe deletes instead of
+    merely declining.
     """
+    stale = {"version": disk_spill.PROTOCOL_VERSION, "writer": "an-earlier-engine-boot",
+             "armed": True, "armed_ts": time.time() - 86400, "latched": True,
+             "root": tier["root"], "epoch": "some-other-process-token",
+             "epoch_scope": "process", "pid": 1,
+             # THIS kernel's boot id, deliberately: the file must be one the fence
+             # cannot see, so what is under test is the boot decision and not the fence.
+             # (`epoch_scope: "process"` for the same reason - a per-process epoch is
+             # NOT evidence of another boot, so it cannot refuse this file either.)
+             "boot_id": disk_spill._boot_id()}
+
+    def plant():
+        with open(arm_path(tier), "w", encoding="utf-8") as handle:
+            json.dump(stale, handle)
+        disk_spill._state["arm_file_checked_mono"] = None
+        assert disk_spill.is_armed() is True, \
+            "the fence refused this file, so this test would not be testing the " \
+            "fail-safe - it would be testing the fence"
+
+    # A boot that REFUSES (the arena cannot service an offer) must erase it.
+    plant()
+    monkeypatch.setenv(config.ENV_DISK_BOOT_ENABLE, "1")
+    with caplog.at_level(logging.WARNING):
+        out = disk_boot.boot_enable({"inert": False, "tier_armed": True,
+                                     "restore_fitted": True, "arena_state": "tiny",
+                                     "arena_reason": "the pool clamps to 1 slot",
+                                     "journal_writable": True, "journal_error": None})
+    assert out["outcome"] == disk_boot.OUTCOME_REFUSED
+    assert disk_spill.is_armed() is False
+    assert not os.path.exists(arm_path(tier)), \
+        "a boot that did not arm left a previous engine boot's file for the ranks"
+
+    # And so must a boot that was told OFF: the flag is the operator's word, and the
+    # file is somebody else's.
+    plant()
+    disk_boot.reset_state_for_tests()
+    disk_spill.reset_state_for_tests()
     monkeypatch.setenv(config.ENV_DISK_BOOT_ENABLE, "0")
-    disk_spill.arm(60)
-    disk_restore.set_disk_authority(True)
-    expire_arm()
-    out = disk_boot.renew_if_due()
-    assert out["renewed"] is False
-    assert "boot default" in out["reason"]
-    assert disk_spill.is_armed() is False
-    assert disk_boot.view()["renewals"] == 0
+    out = disk_boot.boot_enable({"inert": False, "tier_armed": True,
+                                 "restore_fitted": True, "arena_state": "ok",
+                                 "arena_reason": None, "journal_writable": True,
+                                 "journal_error": None})
+    assert out["outcome"] == disk_boot.OUTCOME_OFF
+    assert disk_spill.is_armed() is False, \
+        "the boot honoured a previous boot's arm file: the forbidden re-arm"
+    assert not os.path.exists(arm_path(tier))
 
 
-def test_a_renewal_failure_is_counted_and_loud(tier, arm_boot, monkeypatch, caplog):
-    """A renewal that cannot arm is the silent failure this release exists to end.
+def test_every_outcome_that_is_not_ARMED_goes_through_the_fail_safe():
+    """STRUCTURAL: `boot_enable()` has exactly two ways to leave, one of them the
+    fail-safe.
 
-    So it is counted (`renewal_failures`) and logged - once per distinct reason, never
-    once per tick, because the tick runs per request.
+    The behavioural tests plant files and clock time; this one makes the fail-safe
+    unbypassable by SHAPE. Every `return` with a value inside `boot_enable` is either
+    `_disarmed_exit(...)` or the ARMED path's `view()`, so a new early return cannot be
+    written that skips the disarm - the way the deleted TTL used to make an abandoned
+    file harmless without anyone having to remember it. It also pins that the rollback
+    lives in ONE function: `disk_spill.disarm()` appears exactly once in the module, so
+    there is no second, weaker rollback to keep in sync, and `disk_spill.arm()` appears
+    exactly once, so there is no arm path a disarm cannot reach.
+    """
+    tree = ast.parse(inspect.getsource(disk_boot))
+
+    def _dotted(node):
+        parts = []
+        head = node.func
+        while isinstance(head, ast.Attribute):
+            parts.append(head.attr)
+            head = head.value
+        if isinstance(head, ast.Name):
+            parts.append(head.id)
+        return ".".join(reversed(parts))
+
+    boot = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "boot_enable")
+    exits = sorted({_dotted(n.value) for n in ast.walk(boot)
+                    if isinstance(n, ast.Return) and isinstance(n.value, ast.Call)})
+    assert exits == ["_disarmed_exit", "view"], exits
+    dotted = [_dotted(n) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert dotted.count("disk_spill.disarm") == 1, dotted
+    assert dotted.count("disk_spill.arm") == 1, dotted
+
+
+def test_the_veto_is_process_memory_only_and_never_touches_the_store(tier, arm_boot):
+    """A veto is a HUMAN'S WORD ABOUT THIS PROCESS, not state for the next boot.
+
+    Nothing about it is written to disk: it lives in `disk_boot._state`, and the next
+    process reads the environment's word like every other boot default. A persisted veto
+    would be the 2026-10-03 prohibition wearing the other hat - a previous boot deciding
+    what this boot does - and it would also let an operator disarm a box he had already
+    rebooted away from and never get the tier back.
     """
     arm_boot()
-    expire_arm()
-    monkeypatch.setattr(disk_spill, "arm",
-                        lambda seconds=None: {"armed": False,
-                                              "reason": "the store root vanished"})
-    disk_boot._state["last_renewal_check_mono"] = None
-    with caplog.at_level(logging.WARNING):
-        out = disk_boot.renew_if_due()
-    assert out["renewed"] is False
-    assert disk_boot.view()["renewal_failures"] == 1
-    assert "could NOT be renewed" in caplog.text
-    # A repeat of the SAME reason does not print again.
-    disk_boot._state["last_renewal_check_mono"] = None
-    with caplog.at_level(logging.WARNING):
-        disk_boot.renew_if_due()
-    assert caplog.text.count("could NOT be renewed") == 1
-    assert disk_boot.view()["renewal_failures"] == 2
-
-
-def test_renewal_reports_an_arm_the_worker_ranks_cannot_read(tier, arm_boot,
-                                                             monkeypatch, caplog):
-    """A renewal HERE is not a renewal FLEET-WIDE: the arm file is the ranks' only door.
-
-    A renewal that lands in the EngineCore without an arm file is an arm nobody can use,
-    so it is counted as a failure and named - the same door the boot's own gate reads.
-    """
-    arm_boot()
-    expire_arm()
-    monkeypatch.setattr(disk_spill, "arm",
-                        lambda seconds=None: {"armed": True, "seconds": 7200.0,
-                                              "arm_file_written": False,
-                                              "arm_file_reason": "no diagnostics dir"})
-    disk_boot._state["last_renewal_check_mono"] = None
-    with caplog.at_level(logging.WARNING):
-        assert disk_boot.renew_if_due()["renewed"] is True
-    assert disk_boot.view()["renewal_failures"] == 1
-    assert "renewal that did not happen" in caplog.text
+    disk_store.disk_for_engine(None, {"op": "disarm"})
+    assert disk_boot.view()["disarmed_by_operator"] is True
+    leftovers = [name for name in os.listdir(tier["diag"]) + os.listdir(tier["root"])
+                 if "veto" in name or "latch" in name or "boot" in name]
+    assert leftovers == [], f"the veto persisted state: {leftovers}"
 
 
 # --- 6. the fail-safe: every failure leaves the boot disarmed, loudly ----------
@@ -770,36 +869,36 @@ def test_the_boot_default_arming_refusal_is_attributed_not_masked(tier, arm_boot
 
 # --- 7. the prohibition: no boot-time re-arm from persisted arm state ----------
 
-def test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state(tier,
-                                                                       arm_boot,
-                                                                       monkeypatch,
-                                                                       caplog):
+def test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state(tier, arm_boot,
+                                                                      monkeypatch,
+                                                                      caplog):
     """THE GUARD. `llm-api/AGENTS.md`, 2026-10-03: "Do not add a boot-time re-arm."
 
     The forbidden thing is a process RESURRECTING A POSTURE FROM A PERSISTED FILE
-    written
-    by an earlier boot. The test is behavioural, in the direction that matters: a
-    `disk-spill-arm.json` is planted claiming armed for hours, with a boot id that is
-    NOT
-    this boot's (which is what a reboot leaves behind), and the decision is taken with
-    the
+    written by an earlier boot. The test is behavioural, in the direction that matters:
+    a `disk-spill-arm.json` is planted claiming armed, with a boot id that is NOT this
+    boot's (which is what a reboot leaves behind), and the decision is taken with the
     flag OFF and then with the flag ON.
 
-    With the flag OFF the boot comes up DISARMED even though a file claiming "armed,
-    expires in hours" sits in the directory: the decision came from the environment, not
-    from the file. With the flag ON the boot comes up armed BECAUSE OF THE FLAG - and
-    the
-    planted file is separately refused by the boot fence, which the fence's own counter
-    proves was read and rejected. That is the difference between a boot default and the
-    deleted "restore posture on engine-ready" hook, and this test is the line.
+    With the flag OFF the boot comes up DISARMED even though a file claiming "armed"
+    sits in the directory: the decision came from the environment, not from the file.
+    SINCE 0.2.35 the same boot also DELETES that file (the fail-safe disarms on every
+    non-ARMED outcome), so the assertion changed shape and got stronger - it used to be
+    "the fence read the file and refused it", and it is now "the file is gone, so
+    nothing downstream has to be trusted to refuse it". The fence is still proved to
+    work, and it is proved to work on the flag-ON path, where an arm file IS written and
+    the planted one must not be the one the ranks end up reading.
+
+    Two claims, both needed: the fence (this file, a different KERNEL boot, is refused
+    by name) and the fail-safe (a file the fence CANNOT see is deleted anyway - see
+    `test_the_boot_disarms_a_file_left_by_an_earlier_boot_on_one_kernel`).
     """
     stale = {"version": disk_spill.PROTOCOL_VERSION, "writer": "planted",
-             "armed": True, "armed_ts": time.time() - 3600,
-             "expires_ts": time.time() + 7200, "seconds": 7200.0,
+             "armed": True, "armed_ts": time.time() - 3600, "latched": True,
              "root": tier["root"], "epoch": "this-process-token",
-             # `epoch_scope: "process"` on purpose: with a per-process epoch the epoch
-             # is
-             # NOT evidence (two processes of one boot legitimately disagree on it), so
+             # `epoch_scope: "process"` on purpose: with a per-process epoch the
+             # epoch is NOT evidence (two processes of one boot legitimately disagree
+             # on it), so
              # the fence that must fire is the KERNEL BOOT ID - the one field that moves
              # on a reboot, which is the event the prohibition is about.
              "epoch_scope": "process", "pid": 1,
@@ -807,7 +906,7 @@ def test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state(tier,
     with open(arm_path(tier), "w", encoding="utf-8") as handle:
         json.dump(stale, handle)
 
-    # --- the flag OFF: a file claiming "armed for another 2 hours" decides nothing.
+    # --- the flag OFF: a file claiming "armed, forever" decides nothing.
     monkeypatch.setenv(config.ENV_DISK_BOOT_ENABLE, "0")
     with caplog.at_level(logging.WARNING):
         out = arm_boot()
@@ -815,18 +914,25 @@ def test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state(tier,
     assert disk_spill.is_armed() is False, \
         "the boot honoured a previous boot's arm file: the forbidden re-arm"
     assert disk_restore.disk_posture()["serving_as"] == "off"
-    assert disk_spill.arm_state()["arm_file_boot_refusals"] >= 1, \
-        "the boot fence never read the planted file"
-    assert "boot id mismatch" in disk_spill.arm_state()["arm_file_reason"]
+    # THE FAULT LINE. Before 0.2.35 the stale file survived this boot and the fence was
+    # the only thing between it and a worker; now the boot's own fail-safe removes it,
+    # so the fence's counter may legitimately be zero and the file's absence is the
+    # claim worth testing. Both directions are pinned so a "helpful" change that stops
+    # deleting the file has to fight this assertion.
+    assert not os.path.exists(arm_path(tier)), \
+        "a boot that declined to arm left a previous boot's arm file behind"
 
     # --- the flag ON: armed because the FLAG says so, and the fence still refuses.
     disk_boot.reset_state_for_tests()
     disk_spill.reset_state_for_tests()
     monkeypatch.delenv(config.ENV_DISK_BOOT_ENABLE)
+    with open(arm_path(tier), "w", encoding="utf-8") as handle:
+        json.dump(stale, handle)
     # Read the file's verdict FIRST, so the fence is provably consulted on the planted
     # file before this boot's own arm replaces it. A previous boot's file arms nobody.
     assert disk_spill.is_armed() is False
     assert disk_spill.arm_state()["arm_file_boot_refusals"] >= 1
+    assert "boot id mismatch" in disk_spill.arm_state()["arm_file_reason"]
     out = arm_boot()
     assert out["outcome"] == disk_boot.OUTCOME_ARMED
     assert out["source"] == "default"
@@ -898,8 +1004,12 @@ def test_the_prohibition_structurally_the_module_never_reads_an_arm_file():
     for forbidden_call in ("open", "json", "os", "pathlib", "shutil", "subprocess"):
         assert forbidden_call not in called, \
             f"the boot default calls into {forbidden_call!r}, so it can read state"
-    # The doors it DOES use: the same two functions the dev verb uses, `arm` twice (the
-    # boot and the renewal) and `disarm` for the rollbacks, and the posture setter ONCE.
+    # The doors it DOES use: the same two functions the dev verb uses, `arm` ONCE (the
+    # boot decision - there is no renewal call left to count) and `disarm` ONCE (the
+    # fail-safe, which lives in one function so a rollback cannot be half-remembered),
+    # and the posture setter ONCE. 0.2.34 counted two of each because the renewal tick
+    # armed and the posture-failure path disarmed; both halves of that went with the
+    # tick, and the single remaining `disarm` is the fail-safe that replaced them.
     def _dotted(node):
         parts = []
         head = node.func
@@ -911,8 +1021,8 @@ def test_the_prohibition_structurally_the_module_never_reads_an_arm_file():
         return ".".join(reversed(parts))
 
     dotted = [_dotted(node) for node in calls]
-    assert dotted.count("disk_spill.arm") == 2, dotted
-    assert dotted.count("disk_spill.disarm") == 2, dotted
+    assert dotted.count("disk_spill.arm") == 1, dotted
+    assert dotted.count("disk_spill.disarm") == 1, dotted
     assert dotted.count("disk_restore.set_disk_authority") == 1, dotted
     assert dotted.count("disk_restore.set_offer_switch") == 0, dotted
 
@@ -921,38 +1031,35 @@ def test_the_prohibition_structurally_the_module_never_reads_an_arm_file():
 
 def test_the_disk_verb_and_the_snapshot_payload_expose_the_boot_default(tier,
                                                                         arm_boot):
-    """Status answers "was the boot default on, was it honoured, did renewal run, has an
-    operator disarmed" in one read, on the door an operator already opens.
+    """Status answers "was the boot default on, was it honoured, does the arm expire,
+    has an operator disarmed" in one read, on the door an operator already opens.
 
-    The four fields the brief asks for, on BOTH payloads (the `/disk` verb's `status`
-    and
-    the snapshot's `disk_restore.boot_default`), built by the same function - because
-    two
-    views of one decision is how two views start disagreeing in production.
+    The fields the brief asks for, on BOTH payloads (the `/disk` verb's `status` and the
+    snapshot's `disk_restore.boot_default`), built by the same function - because two
+    views of one decision is how two views start disagreeing in production. The field
+    that used to answer "did renewal run" answers "does this arm expire", and the answer
+    is a flat `false`: a reader that used to watch a number count down now gets a fact
+    that cannot go stale.
     """
     arm_boot()
-    assert "renewal line" in disk_boot.renew_if_due()["reason"]
-    expire_arm()
-    # An hour of serving, then an expiry: the floor is dropped to simulate the elapsed
-    # hour, because the tick is deliberately bounded to one look per 30 s.
-    disk_boot._state["last_renewal_check_mono"] = None
-    assert disk_boot.renew_if_due()["renewed"] is True
     verb = disk_store.disk_for_engine(None, {"op": "status"})
     view = verb["disk_boot_default"]
     assert view["requested"] is True
     assert view["honoured"] is True and view["outcome"] == disk_boot.OUTCOME_ARMED
-    assert view["renewals"] >= 1
+    assert view["arm_expires"] is False
+    for gone in ("renewals", "renewal_failures", "last_renewal", "seconds_left",
+                 "renewal_would_run", "renewal_check_seconds", "renew_ahead_seconds",
+                 "arm_max_seconds", "arm_seconds"):
+        assert gone not in view, f"the verb's view still carries {gone}"
     assert view["disarmed_by_operator"] is False
     assert view["armed_now"] is True
-    assert view["arm_seconds"] == disk_spill.ARM_MAX_SECONDS
     assert config.ENV_DISK_BOOT_ENABLE in view["env_var"]
     assert "KVTIER_DISK_BOOT_ENABLE=0" in view["disable_how"]
     # The same view in the snapshot's one-call payload, from the same builder. The live
-    # countdown is excluded from the equality (the two reads are milliseconds apart);
-    # the
+    # arm read is excluded from the equality (the two reads are milliseconds apart); the
     # KEY SETS are the contract, and every other field must be identical.
     section = disk_restore.scheduler_section()["boot_default"]
-    live = {"armed_now", "seconds_left"}
+    live = {"armed_now"}
     assert set(section) == set(view)
     assert {k: v for k, v in section.items() if k not in live} \
         == {k: v for k, v in view.items() if k not in live}
@@ -969,6 +1076,8 @@ def test_the_view_carries_the_same_keys_on_every_path(tier, arm_boot, monkeypatc
     never = disk_boot.view()
     static = disk_boot.static_view()
     assert set(never) == set(static), set(never) ^ set(static)
+    assert sorted(never) == sorted(disk_boot._KEYS), \
+        "the named key set and the built view have drifted"
     armed = arm_boot()
     disk_boot.reset_state_for_tests()
     monkeypatch.setenv(config.ENV_DISK_BOOT_ENABLE, "0")
@@ -977,8 +1086,8 @@ def test_the_view_carries_the_same_keys_on_every_path(tier, arm_boot, monkeypatc
     refused = arm_boot(arena_state="unreadable", arena_reason="exploded")
     for name, out in (("armed", armed), ("off", off), ("refused", refused)):
         assert set(out) == set(never), (name, set(out) ^ set(never))
-    # And a live view whose arm reads explode still carries every key: the two live
-    # fields are overlaid on the static base, so the base is the contract.
+    # And a live view whose arm reads explode still carries every key: the live field is
+    # overlaid on the static base, so the base is the contract.
     def explode(*_args, **_kwargs):
         raise RuntimeError("no arm view from here")
 
@@ -986,35 +1095,38 @@ def test_the_view_carries_the_same_keys_on_every_path(tier, arm_boot, monkeypatc
     monkeypatch.setattr(disk_spill, "is_armed", explode)
     broken = disk_boot.view()
     assert set(broken) == set(never)
-    assert broken["armed_now"] is None and broken["seconds_left"] is None
+    assert broken["armed_now"] is None
+    # `arm_expires` is NOT a live read: it is a fact about the build, so a view that
+    # could not read the arm still refuses to promise an expiry.
+    assert broken["arm_expires"] is False
 
 
-def test_the_renewal_verdicts_are_named_not_inferred(tier, arm_boot):
-    """Every "no" from the tick says which condition said no.
+def test_the_arm_view_says_what_replaced_renewal_instead_of_going_quiet(tier,
+                                                                        arm_boot):
+    """0.2.34 told an operator whether renewal would run; 0.2.35 has to say something.
 
-    Five distinct verdicts (never honoured, plenty of life left, inside the floor,
-    latched, posture down) and one acceptance. A bare `renewed: false` on a tier that
-    went dark at the two-hour mark is the same silence this release replaces, in a new
-    field.
+    Deleting a field is easy and silently misleading. The question the old field
+    answered - "will this tier go dark on its own?" - still has an answer, and it is
+    now carried
+    by two fields that cannot rot: `arm_expires: false` on the boot view, and
+    `latched: true` plus a note naming the disarm POST on `disk_spill.arm_state()`. If a
+    future change reintroduces a lifetime, it has to change these words, and this test
+    is what makes that a deliberate edit rather than a drift.
     """
-    assert "boot default" in disk_boot.renew_if_due()["reason"]
     arm_boot()
-    # Plenty of life left: the tick looks, and declines with the number that decided it.
-    assert "renewal line" in disk_boot.renew_if_due()["reason"]
-    # And a second call inside the floor does not even look: one comparison, `not due`.
-    assert disk_boot.renew_if_due()["reason"] == "not due"
-    disk_boot._state["disarmed_by_operator"] = True
-    disk_boot._state["latch_reason"] = "POST disarm"
-    disk_boot._state["last_renewal_check_mono"] = None
-    assert "manual disarm" in disk_boot.renew_if_due()["reason"]
-    disk_boot._state["disarmed_by_operator"] = False
-    disk_boot._state["last_renewal_check_mono"] = None
-    disk_restore.set_disk_authority(False)
-    assert "switch is up" in disk_boot.renew_if_due()["reason"]
-    disk_restore.set_disk_authority(True)
-    disk_boot._state["last_renewal_check_mono"] = None
-    expire_arm()
-    assert disk_boot.renew_if_due()["renewed"] is True
+    state = disk_spill.arm_state()
+    assert state["latched"] is True
+    note = state["note"]
+    assert "LATCH" in note and "no clock" in note
+    assert "0.2.35" in note, "the note must date the change it is describing"
+    # Present-tense promises of a lifetime are what would mislead; the note is allowed
+    # to say WHY the renewal was deleted, in past tense, because that is the sentence an
+    # operator reading a 0.2.34 runbook needs to be told is now history.
+    for obsolete in ("expires on its own", "seconds left", "will renew", "renews"):
+        assert obsolete not in note, f"the note promises a lifetime: {obsolete!r}"
+    assert disk_boot.view()["arm_expires"] is False
+    # And the mid-boot sentence an operator is handed agrees with it.
+    assert "LATCH" in disk_boot.disable_how()
 
 
 def test_the_boot_line_token_agrees_with_the_payload_token(tier, arm_boot):
@@ -1045,20 +1157,42 @@ def test_a_second_boot_in_one_process_prints_one_line_and_counts_two(tier, arm_b
     assert disk_boot._state["line_logged"] is True
 
 
-def test_the_payload_says_renewal_rides_the_request_path(tier, arm_boot):
-    """The honest limit, in the payload: no timer thread, so a box that serves NOTHING
-    lets the arm lapse and the next request re-arms it.
+def test_the_note_says_the_arm_needs_no_heartbeat_in_the_note_and_the_line(tier,
+                                                                           arm_boot,
+                                                                           caplog):
+    """0.2.34 had to explain that renewal rides the request path, because renewal needed
+    a request. A latch needs nothing, and neither the note nor the boot line may imply
+    otherwise.
 
-    Said in the payload because a reader who infers "it renews every hour" from a number
-    will be surprised by an idle box. The cadence constants are published too, so the
-    claim is checkable rather than aspirational.
+    The old test asserted the note promised a request-path heartbeat and published the
+    cadence constants. The claim that survives is the operationally important one:
+    NOTHING has to happen for the arm to stay up - not a request, not a tick, and not a
+    timer thread this plugin has never had and will not grow - and the only thing that
+    brings it down is a disarm POST. Asserting the ABSENCE of the heartbeat language is
+    the point: a note that said "keeps the arm alive" would describe a mechanism that is
+    gone, and an operator reading it would hunt for a log line that no longer prints.
+    Checked on both surfaces an operator reads without opening source: the payload's
+    `note` and the one WARNING line the boot prints.
     """
-    out = arm_boot()
-    assert "request path" in out["note"]
-    assert out["renewal_check_seconds"] == disk_boot.RENEW_CHECK_SECONDS
-    assert out["renew_ahead_seconds"] == disk_boot.RENEW_AHEAD_SECONDS
-    assert out["arm_max_seconds"] == disk_spill.ARM_MAX_SECONDS
-    assert out["renewal_would_run"] is True
+    with caplog.at_level(logging.WARNING):
+        out = arm_boot()
+    note = out["note"]
+    assert "LATCH" in note
+    assert "no renewal, because there is no expiry" in note
+    for heartbeat in ("rides the request path", "keeps it up", "renews every"):
+        assert heartbeat not in note, \
+            f"the note still describes a heartbeat: {heartbeat!r}"
+    assert '{\"op\":\"disarm\"}' in note, \
+        "the note must name the ONLY thing that lowers the latch"
+
+    line = [r.getMessage() for r in caplog.records
+            if r.name == "kvtier_dev_plugin.disk_boot"
+            and "KVTIER disk boot default=" in r.getMessage()]
+    assert len(line) == 1, line
+    assert "The arm is a LATCH" in line[0]
+    assert "nothing to renew" in line[0]
+    for heartbeat in ("Renewal keeps it up", "first renewal"):
+        assert heartbeat not in line[0]
 
 
 def test_the_disable_sentence_names_both_ways_off(tier):

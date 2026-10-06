@@ -393,10 +393,18 @@ ARG_SPECS: dict[str, dict] = {
                              "length": {"kind": "int", "min": 1, "max": 1048576},
                              "seconds": {"kind": "int", "min": 1, "max": 7200}},
     # THE SSD SPILL TIER. Every bound here is pinned equal to the one the engine
-    # module enforces (`disk_store.MAX_LS_FILES`, `disk_spill.ARM_MAX_SECONDS`,
-    # `disk_store.DISK_OPS`), the `ROUTE_BLOCKDUMP` rule: a wire bound looser than
-    # the engine's would only move the refusal, and a tighter one would lie about
-    # what the verb can do. `key` is 64 chars so a caller can send the hash text
+    # module enforces (`disk_store.MAX_LS_FILES`, `disk_store.DISK_OPS`), the
+    # `ROUTE_BLOCKDUMP` rule: a wire bound looser than the engine's would only move
+    # the refusal, and a tighter one would lie about what the verb can do.
+    #
+    # `seconds` IS THE ONE BOUND NO LONGER PINNED TO AN ENGINE CONSTANT (0.2.35): the
+    # spill tier's arm became a LATCH and `disk_spill` deleted `ARM_DEFAULT_SECONDS` /
+    # `ARM_MIN_SECONDS` / `ARM_MAX_SECONDS` along with the expiry. The bound stays, for
+    # wire compatibility: a caller that already sends `{"op":"arm","seconds":7200}` must
+    # not start getting a 400 the day this ships, and a value outside it was refused
+    # before and still is. The number simply does nothing - `arm()` reports
+    # `seconds_ignored` - and this is the comment that says so rather than a knob.
+    # `key` is 64 chars so a caller can send the hash text
     # they have; `disk_layout.validate_key16` still demands exactly 16 hex chars,
     # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
     config.ROUTE_DISK: {"op": {"kind": "enum",
@@ -839,7 +847,9 @@ def status_payload(dev_state: dict | None = None) -> dict:
                      "OFF twice over: "
                      f"{config.ENV_DISK_ROOT} must name a real filesystem "
                      "(tmpfs roots are refused) AND the tier must be armed; no env "
-                     "var arms it and an arm expires. `spill-one` is relayed to "
+                     "var arms it and the arm is a LATCH: it stays armed until "
+                     "disarmed, and disarming stops serving from disk too. "
+                     "`spill-one` is relayed to "
                      f"the workers through {config.ENV_DIAG_DIR} because a worker "
                      "has no utility channel, and the write runs on the spill "
                      "thread with NO fsync (buffered writes: the page cache owns "
@@ -1408,7 +1418,11 @@ async def route_disk_post(request: Request):
         that writes KV bytes to disk, so it is a dev-state route in every shape.
       * OFF TWICE OVER: `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the
         tmpfs roots are refused by the layout layer), AND the tier must be ARMED.
-        No env var arms it; `{"op":"arm"}` does, and an arm expires.
+        No env var arms it; `{"op":"arm"}` does, and since 0.2.35 an arm is a LATCH:
+        it comes down on `{"op":"disarm"}` and not on a clock. It gates SERVING from
+        disk as well as writing to it, so a disarm closes both directions. The
+        `seconds` argument is still accepted and does nothing (it is ignored, and
+        reported as ignored), because an existing caller must not start failing.
       * `spill-one` names ONE slot (`{slot, key, fingerprint}`) so the path can be
         proved to write real bytes without waiting for eviction pressure. It
         requires the arm, and it is RELAYED: this process has no KV memory, so the

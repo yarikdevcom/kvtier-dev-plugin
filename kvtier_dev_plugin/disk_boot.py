@@ -18,7 +18,9 @@ This module is the fix, and it is exactly three things:
      came from the environment or from the default, whether it was honoured, and the
      exact way to turn it off - so an operator whose boot misbehaves can find the flag
      from the log without reading source.
-  3. ONE renewal path, so the posture does not go dark two hours in.
+  3. ONE fail-safe direction: every outcome that is not ARMED ends with the tier
+     DISARMED - `disarm()` deletes the arm file, so a boot that never chose to arm
+     leaves nothing behind for a later boot, or a later process, to read.
 
 It invents no third way to arm and no third way to serve: the boot calls
 `disk_spill.arm()` and `disk_restore.set_disk_authority()`, the same two functions the
@@ -62,30 +64,41 @@ the one-slot spill request all still start off and still have no env var.
 default - the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`, which also only ever turns a
 boot effect OFF and is documented as such. Unsetting it cannot arm anything the boot is
 not already on; setting it can only take the boot back to the manual posture.
+
+SINCE 0.2.35 THERE IS NO RENEWAL IN THIS MODULE, because there is nothing left to
+renew: the arm is a LATCH (see `disk_spill`'s module docstring for the ruling - an
+expired arm froze LRU shedding as well as growth, and no setting of the timer bounded
+the store). That removal leaves one hole this module is now responsible for. The boot
+fence in `disk_spill._arm_boot_fence` separates KERNEL boots by boot id, so it cannot
+see an ENGINE RESTART inside one long uptime: an arm file written by boot #1 of a
+two-week uptime is still "this boot" to the fence, and while a TTL existed, the TTL is
+what killed such a file. The rule that replaces the clock is:
+
+    THE ONLY THING THAT ARMS A PROCESS IS THAT PROCESS'S OWN BOOT DECISION.
+
+Hence the fail-safe below - `boot_enable()` calls `disk_spill.disarm()` on EVERY
+outcome except `ARMED`, and `disarm()` removes the file. A boot that did not choose to
+arm therefore erases whatever an earlier engine boot left, instead of inheriting it.
+`tests/test_disk_boot_default.py`
+(`test_the_boot_disarms_an_arm_file_left_by_an_earlier_engine_boot_on_the_same_kernel`)
+plants exactly that file and fails if this module ever grows a dependency on one.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 
 from . import config, disk_spill
 
 logger = logging.getLogger("kvtier_dev_plugin.disk_boot")
 
-# The renewal policy, in three numbers, because this is where the honest part of the
-# feature lives. `ARM_MAX_SECONDS` (7200 s) is a HARD cap inside `disk_spill`, so a
-# boot-default posture that nobody renews goes dark two hours into the boot - silently,
-# which is the exact failure this release is chasing (`restorations: 0` because nobody
-# re-armed). Renewal is what makes "armed by default" mean "armed for this boot".
-#
-#   RENEW_CHECK_SECONDS  how often the tick is allowed to look at the arm at all. The
-#                        tick rides the request path (see `renew_if_due`), so this is
-#                        what makes its per-lookup cost one monotonic comparison.
-#   RENEW_AHEAD_SECONDS  how much life must be left before a renewal is DUE. At half
-#                        the cap the tier renews hourly, never at the last minute.
-RENEW_CHECK_SECONDS = 30.0
-RENEW_AHEAD_SECONDS = 3600.0
+# NO RENEWAL POLICY LIVES HERE ANY MORE (0.2.35). Until then this module held
+# `RENEW_CHECK_SECONDS` / `RENEW_AHEAD_SECONDS` and a `renew_if_due()` tick that rode
+# the request path to beat the arm's 7,200 s cap - a mechanism whose entire purpose was
+# to keep a TIMER from going dark. The arm is a latch now, so the tick, its constants,
+# its counters, its two live view fields and the `disk_restore.offer()` call that drove
+# it are all deleted: there is no lapse to forestall, and a heartbeat that re-arms a
+# box an operator has disarmed is exactly what the veto below exists to prevent.
 
 # The outcomes, as ONE closed vocabulary: the boot line's `disk_boot=` token, the
 # payload's `outcome` field and the log line all draw from this list, so a reader can
@@ -112,20 +125,21 @@ _state: dict = {
     # WHAT THE BOOT DID ABOUT IT.
     "honoured": False,         # True only when the arm AND the posture both landed
     "reason": None,            # why not; or, when honoured, what it did
-    "arm_seconds": None,
     "arm_file_written": None,  # the fleet's door: no file, no armed workers
     "serving_as_after": "off",  # the posture as this boot left it
     "disk_configured": False,
-    # RENEWAL, AND THE OPERATOR'S VETO OVER IT.
-    "renewals": 0,
-    "renewal_failures": 0,
-    "last_renewal": None,      # one sentence, newest
-    "last_renewal_check_mono": None,
-    # THE LATCH. Set by a human's `{"op":"disarm"}` or `{"op":"authority","enabled":
-    # false}`, cleared only by a human's `{"op":"arm"}`. While it is set, renewal does
-    # NOTHING: a manual disarm always beats the boot default, and there is no path -
-    # renewal, a second boot in one process, anything - that re-arms a box an operator
-    # just disarmed.
+    # THE OPERATOR'S VETO. Set by a human's `{"op":"disarm"}` or
+    # `{"op":"authority","enabled":false}`, cleared only by a human's `{"op":"arm"}`.
+    # IN 0.2.34 THIS GATED `renew_if_due()` AND NOTHING ELSE; with renewal gone it
+    # could have been deleted, and it is kept instead because it has a stronger job to
+    # do now that the arm never lapses on its own: `boot_enable()` REFUSES to arm while
+    # it stands. That is what makes "a manual disarm always beats the boot default"
+    # true for the whole life of a process rather than until the next timer expired -
+    # a second connector boot inside one process (which the tests do, and a
+    # re-instantiated engine does) can no longer re-arm a box an operator just
+    # disarmed. Nothing is persisted here: the veto is this process's memory only, and
+    # the next process starts with the environment's word, exactly as the boot default
+    # doctrine requires.
     "disarmed_by_operator": False,
     "latch_reason": None,
     # BOOKKEEPING.
@@ -137,11 +151,9 @@ _state: dict = {
 # The payload's key set, named once so the degraded view cannot drift from the healthy
 # one (the rule `test_the_view_carries_the_same_keys_on_every_path` enforces).
 _KEYS = ("outcome", "requested", "source", "raw_value", "recognised", "env_var",
-         "honoured", "reason", "arm_seconds", "arm_file_written", "serving_as_after",
-         "disk_configured", "renewals", "renewal_failures", "last_renewal",
-         "disarmed_by_operator", "latch_reason", "boots", "armed_now", "seconds_left",
-         "renewal_would_run", "renewal_check_seconds", "renew_ahead_seconds",
-         "arm_max_seconds", "disable_how", "note")
+         "honoured", "reason", "arm_file_written", "serving_as_after",
+         "disk_configured", "disarmed_by_operator", "latch_reason", "boots",
+         "armed_now", "arm_expires", "disable_how", "note")
 
 
 def reset_state_for_tests() -> None:
@@ -150,9 +162,8 @@ def reset_state_for_tests() -> None:
         "outcome": OUTCOME_UNDECIDED, "requested": False, "source": None,
         "raw_value": None, "recognised": True,
         "env_var": config.ENV_DISK_BOOT_ENABLE, "honoured": False, "reason": None,
-        "arm_seconds": None, "arm_file_written": None, "serving_as_after": "off",
-        "disk_configured": False, "renewals": 0, "renewal_failures": 0,
-        "last_renewal": None, "last_renewal_check_mono": None,
+        "arm_file_written": None, "serving_as_after": "off",
+        "disk_configured": False,
         "disarmed_by_operator": False, "latch_reason": None, "boots": 0,
         "line_logged": False, "notes": {}})
 
@@ -172,26 +183,15 @@ def _note_once(key: str, message: str) -> bool:
 
 # --- the view an operator reads ----------------------------------------------
 
-def _arm_max_seconds() -> float:
-    """The arm's hard cap, or a constant. A view is never worth a fault."""
-    try:
-        return float(disk_spill.ARM_MAX_SECONDS)
-    except Exception:  # noqa: BLE001 - a missing constant reads as the shipped cap
-        return 7200.0
-
-
 def static_view() -> dict:
-    """The view WITHOUT the live arm reads: the same key set, built from state alone.
+    """The view WITHOUT the live arm read: the same key set, built from state alone.
 
     This is the fallback a caller uses when reading the arm is not possible, and it is
     also what makes "the degraded view has the same keys" a structural property rather
-    than a copy: `view()` overlays the two live fields on top of this dict, so the two
+    than a copy: `view()` overlays the live field on top of this dict, so the two
     cannot drift apart by construction (and
     `test_the_view_carries_the_same_keys_on_every_path` pins it anyway).
     """
-    honoured = bool(_state["honoured"])
-    latched = bool(_state["disarmed_by_operator"])
-    posture_up = _posture_up()
     return {
         "outcome": _state["outcome"],
         "requested": bool(_state["requested"]),
@@ -199,38 +199,36 @@ def static_view() -> dict:
         "raw_value": _state["raw_value"],
         "recognised": bool(_state["recognised"]),
         "env_var": config.ENV_DISK_BOOT_ENABLE,
-        "honoured": honoured,
+        "honoured": bool(_state["honoured"]),
         "reason": _state["reason"],
-        "arm_seconds": _state["arm_seconds"],
         "arm_file_written": _state["arm_file_written"],
         "serving_as_after": _state["serving_as_after"],
         "disk_configured": bool(_state["disk_configured"]),
-        "renewals": int(_state["renewals"]),
-        "renewal_failures": int(_state["renewal_failures"]),
-        "last_renewal": _state["last_renewal"],
-        "disarmed_by_operator": latched,
+        "disarmed_by_operator": bool(_state["disarmed_by_operator"]),
         "latch_reason": _state["latch_reason"],
         "boots": int(_state["boots"]),
         "armed_now": None,
-        "seconds_left": None,
-        # THE ANSWER TO "WOULD THE TIER COME BACK IF IT EXPIRED?", not a prediction:
-        # renewal runs only while the boot default was on, this boot honoured it, no
-        # operator has disarmed since, AND the posture is still up. The last clause is
-        # the belt over the latch - renewal never arms a box that is not serving.
-        "renewal_would_run": bool(honoured and not latched and posture_up),
-        "renewal_check_seconds": RENEW_CHECK_SECONDS,
-        "renew_ahead_seconds": RENEW_AHEAD_SECONDS,
-        "arm_max_seconds": _arm_max_seconds(),
+        # THE ANSWER TO "WHEN DOES THIS GO DARK?", in the field that used to be
+        # `seconds_left` and carried a number. Never. 0.2.35 made the arm a latch, so a
+        # reader that used to count down a countdown is given the fact instead of an
+        # absence - the absence would have to be interpreted at 3 a.m., the fact does
+        # not. (The proxy's countdown column is the other half of this change and is
+        # removed in the proxy repo, in sequence after this release.)
+        "arm_expires": False,
         "disable_how": disable_how(),
         "note": ("the disk tier's BOOT DEFAULT (0.2.33): the boot arms the spill path "
                  "and raises this boot's serve posture, computed fresh from "
                  f"{config.ENV_DISK_BOOT_ENABLE} and nothing else. It reads no arm "
                  "file and no state an earlier boot wrote - a restart is still a "
-                 "rollback and a previous boot's arm file still arms nobody. Renewal "
-                 "rides the request path, so a boot that serves nothing lets the arm "
-                 "lapse and the next request re-arms it; a manual POST "
-                 f"{_route()} {{\"op\":\"disarm\"}} stops renewal for the boot and "
-                 "nothing re-arms it behind your back"),
+                 "rollback and a previous boot's arm file still arms nobody. SINCE "
+                 "0.2.35 THE ARM IS A LATCH: there is no renewal, because there is no "
+                 "expiry, so what keeps the posture up is that nothing lowers it. The "
+                 "consequence this module owns is the fail-safe - an outcome that is "
+                 "not ARMED calls disarm(), which DELETES the arm file, so an engine "
+                 f"restart inside one kernel boot cannot inherit one. POST {_route()} "
+                 "{\"op\":\"disarm\"} lowers the latch for this boot and the "
+                 "operator veto below keeps this module's own boot decision from "
+                 "raising it again"),
     }
 
 
@@ -239,15 +237,14 @@ def view() -> dict:
 
     EVERY PATH RETURNS EVERY KEY: a boot that never ran the disk default answers with
     the same shape as one that did, because a degraded view that loses fields is a
-    payload whose absence a reader has to interpret at 3 a.m. The two live fields
-    (`armed_now`, `seconds_left`) come from `disk_spill`, the owner of the arm; nothing
-    here recomputes an arm verdict, and `static_view()` above is the base this overlays
-    them on - so the healthy and degraded views share their key set structurally.
+    payload whose absence a reader has to interpret at 3 a.m. The one live field
+    (`armed_now`) comes from `disk_spill`, the owner of the arm; nothing here
+    recomputes an arm verdict, and `static_view()` above is the base this overlays it
+    on - so the healthy and degraded views share their key set structurally.
     """
     out = static_view()
     try:
         out["armed_now"] = bool(disk_spill.is_armed())
-        out["seconds_left"] = disk_spill.arm_state().get("seconds_left")
     except Exception as exc:  # noqa: BLE001 - a view never costs a payload
         logger.debug("kvtier-dev-plugin: disk_boot could not read the arm: %s", exc)
     return {key: out[key] for key in _KEYS}
@@ -258,16 +255,19 @@ def disable_how() -> str:
 
     Both halves belong here, because there are two different "offs" and an operator
     under pressure needs the right one: the ENVIRONMENT one (the next boot is manual
-    again) and the MID-BOOT one (this boot, right now, and it sticks - renewal obeys
-    it). Naming both is the whole reason the boot line is allowed to be long.
+    again) and the MID-BOOT one (this boot, right now). Since 0.2.35 the mid-boot one is
+    the STRONGER of the two: the arm is a latch, so a disarm holds until someone arms
+    again, and the operator veto stops this module's own boot decision from re-arming
+    the box either. Naming both is the whole reason the boot line is allowed to be long.
     """
     return (f"to stop every future boot doing this: set "
             f"{config.ENV_DISK_BOOT_ENABLE}=0 in the engine's environment and restart "
             f"({config.ENV_BOOT_INERT}=1 turns off the whole auto-boot, not just the "
             f"disk tier); to stop THIS boot right now: POST {_route()} "
             "{\"op\":\"authority\",\"enabled\":false} and then POST "
-            f"{_route()} {{\"op\":\"disarm\"}} - a manual disarm latches, and renewal "
-            "never re-arms a box the operator just disarmed")
+            f"{_route()} {{\"op\":\"disarm\"}} - the arm is a LATCH, so that holds "
+            "until someone arms again, and a manual disarm vetoes this module's own "
+            "boot decision for the rest of the process too")
 
 
 # --- the boot decision --------------------------------------------------------
@@ -305,6 +305,20 @@ def _gate_verdict(pre: dict) -> tuple:
     nothing to honour and nothing to complain about), then the four preconditions whose
     failure means arming would lie.
     """
+    # THE OPERATOR'S VETO, FIRST, because it is the most recent human decision in the
+    # process and it post-dates the environment. It never used to be a gate: while the
+    # arm had a TTL, the veto only had to stop `renew_if_due()`, and a fresh boot in the
+    # same process happily re-armed. With a latch there is no timer to bring the tier
+    # back and no timer to take it down either, so the veto is the ONLY thing standing
+    # between "an operator disarmed this" and "a second connector boot in this process
+    # silently re-armed it".
+    if _state["disarmed_by_operator"]:
+        return OUTCOME_REFUSED, (
+            f"an operator has disarmed this process "
+            f"({_state['latch_reason'] or 'no reason recorded'}): a manual disarm "
+            "beats the boot default, and with the arm a LATCH a re-arm here would be "
+            "the last word forever rather than a lapse away. POST "
+            f"{_route()} {{\"op\":\"arm\"}} to lift the veto")
     if not _state["requested"]:
         return OUTCOME_OFF, (
             f"{config.ENV_DISK_BOOT_ENABLE}={_state['raw_value']!r}: the boot default "
@@ -368,6 +382,19 @@ def boot_enable(preconditions: dict | None = None) -> dict:
     one disarmed rank keeps the scheduler closed while the armed ones do work nobody
     asked for. Nothing here can raise either half again once an operator has disarmed.
 
+    THE FAIL-SAFE, STATED AS AN INVARIANT (0.2.35, and the reason `_disarmed_exit()`
+    exists): AN OUTCOME THAT IS NOT `ARMED` ENDS THIS PROCESS WITH THE TIER DISARMED
+    AND NO ARM FILE ON DISK. That is not only tidiness. The boot fence in
+    `disk_spill._arm_boot_fence` compares kernel BOOT IDs, so four engine boots inside
+    one long uptime are all "this boot" to it - and while the arm carried a TTL, the TTL
+    is what made a file left by engine boot #1 harmless to engine boot #2. The TTL is
+    gone, so the file goes too: every non-ARMED path runs `disk_spill.disarm()`, which
+    deletes it (`_remove_arm_file`). The invariant is `THE ONLY THING THAT ARMS A
+    PROCESS IS THAT PROCESS'S OWN BOOT DECISION`, and it is what
+    `test_the_boot_disarms_an_arm_file_left_by_an_earlier_engine_boot_on_the_same_kernel`
+    pins. `_disarmed_exit()` is the ONLY place the fail-safe is written, so a new early
+    `return` that forgets it fails that test rather than shipping a hole.
+
     Never raises. A boot report must not cost an engine its boot, so the outermost
     `try` is the contract; a swallowed failure is reported as `REFUSED` and counted as a
     plugin error by the caller's own bookkeeping.
@@ -390,84 +417,99 @@ def boot_enable(preconditions: dict | None = None) -> dict:
             _state["disk_configured"] = False
         outcome, reason = _gate_verdict(pre)
         if outcome is not OUTCOME_ARMED:
-            _state["outcome"] = outcome
-            _state["honoured"] = False
-            _state["reason"] = reason
-            _state["serving_as_after"] = _serving_as()
-            _log_boot_line()
-            return view()
+            return _disarmed_exit(outcome, reason)
         # THE TWO HALVES, in the order that cannot leave a posture with no arm: the
         # spill path first (it is the thing that can fail - no root, no channel to the
         # ranks), then the serve posture. `disk_spill.arm()` is the same call the dev
-        # verb makes, with the maximum legal TTL: inventing a third arm path is how a
-        # boot ends up armed in a way no disarm can reach.
-        verdict = disk_spill.arm(disk_spill.ARM_MAX_SECONDS)
-        _state["arm_seconds"] = verdict.get("seconds")
+        # verb makes, and it takes no lifetime argument any more: inventing a third arm
+        # path is how a boot ends up armed in a way no disarm can reach.
+        verdict = disk_spill.arm()
         _state["arm_file_written"] = bool(verdict.get("arm_file_written"))
         if not verdict.get("armed"):
-            _state["outcome"] = OUTCOME_REFUSED
-            _state["honoured"] = False
-            _state["reason"] = (f"arming the spill path was refused: "
-                                f"{verdict.get('reason') or 'no reason given'}")
-            _state["serving_as_after"] = _serving_as()
-            _log_boot_line()
-            return view()
+            return _disarmed_exit(
+                OUTCOME_REFUSED,
+                f"arming the spill path was refused: "
+                f"{verdict.get('reason') or 'no reason given'}")
         if not _state["arm_file_written"]:
             # THE FLEET'S DOOR. A worker's arm is the FILE - the EngineCore has no KV
             # memory and no channel to a worker, so an arm that could not be published
             # arms one process that can do nothing and leaves the four ranks that could
             # do it disarmed. That is a partially-armed fleet by definition, so it is
             # refused here rather than reported as a success.
-            disk_spill.disarm()
-            _state["outcome"] = OUTCOME_REFUSED
-            _state["honoured"] = False
-            _state["reason"] = (
+            return _disarmed_exit(
+                OUTCOME_REFUSED,
                 f"the arm could not be published to the worker ranks "
                 f"({verdict.get('arm_file_reason') or 'no arm file was written'}): a "
                 "spill arm reaches a worker only through the diagnostics directory "
                 f"({config.ENV_DIAG_DIR}), and an EngineCore-only arm would leave the "
                 "fleet half-armed, which the scheduler's AND-over-ranks proof then "
-                "closes anyway - while looking armed")
-            _state["serving_as_after"] = _serving_as()
-            _log_boot_line()
-            return view()
+                "closes anyway - while looking armed",
+                arm_file_written=False)
         from . import disk_restore  # noqa: PLC0415 - it imports this module lazily
         raised = disk_restore.set_disk_authority(True)
         if not raised.get("ok"):
             # Roll the arm back: the posture is the half an operator asked for, and an
             # armed tier that serves nothing is the state he is trying NOT to boot into.
-            disk_spill.disarm()
-            _state["arm_seconds"] = None
-            _state["arm_file_written"] = None
-            _state["outcome"] = OUTCOME_REFUSED
-            _state["honoured"] = False
-            _state["reason"] = (f"the serve posture could not be raised: "
-                                f"{raised.get('reason') or 'no reason given'}; the "
-                                "spill arm was rolled back so this boot is uniformly "
-                                "disarmed")
-            _state["serving_as_after"] = _serving_as()
-            _log_boot_line()
-            return view()
+            return _disarmed_exit(
+                OUTCOME_REFUSED,
+                f"the serve posture could not be raised: "
+                f"{raised.get('reason') or 'no reason given'}; the spill arm was "
+                "rolled back so this boot is uniformly disarmed")
         _state["outcome"] = OUTCOME_ARMED
         _state["honoured"] = True
+        _state["arm_file_written"] = True
         _state["serving_as_after"] = _serving_as()
         _state["reason"] = (
-            f"armed the spill path for {verdict.get('seconds')} s and raised this "
-            f"boot's serve posture (serving_as={_state['serving_as_after']}), with no "
-            "POST; renewal rides the request path while the posture stays up")
+            "armed the spill path as a LATCH and raised this boot's serve posture "
+            f"(serving_as={_state['serving_as_after']}), with no POST. The arm has no "
+            "expiry and nothing renews it because nothing expires: it comes down on "
+            f"a POST {{\"op\":\"disarm\"}}, and only on that")
         _log_boot_line()
         return view()
     except Exception as exc:  # noqa: BLE001 - a boot default must never cost a boot
-        _state["outcome"] = OUTCOME_REFUSED
-        _state["honoured"] = False
-        _state["reason"] = (f"the boot default raised {type(exc).__name__} and was "
-                            "abandoned; the boot continues disarmed")
-        try:
-            _log_boot_line()
-        except Exception as exc:  # noqa: BLE001 - nothing here is worth a boot
-            logger.debug("kvtier-dev-plugin: the disk boot line could not be printed: "
-                         "%s", exc)
-        return view()
+        return _disarmed_exit(
+            OUTCOME_REFUSED,
+            f"the boot default raised {type(exc).__name__} and was abandoned; the "
+            "boot continues disarmed, and any arm file this boot could have written "
+            "is deleted rather than left for the next boot to find")
+
+
+def _disarmed_exit(outcome: str, reason: str | None,
+                   arm_file_written: bool | None = None) -> dict:
+    """AN OUTCOME THAT IS NOT `ARMED`, CLOSED OUT: disarm here, delete the file there.
+
+    EVERY non-ARMED exit of `boot_enable()` comes through this one function, which is
+    the whole point of it - the fail-safe is a single call site, so it cannot be
+    forgotten by the next early return, and
+    `test_the_boot_disarms_an_arm_file_left_by_an_earlier_engine_boot_on_the_same_
+    kernel` plus `test_every_outcome_that_is_not_ARMED_leaves_the_tier_disarmed_and_
+    the_file_gone` fail if it is ever bypassed.
+
+    The disarm is not a formality on the paths where nothing was armed. It is how a
+    boot that REFUSED - or a boot whose engine restarted inside one kernel uptime, which
+    the boot-id fence cannot see - erases an arm file written by an EARLIER engine boot
+    and thereby keeps its own decision from being made for it.
+    """
+    _state["outcome"] = outcome
+    _state["honoured"] = False
+    _state["reason"] = reason
+    # `None` means "this boot never got as far as trying to publish an arm"; the two
+    # paths that DID try hand in what they learned, so the payload keeps the ability to
+    # tell "never attempted" from "attempted and could not reach the ranks" - the second
+    # one is a misconfigured `VLLM_E2_TIER_DIAG`, the first is a normal boot.
+    _state["arm_file_written"] = arm_file_written
+    try:
+        verdict = disk_spill.disarm()
+        if not verdict.get("arm_file_removed"):
+            logger.debug("kvtier-dev-plugin: the disk boot fail-safe found no arm "
+                         "file to remove (%s)", verdict.get("arm_file_removed"))
+    except Exception as exc:  # noqa: BLE001 - a fail-safe must not cost a boot
+        logger.warning("kvtier-dev-plugin: the disk boot fail-safe could not disarm "
+                       "the tier (%s): the outcome is %s and an arm file may have "
+                       "survived this boot", type(exc).__name__, outcome)
+    _state["serving_as_after"] = _serving_as()
+    _log_boot_line()
+    return view()
 
 
 def _log_boot_line() -> None:
@@ -501,12 +543,12 @@ def _log_boot_line() -> None:
                  "it was read as ON. ")
     outcome = _state["outcome"]
     if outcome == OUTCOME_ARMED:
-        body = (f"HONOURED: armed the spill path for {_state['arm_seconds']} s and set "
-                f"this boot's serve posture, so it comes up "
-                f"serving_as={_state['serving_as_after']} with NO POST. Renewal keeps "
-                f"it up while the posture stays up (>= {int(RENEW_AHEAD_SECONDS)} s of "
-                f"the {int(disk_spill.ARM_MAX_SECONDS)} s cap left, checked at most "
-                f"once every {int(RENEW_CHECK_SECONDS)} s on the request path). ")
+        body = (f"HONOURED: armed the spill path and set this boot's serve posture, "
+                f"so it comes up serving_as={_state['serving_as_after']} with NO POST. "
+                "The arm is a LATCH (0.2.35): it has no expiry, there is nothing to "
+                "renew, and it comes down on a POST that disarms it and not on a "
+                "clock. It gates SERVING from disk as well as writing to it, so the "
+                "same POST stops both. ")
     elif outcome == OUTCOME_OFF:
         body = ("NOT applied: this boot comes up DISARMED with serving_as=off, exactly "
                 "as every release through 0.2.32, and the two dev-verb POSTs are the "
@@ -524,110 +566,20 @@ def _log_boot_line() -> None:
     logger.warning("kvtier-dev-plugin: %s%s", head + body, disable_how())
 
 
-# --- renewal ------------------------------------------------------------------
-
-def renew_if_due() -> dict:
-    """Keep a boot-default posture alive. Cheap, contained, and obedient to the latch.
-
-    WHY IT RIDES THE REQUEST PATH, stated plainly because it is a real limit. This
-    plugin has no timer thread and will not grow one: every periodic thing it does is
-    driven by the engine's own step or request path, and inventing a thread inside a
-    plugin that patches a serving engine is a worse risk than a renewal that needs a
-    request. So the tick hangs off the scheduler's offer path, which is (a) the only
-    path that consults the arm at all and (b) therefore exactly the moment a lapse
-    would cost somebody a disk restore. The consequence, in the operator's terms: a box
-    that serves NOTHING for two hours lets the arm expire, and the NEXT request re-arms
-    it before the gate reads it - the tier never serves a request from an expired arm,
-    which is the failure that actually costs tokens. The payload's `note` and
-    `renewal_would_run` say so in words rather than leaving the cadence to be inferred.
-
-    THREE CONDITIONS, all required, and the third is the safety one:
-      * the boot default was ON and this boot HONOURED it (renewal is not a way to
-        arm a boot that never had the posture);
-      * no operator has disarmed since (`disarmed_by_operator` - a manual disarm always
-        beats the boot default, which is the property the brief makes non-negotiable);
-      * the posture is STILL UP. If both serve switches are down, there is nothing to
-        serve and nothing to renew: this is the belt over the latch, so even a latch
-        this module somehow missed cannot re-arm a box that is not serving.
-    """
-    out = {"renewed": False, "reason": None}
-    try:
-        if not _state["honoured"] or not _state["requested"]:
-            out["reason"] = ("the boot default did not raise this boot's disk posture, "
-                             "so there is nothing for renewal to keep alive")
-            return out
-        if _state["disarmed_by_operator"]:
-            out["reason"] = (f"a human disarmed this boot "
-                             f"({_state['latch_reason'] or 'no reason recorded'}): a "
-                             "manual disarm beats the boot default and renewal will "
-                             "not re-arm it")
-            return out
-        if not _posture_up():
-            out["reason"] = ("neither serve switch is up any more, so there is nothing "
-                             "to serve and nothing to renew")
-            return out
-        now = time.monotonic()
-        last = _state["last_renewal_check_mono"]
-        if isinstance(last, (int, float)) and (now - last) < RENEW_CHECK_SECONDS:
-            out["reason"] = "not due"
-            return out
-        _state["last_renewal_check_mono"] = now
-        state = disk_spill.arm_state()
-        left = state.get("seconds_left")
-        if isinstance(left, (int, float)) and left > RENEW_AHEAD_SECONDS:
-            out["reason"] = f"{round(float(left), 1)} s of arm left (above the " \
-                            f"{int(RENEW_AHEAD_SECONDS)} s renewal line)"
-            return out
-        # Reaching here means the arm is due, or GONE (expired, or dropped under us).
-        # Re-arming an expired boot-default arm is the point of renewal; the two
-        # conditions above are what make it safe.
-        reason = "the arm expired" if left is None else \
-            f"{round(float(left), 1)} s of arm left, below the " \
-            f"{int(RENEW_AHEAD_SECONDS)} s renewal line"
-        verdict = disk_spill.arm(disk_spill.ARM_MAX_SECONDS)
-        if not verdict.get("armed"):
-            _state["renewal_failures"] += 1
-            line = (f"DISK[boot] the boot-default disk posture could NOT be renewed "
-                    f"({reason}): {verdict.get('reason') or 'no reason given'}. The "
-                    "SSD tier stops serving when the arm lapses - this is the silent "
-                    "failure this release exists to end, so read it, do not ignore it")
-            # One line per distinct reason, never one per tick: the tick runs per
-            # request, and a diagnostic that repeats every step stops being read.
-            _note_once(f"renew-fail:{str(verdict.get('reason'))[:80]}", line)
-            out["reason"] = str(verdict.get("reason"))
-            return out
-        _state["renewals"] += 1
-        _state["arm_seconds"] = verdict.get("seconds")
-        _state["arm_file_written"] = bool(verdict.get("arm_file_written"))
-        _state["last_renewal"] = (f"renewal #{int(_state['renewals'])}: re-armed for "
-                                  f"{verdict.get('seconds')} s ({reason})")
-        if int(_state["renewals"]) == 1:
-            # THE FIRST RENEWAL PER BOOT, LOUD ONCE: it is the moment a 0.2.33 boot
-            # proves it will not go dark at the two-hour mark, and the only evidence in
-            # the log that renewal is running at all.
-            logger.warning("kvtier-dev-plugin: DISK[boot] first renewal of the "
-                           "boot-default disk posture: re-armed the spill path for "
-                           "%s s (%s). Renewal rides the request path, so it only runs "
-                           "while the engine is taking requests; a manual POST %s "
-                           "{\"op\":\"disarm\"} stops it for this boot and nothing "
-                           "re-arms behind your back",
-                           verdict.get("seconds"), reason, _route())
-        if not verdict.get("arm_file_written"):
-            _state["renewal_failures"] += 1
-            _note_once("renew-nofile",
-                       "DISK[boot] a renewal landed HERE but its arm file did not, so "
-                       "the worker ranks cannot see it "
-                       f"({verdict.get('arm_file_reason')}): check "
-                       f"{config.ENV_DIAG_DIR}. A renewal the ranks cannot read is an "
-                       "EngineCore-only arm, which is a renewal that did not happen")
-        out["renewed"] = True
-        out["reason"] = None
-        return out
-    except Exception as exc:  # noqa: BLE001 - a renewal never costs a request
-        _state["renewal_failures"] += 1
-        snapshot_error(exc, "disk_boot renewal")
-        out["reason"] = f"the renewal tick raised {type(exc).__name__}"
-        return out
+# --- (0.2.35) THE RENEWAL PATH THAT USED TO BE HERE -----------------------------
+#
+# This is where `renew_if_due()` lived: a tick that rode `disk_restore.offer()`, read
+# `arm_state()["seconds_left"]`, and re-armed the spill path when less than
+# `RENEW_AHEAD_SECONDS` (3,600 s) of a `disk_spill.ARM_MAX_SECONDS` (7,200 s) arm was
+# left, with counters (`renewals`, `renewal_failures`, `last_renewal`), a log-once
+# failure line, and a `renewal_would_run` field that told an operator whether it would
+# fire. All of it is DELETED, and the reason is the ruling in `disk_spill`'s module
+# docstring: the arm stopped being a timer, so a mechanism whose only job was to beat a
+# timer has no job. `disk_restore.offer()` no longer calls it, its four state keys and
+# its three view fields are gone from `_KEYS`, and nothing in the package re-arms a
+# tier behind an operator's back - which the veto in `_gate_verdict()` now enforces at
+# the boot decision too, the place renewal could never reach.
+#
 
 
 def snapshot_error(exc: BaseException, where: str) -> None:
@@ -649,19 +601,28 @@ def snapshot_error(exc: BaseException, where: str) -> None:
 # --- the operator's veto ------------------------------------------------------
 
 def note_operator_disarm(reason: str) -> dict:
-    """LATCH the operator's veto: renewal stops for this boot, and nothing un-latches it
-    except an explicit `note_operator_arm()`.
+    """LATCH the operator's veto over THIS PROCESS's boot decision.
+
+    What the veto protects changed in 0.2.35, and the name did not need to: it used to
+    stop `renew_if_due()` from re-arming a box an operator had disarmed, and with the
+    renewal deleted it could have been deleted with it. It is kept, and it now guards
+    the one path that can still raise the arm without a human - `_gate_verdict()`
+    refuses to arm while it stands. That matters MORE, not less, now that the arm is a
+    latch: in 0.2.34 a mistaken re-arm would have expired on its own inside two hours,
+    and in 0.2.35 nothing will.
 
     Called from the dev-verb handlers in `disk_store.py` - the human's door - and from
-    nowhere else. That placement is the point: this module's own rollback on a failed
-    boot calls `disk_spill.disarm()` directly and does NOT latch, because a rollback is
-    not an operator's instruction, while `POST {"op":"disarm"}` is one and outranks a
-    boot default forever after.
+    nowhere else. That placement is the point: this module's own fail-safe calls
+    `disk_spill.disarm()` directly and does NOT latch, because a rollback is not an
+    operator's instruction, while `POST {"op":"disarm"}` is one and outranks a boot
+    default for the rest of this process. Nothing here is written to disk: the next
+    process reads the environment's word, which is the boot-default doctrine.
     """
     _state["disarmed_by_operator"] = True
     _state["latch_reason"] = str(reason)[:200]
     logger.warning("kvtier-dev-plugin: DISK[boot] the operator's posture now beats the "
-                   "boot default for this boot (%s): renewal will not re-arm it. %s",
+                   "boot default for this boot (%s): nothing in this process will arm "
+                   "it again, including a second connector boot. %s",
                    _state["latch_reason"], disable_how())
     return {"disarmed_by_operator": True, "reason": _state["latch_reason"]}
 

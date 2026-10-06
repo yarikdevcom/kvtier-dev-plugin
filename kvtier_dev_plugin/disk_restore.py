@@ -264,16 +264,20 @@ RESTORE_DEADLINE_SECONDS = 45.0
 it as a failure. Arithmetic: the measured cost of one 3,200-token span is ~10 ms
 (4 slots x 11,468,800 B = 45.9 MB at the 11.5 GB/s this store measured), and an
 offer is capped at `MAX_RESTORE_BLOCKS_PER_OFFER` spans, so the largest legitimate
-read is 64 x 45.9 MB = 2.94 GB = ~255 ms of streaming - and 45 s is a ~175x margin
-on that. It is ALSO `disk_read.LOAD_DEADLINE_SECONDS` (30 s, the reader's own
-promise) + 50%: the batch deadline must always fire first, so the watchdog only
-ever sees the case the batch deadline could not reach (a batch that settled into
-nothing, or a step that never reached `start_load_kv`). 45 s stays far below the
-point at which an operator calls a parked request a hang, and a stall it fires on
-would otherwise be permanent, because the fork has no timeout for
-WAITING_FOR_REMOTE_KVS."""
+read is 128 x 45.9 MB = 5.87 GB = ~510 ms of streaming at that 11.5 GB/s - and 45 s
+is an ~88x margin on it. (The cap went 64 -> 128 in 0.2.35 because the OPERATOR'S
+POOL grew past 64; see the constant for why a backstop below the pool's affordance
+is a throughput limit and not a bound. The margin is what makes that raise safe on
+time alone: it was ~175x at 64 spans and it is still ~88x here.)
 
-MAX_RESTORE_BLOCKS_PER_OFFER = 64    # SCHEDULER BLOCKS offered per request
+It is ALSO `disk_read.LOAD_DEADLINE_SECONDS` (30 s, the reader's own promise) +
+50%: the batch deadline must always fire first, so the watchdog only ever sees the
+case the batch deadline could not reach (a batch that settled into nothing, or a
+step that never reached `start_load_kv`). 45 s stays far below the point at which an
+operator calls a parked request a hang, and a stall it fires on would otherwise be
+permanent, because the fork has no timeout for WAITING_FOR_REMOTE_KVS."""
+
+MAX_RESTORE_BLOCKS_PER_OFFER = 128   # SCHEDULER BLOCKS offered per request
 #
 # THE TOKEN CAP THAT USED TO SIT HERE IS DELETED (0.2.32), and the deletion is the
 # whole change. Up to and including 0.2.31 this module fixed the per-offer ceiling at
@@ -299,17 +303,67 @@ MAX_RESTORE_BLOCKS_PER_OFFER = 64    # SCHEDULER BLOCKS offered per request
 # different trade, and the arbiter (see `disk_read.pool_state()` / `afford_reads()`:
 # reserve at adoption, release at `finish_batch`) must be scheduled before that.
 #
-# THE BOUND THAT REMAINS IS THE BLOCK WALK, and it is principled rather than a magic
-# token count: `_disk_run` stops its positional walk at `MAX_RESTORE_BLOCKS_PER_OFFER`
-# blocks because that is what one offer can name and stream inside
-# `RESTORE_DEADLINE_SECONDS` (the 45 s arithmetic above is computed FROM 64 spans), so
-# no offer carries more than `MAX_RESTORE_BLOCKS_PER_OFFER x block_size` tokens at any
-# prompt length. Pool affordance binds well before that in practice. Neither bound is
-# what stops a 109k-token prompt (64 x 3,200 = 204,800 tokens is above it): what does is
-# bounce-buffer affordability and the store's own depth - the deepest contiguous run the
-# operator measured on the live store was ~11 spans, because spill follows RAM-tier
-# parking and the CPU arena is ~187 blocks per rank. Deleting a cap removes a ceiling
-# nobody needed; it does not make long prefixes restorable.
+# THE BOUND THAT REMAINS IS THE BLOCK WALK - AND IT IS A BACKSTOP, NOT THE OPERATIVE
+# LIMIT, SO IT HAS TO BE SIZED AGAINST THE POOL AND NOT AGAINST A THEORY.
+#
+# `_disk_run` stops its positional walk at `MAX_RESTORE_BLOCKS_PER_OFFER` blocks, so no
+# offer can name more than `MAX_RESTORE_BLOCKS_PER_OFFER x block_size` tokens at any
+# prompt length. WHAT ACTUALLY SIZES AN OFFER IS THE POOL: `disk_read.afford_reads()`
+# says how many bounce buffers `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` can hold at once
+# and the offer is cut to that, which is why `bounded_by` names `pool_budget` on a
+# healthy box more often than `block_cap`. The two numbers must be sized COHERENTLY or
+# the backstop silently becomes the limit, and that is exactly what happened on the live
+# box: the operator raised the pool to 1 GiB, which affords 1 GiB / 11,468,800 B = ~93
+# buffers, and a run of 62 spilled blocks was cut to 15 by pool arithmetic at the old
+# setting and then met the 64-block wall as the NEXT ceiling. A cap below what the pool
+# affords is not a safety bound any more; it is an undisclosed throughput limit, and it
+# is the same mistake the deleted 32,000-token cap above made in a different unit.
+#
+# So 0.2.35 raises it to 128 - above the ~93 buffers a 1 GiB pool affords, which puts
+# the OPERATIVE bound back where it belongs (in the pool, which the engine can actually
+# afford) and leaves this constant doing what a backstop is for: bounding a run the
+# positional walk could name on a box whose pool was configured far above its RAM.
+#
+# THE COST OF RAISING IT, stated because a backstop you cannot price is not a bound:
+#   * TIME. 128 spans is ~5.87 GB and ~510 ms of streaming at the measured 11.5 GB/s -
+#     ~88x inside `RESTORE_DEADLINE_SECONDS` (45 s), ~10x inside the 5,000 ms settle
+#     allowance, and `disk_read.LOAD_DEADLINE_SECONDS` (30 s) still fires first.
+#   * THE MISSING ARBITER, which is the real one. There is NO reservation arbiter
+#     between ranks or requests: two simultaneous offers each price affordability
+#     against the pool's CURRENT free bytes, both can believe they fit, and together
+#     they over-commit (the open TODO 14 above). Doubling the cap DOUBLES the worst
+#     case of that over-commit, so it is not free. What keeps it tolerable is measured,
+#     not assumed: 4 offers in 332 lookups on the live box, so overlap is near-zero.
+#     RAISING THE OFFER RATE IS A DIFFERENT TRADE and must not be done on this change's
+#     strength - the arbiter (reserve at adoption, release at `finish_batch`; see
+#     `disk_read.pool_state()` / `afford_reads()`) has to be scheduled before that.
+#   * THE READER'S QUEUE, sized independently and NOT priced by the offer path. A read
+#     is handed to `disk_read.request_read()` in a tight loop at bind, and that queue is
+#     `MAX_QUEUE_DEPTH` = 64 JOBS queued-or-in-flight; job 65 of one load event is
+#     refused `queue_full` (returned to the pool, counted in `LOAD_CAPACITY_FAILURES`,
+#     and the block it was for arrives as nothing). The offer prices affordability in
+#     POOL BYTES ONLY (`afford_reads()` -> `budget // size`), so a 1 GiB pool says "93
+#     jobs" to the offer path while the reader's own queue says 64. AT THE LIVE 96 MiB
+#     DEFAULT THIS IS UNREACHABLE (96 MiB affords 8 buffers), and it was already 4 jobs
+#     over at 64 spans x 1 positional group + 4 boundary states = 68; raising the cap to
+#     128 spans moves it to 132 jobs, so the gap becomes the expected case on a box that
+#     raises its pool. IT IS AN OPERATOR DECISION, NOT A TUNE: either the queue rises
+#     with the pool (one bounded pile per rank process, ~11.5 MB of buffer each, already
+#     paid for by the pool budget) or the offer path prices `MAX_QUEUE_DEPTH` next to
+#     the pool budget and the ceiling it names in `bounded_by` stops being a half-
+#     truth. The
+#     second is the honest one; neither belongs in this change unasked.
+#   * CPU SLOTS, unchanged: `MAX_SLOTS_PER_OFFER` (256) is a separate bound and it
+#     binds FIRST on a multi-group hybrid, where 128 blocks x 4 groups is 512 slots and
+#     `cpu_slots` cuts the offer to 64 blocks anyway. Raising this constant therefore
+#     changes nothing for a 4-group model and everything for the live single-cacheable-
+#     group one (128 + 4 boundary states = 132 slots, inside 256).
+#
+# Neither bound is what stops a 109k-token prompt (128 x 3,200 = 409,600 tokens is far
+# above it): what does is bounce-buffer affordability and the store's own depth - the
+# deepest contiguous run the operator measured on the live store was ~11 spans, because
+# spill follows RAM-tier parking and the CPU arena is ~187 blocks per rank. Raising a
+# backstop removes a ceiling nobody needed; it does not make long prefixes restorable.
 DEFAULT_OFFER_BLOCK_SIZE_TOKENS = 3_200
 """TOKENS: the scheduler block size used to NAME the block cap in tokens before the
 first lookup reveals the engine's real one. The boot line and the payload publish a
@@ -558,8 +612,9 @@ NULL_BLOCK_ATTR = "null_block"
 OFFER_REFUSAL_WHY = {
     "not_configured": "no store to read: VLLM_E2_TIER_DISK_ROOT is unset in this "
                       "process, so there is no directory a file could come from",
-    "disarmed": "the spill tier is disarmed (its arm file is absent or expired), "
-                "and restore is deliberately not separately armable",
+    "disarmed": "the spill tier is disarmed (its arm file is absent, unreadable or "
+                "fenced to another boot - never 'expired': the arm is a latch), and "
+                "restore is deliberately not separately armable",
     "tier_disarmed": "the KV tier itself is disarmed, so no lookup reaches the "
                      "connector at all",
     "bad_call": "the scheduler handed this wrapper something unusable (a request "
@@ -2494,8 +2549,10 @@ def disk_boot_section() -> dict:
     raises.
 
     `disk_restore` owns the two serve switches; `disk_boot` owns the decision about what
-    a FRESH BOOT should do with them, and why renewal is or is not running. This is a
-    pass-through of `disk_boot.view()` and nothing else - no recomputation, no
+    a FRESH BOOT should do with them, and whether the arm it raised is still latched.
+    (0.2.35 removed the "why renewal is or is not running" half of that: there is no
+    renewal, because the arm has no expiry.) This is a pass-through of
+    `disk_boot.view()` and nothing else - no recomputation, no
     re-decision - because a payload that re-derived a posture claim from somewhere else
     is how two views start disagreeing in production.
 
@@ -2691,10 +2748,17 @@ def gate() -> dict:
     """May THIS process make/serve a disk restore? Configured AND armed AND armed.
 
     Three switches, no new one: the root (`VLLM_E2_TIER_DISK_ROOT`, which
-    `disk_spill` owns and validates), the spill tier's arm file (which expires), and
-    the KV tier's own arm. A fresh boot answers `disarmed` and the wrappers cost an
-    env read. Reading the arm file is `disk_spill`'s cached verdict, so this is not
-    a per-step `open()`.
+    `disk_spill` owns and validates), the spill tier's arm file (a LATCH since 0.2.35 -
+    no expiry, no renewal, nothing that lowers it but a decision), and the KV tier's own
+    arm. A fresh boot answers `disarmed` and the wrappers cost an env read. Reading the
+    arm file is `disk_spill`'s cached verdict, so this is not a per-step `open()`.
+
+    SAY IT PLAINLY, BECAUSE THE NAME SUGGES A WRITE KNOB AND THIS IS A SERVE DOOR: this
+    gate means DISARMING THE SPILL TIER STOPS SERVING FROM DISK. It is not a
+    write-only switch, and an operator who disarms to "stop the writes" also closes
+    every restore - which is the intended coupling (the release's whole load-failure
+    story is that the ceiling eviction which sheds bytes runs from the spill writer, so
+    an arm that could lapse would freeze eviction too).
     """
     root = disk_spill.disk_root()
     if root is None:
@@ -2703,7 +2767,10 @@ def gate() -> dict:
                      reason_kind="not_configured")
     if not disk_spill.is_armed():
         return _fail("the disk tier is disarmed: the restore path obeys the spill "
-                     "tier's arm, which expires on its own",
+                     "tier's arm, and the arm is a LATCH (0.2.35) - it does not "
+                     "expire, so it stays down until someone POSTs "
+                     "{\"op\":\"arm\"}. Disarming stops serving from disk as "
+                     "well as writing to it, by design",
                      reason_kind="disarmed")
     try:
         from . import backport  # noqa: PLC0415 - lazy: backport imports us lazily
@@ -2741,10 +2808,11 @@ def gate() -> dict:
                          ranks_armed=f"{proof.get('ranks_armed', 0)}/"
                                      f"{proof.get('ranks_seen', 0)}")
         if kind == "tier_arm_disarmed":
-            # 0.2.28: the proof read the ARM FILE and it says no (absent, expired,
-            # or fenced to another boot). The gate counts this under the same
-            # `disarmed` refusal the arm check above uses - the authority is the
-            # file either way, and the reason says which read got there first.
+            # 0.2.28: the proof read the ARM FILE and it says no (absent, unreadable,
+            # or fenced to another boot - never "expired", since 0.2.35 took the timer
+            # out). The gate counts this under the same `disarmed` refusal the arm
+            # check above uses - the authority is the file either way, and the reason
+            # says which read got there first.
             return _fail(proof["reason"], reason_kind="disarmed")
         return _fail(proof["reason"], reason_kind="no_worker_proof")
     return _ok(root=root, ranks=proof["ranks"])
@@ -3097,9 +3165,9 @@ def _read_worker_proof() -> dict:
     if not tier_armed:
         # THE ARM FILE OUTRANKS EVERY RANK FILE (0.2.28). No rank file can arm a
         # disarmed tier by claiming `armed: true` - the arm carries the boot fence
-        # and the expiry, and a cold or expired boot must not offer whatever the
-        # rank files remember from the last armed window. The refusal reason is the
-        # arm file's own, which is what keeps the boot fence honest.
+        # (and, until 0.2.35, an expiry), and a boot that never armed must not offer
+        # whatever the rank files remember from the last armed window. The refusal
+        # reason is the arm file's own, which is what keeps the boot fence honest.
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
                 "ranks_seen": seen, "reads_applied": reads,
                 "tier_armed": False, "stale_arm_claims": stale_claims,
@@ -3926,6 +3994,23 @@ def _cut_run(run: dict, length: int) -> dict:
 def offer(manager, request, num_computed_tokens, ram_result):
     """Widen the fork's `(tokens, is_async)` with the SSD's contiguous span.
 
+    NO RENEWAL TICK ANY MORE (0.2.35). Until 0.2.34 this function began with
+    `disk_boot.renew_if_due()` - a bounded tick that re-armed the spill path before the
+    gate read it, because the arm had a TTL and a lapse here cost a request its disk
+    restore. The TTL is gone (the arm is a latch; see `disk_spill`'s module docstring),
+    so the tick is gone: a latch has no lapse to forestall, and a heartbeat that
+    re-armed from the request path would have been a way to re-arm a box an operator had
+    just disarmed.
+
+    SAYING IT HERE BECAUSE THERE WERE TWO OF THEM. The same eleven lines sat in BOTH
+    offer entry points, and the one this change's first pass missed kept calling the
+    deleted function on EVERY lookup - its own `except Exception` turned that into a
+    `snapshot._error()` counter nobody asserted on, and the suite stayed green. The
+    containment is right and stays; the guard is
+    `test_an_offer_cycle_records_no_plugin_error`, which fails if any door on this path
+    files an internal error while doing ordinary work.
+
+
     Called by the wrapper AFTER the fork's own body, with its result. Returns the
     result to hand the scheduler: on EVERY refusal path that is the fork's value,
     byte-identical and unconsumed - which is the property that makes an unarmed or
@@ -3937,19 +4022,6 @@ def offer(manager, request, num_computed_tokens, ram_result):
     refcounting, pairing and state creation stays the fork's.
     """
     _state["lookups"] += 1
-    # THE SSD TIER'S BOOT-DEFAULT RENEWAL TICK (0.2.33). This is the right place for it
-    # for one reason: the offer path is the only path in this process that consults the
-    # spill arm at all, so an arm lapse costs a disk restore exactly here. Doing it
-    # BEFORE the gate means the request that arrives after a two-hour idle is SERVED
-    # rather than refused - the arm is refreshed and then read, not read and then
-    # regretted. The tick costs one monotonic comparison per lookup until it is due
-    # (`disk_boot.RENEW_CHECK_SECONDS`), obeys the operator's disarm latch, and is
-    # contained twice over: inside itself, and here.
-    try:
-        from . import disk_boot  # noqa: PLC0415 - it reads this module's posture
-        disk_boot.renew_if_due()
-    except Exception as exc:  # noqa: BLE001 - a renewal never costs a schedule
-        snapshot._error(exc, "disk_restore renewal tick")
     try:
         return _offer(manager, request, num_computed_tokens, ram_result)
     except Exception as exc:  # noqa: BLE001 - a restore never breaks a schedule
@@ -4459,6 +4531,17 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         blocks = max(0, (MAX_SLOTS_PER_OFFER - boundary_slots)) // max(1, per_span)
         needed = blocks * per_span + boundary_slots
         disk_tokens = blocks * block_size
+        # NAME IT. Until 0.2.35 this clamp shortened the offer and left no mark in
+        # `bounded_by`, so a multi-group offer read as `["block_cap"]` while the bound
+        # that actually cut it was the CPU-slot cap - one entry short, and the entry
+        # that names the fix (`MAX_SLOTS_PER_OFFER`, or a model with fewer groups).
+        # Raising the block cap 64 -> 128 is what made the gap common rather than
+        # theoretical: at 128 spans x 3 positional groups the slot bound is the
+        # OPERATIVE limit for every multi-group model, so an unlabelled clamp is now the
+        # normal answer instead of a corner. Guarded, because the engine's own free-pool
+        # clamp below reports the SAME label and the list is a set of names in order.
+        if "cpu_slots" not in bounds:
+            bounds.append("cpu_slots")
     if blocks <= 0:
         _refuse("no_cpu_slots", f"one span needs {per_span} CPU slots plus "
                                 f"{boundary_slots} boundary slot(s) and the cap is "
@@ -8410,11 +8493,13 @@ def scheduler_section() -> dict:
         "serving_as": posture["serving_as"],
         # THE BOOT DEFAULT BEHIND THE POSTURE (0.2.33): whether
         # `KVTIER_DISK_BOOT_ENABLE` asked for this boot to come up armed and serving,
-        # whether it was honoured, whether renewal has run, and whether an operator
-        # disarm has latched. `disk_boot.view()` answers with every key on every path,
-        # so a degraded boot cannot hand back a thinner payload than a healthy one - and
-        # nothing here recomputes any of it: the view is the same dict the `/disk` verb
-        # answers with, from the module that owns the decision.
+        # whether it was honoured, and whether an operator disarm has latched a veto
+        # this process cannot lift by itself. (0.2.35: the arm is a latch, so the view
+        # answers `arm_expires: false` where it used to answer a countdown.)
+        # `disk_boot.view()` answers with every key on every path, so a degraded boot
+        # cannot hand back a thinner payload than a healthy one - and nothing here
+        # recomputes any of it: the view is the same dict the `/disk` verb answers
+        # with, from the module that owns the decision.
         "boot_default": disk_boot_section(),
         "per_boot": True,
         "survives_restart": False,

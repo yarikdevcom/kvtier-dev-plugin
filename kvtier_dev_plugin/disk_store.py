@@ -117,7 +117,8 @@ module, e.g. an API server. It is never collapsed into `absent`.)
 SAFETY ENVELOPE (the `blockdump` posture, because this writes where that only reads)
 ------------------------------------------------------------------------------------
   * OFF BY DEFAULT, twice over: `VLLM_E2_TIER_DISK_ROOT` must name a real root AND
-    `disk_spill` must be ARMED (no env var arms it; an arm expires). Unarmed, the
+    `disk_spill` must be ARMED (no env var arms it; the arm is a LATCH, so it is
+    armed by a decision and disarmed by one). Unarmed, the
     bind wrapper's whole cost is two `os.environ.get` calls and the `get_finished`
     wrapper adds one more: no stat, no open, no copy, no queue, no thread.
   * NEVER RAISES INTO THE ENGINE. Every wrapper calls the fork's method FIRST and
@@ -1546,9 +1547,10 @@ def _op_spill_one(body: dict) -> dict:
         # would leave a file a worker has to chew through for nothing.
         return {"ok": False,
                 "reason": "the spill tier is not armed in this process (and the arm "
-                          "file a worker reads is absent or expired): arm it with "
-                          "op:arm first, because a request every rank must refuse "
-                          "is not a diagnostic, it is litter"}
+                          "file a worker reads is absent, unreadable or fenced to "
+                          "another boot - never 'expired': the arm is a latch): arm "
+                          "it with op:arm first, because a request every rank must "
+                          "refuse is not a diagnostic, it is litter"}
     slot = _int(body.get("slot"))
     if slot is None or slot < 0:
         return {"ok": False, "reason": "slot must be a non-negative CPU slot index"}
@@ -2975,9 +2977,15 @@ def _op_arm(body: dict) -> dict:
 
     THE BOOT DEFAULT'S OTHER HALF (0.2.33): a hand arm LIFTS the operator's disarm
     latch. This door is the human's, so an operator who disarmed and then armed by hand
-    has asked for the tier back, and leaving the latch set would switch renewal off for
-    the rest of the boot on a box he just chose to serve from disk - the two-hour dark
-    tier again, wearing a latch. A refused arm lifts nothing.
+    has asked for the tier back - and since 0.2.35 the latch it clears is not a renewal
+    veto but a VETO OVER THIS PROCESS'S OWN BOOT DECISION (`disk_boot._gate_verdict`),
+    so leaving it set would mean a later connector boot in this process refusing to arm
+    a box its operator just chose to serve from disk. A refused arm lifts nothing.
+
+    `seconds` IS ACCEPTED AND IGNORED (0.2.35). It stays in the wire contract because an
+    existing `{"op":"arm","seconds":7200}` must not start failing on the day this
+    ships; `disk_spill.arm()` reports `seconds_ignored: true` rather than pretending the
+    number bought anything.
     """
     from . import disk_boot  # noqa: PLC0415 - it owns the boot default's latch
     verdict = disk_spill.arm(body.get("seconds"))
@@ -2990,10 +2998,12 @@ def _op_disarm(_body: dict) -> dict:
     """`disk_spill.disarm`, and the operator's veto over the boot default (0.2.33).
 
     A manual disarm is an INSTRUCTION, and since 0.2.33 there is a boot default for it
-    to override - so this door latches `disk_boot`, and renewal then refuses to re-arm
-    this boot for the rest of its life. That is the non-negotiable ordering: a human at
-    the verb always beats the plugin's own boot posture, and there is no path that
-    re-arms a box an operator has just disarmed.
+    to override - so this door latches `disk_boot`. Since 0.2.35 the latch is what stops
+    this PROCESS'S OWN BOOT DECISION from re-arming (renewal is gone: the arm is a
+    latch, so there is nothing to renew and nothing to lapse). That is the
+    non-negotiable ordering, and it is stronger than it was: a human at the verb beats
+    the plugin's own boot posture for the life of the process, and with no timer there
+    is also no deadline after which the veto quietly stops mattering.
     """
     from . import disk_boot  # noqa: PLC0415 - it owns the boot default's latch
     verdict = disk_spill.disarm()
@@ -3044,8 +3054,9 @@ def _op_authority(body: dict) -> dict:
     setter and is reported beside it.
 
     LOWERING IT IS AN OPERATOR'S VETO (0.2.33). `enabled: false` latches `disk_boot`, so
-    the boot default's renewal will not put the arm back under an operator who has just
-    taken the box out of disk service. A manual disarm always beats the boot default.
+    nothing in this process - since 0.2.35 including its own boot decision, and there is
+    no renewal left to fear - will put the arm back under an operator who has just taken
+    the box out of disk service. A manual disarm always beats the boot default.
     """
     from . import (
         disk_boot,  # noqa: PLC0415 - it owns the boot default's latch

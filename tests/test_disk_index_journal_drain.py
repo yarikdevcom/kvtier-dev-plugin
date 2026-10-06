@@ -325,9 +325,11 @@ def restore_state(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "diagnostics_dir", lambda: diag)
     monkeypatch.setattr(disk_layout, "FORBIDDEN_ROOT_PREFIXES", ())
 
-    def arm(seconds=600):
+    def arm():
+        # A LATCH (0.2.35): armed is all the file has to say. No `expires_ts`, because
+        # the reader ignores it and writing one here would be testing an inert field.
         (diag / disk_spill.ARM_FILE).write_text(json.dumps(
-            {"armed": True, "expires_ts": time.time() + seconds}))
+            {"armed": True, "latched": True}))
 
     def disarm_file():
         (diag / disk_spill.ARM_FILE).unlink(missing_ok=True)
@@ -506,12 +508,20 @@ def test_worker_proof_passes_with_stale_rank_armed_false_and_a_live_arm_file(
         "and not silently ignored")
     assert verdict["tier_armed"] is True
 
-    # EXPIRED arm file: refuses again (the expiry check is `_read_arm_file`'s).
-    arm(seconds=-5)
+    # AN EXPIRED-LOOKING FILE NO LONGER REFUSES (0.2.35): the proof passes on a file
+    # whose `expires_ts` is in the past, because the arm is a LATCH and the reader reads
+    # no clock. Removing that check is what keeps a box that has been serving for hours
+    # from going disarmed on a timestamp nothing honours any more.
+    (diag / disk_spill.ARM_FILE).write_text(json.dumps(
+        {"armed": True, "expires_ts": time.time() - 60}))
+    assert disk_restore.worker_proof(force=True)["ok"] is True
+
+    # The absence still refuses - that is the real negative, and the fence below is the
+    # other one (a file from another boot).
+    (diag / disk_spill.ARM_FILE).unlink()
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == "tier_arm_disarmed"
-    assert "expired" in verdict["reason"]
 
     # FOREIGN BOOT (the boot fence, unchanged): refuses even with `armed: true`.
     (diag / disk_spill.ARM_FILE).write_text(json.dumps(

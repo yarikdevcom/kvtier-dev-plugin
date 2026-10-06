@@ -397,9 +397,14 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     # block size in this fixture comes from the fallback constant (no lookup has run in
     # this process), and the payload says so instead of pretending to know the engine.
     ceiling = disk_restore.offer_block_ceiling()
-    assert section["offer_block_cap_blocks"] == ceiling["blocks"] == 64
+    # THE CONSTANT, NOT A LITERAL: 0.2.35 raised 64 -> 128 (the operator's 1 GiB
+    # bounce pool affords ~93 buffers, and a backstop under the pool's affordance is a
+    # throughput limit). The payload must agree with the derivation at ANY value.
+    assert section["offer_block_cap_blocks"] == ceiling["blocks"] \
+        == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER
     assert section["offer_block_cap_tokens"] == ceiling["tokens"]
-    assert section["offer_block_cap_tokens"] == 64 * ceiling["block_size"]
+    assert section["offer_block_cap_tokens"] \
+        == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER * ceiling["block_size"]
     assert section["offer_block_cap_block_size"] == ceiling["block_size"]
     assert (section["offer_block_cap_block_size_source"]
             == ceiling["block_size_source"] == "fallback")
@@ -536,8 +541,9 @@ def test_an_offer_past_the_deleted_cap_passes_unbounded_by_default(armed):
     assert counters["offer_pool_capped"] == 0
 
 
-def test_the_bound_that_survives_is_the_block_walk_and_says_block_cap(armed):
-    """72 spans of store is offered as 64, and the bound that cut it is named.
+def test_the_bound_that_survives_is_the_block_walk_and_says_block_cap(armed,
+                                                                     monkeypatch):
+    """A run deeper than the walk is offered AT the walk, and the bound is named.
 
     The request's own length used to be able to reach any cap expressed only in blocks
     and slots (the incident offered EXACTLY 160,000 tokens 123,474 times), which is part
@@ -549,12 +555,23 @@ def test_the_bound_that_survives_is_the_block_walk_and_says_block_cap(armed):
     stay absent - the block bound is not a configured token cap and must never read as
     one.
 
-    SYNTHETIC DEPTH, said plainly: 72 contiguous spilled spans are deeper than anything
-    the live store held (~11 spans on the boot the operator measured). This fixture
-    exists to make the block bound reachable at all.
+    SYNTHETIC DEPTH, said plainly: MAX+8 contiguous spilled spans are deeper than
+    anything the live store held (~11 spans on the boot the operator measured). This
+    fixture exists to make the block bound reachable at all.
+
+    THE CPU-SLOT CAP IS RAISED OUT OF THE WAY HERE, ON PURPOSE. This fixture's model has
+    three prefix-cacheable groups, so a span costs three CPU slots and
+    `MAX_SLOTS_PER_OFFER` (256) would clamp a 128-span walk to 85 spans - the test would
+    then be about the slot cap and not the walk it names. Isolating one bound by
+    relaxing the other is legitimate ONLY because the interaction is pinned where it
+    belongs: `test_disk_offer_bounds.py::
+    test_a_multi_group_run_still_meets_the_cpu_slot_bound_first` runs the same geometry
+    with the real slot cap and asserts `["block_cap", "cpu_slots"]`.
     """
     blocks = disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER + 8
     fill(armed, blocks=blocks)
+    monkeypatch.setattr(disk_restore, "MAX_SLOTS_PER_OFFER",
+                        (blocks + 8) * len(base.CACHEABLE))
     tokens, flag = offer(Manager(), Req(request_id="walk", blocks=blocks))
     assert flag is True
     assert tokens == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER * BLOCK

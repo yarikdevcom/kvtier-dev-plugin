@@ -602,9 +602,11 @@ def test_worker_proof_reads_fitted_from_the_rank_file_and_arm_from_the_arm_file(
             document["disk_restore"] = section
         (directory / f"rank-{rank}.json").write_text(json.dumps(document))
 
-    def arm(seconds=600):
+    def arm(latched=True):
+        # A LATCH (0.2.35): the file says armed and nothing in it expires, so the
+        # helper writes what the reader now reads and no field it ignores.
         (directory / disk_spill.ARM_FILE).write_text(json.dumps(
-            {"armed": True, "expires_ts": time.time() + seconds}))
+            {"armed": True, "latched": latched}))
 
     write(None)
     assert disk_restore.worker_proof(force=True)["ok"] is False
@@ -680,12 +682,22 @@ def test_worker_proof_reads_fitted_from_the_rank_file_and_arm_from_the_arm_file(
     assert disk_restore.worker_proof(force=True)["ok"] is True, \
         "one unreadable file is not evidence against the readable one"
 
-    # The arm file's EXPIRY belongs to the arm file: the proof refuses through it.
-    arm(seconds=-5)
+    # AN EXPIRY IN THE FILE IS INERT (0.2.35). A document carrying an `expires_ts` in
+    # the PAST - one written by an older build, or by anything that still thinks the arm
+    # is a timer - arms the proof like any other, because the reader honours no clock.
+    # The negative this test used to assert ("the proof refuses through the expiry") is
+    # the exact behaviour removed: a serving tier going disarmed at an arbitrary minute.
+    (directory / disk_spill.ARM_FILE).write_text(json.dumps(
+        {"armed": True, "expires_ts": time.time() - 60}))
+    assert disk_restore.worker_proof(force=True)["ok"] is True
+
+    # What DOES close the proof is the file's absence or another boot's identity, and
+    # the absence is the ordinary one: no file, no disk tier for this worker.
+    (directory / disk_spill.ARM_FILE).unlink()
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == "tier_arm_disarmed"
-    assert "expired" in verdict["reason"]
+    assert "no arm file" in verdict["reason"]
 
 
 def test_one_unrefused_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):

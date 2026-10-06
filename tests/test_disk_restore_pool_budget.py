@@ -372,18 +372,31 @@ def test_bounded_by_names_the_pool_when_only_the_pool_bounds_it(armed, monkeypat
 
 def test_bounded_by_lists_both_bounds_in_the_order_they_were_applied(armed,
                                                                     monkeypatch):
-    """Guilty of both: the 64-span walk first, then the pool - in that order.
+    """Guilty of both: the block walk first, then the pool - in that order.
 
     Without this an operator reading "offer shortened" has to guess which knob to
     turn, and turning the wrong one is how a pool fix becomes a block-cap fix that
     changes nothing. The walk is FIRST because it is applied first: the run is built to
     the block ceiling, then the CPU slots, then the bounce buffers.
+
+    SIZED FROM THE CAP, not from the 72 this used to hard-code. The fixture has to be
+    DEEPER than the walk, and 0.2.35 raised the walk from 64 to 128 - a literal 72 would
+    have stopped exercising the block bound entirely, quietly turning a two-bound test
+    into a one-bound test that still asserted two bounds.
     """
-    fill_sized(armed, blocks=72)                 # deeper than the 64-block walk
+    blocks = disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER + 8
+    fill_sized(armed, blocks=blocks)             # deeper than the block walk
     pool_at_most_jobs(monkeypatch, 11, WIDTH)
-    assert offer(Manager(), Req(blocks=72), 0, (0, False)) == (3 * BLOCK, True)
+    assert offer(Manager(), Req(blocks=blocks), 0,
+                 (0, False)) == (3 * BLOCK, True)
     pricing = last_pool()
-    assert pricing["bounded_by"] == ["block_cap", "pool_budget"], pricing
+    # THREE bounds now, in the order applied - and the middle one is new to the record,
+    # not to the code. A 3-positional-group run at MAX+8 spans needs 3 spans' worth of
+    # CPU slots each, so `MAX_SLOTS_PER_OFFER` (256) clamps it to 85 spans between the
+    # walk and the pool. Until 0.2.35 that clamp applied WITHOUT saying so, which the
+    # raised block cap made common enough to matter: the payload named the walk as the
+    # bound that ended a run the slot cap had already cut.
+    assert pricing["bounded_by"] == ["block_cap", "cpu_slots", "pool_budget"], pricing
     assert pricing["block_cap_tokens"] == (disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER
                                            * BLOCK)
     counters = disk_restore.counters()

@@ -240,15 +240,31 @@ def test_arm_requires_a_root_because_a_knob_that_cannot_act_is_a_lie(
     assert "nowhere to write" in report["reason"]
 
 
-def test_an_arm_expires_on_its_own_clock():
-    disk_spill.arm(seconds=5.0)
+def test_an_arm_has_no_clock_left_to_expire_on():
+    """THE INVERSE OF THE TEST THIS ONE USED TO BE (0.2.35).
+
+    `test_an_arm_expires_on_its_own_clock` reached into `_state["arm_expires_mono"]`,
+    backdated it, and asserted the arm had lapsed. There is no deadline field to reach
+    for any more, which is the assertion worth having: the STATE DICT HAS NO CLOCK IN
+    IT. A field added back by a future change fails here by name rather than quietly
+    reintroducing the behaviour - and the behaviour it would reintroduce is the bug this
+    release exists to remove: an armed tier that stopped shedding at 02:00, because the
+    ceiling eviction that sheds runs from the spill writer the arm gates.
+
+    The arm's lifetime is now decided by two things, both tested elsewhere: a decision
+    (`arm()` up, `disarm()` down), and the boot identity the file must name
+    (`_arm_boot_fence`, which is about WHICH BOOT, not about how long).
+    """
+    disk_spill.arm()
     assert disk_spill.is_armed() is True
-    # Backdate the deadline rather than patching `time.monotonic`: the module reads
-    # the clock through the global `time`, so patching it would move the clock out
-    # from under pytest itself.
-    disk_spill._state["arm_expires_mono"] = time.monotonic() - 1.0
-    assert disk_spill.is_armed() is False
-    assert disk_spill.capability() == "configured_disarmed"
+    for clock in ("arm_expires_mono", "arm_expires_wall", "arm_seconds"):
+        assert clock not in disk_spill._state, \
+            f"the arm grew a clock back ({clock}): the TTL is load-bearing again"
+    assert disk_spill.capability() == "armed_and_ready"
+    # A `seconds` argument is accepted for wire compatibility and changes nothing.
+    assert disk_spill.arm(seconds=5.0)["seconds_ignored"] is True
+    assert disk_spill.is_armed() is True
+    assert "latched" in disk_spill.arm_state()
 
 
 def test_the_arm_crosses_to_a_worker_as_a_bounded_file(tmp_path, monkeypatch):
@@ -274,10 +290,18 @@ def test_the_arm_crosses_to_a_worker_as_a_bounded_file(tmp_path, monkeypatch):
     path.write_bytes(b"{not json")
     disk_spill._state["arm_file_checked_mono"] = None
     assert disk_spill.is_armed() is False                  # broken: disarmed
+    # AN OLD-FORMAT FILE IS READ, NOT LAPSING. A document written by 0.2.34 carries an
+    # `expires_ts` that may well be in the past by now; the reader honours no clock, so
+    # such a file arms exactly as a new one does. This matters on the upgrade path - a
+    # box that had been armed for hours when the new build was dropped in must not come
+    # up disarmed at an arbitrary minute because of a timestamp the new code has no use
+    # for. (What DOES disarm a surviving file is naming another boot: see the fence
+    # tests below.)
     path.write_bytes(json.dumps({"armed": True,
                                  "expires_ts": time.time() - 1}).encode())
     disk_spill._state["arm_file_checked_mono"] = None
-    assert disk_spill.is_armed() is False                  # expired: disarmed
+    assert disk_spill.is_armed() is True    # a past expiry is inert: the arm is a latch
+
 
 
 # --- the arm dies at a reboot, by its own contents -------------------------
