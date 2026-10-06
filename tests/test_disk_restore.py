@@ -553,18 +553,29 @@ def test_nothing_fires_when_the_tier_arm_is_down(armed, monkeypatch):
         "the gate's decline is counted, by the name the gate itself gave"
 
 
-def test_worker_proof_needs_a_fresh_rank_file_saying_installed_and_armed(tmp_path,
-                                                                         monkeypatch):
-    """The rank file IS the proof, and it is proof of TWO things.
+def test_worker_proof_reads_fitted_from_the_rank_file_and_arm_from_the_arm_file(
+        tmp_path, monkeypatch):
+    """The proof is TWO SOURCES (0.2.28): per-rank fit facts from the rank file,
+    the tier ARM from the arm file - and each is proof only of what it uniquely
+    knows.
 
-    `installed` says a worker fitted the layer; `armed` says it will SERVICE a load.
-    The 2026-10-05 incident needed the second one and only had the first: the
-    scheduler offered 160,000 tokens 123,474 times to workers that would not bind, so
-    every disk block came back invalid and the request was rescheduled into the same
-    offer. A proof that reads only `installed` cannot see that state at all.
+    2026-10-05 proved `installed` alone is not enough: the scheduler offered
+    160,000 tokens 123,474 times to workers that would not bind. So 0.2.26 read
+    the rank file's `armed` too - and 2026-10-20 proved THAT was the wrong door
+    for THIS fact: the arm is a rank-agnostic boot fact EngineCore owns and
+    publishes as `disk-spill-arm.json`, while a rank file is rewritten on cadence
+    with a signature that never hashed the armed verdict, so an arm with no spill
+    activity stayed invisible and `workers_not_servicing` locked out workers that
+    would serve (reproduced live: 0/4 armed for 120 s, then 4/4 seconds after a
+    spill burst). Now the proof asks the arm file (via `disk_spill._read_arm_file`,
+    boot fence intact) whether the TIER is armed, and the rank files only whether
+    THIS rank is fitted and can name a root. A rank file's lagged `armed: false`
+    under a live arm file no longer vetoes - it is counted as `stale_arm_claims`.
 
-    Covers the three shapes, in this order: fitted-but-unarmed (refused), fitted and
-    armed (accepted), and the freshness/unreadability edges.
+    Covers, in order: no arm file (refused by the arm-file kind, whatever the rank
+    files claim), fitted-but-not-fitted (the real AND veto), the stale-armed pass
+    that was the lockout, `not_configured` as the per-rank env fact it is, the
+    freshness and unreadability edges, and the expiry the arm file owns.
     """
     directory = tmp_path / "diag"
     directory.mkdir()
@@ -580,49 +591,94 @@ def test_worker_proof_needs_a_fresh_rank_file_saying_installed_and_armed(tmp_pat
             document["disk_restore"] = section
         (directory / f"rank-{rank}.json").write_text(json.dumps(document))
 
+    def arm(seconds=600):
+        (directory / disk_spill.ARM_FILE).write_text(json.dumps(
+            {"armed": True, "expires_ts": time.time() + seconds}))
+
     write(None)
     assert disk_restore.worker_proof(force=True)["ok"] is False
-    write({"installed": False, "armed": True})
+    write({"installed": False, "armed": True, "worker_fitted": True})
     assert disk_restore.worker_proof(force=True)["ok"] is False
 
-    # CASE 1 - installed but NOT armed: refused, and named as the incident, not as
-    # "no worker exists". This is the state the old proof walked straight past.
-    write({"installed": True, "armed": False, "reason": "the disk tier is disarmed"})
+    # CASE 1 - every rank fitted and claiming armed, NO arm file: refused, and
+    # named as the ARM FILE's refusal. The arm file outranks every rank file: no
+    # file from the last armed window may arm a rebooted or expired boot.
+    write({"installed": True, "armed": True, "worker_fitted": True})
     verdict = disk_restore.worker_proof(force=True)
-    assert verdict["ok"] is False, "a rank that will not serve cannot vouch for a load"
+    assert verdict["ok"] is False
+    assert verdict["reason_kind"] == "tier_arm_disarmed"
+    assert "arm file" in verdict["reason"]
+
+    # CASE 2 - the real per-rank veto: installed but NOT FITTED in this worker.
+    arm()
+    write({"installed": True, "armed": False, "worker_fitted": False,
+           "service_reason_kind": "worker_half_not_fitted"})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is False, "a rank that cannot bind cannot vouch for a load"
     assert verdict["reason_kind"] == "scheduler_armed_workers_disarmed"
     assert verdict["ranks_armed"] == 0 and verdict["ranks_seen"] == 1
     assert "ranks_armed=0/1" in verdict["reason"]
+    assert "not fitted in this worker" in verdict["reason"]
 
-    # An `armed` field that is absent or the wrong type is NOT armed either: a rank
-    # file written by a plugin that never measured the fact cannot vouch for it.
-    write({"installed": True})
-    assert disk_restore.worker_proof(force=True)["ok"] is False
+    # CASE 3 - TONIGHT'S FIX: installed and fitted, with the rank file's OWN
+    # armed verdict false (written before the arm). The arm file is armed; the
+    # proof PASSES and counts the stale claim instead of locking the tier out.
+    write({"installed": True, "armed": False,
+           "reason": "the disk tier is disarmed", "worker_fitted": True})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is True, verdict["reason"]
+    assert verdict["ranks_armed"] == 1
+    assert verdict["stale_arm_claims"] == 1, (
+        "the stale armed:false is counted and published, not trusted")
+
+    # A file from a plugin that predates `worker_fitted` (absent field) is NOT a
+    # veto: an absent fact is not evidence of a refusal - the old fail-closed on
+    # `armed` remains in reporting only.
     write({"installed": True, "armed": "true"})
-    assert disk_restore.worker_proof(force=True)["ok"] is False, \
-        "the string 'true' is a client's idea of armed, not a rank's"
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is True, "the string 'true' is not armed, and not a veto"
+    assert verdict["stale_arm_claims"] == 1
 
-    # CASE 2 - installed AND armed: the proof, with the rank named.
-    write({"installed": True, "armed": True, "reads_applied": 3})
+    # CASE 4 - installed AND armed AND fitted: the full proof, with the rank's
+    # own applied-read count and no stale claims.
+    write({"installed": True, "armed": True, "worker_fitted": True,
+           "reads_applied": 3})
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is True and verdict["ranks"] == ["PP0_TP0"]
     assert verdict["ranks_armed"] == 1 and verdict["reads_applied"] == 3, \
         "the worker's own applied-read count is the scheduler's only evidence"
+    assert verdict["stale_arm_claims"] == 0
+
+    # CASE 5 - `not_configured` is a PER-RANK env fact the arm file cannot see:
+    # this worker has no disk root, so it cannot name a path. A real veto.
+    write({"installed": True, "armed": False, "worker_fitted": True,
+           "service_reason_kind": "not_configured"})
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is False
+    assert "no disk root" in verdict["reason"]
 
     # Freshness and unreadable files, unchanged in meaning.
-    write({"installed": True, "armed": True}, ts=time.time() - 3600.0)
+    write({"installed": True, "armed": True, "worker_fitted": True},
+          ts=time.time() - 3600.0)
     assert disk_restore.worker_proof(force=True)["ok"] is False, \
         "a heartbeat from a worker that may be gone proves nothing"
-    write({"installed": True, "armed": True})
+    write({"installed": True, "armed": True, "worker_fitted": True})
     (directory / "rank-huge.json").write_text(
         "x" * (disk_restore.MAX_RANK_FILE_BYTES + 10))
     (directory / "rank-broken.json").write_text("{ not json")
     assert disk_restore.worker_proof(force=True)["ok"] is True, \
         "one unreadable file is not evidence against the readable one"
 
+    # The arm file's EXPIRY belongs to the arm file: the proof refuses through it.
+    arm(seconds=-5)
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["ok"] is False
+    assert verdict["reason_kind"] == "tier_arm_disarmed"
+    assert "expired" in verdict["reason"]
 
-def test_one_disarmed_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
-    """THE INCIDENT, as a test: 1 rank armed, 1 rank not, 0 offers.
+
+def test_one_unrefused_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
+    """THE INCIDENT, as a test: 1 rank serving, 1 rank that cannot bind, 0 offers.
 
     The load event spans every rank, so a rank that passes disk entries through "as
     though it had none" leaves blocks the fork already committed to - which the
@@ -630,10 +686,19 @@ def test_one_disarmed_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
     that accepted "some of my ranks serve" would have authorised every one of the
     123,474 offers. The bar is AND over the live ranks, and the refusal names the
     split so a reader sees a partial fleet instead of inferring one.
+
+    0.2.28 changed WHICH field spells the refusal: a rank that cannot serve is one
+    whose WORKER HALF IS NOT FITTED (a fact the rank file uniquely knows), not one
+    whose lagged `armed` mirror says no - the tier arm moved to its authoritative
+    copy, the arm file. Both refusals below read through the same
+    `scheduler_armed_workers_disarmed` kind, so the gate's incident defence is
+    byte-identical.
     """
     directory = tmp_path / "diag"
     directory.mkdir()
     monkeypatch.setattr(config, "diagnostics_dir", lambda: directory)
+    (directory / disk_spill.ARM_FILE).write_text(json.dumps(
+        {"armed": True, "expires_ts": time.time() + 600}))
 
     def write(rank, section):
         document = {"version": 1, "epoch": "aabbccdd",
@@ -643,9 +708,10 @@ def test_one_disarmed_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
                     "disk_restore": section}
         (directory / f"rank-{rank}.json").write_text(json.dumps(document))
 
-    write("PP0_TP0", {"installed": True, "armed": True, "reads_applied": 7})
-    write("PP1_TP0", {"installed": True, "armed": False,
-                      "reason": "the disk tier is disarmed"})
+    write("PP0_TP0", {"installed": True, "armed": True, "worker_fitted": True,
+                      "reads_applied": 7})
+    write("PP1_TP0", {"installed": True, "armed": True, "worker_fitted": False,
+                      "service_reason_kind": "worker_half_not_fitted"})
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is False, "a partial fleet is a refusal, not a partial offer"
     assert verdict["reason_kind"] == "scheduler_armed_workers_disarmed"
@@ -656,7 +722,8 @@ def test_one_disarmed_rank_vetoes_the_whole_scheduler(tmp_path, monkeypatch):
     assert verdict["reads_applied"] == 7
 
     # Pull the veto and the same two files prove the fleet.
-    write("PP1_TP0", {"installed": True, "armed": True, "reads_applied": 2})
+    write("PP1_TP0", {"installed": True, "armed": True, "worker_fitted": True,
+                      "reads_applied": 2})
     verdict = disk_restore.worker_proof(force=True)
     assert verdict["ok"] is True and verdict["ranks_armed"] == 2
     assert verdict["reads_applied"] == 9
@@ -1869,6 +1936,30 @@ def test_worker_report_is_an_allow_listed_rank_file_section(armed):
     assert first.get("registered") is True or first.get("ok") is True
     again = disk_restore.register_contribution()
     assert again.get("registered") is True or again.get("ok") is True
+
+
+def test_the_worker_report_publishes_the_per_rank_facts_and_a_change_signal(
+        armed):
+    """0.2.28: the rank file carries the facts the scheduler's proof reads PER RANK
+    (`worker_fitted`, `service_reason_kind`) - and registers a change SIGNAL so an
+    arm transition rewrites the file on the next step instead of waiting for the
+    spill cadence that never comes on an idle box.
+
+    The proof stopped ASKING the rank files about the tier arm (that moved to the
+    arm file, its authoritative copy - see the drain suite); what it still reads
+    here is exactly what these two fields say, and what the signal keeps fresh.
+    """
+    report = disk_restore.worker_report()
+    assert isinstance(report["worker_fitted"], bool)
+    assert report["service_reason_kind"] is None or isinstance(
+        report["service_reason_kind"], str)
+    assert disk_restore.register_contribution()["registered"] is True
+    signature = worker_diag._signature(object(), 0)
+    rows = dict(signature[-1])
+    assert "disk_restore" in rows, (
+        "the restore contribution registers a change signal, so an arm transition "
+        "alone forces a rank-file rewrite (defence in depth for the idle-box hole "
+        "the arm-file read closes properly)")
 
 
 def test_section_reports_the_whole_state(armed):

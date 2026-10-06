@@ -69,21 +69,36 @@ logged once per episode (`notice_once`, the `miss_attribution` idiom), counted a
 `journal_tmpfs_warnings`, and published as `journal_on_tmpfs` / `journal_dir=tmpfs`
 on the boot line. It must never raise and must never refuse to spill.
 
-THE READER SPENDS ITS BUDGET ON THE NEWEST LINES, NOT THE OLDEST
+THE READER DRAINS EVERY JOURNAL FRONT TO BACK, IN BOUNDED PASSES
 ----------------------------------------------------------------
-A journal is append-only, so a cursor that walks front-to-back hands the index the
-spills the tier has ALREADY SERVED and leaves the recent ones - the ones a restore is
-waiting for - to be reached last. On 2026-10-05 that meant 0 of the 36 newest
-identities were known to the index while four journals sat ~60k lines deep and one
-refresh carried a tenth of one of them. `refresh()` now takes each journal's window
-from the END of its unread run, and gives every journal a SHARE of the byte and line
-budgets instead of letting the first rank spend it all. Whatever a pass cannot carry is
-forfeited - and forfeiting is safe ONLY because of the ordering it preserves: every
-forfeited line is older than every applied line, so the applied stream is still exactly
-the file's order (`+` then `-` still means gone), and the entries the skipped region
-taught are forgotten outright. The caps are unchanged; what was missing was an
-admission. `lag_bytes`, `lag_journals`, `catch_up_jumps`, `bytes_skipped` and
-`lines_skipped` say how far behind the reader is and what it gave up to get there.
+A journal is append-only, and the only way the index can be honest about what it has
+read is to read it IN ORDER. Two failures framed this rule from opposite ends. On
+2026-10-05 a cursor that walked from byte 0 with one shared budget left the NEWEST
+spills unread (0 of 36 just-spilled identities known while four journals sat ~60k
+lines deep), and the 0.2.22 answer was to read each journal's TAIL and FORFEIT
+everything older. That fixed the afternoon and caused the next one: a forfeited region
+is UNRECOVERABLE (the cursor jumps to end-of-file and cursors only ever advance), the
+jump lands `lag_bytes` at zero so the index reads as caught up while it is blind, and
+a box with 4.7 MB / 132,099 journalled records and ~6,290 net-live identities
+reported `entries: 146` for hours while `no_disk_run` refused every offer. A restart
+did not help: 1.4 MB is still deeper than one refresh's share, so the first pass
+buried the history again, deterministically.
+
+The rule now is a DRAIN. A refresh reads from each journal's cursor FORWARD, applies
+whole lines in the file's own order, and RETURNS WITH THE CURSOR SHORT OF EOF when
+its budget binds; the next refresh continues where this one stopped. The first
+refresh of a process runs several such passes under its own larger budget
+(`BOOT_DRAIN_MAX_BYTES`, `BOOT_DRAIN_DEADLINE_SECONDS`) so a cold boot converges
+before the first offer instead of dozens of one-second refreshes later; every later
+refresh is ONE bounded pass, exactly the old caps. A partial-but-advancing index is
+strictly better than partial-and-frozen: the drain cannot lose history, converges in
+a number of passes a reader can compute (`unread_bytes / share`), and every
+intermediate state is publishable. While any cursor is short of its journal's end the
+index says so (`converged: false`, `lag_bytes`, `unread_journals` naming each
+journal and its unread bytes), and a `not_present` out of a partial index is a
+statement about the READER, never about the store. The one legitimate use of
+`_forget_rank` that remains is an externally TRUNCATED journal, where the bytes the
+entries were learned from no longer exist.
 
 THE INDEX MAY ONLY EVER BE STALE IN THE SAFE DIRECTION
 ------------------------------------------------------
@@ -143,13 +158,23 @@ MAX_JOURNAL_FILES = 64              # journal FILES one refresh will open
 MAX_LINES_PER_REFRESH = 8_192       # LINES applied per refresh (bounded work)
 MAX_READ_PER_REFRESH = 512 * 1024   # BYTES read across all journals per refresh
 # THE FLOOR ON ONE JOURNAL'S SHARE of a refresh's budget. Below this a window is
-# smaller than one rank's newest spill burst and the catch-up rule below would buy
-# nothing; the TOTAL cap (`MAX_READ_PER_REFRESH`) is still what one refresh reads.
+# smaller than one rank's newest spill burst; the TOTAL cap (`MAX_READ_PER_REFRESH`)
+# is still what one refresh reads.
 MIN_JOURNAL_WINDOW_BYTES = 4 * 1024  # BYTES: the smallest share one journal gets
-# BYTES scanned forward from a mid-line offset to find the next line start. Bounded
-# because it is a read on the lookup path; a journal whose lines are longer than
-# this simply yields no window this pass (a missed restore, never a half-line).
-CATCHUP_ALIGN_PROBE_BYTES = 64 * 1024
+# THE BOOT DRAIN: the FIRST refresh of a process may make several bounded passes so a
+# cold boot with deep journals converges BEFORE the first offer instead of one share
+# per second afterwards. The bounds are total bytes READ and wall time for that first
+# refresh only - every later refresh is one pass under `MAX_READ_PER_REFRESH` /
+# `MAX_LINES_PER_REFRESH` exactly as before. 32 MiB covers four 32 MiB-cap'd journals
+# at 512 KiB passes only partially; what matters is that neither bound can stall a
+# boot: on the observed shape (4 journals, 4.7 MB, 132k records) the drain reads
+# every byte in ONE refresh in well under a second, and a box that exceeds either
+# bound simply keeps `converged: false` and finishes through ordinary refreshes.
+BOOT_DRAIN_MAX_BYTES = 32 * 1024 * 1024   # BYTES the first refresh may read in total
+BOOT_DRAIN_DEADLINE_SECONDS = 5.0         # SECONDS the first refresh may take
+# HOW MANY journals the per-journal unread map names in a payload before the rest are
+# folded into `unread_journals_omitted`. The bytes are always summed; only names cap.
+MAX_LAG_NAMED_JOURNALS = 8
 MAX_JOURNAL_RANK_CHARS = 32         # CHARS of a rank id in a journal file name
 # HOW MANY RANKS one identity may be recorded as written by. A parked span is one
 # file PER RANK (each names it with its own geometry digest), so the honest answer to
@@ -258,7 +283,17 @@ _state: dict = {
     "removals": 0,
     "misses": 0,
     "hits": 0,
+    # THE DRAIN: whether the first refresh has run, whether every cursor sits at its
+    # journal's end, the total bytes this process has read out of the journals, and
+    # the per-journal unread bytes measured at the last real refresh.
+    "boot_drained": False,
+    "converged": False,
+    "bytes_read": 0,
+    "unread_journals": {},
     "entries_dropped": 0,
+    # THE ENTRY CAP'S OWN TRUTH: set the first time the cap drops an entry, and
+    # published so no payload can present a capped index as a caught-up one.
+    "entry_cap_hit": False,
     "dropped": {reason: 0 for reason in DROP_REASONS},
     "journal_writes": 0,
     "journal_write_errors": 0,
@@ -285,9 +320,13 @@ _state: dict = {
     # the lag is made of, and this module does not guess numbers it has not read.
     "lag_bytes": 0,
     "lag_journals": 0,
-    # WHAT THE NEWEST-FIRST RULE FORFEITED: lines and bytes passed over without being
-    # applied, plus how many times a journal had to jump forward to reach its tail.
-    # A jump is not free - it forgets what that rank taught us - so it is counted.
+    # WHAT A READER FORFEITED. The 0.2.28 drain makes these STRUCTURALLY ZERO for a
+    # fresh boot - a journal's body is now drained, never skipped - and they stay
+    # published for two reasons: a process whose journal was STOPPED by a malformed
+    # line still counts the lines after it (permanently unread), and a payload
+    # produced by an older plugin still has to mean the same thing to a reader.
+    # Any non-zero `bytes_skipped`/`catch_up_jumps` is forfeited history and every
+    # view must say so: spans in a region that was skipped are NOT KNOWABLE.
     "bytes_skipped": 0,
     "lines_skipped": 0,
     "catch_up_jumps": 0,
@@ -320,7 +359,9 @@ def reset_state_for_tests() -> None:
         "rank_records_dropped": 0, "membership_checks": 0,
         "cursors": {}, "seq": {}, "stopped": {},
         "applied": 0, "spills": 0, "removals": 0, "misses": 0, "hits": 0,
-        "entries_dropped": 0,
+        "boot_drained": False, "converged": False, "bytes_read": 0,
+        "unread_journals": {},
+        "entries_dropped": 0, "entry_cap_hit": False,
         "dropped": {reason: 0 for reason in DROP_REASONS},
         "journal_writes": 0, "journal_write_errors": 0,
         "journal_last_error": None, "journal_dir": None,
@@ -349,7 +390,44 @@ def counters() -> dict:
     out = dict(_state)
     out["entries"] = int(len(_state["entries"]))
     out["rank_lines"] = int(len(_state["rank_lines"]))
+    out["unread_journals"] = _unread_view()
     return out
+
+
+def index_lag() -> dict:
+    """THE DRAIN'S STATE, in memory only: what this index has NOT read, and what it
+    once forfeited. Never a stat, never a scan - this is what the offer path reads to
+    keep a `no_disk_run` refusal honest.
+
+    Two different blindnesses, kept apart because they read differently:
+
+      * `converged: false` with `lag_bytes` > 0 means the drain is IN PROGRESS: the
+        unread region is named in `unread_journals` and will be read. A `not_present`
+        for a span that might live in it is "spilled but not yet indexed", never
+        "never spilled".
+      * `catch_up_jumps`/`bytes_skipped` non-zero means history was FORFEITED (the
+        0.2.22 reader, or a build from before this one): those regions are NOT
+        KNOWABLE for this process for as long as it runs - a cursor only ever
+        advances. Both readings mean `no_disk_run` cannot conclude "never spilled".
+    """
+    unread = _unread_view()
+    return {"converged": bool(_state["converged"]),
+            "boot_drained": bool(_state["boot_drained"]),
+            "lag_bytes": int(_state["lag_bytes"]),
+            "lag_journals": int(_state["lag_journals"]),
+            "unread_journals": dict(sorted(unread.items(),
+                                           key=lambda row: -row[1])
+                                   [:MAX_LAG_NAMED_JOURNALS]),
+            "unread_journals_omitted": max(0, len(unread)
+                                           - MAX_LAG_NAMED_JOURNALS),
+            "catch_up_jumps": int(_state["catch_up_jumps"]),
+            "bytes_skipped": int(_state["bytes_skipped"]),
+            "lines_skipped": int(_state["lines_skipped"]),
+            "bytes_read": int(_state["bytes_read"]),
+            "entry_cap_hit": bool(_state["entry_cap_hit"]),
+            "entries_dropped": int(_state["entries_dropped"]),
+            "journals_stopped": sorted(str(os.path.basename(str(p)))
+                                       for p in _state["stopped"])}
 
 
 # --- small helpers ------------------------------------------------------------
@@ -985,34 +1063,39 @@ def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
 def refresh(*, force: bool = False) -> dict:
     """Apply every rank's new journal lines. Cheap, bounded, never raises.
 
-    Called from the lookup path, so the whole refresh is bounded by
-    `MAX_JOURNAL_FILES` files, `MAX_READ_PER_REFRESH` bytes and
-    `MAX_LINES_PER_REFRESH` lines, and each file's read is bounded by its share of
-    the same budget. A refresh opens at most one `stat` per journal and reads only
-    the bytes after its cursor, so an idle store costs one stat per rank.
+    THE DRAIN RULE. Each journal is replayed FROM ITS CURSOR FORWARD: a pass reads
+    at most the journal's share of `MAX_READ_PER_REFRESH` bytes and
+    `MAX_LINES_PER_REFRESH` lines, applies whole lines in the file's own order, and
+    if the unread run is deeper than that it leaves the cursor short of end-of-file
+    and the NEXT refresh continues from there. Nothing is forfeited: the index is
+    temporarily partial-but-advancing, which is observable (`lag_bytes`,
+    `unread_journals`, `converged: false`) and strictly better than the 0.2.22
+    behavior of jumping to the tail, forgetting the rank's history and reporting
+    `lag_bytes: 0` forever after (the `entries: 146` over 132,099 records incident).
 
-    THE BUDGET IS SPENT ON THE NEWEST LINES, NOT THE OLDEST, and that is the whole
-    point of this function. A journal is append-only, so a front-to-back cursor hands
-    the index the SPILLS THE TIER HAS ALREADY SERVED and leaves the lines the restore
-    path is waiting for - the ones written minutes ago - to be reached last. On
-    2026-10-05 that cost 0 of 36 newest identities: four journals ~60k lines deep,
-    one refresh covering a tenth of one of them, and the offer path asking about the
-    span it had parked seconds earlier. The rule now is: read what the budget
-    carries, taking the END of the unread run; forfeit whatever that leaves behind,
-    count it, and say so. Forfeiting is the SAFE direction because every line left
-    unread is OLDER than every line applied (see `_apply_journal`), and the rank's
-    previously-learned entries are dropped when a jump forfeits them, so the index
-    never keeps a claim it did not just read.
+    THE BOOT DRAIN. The FIRST refresh of this process repeats the bounded pass until
+    every journal's cursor reaches end-of-file, bounded TOTAL by
+    `BOOT_DRAIN_MAX_BYTES` bytes read and `BOOT_DRAIN_DEADLINE_SECONDS` of wall time;
+    either bound ending the loop is normal (logged, `converged: false`) and ordinary
+    refreshes finish the job. It runs wherever the first refresh runs - the
+    scheduler's offer path (`disk_restore._refresh_index`) - so a cold boot pays it
+    inside the FIRST offer attempt rather than spreading it over a minute of
+    one-second refreshes.
 
-    `force` ignores the age floor (a verb that wants the truth right now); the
-    lookup path uses the floor so a burst of requests does not turn into a burst
-    of stats.
+    WORK BOUND (the invariant the offer path depends on): any refresh after the
+    first reads at most `MAX_READ_PER_REFRESH` bytes and applies at most
+    `MAX_LINES_PER_REFRESH` lines, opens at most `MAX_JOURNAL_FILES` files and one
+    `stat` per journal; an idle store costs one stat per rank. `force` ignores the
+    age floor (a verb that wants the truth right now); the lookup path uses the
+    floor so a burst of requests does not turn into a burst of stats.
     """
     started = time.monotonic()
     out = {"ok": True, "reason": None, "journals": 0, "lines": 0, "spills": 0,
            "removals": 0, "dropped": 0, "entries": int(len(_state["entries"])),
            "applied": False, "lag_bytes": 0, "lag_journals": 0,
-           "bytes_skipped": 0, "lines_skipped": 0, "jumps": 0}
+           "bytes_skipped": 0, "lines_skipped": 0, "jumps": 0,
+           "bytes_read": 0, "converged": bool(_state["converged"]),
+           "unread_journals": _unread_view()}
     try:
         directory = journal_directory()
         if directory is None:
@@ -1044,41 +1127,67 @@ def refresh(*, force: bool = False) -> dict:
         if not names:
             out["reason"] = ("no spill journal file exists in the diagnostics "
                              "directory: no rank has spilled anything yet")
+            # Nothing to read is caught up, at least as far as any cursor is
+            # concerned - and it stays so even before the first boot drain, which
+            # had no journal to drain.
+            _state["converged"] = True
+            out["converged"] = True
             return out
-        budget = MAX_READ_PER_REFRESH
-        lines = MAX_LINES_PER_REFRESH
-        # EVERY JOURNAL GETS A SHARE, not whatever the previous one left over. One
-        # rank reading the whole budget is one rank reading NOTHING, and a span needs
-        # every rank to have journalled it: a partially-caught-up index is the one
-        # shape that turns "the file is gone" into a offered load that fails. The
-        # TOTAL caps are still what one refresh may read and apply; the share only
-        # decides how that budget is divided.
-        share_bytes = max(MIN_JOURNAL_WINDOW_BYTES,
-                          MAX_READ_PER_REFRESH // max(1, len(names)))
-        share_lines = max(1, MAX_LINES_PER_REFRESH // max(1, len(names)))
-        for name in names:
-            path = os.path.join(directory, name)
-            out["journals"] += 1
-            want_bytes = min(share_bytes, budget)
-            want_lines = min(share_lines, lines)
-            if want_bytes <= 0 or want_lines <= 0:
-                _state["dropped"]["read_cap"] += 1
-                out["dropped"] += 1
-                continue
-            result = _apply_journal(path, want_bytes, want_lines)
-            budget -= int(result["read"])
-            lines -= int(result["applied"])
-            out["lines"] += int(result["applied"])
-            out["spills"] += int(result["spills"])
-            out["removals"] += int(result["removals"])
-            out["lag_bytes"] += int(result["lag_bytes"])
-            out["bytes_skipped"] += int(result["bytes_skipped"])
-            out["lines_skipped"] += int(result["lines_skipped"])
-            out["jumps"] += int(result["jumps"])
-            if int(result["lag_bytes"]) > 0:
-                out["lag_journals"] += 1
+        boot = not _state["boot_drained"]
+        _state["boot_drained"] = True
+        deadline = started + BOOT_DRAIN_DEADLINE_SECONDS if boot else None
+        unread: dict = {}
+        last_lag = None
+        while True:
+            pass_budget = MAX_READ_PER_REFRESH
+            if boot:
+                left = BOOT_DRAIN_MAX_BYTES - out["bytes_read"]
+                if left <= 0:
+                    _note(f"the boot drain stopped at its {BOOT_DRAIN_MAX_BYTES}-"
+                          "byte budget with unread journal bytes left; ordinary "
+                          "refreshes will finish the drain (converged: false "
+                          "until they do)")
+                    break
+                pass_budget = min(pass_budget, left)
+            res = _refresh_pass(directory, names, pass_budget, unread)
+            out["journals"] += res["journals"]
+            out["lines"] += res["applied"]
+            out["spills"] += res["spills"]
+            out["removals"] += res["removals"]
+            out["dropped"] += res["dropped"]
+            out["lag_bytes"] = res["lag_bytes"]
+            out["lag_journals"] = res["lag_journals"]
+            out["bytes_skipped"] += res["bytes_skipped"]
+            out["lines_skipped"] += res["lines_skipped"]
+            out["jumps"] += res["jumps"]
+            out["bytes_read"] += res["read"]
+            if res["lag_bytes"] <= 0:
+                break
+            if not boot:
+                break
+            if last_lag is not None and res["lag_bytes"] == last_lag:
+                # A pass that changed nothing (a torn tail line the writer has not
+                # finished, or a read that failed): re-reading the same bytes in a
+                # tight loop would spin the boot deadline away for the same view.
+                # The next refresh - one floor interval away - tries again.
+                break
+            last_lag = int(res["lag_bytes"])
+            if time.monotonic() >= deadline:
+                _note(f"the boot drain stopped at its "
+                      f"{BOOT_DRAIN_DEADLINE_SECONDS}s deadline with "
+                      f"{res['lag_bytes']} unread journal bytes over "
+                      f"{res['lag_journals']} journal(s); ordinary refreshes will "
+                      "finish the drain (converged: false until they do)")
+                break
         _state["lag_bytes"] = int(out["lag_bytes"])
         _state["lag_journals"] = int(out["lag_journals"])
+        _state["bytes_read"] = int(_state["bytes_read"]) + out["bytes_read"]
+        _state["unread_journals"] = dict(
+            sorted(unread.items(), key=lambda row: -row[1])
+            [:MAX_LAG_NAMED_JOURNALS])
+        _state["converged"] = out["lag_bytes"] <= 0
+        out["converged"] = bool(_state["converged"])
+        out["unread_journals"] = _unread_view()
         out["entries"] = int(len(_state["entries"]))
         out["applied"] = out["lines"] > 0
         out["elapsed_seconds"] = round(time.monotonic() - started, 6)
@@ -1091,6 +1200,57 @@ def refresh(*, force: bool = False) -> dict:
         out["reason"] = f"the journal refresh raised {type(exc).__name__}"
         out["ok"] = False
         return out
+
+
+def _unread_view() -> dict:
+    """A copy of the per-journal unread map (basename -> bytes). Never the live one."""
+    return {str(name): int(value)
+            for name, value in _state["unread_journals"].items()}
+
+
+def _refresh_pass(directory, names, byte_budget, unread_out) -> dict:
+    """ONE bounded pass over every journal. `unread_out` learns per-journal bytes.
+
+    The TOTAL caps (`byte_budget`, `MAX_LINES_PER_REFRESH`) bind the whole pass; the
+    SHARE of each journal only decides how the budget is divided, so one deep rank
+    cannot starve the others. A span needs EVERY rank to have journalled it, so a
+    uniformly-behind drain is honest where a partially-caught-up index would turn
+    "the file is gone for rank 3" into an offered load that fails.
+    """
+    res = {"journals": 0, "applied": 0, "spills": 0, "removals": 0, "dropped": 0,
+           "lag_bytes": 0, "lag_journals": 0, "bytes_skipped": 0,
+           "lines_skipped": 0, "jumps": 0, "read": 0}
+    budget = int(byte_budget)
+    lines = MAX_LINES_PER_REFRESH
+    share_bytes = max(MIN_JOURNAL_WINDOW_BYTES,
+                      MAX_READ_PER_REFRESH // max(1, len(names)))
+    share_lines = max(1, MAX_LINES_PER_REFRESH // max(1, len(names)))
+    for name in names:
+        path = os.path.join(directory, name)
+        res["journals"] += 1
+        want_bytes = min(share_bytes, budget)
+        want_lines = min(share_lines, lines)
+        if want_bytes <= 0 or want_lines <= 0:
+            _state["dropped"]["read_cap"] += 1
+            res["dropped"] += 1
+            continue
+        result = _apply_journal(path, want_bytes, want_lines)
+        budget -= int(result["read"])
+        lines -= int(result["applied"])
+        res["applied"] += int(result["applied"])
+        res["spills"] += int(result["spills"])
+        res["removals"] += int(result["removals"])
+        res["read"] += int(result["read"])
+        res["lag_bytes"] += int(result["lag_bytes"])
+        res["bytes_skipped"] += int(result["bytes_skipped"])
+        res["lines_skipped"] += int(result["lines_skipped"])
+        res["jumps"] += int(result["jumps"])
+        if int(result["lag_bytes"]) > 0:
+            res["lag_journals"] += 1
+            unread_out[os.path.basename(path)] = int(result["lag_bytes"])
+        else:
+            unread_out.pop(os.path.basename(path), None)
+    return res
 
 
 def _journal_names(directory) -> list:
@@ -1112,67 +1272,39 @@ def _journal_names(directory) -> list:
     return names
 
 
-def _align_forward(path, start: int, size: int) -> int:
-    """The first line boundary at or after `start`, or `size` if there is none.
-
-    WHY THIS EXISTS: a window taken from mid-file starts mid-line, and a half line
-    is a MALFORMED line - which `_apply_line` answers by stopping that journal for
-    the rest of the boot. So a tail window is worthless unless it begins on a line
-    boundary, and this is the one read that pays for the privilege: at most
-    `CATCHUP_ALIGN_PROBE_BYTES`, looking for a newline.
-
-    `start > 0` is checked against the byte BEFORE it, because "the byte before the
-    window is a newline" is exactly the statement "the window starts a line".
-    """
-    if start <= 0:
-        return 0
-    if start >= size:
-        return size
-    probe = min(CATCHUP_ALIGN_PROBE_BYTES, max(1, size - start + 1))
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(start - 1)
-            raw = handle.read(probe)
-    except OSError as exc:
-        _note(f"{os.path.basename(path)} could not be read to align a catch-up "
-              f"window: {type(exc).__name__}")
-        return size
-    if not raw:
-        return size
-    if raw[0] == 0x0A:
-        return start
-    found = raw.find(b"\n", 1)
-    if found < 0:
-        # No line start inside the probe: the window would open mid-line, and an
-        # unread pass is better than a journal stopped by its own first half-line.
-        return size
-    return start + found
-
-
 def _apply_journal(path, budget, line_budget) -> dict:
-    """Replay the NEWEST part of one journal that `budget` can carry.
+    """Replay the NEXT bounded run of one journal, FROM ITS CURSOR FORWARD.
 
     Returns `{read, applied, spills, removals, lag_bytes, bytes_skipped,
     lines_skipped, jumps}`.
 
+    THE DRAIN, NOT THE JUMP. The window is the FIRST `budget` bytes after the cursor
+    - the file's own next lines - never a tail window. When the unread run is deeper
+    than `budget` (or holds more complete lines than `line_budget`), the pass applies
+    what fits, advances the cursor only past the lines it APPLIED, and leaves the
+    rest as `lag_bytes` for the next refresh. Nothing is forfeited and nothing is
+    forgotten: an entry the index claims was read, an entry it does not claim was
+    either never journalled, removed, or is sitting in a region the payload names
+    (`unread_journals`). The 0.2.22 rule - read the tail, `_forget_rank` the
+    skipped history, land the cursor at EOF - is GONE, and with it the "don't
+    re-read history" optimization: it bought freshness with unrecoverable amnesia
+    (the cursor jump put `lag_bytes` at 0 on a blind index, and a restart re-buried
+    the same 1.4 MB on its first pass). Freshness without amnesia is what the boot
+    drain plus the per-second share provide: a writer would have to out-run
+    `MAX_READ_PER_REFRESH` bytes per second for the unread run to grow at all, and
+    the journals of the incident boot grew ~80 bytes a minute.
+
     Only COMPLETE lines (ending in a newline) are applied, and the cursor only ever
-    advances to the last newline: a line the writer is halfway through is nobody's
-    fact yet. A file that got SMALLER was truncated by someone who is not this
-    plugin - the entries contributed by that rank are dropped, because we can no
-    longer tell what they were, and the replay starts from the top.
+    advances to the end of the last APPLIED line: a line the writer is halfway
+    through is nobody's fact yet, and lines past the line cap are not read YET, not
+    read-and-discarded. A file that got SMALLER was truncated by someone who is not
+    this plugin - the entries contributed by that rank are dropped, because we can
+    no longer tell what they were (the bytes they were learned from are gone; this
+    is the one legitimate `_forget_rank`), and the replay starts from the top.
 
-    NEWEST-FIRST, AND WHY IT IS THE SAFE DIRECTION. When the unread run is bigger
-    than this pass can carry, the window is taken from the END of the file and the
-    older bytes are forfeited - and forfeiting is only safe because of the ordering
-    it preserves: every forfeited line is OLDER than every applied line, so the
-    applied stream is still exactly the file's order. A `+` we read is a file we saw
-    written; a `-` we read for an identity we never learned is a no-op; a `-` we
-    forfeit can only leave an entry we have JUST forgotten, which is why
-    `_forget_rank(path)` runs before the window is applied. Nothing this does can
-    manufacture a presence the journal did not describe in the window it read.
-
-    The same rule applies inside a window when `line_budget` binds: the OLDEST lines
-    of the window are the ones forfeited.
+    A line the reader cannot interpret STOPS this journal (see `_stop`): the lines
+    after the stop are counted in `lines_skipped` because for THIS journal they are
+    permanently unread - the only shape of skip the drain cannot promise to repair.
     """
     out = {"read": 0, "applied": 0, "spills": 0, "removals": 0, "lag_bytes": 0,
            "bytes_skipped": 0, "lines_skipped": 0, "jumps": 0}
@@ -1202,42 +1334,15 @@ def _apply_journal(path, budget, line_budget) -> dict:
         return out
     if size <= cursor:
         return out
-    window = min(max(int(budget), 0), size)
+    window = min(max(int(budget), 0), size - cursor)
     if window <= 0:
         _state["dropped"]["read_cap"] += 1
+        out["lag_bytes"] = size - cursor
         return out
-    if size - cursor > window:
-        # BURIED. Reach the tail and forget the rest of this rank's history, which
-        # is the only way the index can be honest about a claim it did not read.
-        # The sequence is deliberately NOT reset: it still increases, and a reset
-        # would let an old line be applied twice.
-        start = _align_forward(path, size - window, size)
-        if start >= size:
-            # No line start to be found inside the probe. Reading would open on a
-            # half-line and STOP this journal for the boot, so this pass reads
-            # nothing and says how far behind that leaves us.
-            out["lag_bytes"] = size - cursor
-            return out
-        if start > cursor:
-            skipped = start - cursor
-            _forget_rank(path)
-            out["bytes_skipped"] = skipped
-            out["jumps"] = 1
-            _state["bytes_skipped"] = int(_state["bytes_skipped"]) + skipped
-            _state["catch_up_jumps"] += 1
-            _note(f"{os.path.basename(path)} is {size - cursor} bytes ahead of its "
-                  f"cursor and one refresh carries {window}: reading the newest "
-                  f"{size - start} bytes and forgetting what this rank taught us "
-                  "from the skipped bytes (a forgotten entry is a missed restore, "
-                  "never a wrong one)")
-            cursor = start
-    if size <= cursor:
-        return out
-    want = min(size - cursor, window)
     try:
         with open(path, "rb") as handle:
             handle.seek(cursor)
-            raw = handle.read(want)
+            raw = handle.read(window)
     except OSError as exc:
         _note(f"{os.path.basename(path)} could not be read: "
               f"{type(exc).__name__}")
@@ -1249,33 +1354,42 @@ def _apply_journal(path, budget, line_budget) -> dict:
         out["lag_bytes"] = size - cursor
         return out
     body = raw[:last_newline + 1]
-    lines = body.decode("utf-8", errors="replace").splitlines()
-    if len(lines) > int(line_budget):
-        # Forfeit the OLDEST lines of the window, never the newest: same ordering
-        # rule as the byte window above, applied one level down.
-        forfeit = len(lines) - int(line_budget)
-        lines = lines[forfeit:]
-        out["lines_skipped"] += forfeit
-        _state["lines_skipped"] = int(_state["lines_skipped"]) + forfeit
+    rows = body.split(b"\n")
+    rows.pop()                       # the body ends on its newline: tail is empty
+    complete = len(rows)
+    if complete > int(line_budget):
+        # PAUSE at the line cap: apply the FIRST `line_budget` lines and leave the
+        # rest unread. The old rule forfeited the OLDEST lines of a tail window;
+        # under the drain there is no window to trim, only a queue to work through.
+        rows = rows[:int(line_budget)]
         _state["dropped"]["line_cap"] += 1
     applied = 0
-    for index, text in enumerate(lines):
-        kind = _apply_line(text, path)
+    consumed = 0
+    for index, row in enumerate(rows):
+        kind = _apply_line(row.decode("utf-8", errors="replace"), path)
         if kind is None:
-            # The stream stopped being trustworthy: everything after it in this
-            # window goes unread too, and that is counted rather than silent.
-            out["lines_skipped"] += len(lines) - index
+            # The stream stopped being trustworthy: every complete line of this
+            # window from here on is permanently unread (the journal is stopped),
+            # and that is counted rather than silent.
+            out["lines_skipped"] += complete - index
             _state["lines_skipped"] = (int(_state["lines_skipped"])
-                                       + len(lines) - index)
-            break
+                                       + complete - index)
+            # Move the cursor past the whole window: the journal will never be
+            # applied again, so leaving its bytes "unread" would fake a drain that
+            # can never finish.
+            _state["cursors"][path] = cursor + last_newline + 1
+            out["read"] = window
+            out["lag_bytes"] = max(0, size - int(_state["cursors"][path]))
+            return out
+        consumed += len(row) + 1
         applied += 1
         if kind == SPILL_LINE:
             out["spills"] += 1
         else:
             out["removals"] += 1
-    _state["cursors"][path] = cursor + last_newline + 1
+    _state["cursors"][path] = cursor + consumed
     _state["last_journal"] = path
-    out["read"] = last_newline + 1
+    out["read"] = window
     out["applied"] = applied
     out["lag_bytes"] = max(0, size - int(_state["cursors"][path]))
     return out
@@ -1322,6 +1436,18 @@ def _record_rank(identity, path, size, seq) -> None:
     if rows is None:
         if int(_state["rank_records"]) >= MAX_RANK_RECORDS:
             _state["rank_records_dropped"] += 1
+            if notice_once(
+                    "rank-records-cap",
+                    f"the per-rank table reached its {MAX_RANK_RECORDS}-pair cap: "
+                    f"{int(_state['rank_records_dropped'])} rank record(s) refused "
+                    "so far (rank_records_dropped). An identity whose records a cap "
+                    "refused reads as FEWER ranks than it has - never a false "
+                    "presence, always a claim this index can no longer back. The "
+                    "converged drain makes this reachable on a big store: it means "
+                    "the live identity count times ranks has outgrown the table."):
+                _state["last_reason"] = (
+                    f"the per-rank table is at its {MAX_RANK_RECORDS}-pair cap "
+                    "(rank_records_dropped is counting what it refuses)")
             return
         rows = {}
         rank_lines[identity] = rows
@@ -1449,6 +1575,17 @@ def _insert(identity, size, path, group_id=None) -> None:
         _state["last_reason"] = (f"the index is at its {MAX_INDEX_ENTRIES}-entry "
                                  f"cap: {oldest} was dropped to admit a newer "
                                  "identity (a dropped entry is a missed restore)")
+        if notice_once(
+                "index-entry-cap",
+                f"the disk index reached its {MAX_INDEX_ENTRIES}-identity cap and "
+                f"is DROPPING THE OLDEST entries to admit newer ones "
+                f"(entries_dropped: {int(_state['entries_dropped'])}). A converged "
+                "drain over a big store can live at this cap: every dropped "
+                "identity is one the offer path will answer `not_present` for "
+                "although the file is on disk - a missed restore, never a wrong "
+                "one, but NOT a caught-up index either. The section publishes "
+                "`entry_cap_hit: true` beside the count."):
+            _state["entry_cap_hit"] = True
     entries[identity] = {"bytes": int(size), "journal": path,
                          "group": (int(group_id) if _is_plain_int(group_id)
                                    else None),
@@ -1570,7 +1707,17 @@ def membership(key) -> dict:
                 "lag_journals": int(_state["lag_journals"]),
                 "catch_up_jumps": int(_state["catch_up_jumps"]),
                 "bytes_skipped": int(_state["bytes_skipped"]),
-                "lines_skipped": int(_state["lines_skipped"])}
+                "lines_skipped": int(_state["lines_skipped"]),
+                # THE DRAIN: `converged: false` means a cursor sits short of its
+                # journal and the named `unread_journals` WILL be read; a
+                # `not_present` while it is false is the reader's silence, not the
+                # store's. Non-zero `catch_up_jumps`/`bytes_skipped` means an older
+                # build forfeited history - that region is not knowable at all.
+                "converged": bool(_state["converged"]),
+                "boot_drained": bool(_state["boot_drained"]),
+                "unread_journals": _unread_view(),
+                "bytes_read": int(_state["bytes_read"]),
+                "entry_cap_hit": bool(_state["entry_cap_hit"])}
         blank = {"key16": None, "group_id": None, "identity": None, "shard": None,
                  "bytes": 0, "bytes_all_ranks": 0, "journal": None, "rank": None,
                  "ranks": [], "ranks_present": 0, "index": view}
@@ -1708,6 +1855,10 @@ def section() -> dict:
         "rank_cap_per_identity": MAX_RANKS_PER_IDENTITY,
         "membership_checks": int(_state["membership_checks"]),
         "entries_dropped": int(_state["entries_dropped"]),
+        # THE ENTRY CAP, AS ITS OWN TRUTH: once true, this index answers
+        # `not_present` for identities whose files are on disk and were simply
+        # dropped to make room. A capped index is not a caught-up index.
+        "entry_cap_hit": bool(_state["entry_cap_hit"]),
         "bytes_indexed": int(_state["bytes_indexed"]),
         "journals_tracked": int(len(_state["cursors"])),
         "journals_stopped": sorted(_state["stopped"]),
@@ -1739,6 +1890,16 @@ def section() -> dict:
         "catch_up_jumps": int(_state["catch_up_jumps"]),
         "bytes_skipped": int(_state["bytes_skipped"]),
         "lines_skipped": int(_state["lines_skipped"]),
+        # THE DRAIN, AS DATA. `converged` is the one answer to "is this index done
+        # reading its journals?" - `lag_bytes: 0` alone could also mean a forfeit
+        # landed the cursor at EOF, which is exactly the blindness that hid the
+        # `entries: 146` for hours. `unread_journals` names each still-draining
+        # journal and its unread bytes; `bytes_read` totals what this process has
+        # actually pulled out of them.
+        "converged": bool(_state["converged"]),
+        "boot_drained": bool(_state["boot_drained"]),
+        "unread_journals": _unread_view(),
+        "bytes_read": int(_state["bytes_read"]),
         "applied_lines": int(_state["applied"]),
         "spills_seen": int(_state["spills"]),
         "removals_seen": int(_state["removals"]),
@@ -1781,8 +1942,23 @@ def section() -> dict:
                   "bytes_skipped": "journal bytes forfeited to reach the tail (unit: "
                                    "bytes, NOT lines: this module does not guess a "
                                    "line count it has not read)",
-                  "lines_skipped": "journal lines passed over without being applied "
-                                   "(the line cap, or a stopped stream)",
+                  "lines_skipped": "journal lines permanently unread: the lines "
+                                   "after a stream that stopped being trustworthy "
+                                   "(a journal the drain can never finish)",
+                  "converged": "true when every journal cursor sits at "
+                               "end-of-file; while false a not_present is the "
+                               "READER being behind, not the store being empty",
+                  "boot_drained": "whether the first-refresh drain has run in this "
+                                  "process",
+                  "unread_journals": "per-journal bytes the cursor has not reached "
+                                    "yet (unit: bytes; named newest-lagging first, "
+                                    "capped at MAX_LAG_NAMED_JOURNALS names)",
+                  "bytes_read": "bytes this process has read out of the journals "
+                                "since boot (unit: bytes)",
+                  "entry_cap_hit": "true once the MAX_INDEX_ENTRIES cap has dropped "
+                                   "even one identity: a capped index answers "
+                                   "not_present for files that ARE on disk - a "
+                                   "capped index is not a caught-up index",
                   "refreshes": "refreshes", "applied_lines": "lines",
                   "spills_seen": "files", "removals_seen": "files",
                   "lookup_hits": "lookups", "lookup_misses": "lookups",
@@ -1801,10 +1977,11 @@ def section() -> dict:
                  "journal costs a restore, and a file evicted but not yet "
                  "un-indexed costs a reported load failure (a recompute). No path "
                  "is published: four ranks name one identity four ways, so every "
-                 "worker resolves the name IT would have written. Read `lag_bytes` "
-                 "first: while it is non-zero this index has not read the newest "
-                 "spill lines, and a `not_present` is then a statement about the "
-                 "reader."),
+                 "worker resolves the name IT would have written. Read `converged` "
+                 "first: while it is false this index has not finished reading its "
+                 "journals (`lag_bytes` and `unread_journals` name the bytes and the "
+                 "files), and a `not_present` is then a statement about the reader, "
+                 "not the store - spilled-but-not-yet-indexed, not never-spilled.")
     }
 
 

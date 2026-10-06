@@ -344,7 +344,8 @@ def test_the_payload_names_the_armed_ranks_when_only_the_scheduler_is_armed(four
     published only `ranks_proven`, which reads as "nothing proven" rather than "4 live,
     0 servicing" - two different diagnoses, and only one of them is the incident.
     """
-    four_ranks({"armed": False, "reason": "the disk tier is disarmed"})
+    four_ranks({"worker_fitted": False,
+                "service_reason_kind": "worker_half_not_fitted"})
     disk_restore.set_offer_switch(True)
     section = disk_restore.scheduler_section()
     assert section["ranks_armed"] == 0
@@ -352,7 +353,8 @@ def test_the_payload_names_the_armed_ranks_when_only_the_scheduler_is_armed(four
     assert section["ranks_proven"] == 0
     assert section["offers_enabled"] is True, "the switch was up; the ranks were not"
     assert disk_restore.gate()["ranks_armed"] == "0/4"
-    # Arm the same fleet: the split moves, and nothing else about the payload does.
+    # Lift the veto on the same fleet: the split moves, and nothing else about the
+    # payload does.
     four_ranks({"armed": True, "reads": 1})
     armed = disk_restore.scheduler_section()
     assert armed["ranks_armed"] == 4 and armed["ranks_seen"] == 4
@@ -407,14 +409,25 @@ def test_the_offer_is_capped_below_the_incident_size(armed):
 
 # --- the incident's fuel: armed scheduler, disarmed workers -------------------
 
-def _rank(directory, rank, *, installed=True, armed=True, reads=0, reason=None):
-    """One rank file, in the shape `worker_diag` writes."""
+def _rank(directory, rank, *, installed=True, armed=True, reads=0, reason=None,
+          worker_fitted=True, service_reason_kind=None):
+    """One rank file, in the shape `worker_diag` writes.
+
+    0.2.28: the per-rank SERVICE facts are `worker_fitted` and
+    `service_reason_kind`; the TIER ARM is no longer read from these files at all
+    (the proof reads `disk-spill-arm.json` through `disk_spill._read_arm_file`,
+    boot fence intact), so a file's `armed: false` is a lagged mirror - counted as
+    a stale claim, never a veto. The incident shape (a rank that cannot bind) is
+    spelled `worker_fitted=False` now.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"rank-{rank}.json").write_text(json.dumps({
         "version": 1, "epoch": "aabbccdd", "ts": round(time.time(), 6),
         "role": "worker", "rank": rank, "arena": {}, "counters": {},
         "writer": {"epoch_scope": "process"},
         "disk_restore": {"installed": installed, "armed": armed,
+                         "worker_fitted": worker_fitted,
+                         "service_reason_kind": service_reason_kind,
                          "reads_applied": reads, "reason": reason}}))
 
 
@@ -448,6 +461,13 @@ def four_ranks(tmp_path, monkeypatch):
 
     RANKS = ("PP0_TP0", "PP1_TP0", "PP2_TP0", "PP3_TP0")
 
+    # THE ARM FILE, as the proof reads it now (0.2.28): the tier arm is a
+    # rank-agnostic boot fact owned by EngineCore, so a scheduler-side boot that
+    # is armed HAS the arm file - these tests patch `is_armed` for the GATE's
+    # cached read, and the proof's direct read needs the file itself.
+    (diag / disk_spill.ARM_FILE).write_text(json.dumps(
+        {"armed": True, "expires_ts": time.time() + 3600.0}))
+
     def write(shared=None, **by_rank):
         shared = shared or {}
         for rank in RANKS:
@@ -460,13 +480,20 @@ def four_ranks(tmp_path, monkeypatch):
     return write
 
 
-def test_armed_scheduler_with_disarmed_workers_offers_nothing(four_ranks):
-    """THE FUEL TEST: scheduler armed, every rank refusing, zero external tokens.
+def test_armed_scheduler_with_unrefused_workers_offers_nothing(four_ranks):
+    """THE FUEL TEST: scheduler armed, every rank unable to bind, zero external
+    tokens.
 
     This is the one line of gate logic that would have turned 123,474 load failures, a
     wedged harness and a watchdog reset into a boot that did nothing at all.
+
+    0.2.28 spells the incident as `worker_fitted=False` - the per-rank fact the
+    rank file uniquely knows. The rank files' `armed: false` no longer spells it:
+    that verdict is a lagged mirror of the arm file, and refusing on it is the
+    2026-10-20 lockout (pinned by `test_disk_index_journal_drain.py`).
     """
-    four_ranks({"armed": False, "reason": "the disk tier is disarmed"})
+    four_ranks({"worker_fitted": False,
+                "service_reason_kind": "worker_half_not_fitted"})
     disk_restore.set_offer_switch(True)
     gate = disk_restore.gate()
     assert gate["ok"] is False
@@ -479,10 +506,12 @@ def test_armed_scheduler_with_disarmed_workers_offers_nothing(four_ranks):
     assert counters["refused"]["workers_not_servicing"] == 1
     assert counters["slots_allocated"] == 0
     assert counters["offered_tokens"] == 0
-    assert "scheduler_armed_workers_disarmed" in str(counters["last_refusal"]) or \
-        "disarmed" in counters["last_reason"]
+    assert "workers_not_servicing" in str(counters["last_refusal"]) and \
+        "refuse disk service" in counters["last_reason"], \
+        "the refusal is carried by name AND by the rank-file split"
 
-    # Arm the same four ranks: the veto was the entire story, nothing else moved.
+    # Pull the veto on all four ranks: the veto was the entire story, nothing
+    # else moved.
     four_ranks({"armed": True, "reads": 2})
     assert disk_restore.gate()["ok"] is True
     assert offer(Manager(), Req(request_id="fuel-2", blocks=4)) == (4 * BLOCK, True)
@@ -496,7 +525,8 @@ def test_a_partial_fleet_refuses_like_a_whole_one(four_ranks):
     truncates the whole request - including the legitimate host-RAM hit it was riding
     with.
     """
-    four_ranks(**{rank: {"armed": False, "reason": "disarmed"}
+    four_ranks(**{rank: {"worker_fitted": False,
+                         "service_reason_kind": "worker_half_not_fitted"}
                   for rank in ("PP0_TP0", "PP1_TP0", "PP2_TP0")} |
                 {"PP3_TP0": {"armed": True, "reads": 4}})
     disk_restore.set_offer_switch(True)

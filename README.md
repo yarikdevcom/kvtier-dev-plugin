@@ -1243,7 +1243,8 @@ N-token host-RAM hit` warning; a flagged request the disk cannot serve stays sil
 leaves no allocation behind.
 
 **The index now reads the newest spill lines first, and publishes how far behind it is
-(0.2.22).** `refresh()` used to advance a per-journal cursor from byte 0, sharing one
+(0.2.22; the rule below was replaced by the 0.2.28 drain - kept here as history).** `refresh()` used to
+advance a per-journal cursor from byte 0, sharing one
 512 KiB / 8,192-line budget across every rank's journal. On four ~60k-line journals that
 covered about a tenth of one rank per pass, so the lines the restore path was waiting
 for - spills from the last few minutes, which is what "the GPU forgot this and RAM never
@@ -2069,6 +2070,85 @@ take effect** - it is engine-side code reached through the utility call, so the 
 boot keeps answering with the 0.2.25 payload until it is restarted into 0.2.26.
 
 Tests: `tests/test_disk_spill_rank_rollup.py`.
+
+### The buried journal: the index DRAINS now, and a partial index cannot masquerade as caught up (0.2.28)
+
+**One defect, one deploy.** The 0.2.22 rule - take each journal's newest window and
+forfeit everything older - was unrecoverable by construction and blind in exactly the
+place that mattered. Measured on the box: four journals totalling **4,711,140 bytes /
+132,099 records** with ~**6,290 net-live identities** (proven by a full front-to-back
+replay) and 14,729 live files - and the index reported **`entries: 146`**, so
+`no_disk_run` refused every offer for hours. Each first pass was bigger than its share
+(131,072 of a 512 KiB budget over four journals), so it read the newest ~131 KiB,
+`_forget_rank`ed everything older and landed the cursor at EOF - and a cursor only ever
+advances, so a restart re-buried the same 1.4 MB, deterministically. The tail that night
+was 93% removal lines (a ceiling reclamation), so the surviving window was 146
+identities. `lag_bytes` sat at 0 because the cursor WAS at EOF, and `why_no_restore`
+only spoke when `lag_bytes != 0`: the one blindness it was silent about was the one that
+was happening. The plugin's own `op:contains` contradicted the store - identities whose
+`+` sits early in a journal and was never retracted answered `not_present` while the
+file sat committed on disk (`disk_spill` journals a `+` only after `os.replace` commits).
+
+**The rule now: DRAIN, in bounded passes.** `_apply_journal` reads each journal FROM
+ITS CURSOR FORWARD, applies whole lines in the file's own order, and when the budget
+binds it RETURNS WITH THE CURSOR SHORT OF EOF - the next refresh continues where this
+one stopped. Nothing is forfeited, nothing is forgotten, and the buried branch (and its
+mid-line alignment probe) is gone: the "don't re-read history" optimization it traded
+for - amnesia - is provided honestly by the cursor, which never moves backwards and
+never re-reads a converged journal beyond its new tail. **A single refresh after the
+first still reads at most `MAX_READ_PER_REFRESH` (512 KiB) and applies at most
+`MAX_LINES_PER_REFRESH` (8,192) lines** - the offer-path bound is unchanged and now
+auditable through the published `bytes_read`. The FIRST refresh of a process runs the
+passes back to back under its own budget - `BOOT_DRAIN_MAX_BYTES` (32 MiB read) and
+`BOOT_DRAIN_DEADLINE_SECONDS` (5 s wall) - so a cold boot converges inside the first
+offer attempt instead of one share per second afterwards. Tonight's shape costs the
+boot: ~4.71 MB read (each byte once, plus at most one line-capped window re-read),
+~17 passes, well under a second with warm page cache, on the scheduler thread, inside
+the first `get_num_new_matched_tokens` after engine start. Either bound ending the
+drain early is normal: the index stays `converged: false`, says so everywhere, and
+finishes through ordinary refreshes.
+
+**A partial index can no longer read as a caught-up one.** `disk_index.section()`,
+`counters()`, the `restore.index` payload and `op:contains`'s own view now publish
+`converged` (every cursor at end-of-file), `boot_drained`, `unread_journals` (per-journal
+unread BYTES, named), `bytes_read` and `entry_cap_hit`. `why_no_restore` fires its
+blindness sentence on BOTH blindnesses - a drain in flight *and* forfeited history
+(`catch_up_jumps`/`bytes_skipped` non-zero with a zero `lag_bytes`, the exact silent
+shape) - and the `no_disk_run` refusal carries it too, so the answer reads "spilled but
+not yet indexed", never "never spilled", unless the data says it cannot. At the
+`MAX_INDEX_ENTRIES` cap the drain drops the OLDEST identities (the restore path wants
+the recent spills), counts every drop in `entries_dropped`, flips `entry_cap_hit: true`
+and logs ONE warning per boot - a capped index is loud, never a caught-up costume.
+
+**The arm proof reads its own authority.** `disk_restore.armed` in a rank file is
+written by `worker_diag._maybe_write` on cadence (50 steps) or a signature change - and
+the signature never hashed the armed verdict. So an arm with no spill activity rewrote
+nothing, and an idle box wrote nothing at all: the scheduler's `_read_worker_proof`
+read a stale `armed: false` and refused with `workers_not_servicing` although every
+worker would serve (reproduced live: 0/4 ranks "armed" for 120 s after an arm, then 4/4
+seconds after a spill burst). The arm is a **rank-agnostic boot fact owned by the
+EngineCore process that runs the scheduler**, so the proof now reads
+`disk-spill-arm.json` directly through `disk_spill._read_arm_file` - boot fence and
+expiry untouched, a reboot still cannot arm a cold box, and no rank file can arm a
+disarmed tier by remembering `armed: true`. Rank files keep the facts they uniquely
+know: `installed`, the new `worker_fitted`, `service_reason_kind: "not_configured"`
+(a worker without its own disk root still vetoes the whole fleet, exactly as the
+2026-10-05 incident demands) and `reads_applied`. A rank file's lagged `armed: false`
+under a live arm file no longer vetoes - it is counted as `stale_arm_claims`. As
+defence in depth the armed verdict is now folded into the writer's change signature
+through a new `signal=` hook on the contribution seam, so an arm transition rewrites
+the rank file on the next step; it is not the fix, because an idle box writes no rank
+file at any cadence.
+
+Costs: one bounded read of the arm file per `worker_proof()` cache miss (1 s floor) and
+one signal evaluation per step inside the writer's existing signature test. Tests:
+`tests/test_disk_index_journal_drain.py` (the incident shape, the monotone convergence,
+the exact byte bounds, the cap's shout, both blindness sentences, the arm-proof and its
+boot-fence refusals), `tests/test_disk_index_catchup.py` (rewritten to pin the drain),
+`tests/test_worker_diag.py` (the signal seam), and the retargeted worker-proof tests in
+`tests/test_disk_restore.py` / `tests/test_disk_restore_scope.py` (the incident is now
+spelled `worker_fitted: false`; the old `armed: false` spelling is pinned as the
+lockout it was).
 
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 

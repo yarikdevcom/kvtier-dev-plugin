@@ -283,7 +283,8 @@ def _reset_contributions_for_tests() -> None:
                            "sections": 0, "dropped": 0})
 
 
-def register_contribution(name, produce, owner: str | None = None) -> dict:
+def register_contribution(name, produce, owner: str | None = None,
+                          signal=None) -> dict:
     """Offer a section for the rank file. Contained; returns a dict; never raises.
 
     `produce` is a zero-argument callable returning a plain JSON-serialisable
@@ -291,6 +292,17 @@ def register_contribution(name, produce, owner: str | None = None) -> dict:
     module with live counters (it is asked at write time, so the file carries the
     numbers of the step it was written on); a dict suits a module with boot-
     constant facts.
+
+    `signal` is an optional ZERO-ARGUMENT, CHEAP, side-effect-free callable
+    returning a small hashable value that `_signature` folds into the writer's
+    "did anything change?" tuple. It exists for facts that live in the contributor
+    and move WITHOUT any of the handler's own numbers moving - the disk restore's
+    ARMED verdict is the exact case: an arm transition with no spill activity
+    changed no counter, so no rank file was rewritten, so the scheduler read a
+    stale `armed: false` for the whole idle spell. A signal that raises is treated
+    as `"error"` (it changes the signature exactly once) and a signal is NEVER
+    asked more than once per step, so this stays a cheap test, not a second file
+    reader.
 
     Refused - always with a reason, never silently - when the section name is not
     on `CONTRIBUTION_SECTIONS`, when the name is already held by a different
@@ -301,6 +313,11 @@ def register_contribution(name, produce, owner: str | None = None) -> dict:
     """
     report = {"registered": False, "section": name, "reason": None}
     try:
+        if signal is not None and not callable(signal):
+            report["reason"] = (f"a contribution signal must be callable or None, "
+                                f"got {type(signal).__name__}")
+            _note_refusal(str(name), report["reason"])
+            return report
         if not isinstance(name, str) or name not in CONTRIBUTION_SECTIONS:
             report["reason"] = (f"{name!r} is not an allow-listed section; the "
                                 f"allow-list is {list(CONTRIBUTION_SECTIONS)}")
@@ -324,7 +341,8 @@ def register_contribution(name, produce, owner: str | None = None) -> dict:
             _note_refusal(name, report["reason"])
             return report
         _contributors[name] = {"produce": produce,
-                               "owner": owner or "unknown"}
+                               "owner": owner or "unknown",
+                               "signal": signal if callable(signal) else None}
         if name not in _contrib_state["registered"]:
             _contrib_state["registered"] = list(
                 _contrib_state["registered"]) + [name]
@@ -628,7 +646,25 @@ def _bytes_per_block(handler, arena_bytes) -> int | None:
 
 
 def _signature(handler, arena_bytes) -> tuple:
-    """The cheap "did anything change?" test. Small ints only, never a serialise."""
+    """The cheap "did anything change?" test. Small ints only, never a serialise.
+
+    The contribution SIGNALS ride along (0.2.28): a fact a contributor owns and
+    that moves none of the numbers here (the disk tier's armed verdict is the one
+    that earned this) would otherwise wait for the cadence - or, on an idle box,
+    for a step that never comes. `unregister_contribution` pops the row, so a
+    removed contributor stops contributing to the signature too.
+    """
+    signals = []
+    for name in sorted(_contributors):
+        signal = (_contributors.get(name) or {}).get("signal")
+        if not callable(signal):
+            continue
+        try:
+            value = signal()
+        except Exception as exc:  # noqa: BLE001 - a signal is never worth a fault
+            value = f"error:{type(exc).__name__}"
+        signals.append((name, value if isinstance(
+            value, (bool, int, str, type(None))) else str(value)[:32]))
     return (arena_bytes,
             _int(getattr(handler, "num_cpu_blocks", None)),
             _len_or_none(getattr(handler, "_pending_store_event_indices", None)),
@@ -636,7 +672,8 @@ def _signature(handler, arena_bytes) -> tuple:
             _int(getattr(handler, "_store_hwm", None)),
             _int(getattr(handler, "_load_hwm", None)),
             int(_state["store_blocks_submitted"]),
-            int(_state["load_blocks_submitted"]))
+            int(_state["load_blocks_submitted"]),
+            tuple(signals))
 
 
 def build_document(handler, rank, rank_source) -> dict:

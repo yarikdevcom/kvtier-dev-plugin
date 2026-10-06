@@ -815,6 +815,82 @@ def test_a_plain_dict_is_a_legal_contribution_and_unregister_takes_it_back(
     assert "disk" not in rank_document(writes_to)
 
 
+def test_a_contribution_signal_forces_a_rewrite_no_counter_moved(worker_class,
+                                                                 writes_to,
+                                                                 monkeypatch):
+    """THE ARM TRANSITION WITH NO SPILL ACTIVITY (0.2.28), as a seam property.
+
+    The rank-file writer triggers on cadence or on a signature change, and the
+    disk tier's ARMED verdict moved none of the handler's numbers - so an arm
+    with no spill traffic rewrote no rank file, and the scheduler's proof read a
+    stale `armed: false` for the whole idle spell (reproduced live 2026-10-20:
+    0/4 armed for 120 s, then 4/4 seconds after a spill burst). The `signal` hook
+    folds one cheap contributor-owned value into `_signature`, so the transition
+    forces a rewrite on the NEXT step. It is defence in depth only - an idle box
+    runs no `get_finished` at all, which is why the scheduler no longer asks the
+    rank files about the arm at all (`disk_restore._tier_arm_verdict`).
+
+    The cadence is parked (`INTERVAL=1000`) so ONLY the signature can trigger a
+    rewrite anywhere below.
+    """
+    monkeypatch.setenv(config.ENV_DIAG_INTERVAL, "1000")
+    state = {"armed": False}
+    assert worker_diag.register_contribution(
+        "disk", lambda: {"armed": state["armed"]},
+        signal=lambda: state["armed"])["registered"] is True
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())
+    assert rank_document(writes_to)["disk"] == {"armed": False}
+    writes = worker_diag.counters()["writes"]
+    worker.get_finished(set())
+    assert worker_diag.counters()["writes"] == writes, \
+        "an unchanged step still does not rewrite - the signal is a change test, " \
+        "not a per-step write"
+    state["armed"] = True
+    worker.get_finished(set())
+    assert worker_diag.counters()["writes"] == writes + 1, \
+        "the arm transition alone forced the rewrite"
+    assert rank_document(writes_to)["disk"] == {"armed": True}
+
+
+def test_a_broken_signal_costs_one_rewrite_and_never_raises(worker_class,
+                                                            writes_to,
+                                                            monkeypatch):
+    """A signal that starts raising becomes `error:<Type>` ONCE - then settles.
+
+    Same rule as a contributor that raises: the seam costs itself, never the
+    worker's step. The error string enters the signature exactly once, so the
+    writer pays one rewrite and then treats the failure as the stable state.
+    """
+    monkeypatch.setenv(config.ENV_DIAG_INTERVAL, "1000")
+    seen = {"n": 0}
+
+    def signal():
+        seen["n"] += 1
+        if seen["n"] > 1:
+            raise RuntimeError("the signal blew up")
+        return 1
+
+    assert worker_diag.register_contribution(
+        "disk", lambda: {"ok": True}, signal=signal)["registered"] is True
+    worker = installed_worker(worker_class, writes_to)
+    worker.get_finished(set())                      # signal -> 1, first write
+    writes = worker_diag.counters()["writes"]
+    worker.get_finished(set())                      # signal raises: ONE rewrite
+    assert worker_diag.counters()["writes"] == writes + 1
+    worker.get_finished(set())                      # then the error is the stasis
+    assert worker_diag.counters()["writes"] == writes + 1
+    assert worker_diag.counters()["fallbacks"] == 0, \
+        "a raising signal never reaches the worker's own counters"
+
+
+def test_a_non_callable_signal_is_refused_by_name(writes_to):
+    refused = worker_diag.register_contribution("disk", lambda: {},
+                                                signal="not callable")
+    assert refused["registered"] is False
+    assert "signal" in refused["reason"]
+
+
 def test_a_producer_that_is_neither_a_callable_nor_a_dict_is_refused(writes_to):
     report = worker_diag.register_contribution("disk", 7)
     assert report["registered"] is False and "callable or a dict" in report["reason"]

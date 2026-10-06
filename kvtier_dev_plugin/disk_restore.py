@@ -1733,6 +1733,12 @@ def gate() -> dict:
                          reason_kind="scheduler_armed_workers_disarmed",
                          ranks_armed=f"{proof.get('ranks_armed', 0)}/"
                                      f"{proof.get('ranks_seen', 0)}")
+        if kind == "tier_arm_disarmed":
+            # 0.2.28: the proof read the ARM FILE and it says no (absent, expired,
+            # or fenced to another boot). The gate counts this under the same
+            # `disarmed` refusal the arm check above uses - the authority is the
+            # file either way, and the reason says which read got there first.
+            return _fail(proof["reason"], reason_kind="disarmed")
         return _fail(proof["reason"], reason_kind="no_worker_proof")
     return _ok(root=root, ranks=proof["ranks"])
 
@@ -1750,9 +1756,12 @@ def worker_proof(force: bool = False) -> dict:
     would DMA slots nobody had filled and the request would be served from STALE KV -
     the one failure mode of this design that is silent. So the offer requires proof.
 
-    The proof is the rank file the worker ALREADY writes: `worker_diag` publishes this
-    module's `disk_restore` section in `rank-*.json`, so a file that is FRESH and says
-    `installed: YES` is a worker attesting that its layer is live. It adds no new
+    The proof is TWO things (0.2.28): the rank files the workers ALREADY write -
+    `worker_diag` publishes this module's `disk_restore` section in `rank-*.json`,
+    so a file that is FRESH and says `installed: YES` and `worker_fitted: true` is
+    a worker attesting that its layer is live - and the spill tier's ARM FILE,
+    read live (`_tier_arm_verdict`), because the tier arm is a rank-agnostic boot
+    fact that a cadence-written mirror cannot be the authority for. It adds no new
     precondition (that directory is already the only way this process can know what
     exists on disk) and it is not a handshake: no socket, no new file name, no engine
     channel. Cached for `PROOF_CACHE_SECONDS`; bounded reads; never raises.
@@ -1812,14 +1821,26 @@ def _rank_file_proves_restore(path) -> dict | None:
 
     None means "this file is not evidence of anything" (unreadable, too big, no
     stamp, stale, wrong shape) - it neither proves nor vetoes. A readable file always
-    yields a verdict with `installed`/`armed`, because "fitted but will not serve" is
+    yields a verdict with the PER-RANK facts, because "fitted but will not serve" is
     a DIFFERENT and much more important answer than "nothing here": a rank that is
-    fitted and disarmed passes every disk entry through as though it had none, and
-    the blocks the fork already committed to stay stale.
+    fitted and cannot serve passes every disk entry through as though it had none,
+    and the blocks the fork already committed to stay stale.
 
-    Absent or non-boolean `armed` reads as NO. A file from a plugin that predates the
-    field cannot vouch for a fact it never measured - fail closed, which is also what
-    makes a mixed-version fleet safe.
+    WHICH FACTS ARE PER-RANK (0.2.28). The file's `installed` and `worker_fitted`
+    and its `reads_applied` are the only facts a rank file uniquely knows; the
+    TIER ARM is not one of them. The arm is a rank-agnostic boot fact owned by the
+    EngineCore process that runs the scheduler and reaches the workers as
+    `disk-spill-arm.json` - the very file `_read_worker_proof` now reads directly.
+    The rank file's own `armed` verdict is kept for reporting and for ONE veto it
+    can still legitimately carry: `service_reason_kind: "not_configured"` (this
+    worker's own `VLLM_E2_TIER_DISK_ROOT` is unset - a per-process env fact no
+    arm file can see). It does NOT veto for `disarmed`: a worker's arm verdict is
+    its own cached read of the same file the scheduler is reading live, and a rank
+    file is written on cadence - `armed: false` in a rank file is more often
+    YESTERDAY's truth than this minute's. That staleness was the whole of the
+    `workers_not_servicing` lockout reproduced live on 2026-10-20: 0/4 ranks
+    "armed" for 120 s after an arm with no spill activity, then 4/4 within seconds
+    of a spill burst, because `_signature` never hashed the armed verdict.
     """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -1848,15 +1869,25 @@ def _rank_file_proves_restore(path) -> dict | None:
         name = str(rank)[:32] if rank is not None else str(path.name)[:64]
         installed = section.get("installed") is True
         armed = section.get("armed") is True
+        # THE PER-RANK SERVICE FACTS, three-valued on purpose: `None` means this
+        # file predates the field, and an absent field is NOT evidence of a fault
+        # (a file from a mixed-version fleet that never measured it must not veto a
+        # worker for a fact it never refused). `False` is a worker's own NO.
+        fitted = section.get("worker_fitted")
+        fitted = fitted if isinstance(fitted, bool) else None
+        kind = section.get("service_reason_kind")
+        kind = kind if isinstance(kind, str) else None
         # `reads_applied` is a worker's own counter, published for the honesty check.
         # It arrives from another process, so it is clamped before it is summed: a
-        # hostile or broken writer must not be able to put a fake total in front of the
-        # witness. `disk_store` has a `_bounded_int` with a floor of 1 (it validates
-        # operator knobs); this one wants 0-as-valid, so it uses this module's `_int`.
+        # hostile or broken writer must not be able to put a fake total in front of
+        # the witness. `disk_store` has a `_bounded_int` with a floor of 1 (it
+        # validates operator knobs); this one wants 0-as-valid, so it uses `_int`.
         reads = _int(section.get("reads_applied"))
         if reads is None or reads < 0:
             reads = 0
-        return {"rank": name, "installed": installed, "armed": installed and armed,
+        return {"rank": name, "installed": installed,
+                "worker_fitted": fitted, "service_reason_kind": kind,
+                "armed": installed and armed,
                 "reads_applied": min(reads, MAX_RANK_COUNTER),
                 "reason": _clip(section.get("reason"), 160)}
     except Exception as exc:  # noqa: BLE001 - one bad file is not evidence, that's all
@@ -1864,19 +1895,57 @@ def _rank_file_proves_restore(path) -> dict | None:
         return None
 
 
+def _tier_arm_verdict() -> tuple:
+    """(armed, reason) from the spill tier's ARM FILE, read LIVE. Never raises.
+
+    THE AUTHORITATIVE SIDE OF THE ARM (0.2.28). The arm is issued by `arm()` in the
+    EngineCore - the very process that runs the scheduler and calls this reader -
+    and crosses to the workers as `disk-spill-arm.json`. Asking RANK FILES whether
+    the tier is armed asked four lagged mirrors of one fact each: they are rewritten
+    on cadence (`worker_write_interval_steps`, default 50 steps) or on a signature
+    change that did not include the armed verdict, so an arm transition with no
+    spill activity was invisible to the proof until the next spill burst, and an
+    idle box wrote nothing at all. Reading the arm file through `disk_spill`'s own
+    `_read_arm_file` keeps the boot-fence semantics EXACTLY as they are (a reboot
+    must not arm a cold box: the epoch/boot-id fences and every fail-closed shape
+    are `_read_arm_file`'s, untouched), and it is one bounded read behind the
+    `worker_proof` cache's own 1 s floor.
+    """
+    try:
+        return disk_spill._read_arm_file(disk_spill._arm_path())
+    except Exception as exc:  # noqa: BLE001 - an unreadable arm is no arm at all
+        snapshot._error(exc, "disk_restore tier arm read")
+        return False, f"the arm file could not be read: {type(exc).__name__}"
+
+
 def _read_worker_proof() -> dict:
     """Read the rank files NOW (no cache). See `worker_proof`.
 
-    The verdict is AND over the ranks that are live. A rank that is fitted but says it
-    will not serve disk VETOES the offer even when other ranks are ready: the fork's
-    load event spans every rank, so the ready ones cannot make the refusing one's
-    blocks valid - that is precisely the shape of the 2026-10-05 incident (4 ranks,
-    0 of them servicing, 123,474 offers).
+    TWO SOURCES, each asked only what it uniquely knows (0.2.28). THE TIER ARM
+    comes from the arm file, read live through `disk_spill._read_arm_file` (the
+    authoritative copy, boot-fenced, written by this very process when the operator
+    armed it - see `_tier_arm_verdict` for why the rank files stopped being asked).
+    The PER-RANK facts - `installed`, `worker_fitted`, `not_configured`,
+    `reads_applied` - come from the rank files, which are the only place they live.
+
+    The verdict is still AND over the ranks that are live. A rank that is not fitted
+    VETOES the offer even when other ranks are ready: the fork's load event spans
+    every rank, so the ready ones cannot make the refusing one's blocks valid - that
+    is precisely the shape of the 2026-10-05 incident (4 ranks, 0 of them servicing,
+    123,474 offers). What is no longer a veto is a rank file whose only refusal is
+    its own lagged `armed: false`: when the arm file (the fact's authority, read
+    live) says armed, that file is reporting yesterday. The proof counts those as
+    `stale_arm_claims` and says so, rather than locking the tier out for the life of
+    an idle spell - the `workers_not_servicing` lockout reproduced live on 2026-10-20
+    (0/4 ranks "armed" for 120 s after an arm, then 4/4 seconds after a spill burst,
+    because a rank file is rewritten on cadence and its signature never hashed the
+    armed verdict).
     """
     directory = config.diagnostics_dir()
     if directory is None:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
-                "ranks_seen": 0, "reads_applied": 0,
+                "ranks_seen": 0, "reads_applied": 0, "tier_armed": False,
+                "stale_arm_claims": 0, "arm_file_reason": None,
                 "reason_kind": "no_worker_proof",
                 "reason": f"{config.ENV_DIAG_DIR} is not set, so no worker's rank "
                           "file can be read to prove the worker half of this path "
@@ -1887,17 +1956,21 @@ def _read_worker_proof() -> dict:
                        and name.endswith(RANK_FILE_SUFFIX))
     except OSError as exc:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
-                "ranks_seen": 0, "reads_applied": 0,
+                "ranks_seen": 0, "reads_applied": 0, "tier_armed": False,
+                "stale_arm_claims": 0, "arm_file_reason": None,
                 "reason_kind": "no_worker_proof",
                 "reason": "the diagnostics directory could not be listed: "
                           f"{type(exc).__name__}"}
     if not names:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
-                "ranks_seen": 0, "reads_applied": 0,
+                "ranks_seen": 0, "reads_applied": 0, "tier_armed": False,
+                "stale_arm_claims": 0, "arm_file_reason": None,
                 "reason_kind": "no_worker_proof",
                 "reason": "no worker has written a rank file yet, so nothing proves "
                           "the worker half of this path is fitted"}
+    tier_armed, arm_reason = _tier_arm_verdict()
     armed, silent = [], []
+    stale_claims = 0
     reads = 0
     probed = names[:MAX_RANK_FILES_PROBED]
     for name in probed:
@@ -1907,9 +1980,25 @@ def _read_worker_proof() -> dict:
         if not said["installed"]:
             silent.append(f"{said['rank']}: not fitted")
             continue
-        if not said["armed"]:
-            silent.append(f"{said['rank']}: {said['reason'] or 'will not serve'}")
+        if said["worker_fitted"] is False:
+            silent.append(f"{said['rank']}: restore layer not fitted in this "
+                          "worker process")
             continue
+        if said["service_reason_kind"] == "not_configured":
+            # A per-WORKER env fact no arm file can see: this rank has no disk
+            # root, so it cannot name a path, so it cannot bind. A real veto.
+            silent.append(f"{said['rank']}: no disk root configured in this worker")
+            continue
+        if not tier_armed:
+            silent.append(f"{said['rank']}: the tier arm file says "
+                          f"{arm_reason}")
+            continue
+        if not said["armed"]:
+            # The file's OWN armed verdict is false while the arm file - the
+            # authority for this rank-agnostic fact, read live - says armed. The
+            # file was written before the arm (or before its writer's cache
+            # turned); it is stale evidence, not a refusal.
+            stale_claims += 1
         reads += said["reads_applied"] or 0
         armed.append(said["rank"])
     _state["proof_reads"] += len(probed)
@@ -1917,14 +2006,32 @@ def _read_worker_proof() -> dict:
     seen = len(armed) + len(silent)
     _state["ranks_seen"] = seen
     _state["ranks_reads_applied"] = reads
+    if not tier_armed:
+        # THE ARM FILE OUTRANKS EVERY RANK FILE (0.2.28). No rank file can arm a
+        # disarmed tier by claiming `armed: true` - the arm carries the boot fence
+        # and the expiry, and a cold or expired boot must not offer whatever the
+        # rank files remember from the last armed window. The refusal reason is the
+        # arm file's own, which is what keeps the boot fence honest.
+        return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
+                "ranks_seen": seen, "reads_applied": reads,
+                "tier_armed": False, "stale_arm_claims": stale_claims,
+                "arm_file_reason": arm_reason,
+                "reason_kind": "tier_arm_disarmed",
+                "reason": f"the disk tier's arm file does not arm this boot "
+                          f"({arm_reason}): the arm is a boot fact read from its "
+                          "authoritative copy, and rank files cannot substitute "
+                          "for it (a reboot must not arm a cold box)"}
     if armed and not silent:
         return {"ok": True, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
-                "reads_applied": reads, "reason_kind": None, "reason": None}
+                "reads_applied": reads, "tier_armed": True,
+                "stale_arm_claims": stale_claims, "arm_file_reason": None,
+                "reason_kind": None, "reason": None}
     if silent and armed:
         return {"ok": False, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
-                "reads_applied": reads,
+                "reads_applied": reads, "tier_armed": True,
+                "stale_arm_claims": stale_claims, "arm_file_reason": None,
                 "reason_kind": "scheduler_armed_workers_disarmed",
                 "reason": f"{len(armed)} of {seen} live rank file(s) serve disk and "
                           f"{len(silent)} do not ({'; '.join(silent)[:160]}): the "
@@ -1934,6 +2041,8 @@ def _read_worker_proof() -> dict:
     if silent:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
                 "ranks_seen": seen, "reads_applied": reads,
+                "tier_armed": True, "stale_arm_claims": stale_claims,
+                "arm_file_reason": None,
                 "reason_kind": "scheduler_armed_workers_disarmed",
                 "reason": f"the scheduler is armed and {len(silent)} live rank "
                           f"file(s) refuse disk service "
@@ -1942,7 +2051,8 @@ def _read_worker_proof() -> dict:
                           "and reschedule the request - ranks_armed="
                           f"0/{seen}, the exact shape of the 2026-10-05 loop"}
     return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
-            "ranks_seen": 0, "reads_applied": reads,
+            "ranks_seen": 0, "reads_applied": reads, "tier_armed": True,
+            "stale_arm_claims": stale_claims, "arm_file_reason": None,
             "reason_kind": "no_worker_proof",
             "reason": f"{len(probed)} rank file(s) were read and none reports a "
                       "fitted disk restore layer (disk_restore.installed) - so the "
@@ -2996,7 +3106,8 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
             return ram_result
         _refuse("no_disk_run", f"the SSD tier holds no contiguous span starting at "
                                f"block {start_block} for all of groups "
-                               f"{groups['groups']}")
+                               f"{groups['groups']}"
+                               + _index_blindness()["sentence"])
         return ram_result
     # The SPAN half of the loop fuse: this exact span already failed for somebody.
     span = _suppressed_span(run)
@@ -3227,8 +3338,11 @@ def _refresh_index() -> dict:
     """Let the scheduler learn what the ranks spilled since it last asked.
 
     Bounded inside `disk_index.refresh` (one stat per journal, a byte cursor, a
-    line cap, a 1 s floor) and never raising there; the try/except is for a fork
-    that renamed something under it.
+    line cap, a 1 s floor; the FIRST refresh of the process additionally runs the
+    boot drain under `BOOT_DRAIN_MAX_BYTES` / `BOOT_DRAIN_DEADLINE_SECONDS`, so a
+    cold boot with deep journals converges inside the first offer attempt instead
+    of staying blind for a minute of one-share refreshes) and never raising there;
+    the try/except is for a fork that renamed something under it.
     """
     try:
         out = disk_index.refresh()
@@ -3241,6 +3355,56 @@ def _refresh_index() -> dict:
         _state["index_refresh_errors"] += 1
         snapshot._error(exc, "disk_restore refresh")
         return _fail(f"the disk index refresh raised {type(exc).__name__}")
+
+
+def _index_blindness() -> dict:
+    """Why this index may not be able to answer "is it on disk?", from memory only.
+
+    Two blindnesses, and the distinction is the whole point (the `entries: 146`
+    incident, 2026-10-20): a DRAIN still in flight says "spilled but not yet
+    indexed" - the named bytes WILL be read - while a FORFEITED history (the 0.2.22
+    reader, or a boot of an older plugin) says "not knowable for the life of this
+    process", because a cursor only ever advances. Both get a sentence, because
+    both mean `no_disk_run` cannot be read as "never spilled". That is the exact
+    blind spot the night cost hours on: after a jump `lag_bytes` is legitimately 0,
+    so a check written only on `lag_bytes != 0` was silent about the one shape that
+    mattered. Reads `disk_index.index_lag()` - memory, never a stat, never a scan -
+    and never raises.
+    """
+    try:
+        lag = disk_index.index_lag()
+    except Exception as exc:  # noqa: BLE001 - a view is never worth a fault
+        snapshot._error(exc, "disk_restore index blindness")
+        return {"blind": False, "sentence": "", "lag": None}
+    unread = lag.get("unread_journals") or {}
+    names = "; ".join(f"{name}: {int(row)} unread byte(s)"
+                      for name, row in list(unread.items())[:4])
+    omitted = int(lag.get("unread_journals_omitted") or 0)
+    if omitted > 0:
+        names = (f"{names}; {omitted} more journal(s) unnamed"
+                 if names else f"{omitted} journal(s) unnamed")
+    behind = (not bool(lag.get("converged"))) or int(lag.get("lag_bytes") or 0) > 0
+    jumps = int(lag.get("catch_up_jumps") or 0)
+    skipped = int(lag.get("bytes_skipped") or 0)
+    forfeited = jumps > 0 or skipped > 0
+    if behind:
+        sentence = (f"THE INDEX IS NOT CAUGHT UP: {int(lag.get('lag_bytes') or 0)} "
+                    f"unread journal byte(s) over "
+                    f"{int(lag.get('lag_journals') or 0)} journal(s) "
+                    f"({names or 'no per-journal names measured yet'}); the drain "
+                    "is still reading, spans living in an unread region are NOT "
+                    "KNOWABLE to this index, and `no_disk_run` must therefore be "
+                    "read as 'spilled but not yet indexed', never as 'never "
+                    "spilled'.")
+    elif forfeited:
+        sentence = (f"THE INDEX FORFEITED HISTORY (catch_up_jumps: {jumps}, "
+                    f"bytes_skipped: {skipped} bytes): the skipped regions of "
+                    "these journals are NOT KNOWABLE for the life of this process "
+                    "(a cursor only ever advances), so `no_disk_run` must be read "
+                    "as 'spilled, possibly, but unread', never as 'never spilled'.")
+    else:
+        return {"blind": False, "sentence": "", "lag": lag}
+    return {"blind": True, "sentence": sentence, "lag": lag}
 
 
 def _allocate(pool, count: int) -> dict:
@@ -5450,6 +5614,15 @@ def worker_report() -> dict:
         service = worker_service_verdict()
         report = {"section": "disk_restore", "writer": OWNER_TAG,
                   "installed": bool(_state["installed"]),
+                  # THE PER-RANK SERVICE FACTS the scheduler's proof reads (0.2.28):
+                  # whether THIS process fitted the worker half, and the kind of the
+                  # service verdict's refusal. The `armed` field stays for reporting
+                  # and for backward-reading, but the TIER ARM is no longer asked of
+                  # rank files - the scheduler reads `disk-spill-arm.json` live
+                  # (`_tier_arm_verdict`); this file's armed claim is a lagged mirror
+                  # of a fact its owner does not own.
+                  "worker_fitted": bool(_state["worker_fitted"]),
+                  "service_reason_kind": service.get("reason_kind"),
                   "class": _clip(_state["class"], 60),
                   "armed": bool(service["ok"]),
                   "armed_reason": _clip(service.get("reason"), 100),
@@ -5547,6 +5720,8 @@ def worker_report() -> dict:
             return {"section": "disk_restore", "writer": OWNER_TAG,
                     "truncated": True,
                     "installed": bool(_state["installed"]),
+                    "worker_fitted": bool(_state["worker_fitted"]),
+                    "service_reason_kind": service.get("reason_kind"),
                     "armed": bool(service["ok"]),
                     "reads_applied": int(_state["reads_applied"]),
                     "bytes_applied": int(_state["bytes_applied"]),
@@ -5559,10 +5734,22 @@ def worker_report() -> dict:
 
 
 def register_contribution() -> dict:
-    """Offer the restore verdict to the rank-file writer. Idempotent."""
+    """Offer the restore verdict to the rank-file writer. Idempotent.
+
+    The `signal` is DEFENCE IN DEPTH for the stale-arm hole (0.2.28): it folds the
+    armed verdict into `worker_diag`'s change signature, so an arm or fit transition
+    forces a rewrite on the next step instead of waiting for the cadence or a spill
+    to move a counter. It does NOT close the idle-box hole on its own (a box with no
+    finished requests runs no `get_finished` and writes nothing at any cadence),
+    which is exactly why the proof stopped depending on the rank files for the arm
+    in the first place (`_tier_arm_verdict`).
+    """
     from . import worker_diag  # noqa: PLC0415 - one writer, and no import cycle
-    return worker_diag.register_contribution("disk_restore", worker_report,
-                                             owner=OWNER_TAG)
+    return worker_diag.register_contribution(
+        "disk_restore", worker_report, owner=OWNER_TAG,
+        signal=lambda: (int(bool(disk_spill.is_armed())),
+                        int(bool(_state["worker_fitted"])),
+                        int(bool(_state["installed"]))))
 
 
 # --- install / uninstall ------------------------------------------------------
@@ -6231,6 +6418,8 @@ def scheduler_section() -> dict:
     # recomputes nothing, so a payload and a verb can never disagree about a posture.
     posture = offer_posture()
     tally = counters()
+    # THE INDEX'S OWN BLINDNESS, computed once for every branch below (0.2.28).
+    blindness = _index_blindness()
     # THE VERDICT AS OF THIS INSTANT, for `witness_*_now`. Computed here, not stored "
     # anywhere: `witness_now()` writes nothing, so a payload poll cannot rewrite the "
     # as-of-emission fields the log dedupe depends on.
@@ -6274,6 +6463,12 @@ def scheduler_section() -> dict:
             why += (f" {missed} journal line(s) could not be recorded "
                     f"(journal_last_error: {index.get('journal_last_error')}): "
                     "those files exist and this index cannot name them.")
+        # "entries: 0 over journals that are not empty" has a third cause besides
+        # those two (0.2.28): the drain has simply not REACHED the spill lines yet.
+        # Say it, because "A fresh boot knows nothing until its ranks have spilled"
+        # is a lie about a box that spilled a long time ago.
+        if blindness["blind"]:
+            why += " " + blindness["sentence"]
     elif ranks == 0:
         why = (f"no rank file proves a fitted worker half ({proof.get('reason')}): "
                "offering disk tokens would DMA CPU slots nobody fills, so the "
@@ -6284,16 +6479,16 @@ def scheduler_section() -> dict:
                "offer has been made. Read `refused`: the per-request refusals "
                "(usually `no_disk_run`: the spilled spans do not continue the "
                "prefix this request asked for)")
-        # THE ANSWER BEHIND THE ANSWER. A span spilled minutes ago is invisible to
-        # an index that has not read its journal's tail, and `no_disk_run` cannot
-        # tell "never spilled" apart from "spilled, unread". Say which this is.
-        lag = int(index.get("lag_bytes") or 0)
-        if lag:
-            why += (f" The index is {lag} byte(s) of journal BEHIND the newest "
-                    "spill lines, so a span spilled since the last refresh is not "
-                    "knowable here yet (catch_up_jumps: "
-                    f"{int(index.get('catch_up_jumps') or 0)}, bytes_skipped: "
-                    f"{int(index.get('bytes_skipped') or 0)}).")
+        # THE ANSWER BEHIND THE ANSWER (0.2.28: the WHOLE blindness, not just the
+        # lag). A span spilled minutes ago is invisible to an index that has not
+        # read its journal's drain, and a span whose lines an OLDER build forfeited
+        # is invisible forever - and after a forfeit `lag_bytes` is legitimately 0,
+        # which is how the `entries: 146` over 132,099 records stayed silent for
+        # hours. `_index_blindness` names the bytes, the journals and the skips,
+        # and says plainly that such spans are NOT KNOWABLE, so `no_disk_run` reads
+        # as "spilled but not yet indexed" rather than "never spilled".
+        if blindness["blind"]:
+            why += " " + blindness["sentence"]
         # THE ARCHITECTURAL ANSWER, IN THE FIRST SENTENCE (0.2.25). An operator who
         # reads `why_no_restore` at 3 a.m. should not have to know what a MambaSpec is,
         # let alone that its recurrent state has no per-block file name: say that the
@@ -6495,6 +6690,17 @@ def scheduler_section() -> dict:
                   "catch_up_jumps": int(index.get("catch_up_jumps") or 0),
                   "bytes_skipped": int(index.get("bytes_skipped") or 0),
                   "lines_skipped": int(index.get("lines_skipped") or 0),
+                  # THE DRAIN, PASSED THROUGH (0.2.28): `converged` is the answer to
+                  # "may this index answer 'not present' at all?", and
+                  # `unread_journals` names what it has not read yet. A snapshot
+                  # reader must not have to recompute either from a lag number.
+                  "converged": bool(index.get("converged")),
+                  "boot_drained": bool(index.get("boot_drained")),
+                  "unread_journals": dict(index.get("unread_journals") or {}),
+                  "bytes_read": int(index.get("bytes_read") or 0),
+                  "entry_cap_hit": bool(index.get("entry_cap_hit")),
+                  "blind": blindness["blind"],
+                  "blindness": blindness["sentence"] or None,
                   "last_reason": index.get("last_reason")},
         "ranks_proven": ranks,
         "digests_expected": ranks,
@@ -6540,7 +6746,31 @@ def scheduler_section() -> dict:
                                     "forfeited and that rank's entries forgotten",
             "index.bytes_skipped": "journal bytes forfeited to reach the tail (unit: "
                                    "bytes, never a guessed line count)",
-            "index.lines_skipped": "journal lines passed over without being applied",
+            "index.lines_skipped": "journal lines permanently unread: the lines "
+                                   "after a journal that stopped being trustworthy "
+                                   "(the drain can never repair this one)",
+            "index.converged": "true when every journal cursor sits at "
+                               "end-of-file; while false a `not_present` from the "
+                               "index describes the READER, not the store - the "
+                               "drain has not reached the line yet",
+            "index.boot_drained": "whether the first-refresh drain has run in "
+                                  "this process",
+            "index.unread_journals": "per-journal bytes behind the cursor, named "
+                                     "(unit: bytes per journal; the drain in flight "
+                                     "made visible as files, not just a total)",
+            "index.bytes_read": "bytes this process has read out of the journals "
+                                "since boot (unit: bytes) - the refresh bound is "
+                                "auditable through it",
+            "index.entry_cap_hit": "true once the identity cap dropped even one "
+                                   "entry: the index answers `not_present` for "
+                                   "files that ARE on disk; a capped index is not "
+                                   "a caught-up index",
+            "index.blind": "true when this index cannot answer 'is it on disk?' "
+                           "for spans living in an unread or forfeited region - "
+                           "the one reading that turns `no_disk_run` from 'never "
+                           "spilled' into 'spilled but not yet indexed'",
+            "index.blindness": "the sentence `why_no_restore` prints when `blind` "
+                               "is true (names, bytes and journals included)",
             "ranks_proven": "rank files attesting a fitted worker half",
             "digests_expected": "distinct geometry digests a restore must satisfy "
                                 "(one per proven rank: the WORKER names the file "
