@@ -401,18 +401,21 @@ ARG_SPECS: dict[str, dict] = {
     # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
     config.ROUTE_DISK: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm", "spill-one",
-                                          "ls", "contains", "offers")},
+                                          "ls", "contains", "offers", "authority",
+                                          "failures")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         "fingerprint": {"kind": "str", "max_chars": 32},
                         "seconds": {"kind": "int", "min": 1, "max": 7200},
                         "limit": {"kind": "int", "min": 1, "max": 200},
-                        # `op=offers`: the boot's offer switch and the scope. A real
-                        # boolean and one of two names, validated here so a typo is a
-                        # 400 rather than a silently ignored field.
+                        # `op=offers` and `op=authority`: this boot's two disk
+                        # switches. A real boolean, validated here so a typo is a 400
+                        # rather than a silently ignored field. There is NO `scope`
+                        # key any more (0.2.31): the per-request opt-in marker it
+                        # governed is gone, so a caller still sending it gets
+                        # "unsupported request keys" instead of a posture it did not
+                        # ask for.
                         "enabled": {"kind": "bool"},
-                        "scope": {"kind": "enum",
-                                  "values": ("optin", "all")},
                         # `ls` has always accepted a shard filter engine-side
                         # (`disk_store._op_ls`); it was unreachable because it was not
                         # in THIS table, so every attempt answered `unsupported request
@@ -806,8 +809,11 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # "this boot has no disk tier", not "this verb is broken".
         "disk": {
             "route": config.ROUTE_PREFIX + config.ROUTE_DISK,
-            "ops": ["status", "arm", "disarm", "spill-one", "ls", "contains",
-                    "offers"],
+            # THE OPS TABLE, READ FROM ITS OWNER. This used to be a hand-copied list,
+            # and a new op added to `DISK_OPS` silently stayed unadvertised here - the
+            # exact drift the status route exists to prevent. Importing the table makes
+            # the two views un-mergeable by construction.
+            "ops": list(disk_store.DISK_OPS),
             "root_env": config.ENV_DISK_ROOT,
             "ceiling_env": config.ENV_DISK_BYTES,
             # The journal gets its own path because it is the one piece of state
@@ -862,7 +868,16 @@ def status_payload(dev_state: dict | None = None) -> dict:
                      "without a rank file proving the worker half. Read "
                      "`engine_fields` from the engine to know whether this boot's "
                      "metadata carries store_keys: without it the worker refuses "
-                     "and counts `no_key_for_slot` and writes zero bytes; a GET "
+                     "and counts `no_key_for_slot` and writes zero bytes. "
+                     "`failures` answers WHY A READ DID NOT HAPPEN: the bounded "
+                     "ring of refused/failed loads this process wrote, merged with "
+                     "what the live rank files carried (a worker's reasons cannot "
+                     "reach EngineCore any other way), each record naming its "
+                     "request, span, group, block key and GPU block, the failure "
+                     "kind from the worker vocabulary, the block's provenance, and "
+                     "for `buffer_cap` the pool budget, the bytes already committed, "
+                     "the bytes the read needed and the jobs the offer needed versus "
+                     "the jobs that fit. a GET "
                      "will not run a mutating op."),
         },
         "tier": {
@@ -1311,8 +1326,8 @@ async def route_disk(request: Request):
 async def route_disk_post(request: Request):
     """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
-    `{op: status|arm|disarm|spill-one|ls|contains|offers, slot?, key?,
-    fingerprint?, seconds?, limit?, shard?, enabled?, scope?}`. KV slots evicted from
+    `{op: status|arm|disarm|spill-one|ls|contains|offers|authority|failures, slot?,
+    key?, fingerprint?, seconds?, limit?, shard?, enabled?}`. KV slots evicted from
     the RAM tier are spilled to
     `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin` on the engine's own
     disk, so the RAM tier can shrink - the group id is part of the identity, since
@@ -1324,47 +1339,52 @@ async def route_disk_post(request: Request):
     fork's own load tuple with the CPU slots it allocated, and the worker reads the
     file back into them.
 
-    IT DOES NOT OFFER UNTIL YOU TELL IT TO, TWICE OVER. `op=offers` is that switch:
-    `{"op":"offers"}` reads the posture, `{"op":"offers","enabled":true}` lets this
-    boot offer at all, and `scope` decides which requests - `optin` (default) serves
-    only a request that asked, `all` serves every request. A fresh boot is
-    `enabled:false`, and no env var, config file or spill arm changes that: the
-    incident of 2026-10-05 was a spill arm raised for a WRITE measurement being
-    enough to put 123,474 un-requested 160,000-token offers in front of live traffic.
+    IT DOES NOT SERVE UNTIL YOU TELL IT TO, AND WHICH SWITCH YOU RAISE IS THE
+    POSTURE. Two per-boot switches, both FALSE at every fresh boot, both POST-only:
 
-      REQUESTS OPT IN THROUGH THE ENGINE'S OWN FIELD - no new channel, no env var.
-      TOP LEVEL of the chat/completions body (NOT wrapped in `extra_args`, which this
-      build's chat-completions does not declare and ignores without a word):
+      * `{"op":"authority","enabled":true}` - THE DISK IS THE AUTHORITY FOR EVERY
+        REQUEST, every request of this boot. Each request's host-RAM hit is treated
+        as zero tokens for the offer
+        arithmetic and released, so the disk index decides the span from the local
+        GPU-computed boundary. It opens the offer gate BY ITSELF, so this one POST is
+        the whole change: one POST serves every request from SSD, a restart turns it
+        off, and no env var, config file, spill arm or recovery path can raise it.
+        `{"op":"authority"}` alone reads the posture back.
+      * `{"op":"offers","enabled":true}` - the cheaper posture: RAM first, the disk
+        EXTENDING a prefix the host-RAM tier left short. `{"op":"offers"}` alone reads
+        the posture.
 
-        {"kv_transfer_params": {"kvtier_disk_restore": true}}
+      `restore.serving_as` collapses the two into one verdict (`off` /
+      `disk_authority` / `ram_first_gap_fill`), and a fresh boot is
+      `serving_as:"off"`. The reason both switches exist and neither is the spill arm:
+      the incident of 2026-10-05 was a spill arm raised for a WRITE measurement being
+      enough to put 123,474 un-requested 160,000-token offers in front of live traffic.
 
-      The engine folds that field into `extra_args["kv_transfer_params"]` and
-      `vllm/v1/request.py:118-119` lifts it onto the Request this plugin reads.
-      Strictly the JSON boolean `true`: `"true"`, `1` or a missing field mean "not
-      asked", and an unasked request is answered by the fork's own lookup with no
-      journal refresh, no index query and no allocation. The restore never publishes
-    into `cached_block_hash_to_block`, which is why a restored block helps only the
-    request that paid for it. Every answer
-    from this verb carries the scheduler's own verdict under `restore`, and
-    `restore.why_no_restore` names the first link that is missing (layer not fitted
-    here / gate closed / index empty / no worker proof / no offer made).
+      NO REQUEST FIELD DECIDES ANY OF THIS (0.2.31). Until now the authority rule was
+      carried by a client-supplied marker - the `kvtier_disk_restore` boolean inside the
+      engine's own `kv_transfer_params` field - and a `scope` argument chose whether
+      that
+      marker was required (`optin`) or ignored (`all`). A request
+      body must not decide whether its KV comes off NVMe, so the marker, the `scope`
+      argument and the `flagged` / `skipped_no_marker` / `marker_key` / `requests_seen`
+      fields it fed are RETIRED: sending `scope` is now refused as an unsupported
+      request key, and no client can ask for disk authority or decline it.
+      `disk_restore` no longer reads `request.kv_transfer_params` at all. Do NOT send
+      the old marker - it is ignored, and a request that sends it is served exactly like
+      one that does not. It is named here as retired vocabulary an operator may still
+      see in an old client, not as an instruction.
 
-      THE MARKER MAKES THE DISK THE AUTHORITY FOR THAT REQUEST (0.2.22), and there is
-      no second field to set. A marked request's host-RAM hit is treated as ZERO for
-      the offer arithmetic, so the disk index decides the span from the local
-      GPU-computed boundary - which is the only way the read path can be exercised on
-      an ordinary small prompt. Before this, a small prompt either hit RAM entirely
-      (nothing left to offer) or hit it partially (`ram_hit_not_block_aligned`), so
-      one disk read cost ~1.3M tokens of eviction filler. An UNMARKED request is
-      unchanged: RAM first, the disk filling the gap. `scope=all` does NOT grant
-      authority, it only widens who may be offered, so no request becomes
-      disk-forced without sending the marker.
+      The restore never publishes into `cached_block_hash_to_block`, which is why a
+      restored block helps only the request that paid for it. Every answer
+      from this verb carries the scheduler's own verdict under `restore`, and
+      `restore.why_no_restore` names the first link that is missing (layer not fitted
+      here / gate closed / index empty / no worker proof / no offer made).
 
-      WHAT THE MARKER CANNOT DO. It does not zero `num_computed_tokens`: that number
+      WHAT THE SWITCH CANNOT DO. It does not zero `num_computed_tokens`: that number
       is the offset the fork's own DMA writes at, so zeroing it would put disk bytes
-      into the request's already-cached, shared GPU prefix blocks. A marked request
+      into the request's already-cached, shared GPU prefix blocks. A request
       with a full GPU prefix hit therefore has nothing to restore and recomputes, like
-      any other. And a marked request the disk cannot serve is a silent, cheap
+      any other. And a request the disk cannot serve is a silent, cheap
       fallback: the fork's own answer, no allocation left behind, `refused.no_disk_run`
       counted. To tell a forced read from a real one, read
       `restore.last_offer` (`ram_tokens_reported` vs `ram_tokens_used`),

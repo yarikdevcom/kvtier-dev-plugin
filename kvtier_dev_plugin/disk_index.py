@@ -1636,6 +1636,76 @@ def _rank_of(journal_path_value):
     return name[len(JOURNAL_PREFIX):-len(JOURNAL_SUFFIX)]
 
 
+def entry_bytes(key) -> int | None:
+    """The size one identity's file was journalled at, in bytes. None if unknown.
+
+    WHY THIS EXISTS BESIDE `lookup()`: the offer path must PRICE a read before it
+    offers one (a read costs one bounce buffer of exactly this many bytes), and it
+    must not move `hits`/`misses` - those are the witness's ledger and an experiment
+    reads them as evidence of offer-path behaviour. `contains()` is the same rule for
+    a yes/no question; this is the same rule for the size the writer journalled, read
+    straight out of the entry the journal already built. No I/O, no counters, and
+    None rather than 0: a zero price is a number a caller multiplies.
+    """
+    try:
+        split = disk_layout.split_block_key(key)
+        if not split["ok"]:
+            return None
+        entry = _state["entries"].get(identity_of(split["key16"],
+                                                  split["group_id"]))
+        if entry is None:
+            return None
+        size = entry.get("bytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            return None
+        return int(size)
+    except Exception as exc:  # noqa: BLE001 - a price is never worth a fault
+        snapshot._error(exc, "disk_index entry_bytes")
+        return None
+
+
+def entry_for(key16, group_id) -> dict:
+    """`{present, bytes, seen_ts, journal, reason}` for a `key16` + group. No counters.
+
+    WHY THIS EXISTS WHEN `lookup()` AND `entry_bytes()` EXISTED. Both of those take
+    the ENGINE's full group-qualified block hash, because that is what the offer path
+    holds. A load-failure record holds the other half of that split: a 16-hex `key16`
+    and a group id, which is what a spilled PATH names and therefore what a worker
+    can report across a process boundary. Synthesizing a full key out of those two is
+    not possible - the digest between the `key16` and the group suffix is exactly the
+    part that was dropped - so the honest accessor takes the two fields it actually
+    has. Like `entry_bytes`, it moves no `hits`/`misses` (those are the witness's
+    ledger) and does no I/O: this is the entry the journal already built.
+    """
+    try:
+        key = str(key16 or "").strip().lower()
+        group = group_id
+        if isinstance(group, bool) or group is None:
+            return {"present": False, "bytes": None, "seen_ts": None,
+                    "journal": None,
+                    "reason": "a key16 without a group id names no identity"}
+        try:
+            group = int(group)
+        except (TypeError, ValueError):
+            return {"present": False, "bytes": None, "seen_ts": None,
+                    "journal": None, "reason": f"group {group_id!r} is not an int"}
+        if not key:
+            return {"present": False, "bytes": None, "seen_ts": None,
+                    "journal": None, "reason": "no key16 was given"}
+        entry = _state["entries"].get(identity_of(key, group))
+        if entry is None:
+            return {"present": False, "bytes": None, "seen_ts": None,
+                    "journal": None,
+                    "reason": "this boot's index holds no entry for this identity"}
+        return {"present": True, "bytes": entry.get("bytes"),
+                "seen_ts": entry.get("seen_ts"),
+                "journal": entry.get("journal"), "reason": None}
+    except Exception as exc:  # noqa: BLE001 - a provenance read is never fatal
+        snapshot._error(exc, "disk_index entry_for")
+        return {"present": False, "bytes": None, "seen_ts": None, "journal": None,
+                "reason": f"reading the entry raised {type(exc).__name__}"}
+
+
 def contains(key) -> bool:
     """The bare membership test the offer loop uses, without a counter move.
 

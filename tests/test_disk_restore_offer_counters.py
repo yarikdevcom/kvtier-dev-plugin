@@ -1,25 +1,37 @@
-r"""The counters that make a marked request, and a closed gate, visible from data.
+r"""The counters that make a boot's POSTURE and a closed gate visible from data.
 
-Two observability gaps from the 2026-10-05 restore experiment, both in
-`disk_restore`'s scheduler-side view, both fixed without changing what the restore path
-DOES (its return value is the fork's object, byte-identical, in every case here - which
-is what the last group of tests pins).
+Observability gaps from the 2026-10-05 restore experiment, all in `disk_restore`'s
+scheduler-side view, all fixed without changing what the restore path DOES (its return
+value is the fork's object, byte-identical, in every case here - which is what the last
+group of tests pins).
 
-CHANGE 2 - THE MARKER WAS INVISIBLE. `flagged`, `requests_seen` and `lookups` existed in
-`counters()` with units and were never published by `scheduler_section()`, so proving a
-marker had survived the engine's own field-folding required a CONTROL EXPERIMENT: send a
-paired unflagged request and watch `skipped_no_marker` move for the control and not for
-the marked one. Genuinely clever, and it costs a second request through a live engine to
-learn one bit. Publishing the three makes a marked request self-evident.
+CHANGE 2 - THE POSTURE WAS INVISIBLE. `scheduler_section()` published neither the boot's
+switches nor the one-word verdict they collapse to, so answering "is this boot serving
+every request from SSD, or only extending RAM shortfalls?" meant reading `boot_line` as
+prose. `disk_authority`, `serving_as`, `authority_lookups` and `lookups` are published
+here with units now, from the same one call an experiment already makes.
 
-CHANGE 3 - A CLOSED GATE LEFT NO TRACE. A marked request declined at the gate called
-`_note()` (which writes `last_reason` and nothing else) and returned, while only
+What change 2 used to be, and why it is gone: these were `flagged`, `requests_seen` and
+`lookups`, published so that a CLIENT-SUPPLIED MARKER could be proved to have arrived
+without a control request. The marker was removed in 0.2.31 - a request body must not
+decide whether its KV comes off NVMe - so the three counters it fed went with it, and
+the question the payload answers now is about the boot, which is the only thing that
+decides posture.
+
+CHANGE 3 - A CLOSED GATE LEFT NO TRACE. A request declined at the gate called `_note()`
+(which writes `last_reason` and nothing else) and returned, while only
 `offers_disabled` / `workers_not_servicing` / `no_worker_proof` were counted. So
 `refused == {}` was ambiguous between "nothing refused us" and "the gate refused every
 request of the boot silently", and that ambiguity cost the afternoon: an empty `refused`
 was read as evidence that the ALIGNMENT guard had declined the request when the gate had
 declined it. `not_configured`, `disarmed` and `tier_disarmed` are counted by name now,
 in the same region that already counts the other three.
+
+One consequence of removing the marker deserves its own sentence, because it reverses a
+rule this file used to pin: with no per-request door, a boot with its switches down is a
+counted REFUSAL naming the ops that open the gate, not a "skip". There is no longer a
+category of request that "never asked" - every request is asked, and if the gate is shut
+that is a fact about the boot worth a counter.
 
 `last_reason` behaviour is unchanged on purpose: something may be parsing it, and the
 brief's rule is that the restore path's behaviour must not move - only its bookkeeping.
@@ -64,16 +76,14 @@ def allow_tmp_root(monkeypatch):
 
 
 class Req:
-    """A request, flagged or not, the way the engine's own field carries it.
+    """A request: an id, and nothing that decides anything.
 
-    `kv_transfer_params.kvtier_disk_restore` must be the JSON boolean `True`; anything
-    else (including `"true"` and `1`) is "not asked", which is `test_the_marker_is_the_
-    engines_own_field_and_strictly_a_boolean` in `test_disk_restore.py`'s business.
+    Deliberately no `kv_transfer_params`. The offer path has no reason to read a client
+    field since 0.2.31, and a fake that cannot supply one turns a leftover read into an
+    AttributeError instead of a passing test.
     """
 
-    def __init__(self, flagged=True, request_id="req-1") -> None:
-        self.kv_transfer_params = ({disk_restore.RESTORE_MARKER_KEY: True}
-                                   if flagged else {"other": 1})
+    def __init__(self, request_id="req-1") -> None:
         self.request_id = request_id
 
 
@@ -93,64 +103,105 @@ def section():
     return disk_restore.scheduler_section()
 
 
-# --- change 2: the marker's own evidence, published -------------------------
+# --- change 2: the boot's posture, published --------------------------------
 
-@pytest.mark.parametrize("key", ["flagged", "requests_seen", "lookups"])
-def test_the_three_marker_counters_reach_the_payload_with_units(key):
+@pytest.mark.parametrize("key", ["disk_authority", "offers_enabled", "serving_as",
+                                 "authority_lookups", "lookups"])
+def test_the_posture_fields_reach_the_payload_with_units(key):
     """`scheduler_section()` is the one-call payload an experiment reads, and a counter
     that lives only in `counters()` is a counter nobody sees. Units are not optional:
     the suite that walks the section fails on a bare number."""
     view = section()
     assert key in view, f"{key} is in counters() but not in the payload"
-    assert isinstance(view[key], int)
     assert key in view["units"], f"{key} reaches the payload with no unit"
     assert view["units"][key], f"{key} has an empty unit"
     # The unit must say which counters() it came from, the rule the neighbouring
     # pass-throughs follow: two views of one counter that cannot be traced to their
     # owner are two numbers waiting to disagree.
-    assert "counters()" in view["units"][key]
+    assert "counters()" in view["units"][key] or "disk_posture()" in view["units"][key]
 
 
-def test_a_marked_request_is_now_self_evident_without_a_control_request():
-    """THE WORKAROUND, retired. One marked and one unflagged lookup, in one payload:
-    `requests_seen` moves for both, `flagged` moves for one, `skipped_no_marker` for the
-    other. Before, the only way to see that the marker arrived was to send the
-    unflagged one as a control and subtract.
+@pytest.mark.parametrize("retired", ["flagged", "requests_seen", "skipped_no_marker",
+                                     "scope", "marker_key"])
+def test_the_marker_fields_are_gone_from_the_payload(retired):
+    """A removed feature that leaves its counters behind is a feature that was not
+    removed, and a payload full of permanently-zero counters is a payload that lies: an
+    operator reading `flagged: 0` on a boot that IS serving everyone from SSD would
+    conclude the opposite of the truth.
+    """
+    assert retired not in section(), retired
+    assert retired not in disk_restore.counters(), retired
+
+
+def test_the_posture_needs_no_control_request_to_be_read():
+    """ONE payload read answers "which switch is up", for both switches.
+
+    The old proof was a pair of requests and a subtraction. The new proof is one field
+    per switch plus `serving_as`, and the two switches are independently readable, so a
+    boot running the cheaper posture cannot be mistaken for one running authority.
+    """
+    view = section()
+    assert (view["disk_authority"], view["offers_enabled"], view["serving_as"]) == (
+        False, False, "off")
+    disk_restore.set_disk_authority(True)
+    view = section()
+    assert (view["disk_authority"], view["offers_enabled"], view["serving_as"]) == (
+        True, False, "disk_authority")
+    disk_restore.set_offer_switch(True)
+    view = section()
+    assert view["serving_as"] == "disk_authority", \
+        "both up is authority, and the payload must not make the reader guess"
+    disk_restore.set_disk_authority(False)
+    view = section()
+    assert view["serving_as"] == "ram_first_gap_fill"
+    # The change counters are the audit trail: two moves in, one more each.
+    assert view["disk_authority_changes"] == 2
+    assert view["offer_switch_changes"] == 1
+
+
+def test_authority_lookups_and_lookups_measure_different_things():
+    """`lookups` is the path's entry count; `authority_lookups` is a POSTURE's count.
+
+    With the store unconfigured every lookup is turned away at the gate, so `lookups`
+    rises under both switches while `authority_lookups` stays at zero: the authority
+    line is drawn only where an offer is actually decided, and a counter that moved on a
+    refused lookup would count intentions instead of work. (The pair moving TOGETHER on
+    a boot that can serve is pinned in `test_disk_restore_authority.py`, where the store
+    exists.)
     """
     disk_restore.set_offer_switch(True)
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_OPTIN)
-    before = section()
-    offer(Req(flagged=False))
-    middle = section()
-    assert middle["requests_seen"] == before["requests_seen"] + 1
-    assert middle["skipped_no_marker"] == before["skipped_no_marker"] + 1
-    assert middle["flagged"] == before["flagged"], "an unflagged request is not flagged"
+    for _ in range(2):
+        offer(Req())
+    view = section()
+    assert view["lookups"] == 2
+    assert view["authority_lookups"] == 0
+    disk_restore.set_offer_switch(False)
+    disk_restore.set_disk_authority(True)
+    for _ in range(3):
+        offer(Req())
+    view = section()
+    assert view["lookups"] == 5
+    assert view["authority_lookups"] == 0, (
+        "the gate refused every one of these, so no lookup ever ran under authority")
+    assert view["refused"]["not_configured"] == 5
 
-    offer(Req(flagged=True))
-    after = section()
-    assert after["requests_seen"] == middle["requests_seen"] + 1
-    assert after["flagged"] == middle["flagged"] + 1
-    assert after["skipped_no_marker"] == middle["skipped_no_marker"]
-    assert after["lookups"] == middle["lookups"] + 1
 
-
-def test_lookups_counts_the_path_entry_before_any_gate_or_scope():
+def test_lookups_counts_the_path_entry_before_any_gate():
     """`lookups` is the offer path's own entry count, so a `lookups` that rises while
     `offers` sits at zero is the refusal vocabulary's job to explain - which needs
     the refusals counted too (change 3). The pair is the diagnostic.
     """
     for _ in range(3):
-        offer(Req(flagged=True))
+        offer(Req())
     view = section()
     assert view["lookups"] == 3
-    assert view["requests_seen"] == 3
     assert view["offers"] == 0
     assert view["refused"]["not_configured"] == 3
 
 
 # --- change 3: a closed gate, counted by name -------------------------------
 
-def test_a_gate_closed_marked_request_is_counted_as_what_the_gate_said():
+def test_a_gate_closed_request_is_counted_as_what_the_gate_said():
     """The whole point: `refused` tells the truth on its own now.
 
     This is the state the experiment ran in - no store root configured for the restore
@@ -159,10 +210,40 @@ def test_a_gate_closed_marked_request_is_counted_as_what_the_gate_said():
     """
     verdict = disk_restore.gate()
     assert verdict["ok"] is False and verdict["reason_kind"] == "not_configured"
-    result = offer(Req(flagged=True))
+    result = offer(Req())
     assert refused()["not_configured"] == 1
     assert result == FORK_ANSWER
     assert disk_restore.counters()["refusals_total"] == 1
+
+
+def test_a_boot_with_no_switch_up_refuses_by_name_and_names_the_way_out(monkeypatch,
+                                                                        tmp_path):
+    """Both switches down is `offers_disabled`, counted, with the two ops in the text.
+
+    Since the marker is gone there is no request that "did not ask", so the closed gate
+    is the only no-op left on the path and it must never be silent: the counter is the
+    number of lookups the boot turned away, and the reason string names both ops that
+    would open it. An operator who deploys without POSTing anything gets a log and a
+    counter that both say what to do next.
+
+    The store root and both arms are set here because the gate reads them BEFORE the
+    switches: without them the honest answer is `not_configured`, a different refusal
+    with its own bucket and its own test above.
+    """
+    root = tmp_path / "spill"
+    root.mkdir()
+    monkeypatch.setattr(disk_spill, "disk_root", lambda: str(root))
+    monkeypatch.setattr(disk_spill, "is_armed", lambda: True)
+    monkeypatch.setattr(backport, "is_armed", lambda: True)
+    assert disk_restore.gate()["reason_kind"] == "offers_disabled"
+    result = offer(Req())
+    counters = disk_restore.counters()
+    assert result is FORK_ANSWER
+    assert counters["refused"]["offers_disabled"] == 1
+    assert counters["refusals_total"] == 1
+    assert counters["serving_as"] == "off"
+    reason = disk_restore.OFFER_REFUSAL_WHY["offers_disabled"]
+    assert '"op":"offers"' in reason and '"op":"authority"' in reason
 
 
 @pytest.mark.parametrize("switch,expected", [
@@ -184,7 +265,7 @@ def test_each_closed_switch_has_its_own_bucket(monkeypatch, tmp_path, switch,
     verdict = disk_restore.gate()
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == expected
-    offer(Req(flagged=True))
+    offer(Req())
     assert refused()[expected] == 1
     other = "disarmed" if expected != "disarmed" else "tier_disarmed"
     assert refused()[other] == 0, "the buckets must not borrow each other's name"
@@ -201,7 +282,7 @@ def test_the_refused_dict_alone_now_names_the_gate_as_the_cause():
     `refused` says which guard refused, and the guard vocabulary is closed.
     """
     for _ in range(2):
-        offer(Req(flagged=True))
+        offer(Req())
     view = section()
     # `refused` publishes the WHOLE closed vocabulary (every bucket, zeros included), so
     # the readable form is the non-zero one - and it is non-zero now.
@@ -219,7 +300,7 @@ def test_last_reason_is_still_written_exactly_as_before():
     parsing the old field sees the same text. The new counters are additive.
     """
     reason = disk_restore.gate()["reason"]
-    offer(Req(flagged=True))
+    offer(Req())
     counters = disk_restore.counters()
     assert counters["last_reason"] == reason[:160]
     assert counters["last_refusal"].startswith("not_configured: ")
@@ -241,57 +322,25 @@ def test_the_forks_answer_comes_back_as_the_same_object(monkeypatch, tmp_path):
     monkeypatch.setattr(disk_spill, "disk_root", lambda: str(root))
     monkeypatch.setattr(disk_spill, "is_armed", lambda: False)
     ram = (4096, True)
-    result = offer(Req(flagged=True), ram=ram)
+    result = offer(Req(), ram=ram)
     assert result is ram
     assert refused()["disarmed"] == 1
 
     monkeypatch.setattr(disk_spill, "is_armed", lambda: True)
     monkeypatch.setattr(backport, "is_armed", lambda: False)
-    result = offer(Req(flagged=True), ram=ram)
+    result = offer(Req(), ram=ram)
     assert result is ram
     assert refused()["tier_disarmed"] == 1
 
     monkeypatch.setattr(disk_spill, "disk_root", lambda: None)
-    result = offer(Req(flagged=True), ram=ram)
+    result = offer(Req(), ram=ram)
     assert result is ram
     assert refused()["not_configured"] == 1
 
 
-def test_an_unflagged_request_is_still_a_skip_and_never_a_refusal(monkeypatch):
-    """The rule from `test_disk_restore.py`, re-pinned here because change 3 touched the
-    very region that decides it: in `optin` scope an unflagged request never reaches the
-    gate, so it must not move any refusal bucket - a skip says "it did not ask", a
-    refusal says "we could not".
-    """
-    disk_restore.set_offer_switch(True)
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_OPTIN)
-    result = offer(Req(flagged=False))
-    counters = disk_restore.counters()
-    assert result is FORK_ANSWER
-    assert counters["refusals_total"] == 0, \
-        "an unflagged request is a skip, not a refusal"
-    assert not [name for name, count in counters["refused"].items() if count], \
-        "every refusal bucket stays at zero for a request that never asked"
-    assert counters["skipped_no_marker"] == 1
-    assert counters["flagged"] == 0
-
-
-def test_a_request_in_all_scope_is_counted_at_the_gate_like_any_other(monkeypatch):
-    """`scope=all` means every request is asked, so every one of them is now visible at
-    the gate. The counters say so without a control request in either scope.
-    """
-    disk_restore.set_offer_switch(True)
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
-    offer(Req(flagged=False))
-    view = section()
-    assert view["requests_seen"] == 1
-    assert view["skipped_no_marker"] == 0, "scope=all asks on everyone's behalf"
-    assert view["refused"]["not_configured"] == 1
-
-
 def test_the_gate_function_itself_is_unchanged(monkeypatch):
     """Change 3 counts what `gate()` already said. `gate()`'s own verdicts, order and
-    reasons must be untouched - the four-switch rule is pinned in its own suite, and a
+    reasons must be untouched - the switch rule is pinned in its own suite, and a
     counter that changed which switch answers first would be a behaviour change wearing
     an observability costume.
     """
@@ -303,10 +352,10 @@ def test_the_gate_function_itself_is_unchanged(monkeypatch):
     monkeypatch.setattr(backport, "is_armed", lambda: False)
     assert disk_restore.gate()["reason_kind"] == "tier_disarmed"
     monkeypatch.setattr(backport, "is_armed", lambda: True)
-    # THE GATE'S OWN ORDER: the offer switch is read BEFORE the worker proof, so a
-    # boot that has never been told to offer does not look for proof at all. Unchanged
-    # by change 3 - and reached here by raising the switch, as an operator would.
-    disk_restore.set_offer_switch(True)
+    # THE GATE'S OWN ORDER: the boot switches are read BEFORE the worker proof, so a
+    # boot that has never been told to serve does not look for proof at all. Unchanged
+    # by change 3 - and reached here by raising a switch, as an operator would.
+    disk_restore.set_disk_authority(True)
     monkeypatch.setattr(disk_restore, "worker_proof",
                         lambda force=False: {"ok": False, "count": 0, "ranks": [],
                                              "reason": "no worker proved itself"})

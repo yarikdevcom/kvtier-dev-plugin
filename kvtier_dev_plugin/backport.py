@@ -2024,6 +2024,19 @@ def boot_from_connector(cls, install_report, manager) -> dict:
                  "layer is not fitted on this manager: spilled KV can be written "
                  "but never read back")[:MAX_BOOT_ITEM_CHARS]))
 
+        # THE ARENA THE DISK TIER LIVES IN, asked at the one moment the manager is in
+        # hand. An armed spill tier over an arena that cannot give an offer a
+        # destination slot moves no byte in either direction, and until now nothing
+        # detected that combination: the line printed `disk_tier=ARMED` and the offers
+        # died at `no_cpu_slots`. The arm field keeps its meaning (it is a true fact)
+        # and the arena's own verdict rides beside it, in the line and in `refusals`.
+        arena = _boot_arena(manager)
+        boot["arena"] = arena
+        if arena.get("state") in ("tiny", "no_pool", "unreadable"):
+            boot["refusals"].append("disk: {}".format(
+                (arena.get("reason") or "the host-RAM arena is unusable")[
+                    :MAX_BOOT_ITEM_CHARS]))
+
         _state["boots"] += 1
         _state["boot"] = boot
         boot["line"] = boot_line(boot)
@@ -2073,6 +2086,47 @@ def _disk_tier_field() -> str:
         return "ARMED" if disk_spill.is_armed() else "DISARMED"
     except Exception as exc:  # noqa: BLE001 - a boot line never fails because of a field
         snapshot._error(exc, "backport boot line disk tier")
+        return "UNKNOWN"
+
+
+def _boot_arena(manager) -> dict:
+    """THE HOST-RAM ARENA'S verdict, for the boot report. Never raises.
+
+    WHY IT BELONGS IN THE BOOT LINE. The disk tier owns no KV bytes: spill reads them
+    out of the arena's pinned CPU tensors and is triggered by the RAM tier's own store
+    completions, and restore allocates its destination slots out of the arena's CPU
+    block pool. So an arena that is missing or clamps to a slot or two per rank (a
+    mis-set `KV_OFFLOAD_SIZE`, a missing `VLLM_USE_SIMPLE_KV_OFFLOAD`, the fork's own
+    `max(1, ...)` clamp) leaves the tier STRUCTURALLY INERT while its arm file still
+    says ARMED - and `disk_tier=ARMED` on that boot is, literally, true and useless.
+
+    The verdict keeps the boot line's existing contract intact: `disk_tier=` stays the
+    spill arm's fact (unchanged field, unchanged meaning), and the arena gets its own
+    adjacent field plus a refusal line naming it. Fails CLOSED on its own errors:
+    `unreadable`, never a silent `ok`.
+    """
+    try:
+        from . import disk_restore  # noqa: PLC0415 - sibling layer, lazy by idiom
+        return disk_restore.arena_verdict(manager)
+    except Exception as exc:  # noqa: BLE001 - a boot line never fails over a field
+        snapshot._error(exc, "backport boot arena")
+        return {"state": "unreadable", "reason":
+                f"reading the arena verdict raised {type(exc).__name__}",
+                "cpu_slot_reserve": None, "free_blocks": None,
+                "pool_total_blocks": None, "blocks_usable_for_an_offer": None}
+
+
+def _arena_field(boot: dict) -> str:
+    """The boot line's `arena=` token: OK / TINY / NO_POOL / UNSEEN / UNREADABLE."""
+    try:
+        verdict = boot.get("arena")
+        if not isinstance(verdict, dict):
+            return "UNSET"
+        state = str(verdict.get("state") or "unseen").upper()
+        return {"OK": "OK", "TINY": "TINY", "NO_POOL": "NO_POOL",
+                "NO_MANAGER": "UNSEEN", "UNREADABLE": "UNREADABLE"}.get(
+                    state, "UNKNOWN")
+    except Exception:  # noqa: BLE001 - a boot line never fails over a field
         return "UNKNOWN"
 
 
@@ -2153,6 +2207,16 @@ def boot_line(boot: dict) -> str:
     # stops a spill - a tier that refused to write because of its INDEX would be a
     # diagnostic causing the outage it measures.
     parts.append("journal_dir={}".format(_journal_dir_field()))
+    # THE HOST-RAM ARENA the disk tier has to move bytes through: `OK`, `TINY`,
+    # `NO_POOL`, `UNSEEN`, `UNREADABLE` (or `UNSET` for a line written without a
+    # boot verdict, like the no-tier note). Placed AFTER the bare `tier=` on purpose:
+    # the restart verifier in the llm-api repo takes the LAST `tier=`-shaped token,
+    # and this field's name does not contain `tier=`, so it is invisible to that grep -
+    # while `arena=` sitting here still reads next to `disk_tier=` in a line a human
+    # scans. An ARMED spill tier over a `TINY`/`NO_POOL` arena is the boot that looks
+    # healthy and serves nothing, and the reason is in `boot.arena.reason` and in the
+    # refusal tail below.
+    parts.append("arena={}".format(_arena_field(boot)))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2206,6 +2270,7 @@ def boot_section() -> dict:
                 "tier": False, "faults_at_boot": 0, "refusals": [],
                 "not_covered": [], "nested": [], "live_check": None,
                 "install_reason": None, "manager": None, "restore": None,
+                "arena": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "

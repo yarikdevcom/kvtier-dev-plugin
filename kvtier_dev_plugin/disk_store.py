@@ -290,12 +290,18 @@ MAX_FILENAME_DISPLAY = 200          # CHARS of a path shown in a response
 MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
-DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers")
-MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers")
-"""`offers` is mutating and POST-only: it raises or drops THIS BOOT's offer switch
-and (optionally) sets the scope. It is not the arm. Arming the spill tier says bytes
-may be WRITTEN; this says requests may be SERVED from disk, which on 2026-10-05 was a
-difference of 123,474 un-requested 160,000-token offers."""
+DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
+             "authority", "failures")
+MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority")
+"""`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
+this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
+may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
+difference of 123,474 un-requested 160,000-token offers.
+
+`authority` is the one that means "serving everyone from SSD": the disk, not the
+request's host-RAM hit, decides every request's own prefix. It replaced the per-request
+opt-in marker (and the `scope` argument that went with it) in 0.2.31, because a request
+body must not decide whether its KV comes off NVMe."""
 
 # This module's own refusal vocabulary. `no_key_for_slot` and `bad_digest` share a
 # WORD with `disk_spill.REFUSAL_REASONS` because they are the same operational
@@ -2917,36 +2923,96 @@ def _op_disarm(_body: dict) -> dict:
 
 
 def _op_offers(body: dict) -> dict:
-    """Raise/drop this boot's disk-OFFER switch, and optionally set the scope.
+    """Raise/drop this boot's GAP-FILL switch: RAM first, the disk fills the gap.
 
     `{"op":"offers"}` alone reads the posture. `{"op":"offers","enabled":true}` raises
-    the switch. `{"op":"offers","scope":"optin"|"all"}` decides WHICH requests may be
-    offered once it is up; `optin` (the default) serves only a request carrying
-    `kv_transfer_params.kvtier_disk_restore = true`.
+    the switch, which makes this boot serve EVERY request whose host-RAM prefix came up
+    short - there is no per-request filter any more, and `{"op":"authority"}` is the
+    switch that makes the disk decide instead.
 
-    Two separate facts on purpose, and neither is the spill arm: the incident boot had
-    a healthy spill arm (raised for a spill measurement) and that alone was enough to
-    put disk offers in front of live traffic. A fresh boot answers `enabled: false` and
-    no restart, config file or environment variable changes that - only this verb does.
+    Two separate switches on purpose, and neither is the spill arm: the incident boot
+    had a healthy spill arm (raised for a spill measurement) and that alone was enough
+    to put disk offers in front of live traffic. A fresh boot answers `enabled: false`
+    and no restart, config file or environment variable changes that - only this verb
+    does, and a restart undoes it.
     """
     from . import disk_restore  # noqa: PLC0415 - it imports this module
-    out = {"ok": True, "posture": disk_restore.offer_posture()}
-    for field, apply in (("enabled", disk_restore.set_offer_switch),
-                         ("scope", disk_restore.set_scope)):
-        if field not in body or body[field] is None:
-            continue
-        verdict = apply(body[field])
+    return _apply_switch(body, "offers_enabled", disk_restore.set_offer_switch)
+
+
+def _op_authority(body: dict) -> dict:
+    """THE global disk-authority switch: the disk decides EVERY request's prefix.
+
+    `{"op":"authority"}` alone reads the posture; `{"op":"authority","enabled":true}`
+    turns it on for every request this boot, and `{"op":"authority","enabled":false}`
+    turns it back off. One POST is the whole change: raising it opens the offer gate by
+    itself, so an operator does not have to raise two switches to serve everyone from
+    SSD. Eligibility bounds are untouched by it - the pool budget, the CPU slots, the
+    offer cap and "is the span actually spilled" all still decide how much any single
+    request is offered.
+
+    WHAT THIS REPLACED. Until 0.2.31 the authority rule was carried by a
+    client-supplied marker (`kv_transfer_params.kvtier_disk_restore = true`) and a
+    `scope` argument chose whether that marker was required. A request body must not
+    decide whether its KV comes off NVMe, so the marker, the `scope` argument and the
+    `flagged` / `skipped_no_marker` / `marker_key` fields it fed are all retired. No
+    client can ask for disk authority and no client can decline it.
+
+    And the lifetime, stated in the response because "is this posture sticky?" is the
+    first question a posture this expensive deserves: per boot, lost by a restart, and
+    raised by nothing except this POST - not an env var, not a config file, not the
+    spill arm, not a recovery path.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    return _apply_switch(body, "disk_authority", disk_restore.set_disk_authority)
+
+
+def _apply_switch(body: dict, field: str, apply_switch) -> dict:
+    """Read the posture, and apply `enabled` to one boot switch if it was sent.
+
+    Reading is the default because an operator checking what this boot will do must not
+    change it. But a key that is PRESENT is an instruction: `{"op":"authority",
+    "enabled":null}` is a malformed command, not a read, and obeying it as a read would
+    leave the operator holding an `ok: true` for a switch that never moved. A value that
+    is not a real boolean is refused by the setter, so a typo in a curl cannot change
+    engine behaviour in either direction.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    out = {"ok": True, "posture": disk_restore.disk_posture(),
+           "per_boot": True, "survives_restart": False}
+    if "enabled" in body:
+        verdict = apply_switch(body["enabled"])
         if not verdict.get("ok"):
             return {"ok": False, "reason": f"{field}: {verdict.get('reason')}",
-                    "posture": disk_restore.offer_posture()}
+                    "posture": disk_restore.disk_posture(),
+                    "per_boot": True, "survives_restart": False}
         out[field] = verdict
-    out["posture"] = disk_restore.offer_posture()
+    out["posture"] = disk_restore.disk_posture()
     return out
+
+
+def _op_failures(body: dict) -> dict:
+    """Why a disk LOAD did not happen, in the process that cannot see it happen.
+
+    `{"op":"failures"}` reads the load-failure ring; `{"op":"failures","limit":N}` reads
+    at most N. A read-only op, so a safe method reaches it (the mutating-op rule is
+    for the ops that write).
+
+    WHY AN OP AT ALL. Every reason already existed as a name in `WORKER_FAILURES` and
+    a counter in the process that READ the file, and the only worker-to-scheduler
+    channel is a set of GPU block ids - so `disk_restore.reads_failed` on EngineCore
+    was structurally zero and the hunt for one failed read cost hours of reading rank
+    files by hand. This is those files' contents, merged, newest first, with the byte
+    figures a `buffer_cap` refusal decided on and the writing block's provenance.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    return disk_restore.load_failure_report(limit=body.get("limit"))
 
 
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
-             "offers": _op_offers}
+             "offers": _op_offers, "authority": _op_authority,
+             "failures": _op_failures}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

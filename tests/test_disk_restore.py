@@ -215,14 +215,14 @@ class Manager:
 class Req:
     """`Request`: the fields the offer path reads, and nothing else.
 
-    `restore=True` carries the opt-in marker the way a real client does - inside
-    `kv_transfer_params`, which the engine fills from `extra_args`. The default is
-    flagged because these tests are about the offer path; an unflagged request is the
-    subject of its own tests, and the plugin's default scope offers it nothing.
+    Deliberately NO `kv_transfer_params` attribute: since 0.2.31 there is no client
+    marker, and a fake that cannot supply one is the proof the offer path never reads
+    it - a leftover `request.kv_transfer_params` would raise AttributeError here rather
+    than pass silently.
     """
 
     def __init__(self, request_id="req-1", blocks=4, seed=1, num_tokens=None,
-                 skip_reading_prefix_cache=False, restore=True):
+                 skip_reading_prefix_cache=False):
         self.request_id = request_id
         # The digest at the END of each STEP-run is what the engine's view keeps for
         # that scheduler block, so block ordinal b (0-based) carries view_digest(b+1)
@@ -232,8 +232,6 @@ class Req:
         self.num_tokens = (num_tokens if num_tokens is not None
                            else blocks * BLOCK + 1200)
         self.skip_reading_prefix_cache = skip_reading_prefix_cache
-        self.kv_transfer_params = ({disk_restore.RESTORE_MARKER_KEY: True}
-                                   if restore else {})
 
 
 class Meta:
@@ -370,27 +368,40 @@ def armed(monkeypatch, tmp_path):
     utils.make_block_hash_with_group_id = pack
     utils.resolve_block_hashes = resolve
     monkeypatch.setitem(sys.modules, disk_restore.KV_UTILS_MODULE, utils)
-    # THE SWITCH, raised on purpose: see the docstring. `scope` stays at its default
-    # `optin`, and the suite's `Req` asks for a restore because a real opt-in request
-    # does - `test_the_default_boot_offers_nothing_and_touches_no_index` covers the
-    # request that does not.
-    disk_restore.set_offer_switch(True)
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_OPTIN)
+    # THE SWITCHES, raised on purpose: see the docstring. `armed` raises DISK
+    # AUTHORITY, which is the posture the suite was built around - the one where the
+    # disk, not the request's host-RAM hit, decides the span. `armed_gap_fill` lowers it
+    # and raises the cheaper switch instead; `switches_down` leaves both at the boot
+    # default and is what pins that a fresh boot does nothing.
+    disk_restore.set_disk_authority(True)
     return str(root)
 
 
 @pytest.fixture
-def armed_all(armed):
-    """The gate open, the switch up, and `scope=all`: EVERY request is a candidate.
+def armed_gap_fill(armed):
+    """The gate open, and ONLY the gap-fill switch up: RAM first, the disk extends.
 
-    This is the scope that keeps the PRE-0.2.22 meaning of a host-RAM hit alive. From
-    0.2.22 the MARKER, not the scope, is what hands the disk the authority, so a
-    request WITHOUT the marker - even a candidate one - still gets "RAM first, the
-    disk fills the gap". Every test about the merged tuple's RAM-leading shape runs
-    here with an unflagged `Req`, which pins that the old behaviour is intact for the
-    client that never asks.
+    This is the posture that keeps the PRE-0.2.22 meaning of a host-RAM hit alive. It is
+    what `scope=all` plus an unflagged request used to pin, so every test about the
+    merged tuple's RAM-leading shape - the fork's own blocks first, our slots after -
+    runs here.
     """
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
+    disk_restore.set_disk_authority(False)
+    disk_restore.set_offer_switch(True)
+    return armed
+
+
+@pytest.fixture
+def switches_down(armed):
+    """The gate open and BOTH switches down: exactly what a fresh boot is.
+
+    The offer path must return the fork's own answer and touch nothing - no journal
+    refresh, no index query, no allocation, no CPU slot - which is the property the
+    2026-10-05 incident (123,474 un-requested 160,000-token offers) made worth pinning
+    harder than any positive test.
+    """
+    disk_restore.set_disk_authority(False)
+    disk_restore.set_offer_switch(False)
     return armed
 
 
@@ -897,7 +908,7 @@ def test_offer_extends_the_forks_hit_and_parks_nothing(armed):
     assert len(manager.cpu_block_pool.allocated) == 3 * len(CACHEABLE)
 
 
-def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed_all):
+def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed_gap_fill):
     """(per-group lists, hit_length, num_computed), ours APPENDED after the RAM hit.
 
     `update_state_after_alloc` takes `cdiv(num_external, g_block_size)` LEADING
@@ -906,17 +917,17 @@ def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed_all):
     field is the fork's local prefix and must survive untouched, because the pairing
     offsets are computed from it.
 
-    THIS IS THE UNMARKED PATH (`armed_all`, `restore=False`), and since 0.2.22 it is
-    the ONLY path that merges a RAM hit with a disk span: a flagged request makes the
-    disk the authority and never reaches it. `test_disk_restore_authority.py` pins
-    what the marker does instead.
+    THIS IS THE GAP-FILL PATH (`armed_gap_fill`), and it is the ONLY path that merges a
+    RAM hit with a disk span: under disk authority the RAM hit is not consulted and the
+    merge never happens. `test_disk_restore_authority.py` pins what authority does
+    instead.
     """
-    fill(armed_all, seeds=[3, 4])
+    fill(armed_gap_fill, seeds=[3, 4])
     manager = Manager()
     ram = [[Slot(900 + group * 10 + i) for i in range(2)]
            for group in range(len(GROUP_SIZES))]
     manager._pending_cpu_hits["req-1"] = (ram, 2 * BLOCK, 0)
-    request = Req(request_id="req-1", blocks=4, restore=False)
+    request = Req(request_id="req-1", blocks=4)
     assert offer(manager, request, 0, (2 * BLOCK, False)) == (4 * BLOCK, True)
     lists, hit_length, num_computed = manager._pending_cpu_hits["req-1"]
     assert num_computed == 0, "the fork's local prefix must survive untouched"
@@ -934,20 +945,20 @@ def test_merged_tuple_is_the_forks_shape_with_our_slots_last(armed_all):
             assert len(lists[group]) == 2, "an ineligible group gains no slots"
 
 
-def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed_all):
+def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed_gap_fill):
     """A RAM tuple whose per-group length disagrees with its token count: refuse all.
 
     The merge rests on "leading entries are the RAM hit, one per whole group block".
     If that is false, our slots land at GPU offsets belonging to someone else's
     tokens - a wrong-bytes restore, the one corruption this module must never cause.
-    A refusal costs a recompute. Unmarked (`armed_all`): a marker would have made the
-    RAM hit irrelevant rather than a reason to refuse.
+    A refusal costs a recompute. Under gap fill (`armed_gap_fill`) a malformed hit is a
+    refusal; under disk authority the hit is irrelevant rather than a reason to refuse.
     """
-    fill(armed_all, seeds=[3, 4])
+    fill(armed_gap_fill, seeds=[3, 4])
     manager = Manager()
     manager._pending_cpu_hits["req-1"] = ([[Slot(700)] for _ in GROUP_SIZES],
                                           2 * BLOCK, 0)
-    assert offer(manager, Req(request_id="req-1", blocks=4, restore=False), 0,
+    assert offer(manager, Req(request_id="req-1", blocks=4), 0,
                  (2 * BLOCK, False)) == (2 * BLOCK, False), \
         "the fork's own answer, untouched"
     assert disk_restore.counters()["refused"]["ram_shape"] == 1
@@ -955,15 +966,15 @@ def test_merge_refuses_a_ram_hit_that_does_not_add_up(armed_all):
     assert manager.cpu_block_pool.get_num_free_blocks() == 1024
 
 
-def test_merge_refuses_a_tuple_the_fork_left_behind(armed_all):
+def test_merge_refuses_a_tuple_the_fork_left_behind(armed_gap_fill):
     """Tokens claimed with no `_pending_cpu_hits` tuple: there is nothing to merge.
 
-    Unmarked (`armed_all`): with a marker there is nothing to merge EITHER, and that
-    is fine rather than fatal - see
-    `test_a_flagged_request_needs_no_fork_tuple_because_ram_is_not_consulted`.
+    Under gap fill (`armed_gap_fill`) this is fatal; under disk authority there is
+    nothing to merge EITHER, and that is fine rather than fatal - see
+    `test_a_request_with_no_fork_tuple_costs_nothing_because_ram_is_not_consulted`.
     """
-    fill(armed_all, seeds=[3, 4])
-    assert offer(Manager(), Req(request_id="req-1", blocks=4, restore=False), 0,
+    fill(armed_gap_fill, seeds=[3, 4])
+    assert offer(Manager(), Req(request_id="req-1", blocks=4), 0,
                  (2 * BLOCK, False)) == (2 * BLOCK, False)
     assert disk_restore.counters()["refused"]["ram_shape"] == 1
 
@@ -982,7 +993,7 @@ def test_a_sub_block_match_offers_nothing_through_the_real_path(armed):
     assert disk_restore.counters()["refused"]["disk_run_below_one_block"] == 1
 
 
-def test_the_offer_refuses_a_hit_that_is_not_block_aligned(armed_all):
+def test_the_offer_refuses_a_hit_that_is_not_block_aligned(armed_gap_fill):
     """A hash-granular RAM hit interleaves with our blocks inside a group block.
 
     UNMARKED ONLY, and that is the 0.2.22 change the operator asked for: this refusal
@@ -990,8 +1001,8 @@ def test_the_offer_refuses_a_hit_that_is_not_block_aligned(armed_all):
     not a whole number of blocks. A flagged request takes this branch never, because
     the RAM hit it carries is not the thing that decides its span.
     """
-    fill(armed_all, blocks=2)
-    assert offer(Manager(), Req(blocks=2, restore=False), 0,
+    fill(armed_gap_fill, blocks=2)
+    assert offer(Manager(), Req(blocks=2), 0,
                  (100, False)) == (100, False)
     assert disk_restore.counters()["refused"]["ram_hit_not_block_aligned"] == 1
 
@@ -1749,9 +1760,13 @@ def test_boot_line_names_the_verdict_and_the_counters():
     assert line.startswith("DISK[restore] ")
     for field in ("installed=", "class=", "armed=", "root=", "index=", "digest=",
                   "offers=", "reads_applied=", "ranks_armed=", "deadline=",
-                  "offers_switch=", "scope=", "marker=", "offer_cap=",
+                  "disk_authority=", "serving_as=", "offers_switch=", "offer_cap=",
                   "refused="):
         assert field in line, field
+    # A fresh boot says so, in the field an operator reads to answer "is this boot
+    # serving everyone from SSD?"
+    assert "disk_authority=OFF" in line
+    assert "serving_as=off" in line
     assert len(line) <= disk_restore.MAX_BOOT_LINE_CHARS * 4
 
 
@@ -3056,8 +3071,8 @@ def test_every_counter_has_a_unit():
     that came from `_state`.
 
     The applied-read evidence is pinned here by name (`reads_applied`,
-    `disk_reads_applied`, `ranks_reads_applied`, `loads_released`,
-    `skipped_no_marker`, and the three `witness_*`), because those keys are the reason
+    `disk_reads_applied`, `ranks_reads_applied`, `loads_released`, and the three
+    `witness_*`), because those keys are the reason
     the payload exists for an experiment: `restorations` reported CONFIRMED through the
     2026-10-05 livelock while `reads_applied` sat at 0, and the direct counter was not
     in the payload at all. A pass-through that silently loses its unit is the first
@@ -3065,7 +3080,7 @@ def test_every_counter_has_a_unit():
     """
     APPLIED_READ_KEYS = ("reads_applied", "disk_reads_applied",
                          "ranks_reads_applied", "loads_released",
-                         "skipped_no_marker", "witness_verdict",
+                         "authority_lookups", "witness_verdict",
                          "witness_reason", "witness_kind")
     counters = disk_restore.counters()
     units = disk_restore.counters_view(dict(counters))["units"]
@@ -3209,27 +3224,32 @@ def test_the_restore_wrapper_is_on_the_method_the_live_scheduler_calls(
     assert "restore" in sched_layer_kinds(cls, disk_restore.METHOD_MATCHED)
 
     assert disk_restore.gate()["ok"] is True
-    # The fork's own answer, unchanged, and NO work done: `object()` carries no
-    # opt-in marker, so in the default `optin` scope the request goes straight back to
-    # the fork. The wrapper is provably on the call path (it returned the fork's
-    # 4096 through the fitted method) without the restore path having to touch a file.
-    skipped_before = disk_restore.counters()["skipped_no_marker"]
+    # THE SWITCHES COME DOWN, and the fork's answer comes back unchanged with NO work
+    # done: no journal refresh, no index query, no allocation. `object()` is not even a
+    # Request - the only way this can be safe is for the gate to close before the offer
+    # path reads anything. The wrapper is provably on the call path (it returned the
+    # fork's 4096 through the fitted method) without the restore path having to touch a
+    # file. Since 0.2.31 a closed gate is a counted REFUSAL naming the two ops that
+    # open it; there is no "nobody asked" category any more, because nothing a client
+    # sends can ask.
+    disk_restore.set_disk_authority(False)
+    disk_restore.set_offer_switch(False)
+    assert disk_restore.gate()["reason_kind"] == "offers_disabled"
+    offers_before = disk_restore.counters()["offers"]
     assert manager.get_num_new_matched_tokens(object(), 0) == (4096, True)
     counters = disk_restore.counters()
-    assert counters["skipped_no_marker"] == skipped_before + 1
-    assert counters["refusals_total"] == 0, \
-        "an unflagged request is a skip, not a refusal: a refusal says we could not, " \
-        "a skip says it never asked"
-    assert counters["offers"] == 0
+    assert counters["refusals_total"] == 1, \
+        "a closed gate is refused in the open, never silently"
+    assert counters["refused"]["offers_disabled"] == 1
+    assert counters["offers"] == offers_before
 
-    # A FLAGGED request with a manager the path cannot read is refused IN THE OPEN,
-    # counted by name. Same wrapper, other side of the scope switch.
+    # Under disk AUTHORITY, a manager the path cannot read is refused IN THE OPEN,
+    # counted by name. Same wrapper, other side of the switch.
     class Hostile:
         block_size = None
         hash_block_size = None
         block_hashes = []
         num_tokens = 9999
-        kv_transfer_params = {disk_restore.RESTORE_MARKER_KEY: True}
         request_id = "req-hostile"
 
     before = disk_restore.counters()["refusals_total"]
@@ -3315,14 +3335,20 @@ def test_the_snapshot_payload_carries_the_scheduler_restore_section():
                 "tokens_offered", "blocks_offered", "refused", "refusal_reasons",
                 "index", "ranks_proven", "digests_expected", "why_no_restore",
                 "units", "boot_line",
-                # THE POSTURE, AS FIELDS (0.2.17's switch, scope, cap, the armed-rank
-                # split and the fuse): the section used to answer "what happened" and
-                # never "what this boot is allowed to do", which was only printed in
-                # `boot_line`.
-                "offers_enabled", "scope", "marker_key", "offer_cap", "ranks_armed",
+                # THE POSTURE, AS FIELDS (the two boot switches, the one-word verdict
+                # they collapse to, their lifetimes, the armed-rank split and the
+                # fuse): the section used to answer "what happened" and never "what
+                # this boot is allowed to do", which was only printed in `boot_line`.
+                # `scope` and `marker_key` are GONE with the marker they described.
+                "disk_authority", "serving_as", "per_boot", "survives_restart",
+                "disk_authority_changes", "offer_switch_changes",
+                "offers_enabled", "offer_cap", "ranks_armed",
                 "ranks_seen", "suppressed_hits", "suppressed_spans",
                 "suppressed_requests", "suppressions"):
         assert key in view, key
+    for retired in ("scope", "marker_key", "flagged", "skipped_no_marker",
+                    "requests_seen"):
+        assert retired not in view, retired
     # EVERY OFFER REFUSAL, counted AND spelled out: the closed vocabulary is the
     # whole answer, and a name without a sentence is a name nobody can act on.
     assert set(view["refused"]) == set(disk_restore.OFFER_REFUSALS)

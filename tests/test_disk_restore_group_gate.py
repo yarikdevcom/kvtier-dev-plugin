@@ -78,6 +78,7 @@ from kvtier_dev_plugin import disk_restore
 # The fixtures live in the sibling module; importing the names is how this suite reuses
 # them (pytest collects fixtures from imported names).
 armed = base.armed  # noqa: F811 - re-exported as a fixture, not shadowed
+switches_down = base.switches_down  # noqa: F811 - `armed` with both boot switches down
 allow_tmp_root = base.allow_tmp_root  # noqa: F811 - autouse: tmp_path is under /tmp
 fresh = base.fresh  # noqa: F811 - autouse: a fresh boot per test, or counters leak
 
@@ -466,23 +467,26 @@ def test_the_offer_path_prices_the_final_span_not_the_ceiling(armed):
         assert row["restored"] is True and row["blocks_filled"] == offered_blocks
 
 
-def test_the_unflagged_request_never_reaches_the_gate_and_stays_untouched(armed):
-    """UNFLAGGED PRODUCTION TRAFFIC IS BYTE-IDENTICAL: the gate is not even consulted.
+def test_a_boot_with_the_switches_down_never_reaches_the_group_gate(switches_down):
+    """A CLOSED BOOT IS BYTE-IDENTICAL: the group arithmetic is not even consulted.
 
-    `optin` scope answers the marker question first, so a request that did not ask
-    costs one attribute read - no gate, no group arithmetic, no refusal counted, no
-    `group_serviceability` written. This is the constraint the whole change had to
-    respect, and it is pinned here rather than asserted in a review comment.
+    Since 0.2.31 there is no per-request door, so the gate itself is the first thing
+    every lookup consults - and when both boot switches are down it closes BEFORE the
+    group serviceability predicate runs. No group arithmetic, no `incomplete_group_set`
+    counted, no `group_serviceability` written, no allocation. That ordering is the
+    constraint: an operator who has not turned this feature on must not pay for its
+    analysis on every request, and a refusal blamed on group shape would send them
+    looking at the wrong thing entirely.
     """
-    fill(armed, seeds=[1, 2, 3, 4], groups=list(HYBRID_CACHEABLE))
+    fill(switches_down, seeds=[1, 2, 3, 4], groups=list(HYBRID_CACHEABLE))
     manager = hybrid()
     ram_result = (0, False)
-    assert offer(manager, Req(request_id="req-u", blocks=1, restore=False), 0,
+    assert offer(manager, Req(request_id="req-u", blocks=1), 0,
                  ram_result) is ram_result
     counters = disk_restore.counters()
-    assert counters["skipped_no_marker"] == 1
+    assert counters["refused"]["offers_disabled"] == 1
     assert counters["refused"]["incomplete_group_set"] == 0
-    assert counters["group_serviceability"] is None, ("an unflagged request must not "
+    assert counters["group_serviceability"] is None, ("a closed boot must not "
                                                       "even reach the predicate")
     assert counters["last_groups_required"] is None
     assert counters["offers"] == 0
@@ -491,8 +495,8 @@ def test_the_unflagged_request_never_reaches_the_gate_and_stays_untouched(armed)
 def test_the_refusal_counts_every_lookup_and_logs_once(armed, caplog):
     """Countable per lookup, ONE log line per episode.
 
-    ~6% of production requests on this box carry the marker, so a refusal that logged
-    would put a sentence in the engine log for each of them. The counter is the
+    Under disk authority EVERY lookup is refused, so a refusal that logged per request
+    would put a sentence in the engine log for each one. The counter is the
     measurement; `notice_once` is the announcement - and the announcement names the
     clamp-is-not-the-answer rule, because the next reader's first instinct is to
     "optimise" the refusal into a clamp.

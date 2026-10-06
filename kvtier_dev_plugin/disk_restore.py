@@ -21,17 +21,37 @@ that could corrupt OTHER requests' lookups, and it buys nothing correctness-wise
 Cross-boot adoption is likewise absent - `disk_index` indexes what THIS boot's
 ranks journalled, so a fresh boot restores nothing until it has spilled.
 
-THE MARKER DECIDES THE SPAN (0.2.22), AND THAT IS THE WHOLE READ PATH'S TESTABILITY.
-A request carrying `kv_transfer_params.kvtier_disk_restore = true` has the fork's
-host-RAM hit treated as ZERO tokens for the offer arithmetic, so the disk index - not
-whatever RAM happened to hold - decides what is offered, starting at the local
-GPU-computed boundary. Without that rule the disk could only ever fill the gap RAM
-left, so a small prompt either hit RAM wholly (nothing to offer) or hit it with a
-remainder (a refusal), and exercising one disk read cost ~1.3M tokens of eviction
-filler. A request WITHOUT the marker is unaffected: RAM first, disk second, byte for
-byte as before. `computed` is never forced to zero, because it is the offset the fork's
-own copy writes at, not an opinion - see the RESTORE_MARKER_KEY docstring for the
-exact corruption that forcing it would cause.
+WHO IS SERVED FROM DISK IS A BOOT POSTURE, NOT A REQUEST FIELD (0.2.31).
+Two per-boot switches, both POST-only and both False at every fresh boot, answer the
+one question the read path has: may this boot serve requests from disk, and if so,
+WHOSE answer decides a request's own prefix.
+
+  * `disk_authority_enabled` - THE DISK IS THE AUTHORITY FOR EVERY REQUEST. The fork's
+    host-RAM hit is treated as ZERO tokens for the offer arithmetic, so the disk index
+    - not whatever RAM happened to hold - decides what is offered, starting at the
+    local GPU-computed boundary. One POST turns it on for every request; a restart
+    turns it off; nothing else in this process can turn it on. It opens the offer gate
+    by itself, because "serve everyone from disk, with disk deciding" is one decision
+    and not two.
+  * `offers_enabled` - the disk may EXTEND what the host-RAM tier left short: RAM
+    first, the disk filling the gap. The pre-0.2.22 shape, kept because it is the
+    mode that spends the fewest disk bytes.
+
+There is NO per-request decider. Until 0.2.31 the authority rule was carried by a
+client-supplied marker (`kv_transfer_params.kvtier_disk_restore`), which meant a
+request body decided whether its KV came off SSD - acceptable for a measurement, not
+for production. The marker, its constant, the `flagged`/`skipped_no_marker` counters,
+the `skipped_no_marker` refusal and the `optin`/`all` scope are all GONE: no client
+can ask for disk service and no client can decline it.
+
+`computed` is never forced to zero under either switch, because it is the offset the
+fork's own copy writes at, not an opinion: zeroing it would aim the copy at the
+request's already-cached, ref-counted prefix blocks (shared with every other request
+reading them) and leave the newly allocated external region unwritten. The scheduler's
+local hit is not this module's to un-learn, so a disk span always starts where the
+local prefix ends; what the authority switch changes is the host-RAM hit, which the
+fork keeps in exactly one place (`_pending_cpu_hits`) and releases through exactly
+one method (`_free_pending_cpu_hit`).
 
 THE THREE ENGINE FACTS THIS IS BUILT ON (all read from the deployed fork)
 ------------------------------------------------------------------------
@@ -272,6 +292,44 @@ MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
 MAX_RANK_COUNTER = 1_000_000_000     # ceiling on a counter read from a rank file
 MAX_SPANS_REPORT = 16                # PARTIAL SPANS one shape report may name
 
+# --- what an offer costs the bounce-buffer pool (0.2.31) ---------------------
+#
+# THE CONSTRAINT THE OFFER PATH NEVER PRICED. A read does not land in a KV slot: it
+# lands in a host-RAM bounce buffer that `disk_read` takes at ISSUE and returns at
+# the APPLY POINT - one forward pass later (`disk_read.counters()`'s pool note: one
+# offer needs the pool to hold the whole offer). So the number of JOBS an offer
+# carries (spans x positional groups + one boundary-state block per align-mode
+# group, the same `needed` the CPU-slot arithmetic uses) times the bytes in one
+# spilled file must fit the pool, or the surplus jobs are refused at bind as
+# `buffer_cap` - which the scheduler never hears about, because the only worker-to-
+# scheduler channel is a set of GPU block ids.
+#
+# THE LIVE FAILURE THIS PRICES. The pool is `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES`,
+# 134,217,728 B per PROCESS on the box; one file is 11,468,800 B there, so 11 jobs fit
+# and a 65,000-token offer wanted 13 (9 span blocks of group 5 plus one boundary-state
+# block in each of groups 0-3). The surplus died at bind, was pruned at the apply
+# point into `invalid_block_ids`, rescheduled the request as a KV load failure, and
+# `note_reported` then read that same set back and fused the request forever.
+#
+# THE FALLBACK PRICE IS THE LARGER FILE, ON PURPOSE. The current build writes TWO
+# legitimate widths CONCURRENTLY because the slot width is rank-local and the digest
+# carries it: 11,468,800 B on PP0 and 12,902,400 B on PP1 (`disk_spill
+# measured_slot_bytes`). An offer spans EVERY rank and the pool is per process, so
+# pricing a PP0 offer and being wrong by 1.13x is exactly the cliff this constant
+# exists to remove: when no rank file has published its width yet, price the bigger
+# shape and cap a little harder. When they have, use the largest published width -
+# still the conservative answer, and exact for the rank with the widest slots.
+POOL_PRICE_BYTES_PER_JOB_FALLBACK = 12_902_400
+
+MAX_LOAD_FAILURE_RECORDS = 32        # refused/failed LOADS this process remembers
+MAX_FAILURES_PER_BIND = 4            # records ONE bind may write (a big step refuses
+                                     # many jobs at once; the ring wants the episode)
+MAX_FAILURES_PER_RANK_FILE = 2       # records ONE rank file may carry (byte budget)
+MAX_FAILURES_PUBLISHED = 6           # records a section or an op surfaces
+MAX_FAILURE_STRING_CHARS = 80        # a string inside one failure record
+REFUSAL_LOG_MIN_SECONDS = 30.0       # SECONDS between load-failure lines of one kind
+POOL_PRICE_MAX_IDENTITIES = 64       # index lookups ONE price walk may make
+
 # --- the settle wait, and the arithmetic that sizes it -----------------------
 #
 # WHY A CAP AND NOT A BUDGET. The wait has to be proportional to the work in flight,
@@ -311,55 +369,47 @@ SETTLE_POLL_SECONDS = 0.0005          # SECONDS between looks while waiting; hal
 MAX_SETTLE_SAMPLES = 512              # WINDOW samples kept for a median; min/max are
                                       # boot-wide regardless
 
-# --- the request-scoped gate --------------------------------------------------
+# --- the two boot switches ----------------------------------------------------
+# WHO IS SERVED FROM DISK, AND BY WHOSE ANSWER. Both are per-boot in-process booleans,
+# both False at every fresh boot, and both are settable ONLY by the `/disk` dev verb
+# over a POST. No env var, no config file, no arm file, no recovery path and no
+# request field can raise either one: `set_disk_authority()` and `set_offer_switch()`
+# are the two writers, and the test suite asserts by AST that neither reads the
+# environment.
+#
+# WHY THERE ARE TWO AND NOT ONE. They answer different questions and a boot can sit in
+# either posture:
+#
+#   disk_authority = True  -> THE DISK IS THE AUTHORITY FOR EVERY REQUEST. Each
+#     request's host-RAM hit is treated as ZERO tokens for the offer arithmetic and
+#     released back to the pool, so the disk index decides the span from the local
+#     GPU-computed boundary. This is "serving everyone from SSD": the expensive
+#     posture, the one that must be confirmable at a glance, and the one that opens
+#     the offer gate BY ITSELF - "serve every request from disk, with disk deciding"
+#     is a single decision and must not need two POSTs.
+#   offers_enabled = True  -> the disk may EXTEND a request whose host-RAM prefix came
+#     up short: RAM first, the disk filling the gap. The cheaper posture, and the
+#     pre-0.2.22 shape.
+#
+# WHY THERE IS NO THIRD KNOB AND NO REQUEST FIELD. Until 0.2.31 the authority rule
+# was carried by a client-supplied marker,
+# `kv_transfer_params.kvtier_disk_restore = true`, and `scope` chose whether that
+# marker was required (`optin`) or ignored (`all`). That meant a REQUEST BODY decided
+# whether its KV came off SSD - fine for a measurement, not acceptable approaching
+# production. The marker, its constant, the `flagged`/`skipped_no_marker` counters, the
+# `skipped_no_marker` refusal reason and the `optin`/`all` scope are all retired here:
+# with the marker gone, `scope`'s question ("WHICH requests?") has exactly one answer
+# ("every request"), so the knob is retired rather than kept as a constant. What is
+# left is the axis that always mattered: WHAT the disk may do.
 
-RESTORE_MARKER_KEY = "kvtier_disk_restore"
-"""THE opt-in key, read out of `request.kv_transfer_params`.
+DISK_AUTHORITY_DEFAULT = False
+"""THE boot default, stated as a constant so the import-time value is the assertion.
 
-The channel is the engine's own: `vllm/v1/request.py:103` declares
-`self.kv_transfer_params: dict[str, Any] | None` and `:118-119` fills it from
-`sampling_params.extra_args.get("kv_transfer_params")`, and
-`get_num_new_matched_tokens(self, request, num_computed_tokens)` receives the
-request object - so the opt-in is readable at exactly the decision point, with no
-new socket, file, env var or side table. The fork's own connector reads nothing
-from it (`grep -rn kv_transfer_params vllm/v1/simple_kv_offload/` is empty on the
-box), so taking it over does not collide with fork behaviour.
-
-STRICTNESS, spelled out because a client can send anything here: a request is
-flagged when `kv_transfer_params` is a real `dict` AND its value under this key is
-the boolean `True`. Not `"true"`, not `1`, not a nested object - a caller who means
-it sends JSON `true`. Everything else is "not flagged", counted, never raised.
-
-WHAT THE MARKER MEANS (0.2.22): THE DISK IS THE AUTHORITY FOR THAT REQUEST. It is
-not a hint that a disk offer would be welcome. A flagged request's host-RAM hit is
-treated as ZERO tokens for the offer arithmetic, so the disk index decides the span
-from the local GPU-computed boundary rather than filling the gap the RAM tier left.
-That is the only way the read path can be exercised at all: with RAM consulted, a
-small prompt either hits RAM (nothing left to offer) or hits it partially, which the
-old alignment rule refused outright - so proving the disk could serve ONE block meant
-evicting ~1.3M tokens of filler first. An UNFLAGGED request is not touched by any of
-this: it gets the fork's own answer, byte for byte, which is how the existing client
-keeps running on the RAM tier with no client-side change.
-
-WHY `computed` IS NOT ALSO FORCED TO ZERO. `update_state_after_alloc`
-(`manager.py:441-463`) places the external blocks at
-`num_computed_tokens // group_block_size + i` INTO THE REQUEST'S WHOLE BLOCK LIST
-(the scheduler passes `kv_cache_manager.get_blocks(request_id)`,
-`scheduler.py:1228-1232`). The third field of the pending tuple is therefore not an
-opinion - it is the offset the DMA writes at. Zeroing it while the scheduler still
-believes `computed` tokens are cached would aim the copy at the request's ALREADY
-CACHED, ref-counted prefix blocks (shared with every other request reading them) and
-leave the newly allocated external region unwritten: wrong KV, plus a write into
-blocks this request does not own. The scheduler's local hit is not this module's to
-un-learn, so the disk span starts where the local prefix ends. The RAM hit IS ours to
-ignore, because the fork keeps it in exactly one place, `_pending_cpu_hits`, and
-releases it through one method, `_free_pending_cpu_hit` (see `_release_fork_pin`).
+A fresh boot gives disk authority to NOBODY. If the boot is unhealthy it stays off,
+because nothing but the POST route op can move it and the route op cannot run before
+the plugin is fitted. `tests/test_disk_authority_switch.py` pins this value, the
+absence of any other writer, and the fact that a `reset()` puts it back.
 """
-
-RESTORE_SCOPE_OPTIN = "optin"
-RESTORE_SCOPE_ALL = "all"
-RESTORE_SCOPES = (RESTORE_SCOPE_OPTIN, RESTORE_SCOPE_ALL)
-RESTORE_SCOPE_DEFAULT = RESTORE_SCOPE_OPTIN
 
 OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "bad_result", "unaligned_local_prefix", "skip_read_requested",
@@ -369,9 +419,9 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "no_channel", "path_build_failed", "index_refresh_failed",
                   "too_many_loads", "ram_hit_not_block_aligned",
                   "no_worker_proof", "offers_disabled", "workers_not_servicing",
-                  "skipped_no_marker", "suppressed_after_failure",
+                  "suppressed_after_failure",
                   "pin_release_unavailable", "incomplete_group_set",
-                  "no_boundary_anchor", "no_null_block")
+                  "no_boundary_anchor", "no_null_block", "no_pool_budget")
 
 # --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
 #
@@ -492,12 +542,14 @@ OFFER_REFUSAL_WHY = {
     "no_worker_proof": "no fresh rank file attests a fitted worker half, so the "
                        "CPU slots an offer allocates might never be filled - the "
                        "one refusal that exists to prevent serving stale KV",
-    "offers_disabled": "the operator has not raised this boot's offer switch "
-                       "(`POST /plugins/kvtier/disk {\"op\":\"enable\"}`): the "
-                       "restore path stays out of the scheduling decision until "
-                       "someone chooses that in this boot, because arming the "
-                       "spill tier for a different experiment once put an "
-                       "un-requested disk offer in front of live traffic",
+    "offers_disabled": "neither boot switch is up: no offer switch "
+                       "(`{\"op\":\"offers\",\"enabled\":true}`, RAM first and the "
+                       "disk filling the gap) and no disk authority "
+                       "(`{\"op\":\"authority\",\"enabled\":true}`, every request "
+                       "served from SSD with disk deciding). Both are per boot, both "
+                       "start OFF, because arming the spill tier for a different "
+                       "experiment once put an un-requested disk offer in front of "
+                       "live traffic",
     "workers_not_servicing": "the scheduler is armed but at least one live rank "
                              "file says its worker half will NOT service a disk "
                              "load (disarmed in its own process, or a boot the "
@@ -505,16 +557,9 @@ OFFER_REFUSAL_WHY = {
                              "nobody fills, the fork would report the load failed "
                              "and the request would be rescheduled - the exact "
                              "loop that starved the box on 2026-10-05",
-    "skipped_no_marker": "scope is `optin` and this request did not ask for a "
-                         f"disk restore (`extra_args.kv_transfer_params."
-                         f"{RESTORE_MARKER_KEY} = true` in the request body): the "
-                         "fork's own answer is returned untouched, which is the "
-                         "default posture for every request that does not ask: "
-                         "no marker means the host-RAM tier answers it exactly as "
-                         "it did before this module existed",
-    "pin_release_unavailable": "the request asked to be served from disk and the "
-                               "fork had already PINNED host-RAM blocks for its "
-                               "own hit, but this build's manager exposes no "
+    "pin_release_unavailable": "disk authority is up and the fork had already "
+                               "PINNED host-RAM blocks for this request's own hit, "
+                               "but this build's manager exposes no "
                                "`_free_pending_cpu_hit` to put them back: offering "
                                "disk bytes instead would strand those pins for the "
                                "rest of the boot, so the request keeps its RAM hit "
@@ -562,6 +607,18 @@ OFFER_REFUSAL_WHY = {
                      "own hit shape cannot be built; offering the real state block "
                      "alone would land it on the run's FIRST block instead of its "
                      "last, which is a wrong state read back as a right one",
+    "no_pool_budget": "the bounce-buffer pool cannot carry even ONE job of this "
+                      "offer's byte shape, so no offer is made at all. A read lands "
+                      "in a host-RAM buffer taken at issue and returned a forward "
+                      "pass later, so an offer the pool cannot hold IN FULL is "
+                      "refused at bind as `buffer_cap`, its GPU blocks are reported "
+                      "as load errors, the request is rescheduled and then fused by "
+                      "`note_reported`: the 0.2.30 shape, where the scheduler made "
+                      "an offer the worker could not physically service. Refusing "
+                      "costs a recompute; offering costs the request its RAM hit "
+                      "too. The reason carries the byte figures (pool budget, price "
+                      "per job, jobs the offer needed) because publishing those is "
+                      "the whole point: nobody could see them before",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -581,23 +638,29 @@ _state: dict = {
     "sched_fitted": False, "worker_fitted": False, "methods_fitted": [],
     "install_refusals": 0, "install_deferrals": 0, "missing_methods": [],
     "install_refusal_line": None, "install_deferral_line": None,
-    # THE OFFER POSTURE, per boot, dev-verb only. `offers_enabled` is False at every
-    # boot: arming the SPILL tier must not be enough to put a disk offer in front of
-    # live traffic (on 2026-10-05 an arm raised for a different experiment offered
-    # 19.7 BILLION tokens and starved the harness). `scope` then decides which
-    # requests may be offered at all once the switch is up.
-    "offers_enabled": False, "scope": RESTORE_SCOPE_DEFAULT,
-    "scope_changes": 0, "offer_switch_changes": 0, "ranks_seen": 0,
-    # scheduler-side request ledger (the request-scoped gate)
-    "requests_seen": 0, "flagged": 0, "skipped_no_marker": 0,
+    # WHO IS SERVED FROM DISK, AND WHOSE ANSWER DECIDES A REQUEST'S OWN PREFIX. Two
+    # independent per-boot switches, both False at every fresh boot, both settable only
+    # by the `/disk` dev verb over a POST. Arming the SPILL tier is neither of them:
+    # on 2026-10-05 an arm raised for a different experiment offered 19.7 BILLION
+    # tokens and starved the harness, which is why offering is its own decision and
+    # `disk_authority` (the expensive posture: every request's KV comes off SSD and its
+    # host-RAM hit is given back) is its own decision on top of it.
+    "offers_enabled": False, "disk_authority": DISK_AUTHORITY_DEFAULT,
+    "offer_switch_changes": 0, "disk_authority_changes": 0, "ranks_seen": 0,
+    # scheduler-side request ledger. `lookups` (below) is the population; the
+    # request-scoped `requests_seen` it used to sit beside is retired with the
+    # marker - it existed as the denominator of `flagged` + `skipped_no_marker`, and
+    # `lookups` is incremented at the same statement.
     "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
-    # THE MARKER'S AUTHORITY (0.2.22). A flagged request hands the DISK the decision
-    # about its own prefix: the fork's host-RAM hit is treated as zero tokens for the
-    # offer arithmetic. `disk_authority` counts the lookups that took that rule; the
-    # other two count the ones where a real RAM hit was thrown away and how many
-    # tokens it was, so "was this read forced from disk, or did RAM have nothing?" is
-    # one payload read and not an inference.
-    "disk_authority": 0, "local_hit_ignored": 0, "local_hit_tokens_ignored": 0,
+    # THE AUTHORITY RULE, IN USE. Under the switch every request hands the DISK the
+    # decision about its own prefix: the fork's host-RAM hit is treated as zero tokens
+    # for the offer arithmetic. `authority_lookups` counts the lookups that took that
+    # rule (the switch itself is `disk_authority`, above); the other two count the ones
+    # where a real RAM hit was thrown away and how many tokens it was, so "was this
+    # read forced from disk, or did RAM have nothing?" is one payload read and not an
+    # inference.
+    "authority_lookups": 0, "local_hit_ignored": 0,
+    "local_hit_tokens_ignored": 0,
     "pin_release_failures": 0,
     "last_local_hit_ignored": None,
     # THE LAST OFFER, AS STRUCTURE: the numbers a forced read and an ordinary one
@@ -710,6 +773,27 @@ _state: dict = {
                                       # impossible with one reader, so this counter
                                       # rising IS the concurrency finding
     "last_span_shape": None,          # the most recent batch's shape, as data
+    # THE OFFER'S PRICE IN BOUNCE BUFFERS (0.2.31). `offer_pool_capped` counts offers
+    # SHORTENED to what the pool can carry and `offer_pool_refused` the lookups given
+    # no offer at all because not one job fits. `last_offer_pool` is the arithmetic of
+    # the most recent pricing, so "was this offer bounded by the token cap or by the
+    # pool?" is a payload read and not an inference from a job count.
+    "offer_pool_capped": 0, "offer_pool_refused": 0,
+    "last_offer_pool": None,
+    # THE LOAD-FAILURE RING (0.2.31): what the worker said when a read did not happen,
+    # in the process that can READ it. `load_failures` counts records written and
+    # `load_failures_overwritten` the ones the ring recycled; `ranks_load_failures`
+    # is how many arrived from live rank files, the `ranks_reads_applied` idiom.
+    "load_failures": 0, "load_failures_overwritten": 0,
+    "ranks_load_failures": 0, "failure_log_lines": 0, "failure_log_suppressed": 0,
+    "ranks_bytes_per_file_max": None,
+    # The records the LIVE rank files carried the last time the proof read them -
+    # the transport, refreshed with the proof's own 1 s cache, not a second cache.
+    "rank_failure_records": [],
+    # THE BLOCK IDS THE FORK REPORTED, kept. `note_reported` used to take
+    # `len(ids)` and drop the ids, which is why a hunt for WHICH of our blocks were
+    # the load errors had no answer in any payload.
+    "invalid_block_ids_seen": 0, "last_invalid_block_ids": None,
     "reads_failed": {r: 0 for r in WORKER_FAILURES},
     "invalid_reports": 0, "finished_released": 0, "worker_watchdog_fires": 0,
     "phantom_guard_trips": 0, "region_plan_errors": 0, "worker_errors": 0,
@@ -792,11 +876,400 @@ def notice_once(key: str, message: str) -> bool:
         return False
 
 
+# Worker/scheduler side: the LOAD-FAILURE RING (0.2.31). One record per refused or
+# failed load read, newest first, recycled at `MAX_LOAD_FAILURE_RECORDS`. It exists
+# because the reasons already existed and went nowhere: `WORKER_FAILURES` names 26
+# kinds, every one of them counted in the process that READ the file, and the only
+# channel back to the scheduler is a set of GPU block ids - so `reads_failed` was
+# structurally zero on EngineCore and a hunt for "why did this read not happen" had
+# to be settled by reading four rank files by hand.
+_load_failures: list = []
+# Kind -> monotonic of the last line logged for it: the rate limit that lets a line
+# be printed per EPISODE and never per step.
+_failure_log_at: dict = {}
+
+# The pointer a record uses instead of pasting the provenance essay into every row,
+# the `miss_attribution.attribute` idiom (`not_established` points at `section()`).
+PROVENANCE_POINTER = "see the disk verb's failures op: provenance_meaning"
+
+
+def _failure_text(value, chars: int = MAX_FAILURE_STRING_CHARS):
+    """A clipped string for one field of a failure record, or None."""
+    if value is None:
+        return None
+    return str(value)[:chars]
+
+
+def _failure_int(value):
+    """A plain int for one field of a failure record, or None. Bool is not an int."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 - an unreadable number is no number
+        return None
+    return int(value) if text.lstrip("-").isdigit() else None
+
+
+def _failure_time(value):
+    """A timestamp for a record: int or float, never a bool, never a guess.
+
+    `_failure_int` is deliberately integer-only - it is what a block id or a byte
+    count uses, and a float byte count means the writer is confused. Journal stamps are
+    `time.time()` floats, so provenance needs a second, wider reader: reading them with
+    the int-only one produced `learned_at: null` for an entry the index holds, which is
+    the field that tells an operator whether these bytes are from this boot or from a
+    spill days old.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _failure_field(record: dict, name: str) -> str:
+    """One field of a record as log text, with None spelled as `?`."""
+    value = record.get(name)
+    return "?" if value is None else str(value)
+
+
+def _identity_pair(raw, group) -> tuple:
+    """(key16, group_id) from EITHER a full group-qualified hash or a bare key16.
+
+    WHY THE RECORD NORMALIZES RATHER THAN PASSING THROUGH. The two callers hand in
+    different spellings of one identity: the offer path reads `run["keys"]`, whose
+    entries carry the engine's FULL group-qualified block hash, while a worker's
+    record comes from a spilled PATH, which `disk_layout` splits into a 16-hex
+    `key16` plus a group. A payload field called `key16` must hold a key16, and the
+    index's own identity rule (`disk_index.identity_of`) is built from one - feed it
+    a 64-character hash and every lookup misses, so provenance would answer "never
+    seen" about a file this index journalled itself. Reusing `split_block_key` is the
+    point: the journal's writer and this reader then cannot drift into two spellings.
+
+    An unreadable string comes back as its own clipped text with the group untouched:
+    a record about an identity this module cannot parse is still a record, and the
+    provenance lookup refuses it on its own terms.
+    """
+    text = _failure_text(raw, 128)
+    group_id = _failure_int(group)
+    if not text:
+        return None, group_id
+    split = disk_layout.split_block_key(text)
+    if split.get("ok"):
+        return _failure_text(split.get("key16"), 64), (
+            group_id if group_id is not None else _failure_int(
+                split.get("group_id")))
+    return _failure_text(text, 64), group_id
+
+
+def _block_provenance(key16, group) -> dict | None:
+    """What THIS process's index can say about the bytes behind one block.
+
+    WHAT IT CANNOT SAY, AND WHY THE FIELD IS NOT NAMED `attribution`. The journal
+    line is `<seq> <+|-> <key16> <bytes> <group>` (`disk_index.JOURNAL_FIELDS`, five
+    fields) and `record_spill` is called from the writer thread with a PATH and a
+    SIZE: no request id reaches the journal at all, on either side of the spill, so
+    "which request wrote this block" is not knowable from anything this plugin holds.
+    The lookup ledger's `attribution` object is about the CURRENT lookup (num_tokens,
+    the local hit, the tokens offered, the prefix-walk verdict) and never named a
+    writer either. Inventing a writer field here would be a guess wearing a name.
+
+    What IS knowable, and is what the operator needs to tell "restored from bytes I
+    spilled an hour ago" from "restored from bytes this prompt just wrote":
+      * key16 + group, which IS the content identity - the same prompt and settings
+        under a restart produce the SAME key, so reuse is visible in the key itself;
+      * which rank's journal claims the identity, and its position (seq) in that
+        journal, from `disk_index.rank_claims`, and the size/learn stamp of the entry
+        those claims resolved to from `disk_index.entry_for` (the accessor that takes
+        a `key16` + group, which is what a record carries; `lookup()` needs the
+        engine's full hash and a record does not have it);
+      * `learned_at`, the time THIS index applied the spill line. That is a LEARN
+        time, not a write time - a cold boot's drain stamps files written days ago
+        with the drain's clock - and the record says so rather than implying more.
+
+    Never raises; None when the identity cannot be read or was never given.
+    """
+    try:
+        key = _failure_text(key16, 64)
+        group_id = _failure_int(group)
+        if not key or group_id is None:
+            return None
+        identity = disk_index.identity_of(key, group_id)
+        claims = disk_index.rank_claims(identity)
+        entry = disk_index.entry_for(key, group_id)
+        rows = []
+        newest_seq = None
+        newest_rank = None
+        newest_bytes = None
+        for name in sorted(claims)[:4]:
+            row = claims[name] or {}
+            seq = _failure_int(row.get("seq"))
+            rows.append({"rank": _failure_text(name, 32),
+                         "bytes": _failure_int(row.get("bytes")),
+                         "journal_seq": seq})
+            if seq is not None and (newest_seq is None or seq > newest_seq):
+                # The LAST claim wins, exactly as it does when the index replays a
+                # journal: a rank that spilled the same identity twice is the author
+                # of the bytes the entry stands for now.
+                newest_seq, newest_rank = seq, name
+                newest_bytes = _failure_int(row.get("bytes"))
+        seen = None
+        for row in claims.values():
+            stamp = _failure_time((row or {}).get("seen_ts"))
+            if stamp is not None and (seen is None or stamp > seen):
+                seen = stamp
+        known = bool(entry.get("present"))
+        size = _failure_int(entry.get("bytes"))
+        learned = _failure_time(entry.get("seen_ts"))
+        if learned is None:
+            learned = seen
+        return {"key16": key, "group": group_id,
+                "known_to_this_index": known,
+                "bytes": size if size is not None else newest_bytes,
+                "writer_rank": _failure_text(
+                    newest_rank if newest_rank is not None
+                    else (sorted(claims)[0] if claims else None), 32),
+                "writer_journal_seq": newest_seq,
+                "learned_at": learned,
+                "learned_age_seconds": (round(time.time() - learned, 3)
+                                        if learned is not None else None),
+                "ranks": rows,
+                "learned_at_is_learn_time_not_write_time": True,
+                "meaning": PROVENANCE_POINTER}
+    except Exception as exc:  # noqa: BLE001 - provenance is never worth a fault
+        snapshot._error(exc, "disk_restore failure provenance")
+        return None
+
+
+def _log_failure_episode(kind, line: str) -> bool:
+    """One load-failure line per kind per `REFUSAL_LOG_MIN_SECONDS`. Never per step.
+
+    THE LINE THE OPERATOR ASKED FOR. Nothing in any log explained why a read did not
+    happen: `witness_line` speaks once per verdict change and `suppress_load` speaks
+    about the FUSE, not the cause. This is the cause, at the moment it happens, with
+    the byte figures in it - rate-limited because a refusal that repeats every step
+    is the 1,048-lines-a-second flood that already cost this module its log.
+    """
+    try:
+        key = str(kind or "?")[:48]
+        now = time.monotonic()
+        fired = _failure_log_at.get(key)
+        if isinstance(fired, (int, float)) \
+                and (now - float(fired)) < REFUSAL_LOG_MIN_SECONDS:
+            _state["failure_log_suppressed"] += 1
+            return False
+        if len(_failure_log_at) >= 32:
+            _failure_log_at.clear()
+        _failure_log_at[key] = now
+        _state["failure_log_lines"] += 1
+        _logger.warning("kvtier-dev-plugin: DISK[load-fail] %s", line[:640])
+        return True
+    except Exception as exc:  # noqa: BLE001 - a log line is never worth a fault
+        snapshot._error(exc, "disk_restore failure log")
+        return False
+
+
+def _note_load_failure(kind, *, where: str, reason: str = "", request_id=None,
+                       span=None, group=None, contract=None, key16=None,
+                       gpu_block_id=None, cpu_block_id=None, job_id=None,
+                       bytes_needed=None, jobs_needed=None, jobs_fit=None,
+                       pool_budget_bytes=None, pool_committed_bytes=None,
+                       provenance: bool = True) -> dict:
+    """Record one refused or failed load read, and say it out loud (rate-limited).
+
+    `provenance` is the caller's opt-out for a record whose identity is not a block
+    identity at all (a whole-step refusal, a dropped queue entry): looking one up
+    would cost an index read to produce a `known_to_this_index: false`.
+
+    THE VOCABULARY IS THE EXISTING ONE: `kind` is a name from `WORKER_FAILURES`, so a
+    record and the `reads_failed` counter can never disagree about what happened - a
+    fourth spelling of "short read" is how a counter stops being evidence.
+
+    For `buffer_cap` specifically the record carries the arithmetic that decides it:
+    `pool_budget_bytes`, `pool_committed_bytes`, `bytes_needed` (the price of ONE
+    job), `jobs_needed` (what the offer asked for) and `jobs_fit`. Those five answer
+    "is the pool too small for an offer this big" (budget vs needed) and "is some-
+    thing holding buffers it is not returning" (committed) without a second boot.
+
+    Bounded, never raises, and cheap: one dict, one append, one monotonic read.
+    """
+    record: dict = {}
+    try:
+        name = str(kind or "read_failed")[:48]
+        _state["load_failures"] += 1
+        key_field, group_field = _identity_pair(key16, group)
+        record = {"seq": int(_state["load_failures"]),
+                  "ts": round(time.time(), 6),
+                  "kind": name if name in WORKER_FAILURES else "read_failed",
+                  "kind_as_reported": name,
+                  "where": _failure_text(where, 24),
+                  "request_id": _failure_text(request_id, 48),
+                  "span": _failure_text(span, 80),
+                  "group": group_field,
+                  "contract": _failure_text(contract, 24),
+                  "key16": key_field,
+                  "gpu_block_id": _failure_int(gpu_block_id),
+                  "cpu_block_id": _failure_int(cpu_block_id),
+                  "job_id": _failure_int(job_id),
+                  "bytes_needed": _failure_int(bytes_needed),
+                  "jobs_needed": _failure_int(jobs_needed),
+                  "jobs_fit": _failure_int(jobs_fit),
+                  "pool_budget_bytes": _failure_int(pool_budget_bytes),
+                  "pool_committed_bytes": _failure_int(pool_committed_bytes),
+                  "reason": _failure_text(reason, 200),
+                  "rank": None,
+                  "block_provenance": (_block_provenance(key_field, group_field)
+                                       if provenance and key_field else None)}
+        _load_failures.insert(0, record)
+        while len(_load_failures) > MAX_LOAD_FAILURE_RECORDS:
+            _load_failures.pop()
+            _state["load_failures_overwritten"] += 1
+        parts = [f"kind={record['kind']}", f"where={record['where']}",
+                 f"req={_failure_field(record, 'request_id')}",
+                 f"group={_failure_field(record, 'group')}",
+                 f"key16={_failure_field(record, 'key16')}",
+                 f"gpu_block={_failure_field(record, 'gpu_block_id')}"]
+        if record["bytes_needed"] is not None:
+            parts.append(f"bytes_needed={record['bytes_needed']}")
+        if record["jobs_needed"] is not None:
+            parts.append(f"jobs_needed={record['jobs_needed']} "
+                         f"jobs_fit={record['jobs_fit']}")
+        if record["pool_budget_bytes"] is not None:
+            parts.append(f"pool_budget={record['pool_budget_bytes']} "
+                         f"pool_committed={record['pool_committed_bytes']}")
+        prov = record.get("block_provenance") or {}
+        if prov:
+            parts.append(f"block_rank={prov.get('writer_rank') or '?'} "
+                         f"block_seq={prov.get('writer_journal_seq')} "
+                         f"learned_age_s={prov.get('learned_age_seconds')}")
+        _log_failure_episode(record["kind"], " ".join(parts) + " "
+                             + _failure_text(reason, 160))
+        return record
+    except Exception as exc:  # noqa: BLE001 - a record never breaks a step
+        _state["errors"] += 1
+        snapshot._error(exc, "disk_restore load failure record")
+        return record
+
+
+def _last_invalid_blocks(limit: int = 8) -> list:
+    """The GPU block ids of the most recent load-error report, bounded for a line."""
+    try:
+        return list(((_state.get("last_invalid_block_ids") or {}).get("blocks"))
+                    or [])[:int(limit)]
+    except Exception:  # noqa: BLE001 - a sentence is never worth a fault
+        return []
+
+
+def _recent_failure_kinds(limit: int = 6) -> set:
+    """The failure kinds seen most recently, here or in a live rank file.
+
+    One line of an operator's log should say WHICH kind the worker blamed, even when
+    the line itself was written by the scheduler - and the scheduler's own
+    `reads_failed` is zero by construction, so the ring and the rank files are the
+    only places that know.
+    """
+    kinds: set = set()
+    try:
+        for item in list(_load_failures)[:int(limit)]:
+            if item.get("kind"):
+                kinds.add(str(item["kind"]))
+        for item in list(_state.get("rank_failure_records") or [])[:int(limit)]:
+            if item.get("kind"):
+                kinds.add(str(item["kind"]))
+    except Exception as exc:  # noqa: BLE001 - a sentence is never worth a fault
+        snapshot._error(exc, "disk_restore recent failure kinds")
+    kinds.discard(None)
+    return kinds
+
+
+def load_failures(limit=None) -> list:
+    """The ring's records, newest first. Bounded by `MAX_LOAD_FAILURE_RECORDS`.
+
+    THIS PROCESS ONLY. A worker writes the refusals it sees and the scheduler cannot,
+    so a reader that wants the fleet's records wants `load_failure_report()`, which
+    folds in what the live rank files carry (the `ranks_reads_applied` transport).
+    """
+    try:
+        wanted = _int(limit) if limit is not None else MAX_FAILURES_PUBLISHED
+        if wanted is None or wanted < 1:
+            wanted = MAX_FAILURES_PUBLISHED
+        wanted = min(int(wanted), MAX_LOAD_FAILURE_RECORDS)
+        return [dict(item) for item in _load_failures[:wanted]]
+    except Exception as exc:  # noqa: BLE001 - a payload field never breaks a poll
+        snapshot._error(exc, "disk_restore load_failures")
+        return []
+
+
+def load_failure_report(limit=None) -> dict:
+    """The load-failure records an operator can read: this process, plus every rank.
+
+    Cross-process the way this module already does it - the rank file. A worker's
+    `worker_report()` publishes its last `MAX_FAILURES_PER_RANK_FILE` records inside
+    its (byte-capped) `disk_restore` section and `_read_worker_proof()` reads them
+    with the same bounded, defensive, fresh-from-disk walk that carries
+    `reads_applied` today; this merges the two sources newest-first.
+
+    Provenance is attached HERE for records that came from a worker, because the
+    worker's own `disk_index` is empty by construction (the index is the scheduler's)
+    and the SCHEDULER is the process holding the index when this runs. The identity
+    in the record is a content hash, so the lookup is the same identity the worker
+    was reading bytes for.
+    """
+    wanted = _int(limit)
+    if wanted is None or wanted < 1:
+        wanted = MAX_FAILURES_PUBLISHED
+    wanted = min(int(wanted), MAX_LOAD_FAILURE_RECORDS * (MAX_RANK_FILES_PROBED + 1))
+    records = [dict(item) for item in _load_failures[:wanted]]
+    ranks: list = []
+    for item in _state.get("rank_failure_records") or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        if row.get("block_provenance") is None and row.get("key16"):
+            row["block_provenance"] = _block_provenance(row.get("key16"),
+                                                        row.get("group"))
+        ranks.append(row)
+    merged = sorted(records + ranks,
+                    key=lambda item: (item.get("ts") or 0.0,
+                                       item.get("seq") or 0), reverse=True)
+    return {"ok": True,
+            "records": merged[:wanted],
+            "records_here": len(records),
+            "records_from_rank_files": int(_state["ranks_load_failures"] or 0),
+            "ring_depth": MAX_LOAD_FAILURE_RECORDS,
+            "ring_written": int(_state["load_failures"]),
+            "ring_overwritten": int(_state["load_failures_overwritten"]),
+            "newest_first": True,
+            "kinds": sorted(WORKER_FAILURES),
+            "provenance_meaning": (
+                "key16+group IS the content identity: the same prompt and the same "
+                "settings under a restart produce the SAME key, so a restore can be "
+                "served by bytes an older boot (or another session, or another "
+                "request) spilled. Which REQUEST wrote a block is NOT knowable from "
+                "the store: a journal line is `<seq> <+|-> <key16> <bytes> <group>` "
+                "and `record_spill` is handed a path and a size, so no request id "
+                "ever reaches the journal. The closest real provenance is what these "
+                "records carry - the rank whose journal claims the identity, that "
+                "line's position in the rank's journal, and when THIS process's index "
+                "learned it (a learn time, not a write time: a cold boot's drain "
+                "stamps old files with the drain's clock)."),
+            "note": ("a worker writes the records (it is the only process that reads "
+                     "a file) and this report merges what its rank file carried. "
+                     "`reads_failed` on EngineCore is zero by construction: that is "
+                     "why the records, not the counter, are the evidence.")}
+
+
 def reset_state_for_tests() -> None:
     """Back to a fresh boot: no ledgers, no counters, no installed layer."""
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
     global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
-    global _offered_at, _burned, _aged_out
+    global _offered_at, _burned, _aged_out, _load_failures, _failure_log_at
     _loads = {}
     _slot_paths = {}
     _wloads = {}
@@ -810,6 +1283,8 @@ def reset_state_for_tests() -> None:
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
+    del _load_failures[:]
+    _failure_log_at.clear()
     for samples in _apply_samples.values():
         del samples[:]
     _notices.clear()
@@ -854,15 +1329,22 @@ def reset_state_for_tests() -> None:
             "spans_observed": 0, "span_entries_observed": 0, "spans_whole": 0,
             "spans_partial": 0, "spans_empty": 0, "spans_hole_in_the_middle": 0,
             "last_span_shape": None,
+            "offer_pool_capped": 0, "offer_pool_refused": 0,
+            "last_offer_pool": None,
+            "load_failures": 0, "load_failures_overwritten": 0,
+            "ranks_load_failures": 0, "failure_log_lines": 0,
+            "failure_log_suppressed": 0,
+            "ranks_bytes_per_file_max": None,
+            "rank_failure_records": [],
+            "invalid_block_ids_seen": 0, "last_invalid_block_ids": None,
             "witness_verdict": None, "witness_reason": None,
             "witness_kind": None, "witness_emissions": 0,
             "witness_suppressed": 0,
-            "offers_enabled": False, "scope": RESTORE_SCOPE_DEFAULT,
-            "scope_changes": 0, "offer_switch_changes": 0, "ranks_seen": 0,
-            "requests_seen": 0,
-            "flagged": 0, "skipped_no_marker": 0, "suppressed_hits": 0,
-            "suppressed_spans": 0, "suppressions": 0,
-            "disk_authority": 0, "local_hit_ignored": 0,
+            "offers_enabled": False, "disk_authority": DISK_AUTHORITY_DEFAULT,
+            "offer_switch_changes": 0, "disk_authority_changes": 0,
+            "ranks_seen": 0,
+            "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
+            "authority_lookups": 0, "local_hit_ignored": 0,
             "local_hit_tokens_ignored": 0, "pin_release_failures": 0,
             "last_local_hit_ignored": None, "last_offer": None,
             "last_groups_required": None,
@@ -1192,6 +1674,10 @@ def counters() -> dict:
     out = dict(_state)
     out["refused"] = dict(_state["refused"])
     out["reads_failed"] = dict(_state["reads_failed"])
+    # THE POSTURE, beside the numbers it explains: "offers: 0" means something
+    # different under `off` than under `disk_authority`, and the reader should not
+    # have to combine two booleans to find out which.
+    out["serving_as"] = serving_as()
     out["tracked_loads"] = len(_loads)
     out["tracked_slots"] = len(_slot_paths)
     out["tracked_worker_loads"] = len(_wloads)
@@ -1292,25 +1778,35 @@ def counters_view(out: dict) -> dict:
                               "scheduler-only process by construction)",
         "ranks_reads_applied": "applied disk reads attested by live worker rank "
                                "files at the last proof read",
-        "offers_enabled": "this boot's offer switch: False until the dev verb "
+        "offers_enabled": "this boot's gap-fill switch: False until the dev verb "
                           "raises it, so an armed spill tier alone cannot put a "
-                          "disk offer in front of live traffic",
-        "scope": "which requests may be offered at all: `optin` (only a request "
-                 "carrying the kvtier_disk_restore marker) or `all`",
-        "scope_changes": "times the scope was changed in this boot: a knob that "
-                         "moves once per experiment, so anything above 1-2 in a "
-                         "production log means someone was deciding mid-flight",
-        "offer_switch_changes": "times this boot's offer switch was raised or "
+                          "disk offer in front of live traffic. Up on its own it "
+                          "means RAM first and the disk filling the gap; "
+                          "`disk_authority` is the switch that makes the disk "
+                          "decide instead",
+        "disk_authority": "this boot's DISK-AUTHORITY switch, and the whole answer "
+                          "to 'is everyone being served from SSD?': true means the "
+                          "disk, not the host-RAM hit, decides EVERY request's own "
+                          "prefix. False at every fresh boot, set only by "
+                          "`{\"op\":\"authority\",\"enabled\":true}`, and a restart "
+                          "turns it off",
+        "serving_as": "the two switches read as one verdict: `off` (nothing is "
+                      "served from disk), `disk_authority` (EVERY request, with the "
+                      "disk deciding its prefix) or `ram_first_gap_fill` (only the "
+                      "prefix the host-RAM tier left short). Derived from the two "
+                      "switches by `disk_posture()` and published nowhere else",
+        "disk_authority_changes": "times the disk-authority switch was raised or "
+                                  "dropped in this boot: a posture moved once per "
+                                  "experiment, so a rising count is someone "
+                                  "deciding mid-flight",
+        "offer_switch_changes": "times this boot's gap-fill switch was raised or "
                                 "dropped: a boot that never offered and never "
                                 "changed hands says OFF and 0",
-        "requests_seen": "lookups observed by the request-scoped gate",
-        "flagged": "requests carrying the kvtier_disk_restore marker",
-        "skipped_no_marker": "requests left exactly as the fork would have left "
-                             "them because they did not ask for a disk restore",
-        "disk_authority": "flagged lookups where the DISK was made the authority "
-                          "for the request's own prefix, so the host-RAM hit did "
-                          "not decide the span (0.2.22: the marker's meaning)",
-        "local_hit_ignored": "OFFERS committed on a flagged request whose host-RAM "
+        "authority_lookups": "lookups that ran under disk authority, so the disk "
+                             "and not the host-RAM tier decided the span (unit: "
+                             "lookups). While the switch is up this is the offer "
+                             "path's whole population; while it is down it stays 0",
+        "local_hit_ignored": "OFFERS committed under disk authority whose host-RAM "
                              "hit was non-zero and was discarded to let the disk "
                              "span start at the local prefix instead. A refusal "
                              "counts here NEVER: a refused offer leaves the RAM hit "
@@ -1319,7 +1815,7 @@ def counters_view(out: dict) -> dict:
                                     "offers: what the request gave up to exercise "
                                     "the disk path (unit: tokens)",
         "pin_release_failures": "times the fork's pinned host-RAM blocks could not "
-                                "be released when a flagged request chose disk over "
+                                "be released when disk authority chose the disk over "
                                 "them: each one is a pin that may outlive the "
                                 "request, so it must stay 0 (an unavailable "
                                 "`_free_pending_cpu_hit` refuses up front instead)",
@@ -1410,6 +1906,31 @@ def counters_view(out: dict) -> dict:
                            "partial, empty, `applied_is_prefix`, and which span "
                            "indices came away partial (bounded by MAX_SPANS_REPORT "
                            "with `truncated` naming the rest)",
+        "offer_pool_capped": "offers SHORTENED to the job count the bounce-buffer pool "
+                             "can hold at once (one read holds its buffer from issue "
+                             "to the apply point, so an offer needs the pool to hold "
+                             "ALL of its buffers); the tighter sibling of "
+                             "`offer_clamped`, which counts the TOKEN ceiling",
+        "offer_pool_refused": "lookups given no disk offer at all because the pool "
+                              "cannot carry one span's reads: the refusal that "
+                              "replaces the 0.2.30 shape, where the offer was made, "
+                              "refused at bind as `buffer_cap` and fused the request",
+        "last_offer_pool": "the most recent offer's bounce-buffer arithmetic: bytes "
+                           "per job and where that price came from, the pool budget "
+                           "and what was committed, jobs needed versus jobs the pool "
+                           "can carry, and `bounded_by`",
+        "load_failures": "load-failure RECORDS written by this process (one per "
+                         "refused or failed read), bounded by the ring cap",
+        "load_failures_overwritten": "records the ring recycled at its cap",
+        "ranks_load_failures": "load-failure records read from live worker rank "
+                               "files (the transport `ranks_reads_applied` uses)",
+        "failure_log_lines": "DISK[load-fail] lines this process logged, one per "
+                             "episode per kind",
+        "failure_log_suppressed": "lines the rate limit suppressed, so a quiet log is "
+                                  "provably a quiet tier and not a silent one",
+        "invalid_block_ids_seen": "GPU block ids the fork reported as load errors, "
+                                  "counted over the boot instead of discarded",
+        "last_invalid_block_ids": "the ids from the most recent report (bounded)",
         "settle_waits_granted": "batches given a non-zero settle budget",
         "settled_after_wait": "batches that settled during their wait: the waits that "
                               "bought bytes",
@@ -1594,96 +2115,228 @@ def _worker_fail(kind: str, reason: str) -> dict:
     name = kind if kind in _state["reads_failed"] else "read_failed"
     _state["reads_failed"][name] += 1
     _note(reason)
+    # THE WHOLE-STEP REFUSALS, recorded too. A bind that queued nothing because the
+    # identity is unreadable or the metadata's lists disagree is the biggest "why did
+    # no read happen" shape there is, and until now it moved a counter in the worker
+    # and said nothing anywhere the scheduler or the operator could read. Rate-limited
+    # with everything else here, so a gate that stays closed costs one line per window
+    # and not one per step.
+    _note_load_failure(name, where="bind", reason=reason)
     return _fail(reason, reason_kind=name)
 
 
 # --- the gate -----------------------------------------------------------------
 
-def offer_posture() -> dict:
-    """This boot's offer posture: the switch and the scope. Read-only, never raises.
+def serving_as() -> str:
+    """The two boot switches, read as ONE verdict. Derived here and nowhere else.
 
-    Two independent facts, both per-boot, both set only by the dev verb:
+    A payload with two booleans invites the reader to do the arithmetic, and the
+    arithmetic is the part that matters: "am I serving everyone from SSD?" must be one
+    field read. Exactly three answers, and they are exhaustive.
+    """
+    if _state["disk_authority"]:
+        # Authority implies offering: a boot that made the disk the authority has
+        # decided to serve from disk, so the gap-fill switch cannot contradict it.
+        return "disk_authority"
+    if _state["offers_enabled"]:
+        return "ram_first_gap_fill"
+    return "off"
 
-    `enabled` - may this boot offer disk restores AT ALL. False at every fresh boot.
+
+def disk_posture() -> dict:
+    """This boot's disk posture: who may be served, and whose answer decides. Never
+    raises, reads no file.
+
+    THREE facts, all per-boot, all set only by the `/disk` dev verb over a POST, and
+    all lost by a restart - which is stated in the payload because an operator deciding
+    "is this boot safe to leave running?" needs to know whether the posture survives a
+    crash. It does not, deliberately: an unhealthy boot comes back giving disk
+    authority to nobody.
+
+    `disk_authority` - THE DISK IS THE AUTHORITY FOR EVERY REQUEST. Each request's
+      host-RAM hit is treated as zero tokens for the offer arithmetic and released, so
+      the disk index decides the span from the local GPU-computed boundary. This is
+      "serving everyone from SSD": it opens the offer gate BY ITSELF, so one POST is
+      the whole change, and nothing - no env var, no config file, no arm, no recovery
+      path - can raise it instead of the verb.
+    `offers_enabled` - the cheaper posture: RAM first, the disk filling the gap.
       Arming the spill tier is not this: on 2026-10-05 an arm raised for a spill
       measurement was enough to put an un-requested 160,000-token disk offer in front
-      of live traffic 123,474 times, because the restore path keyed off the spill
-      arm. It is its own decision now.
-
-    `scope` - WHICH requests, once the switch is up. `optin` (the default) offers to
-      a request only if it carries `kv_transfer_params.kvtier_disk_restore = true`;
-      `all` offers to every request, which is what a measurement of the whole
-      workload wants and what no production boot should be left in.
+      of live traffic 123,474 times, because the restore path keyed off the spill arm.
+    `serving_as` - the two switches collapsed into one verdict, so a poller never has
+      to guess which of them it was looking at.
     """
-    return {"enabled": bool(_state["offers_enabled"]),
-            "scope": _state["scope"],
-            "marker_key": RESTORE_MARKER_KEY,
-            "flagged": _state["flagged"], "requests_seen": _state["requests_seen"],
-            "skipped_no_marker": _state["skipped_no_marker"],
+    return {"disk_authority": bool(_state["disk_authority"]),
+            "enabled": bool(_state["offers_enabled"]),
+            "serving_as": serving_as(),
+            "per_boot": True,
+            "survives_restart": False,
+            "disk_authority_changes": int(_state["disk_authority_changes"]),
+            "offer_switch_changes": int(_state["offer_switch_changes"]),
+            "authority_lookups": int(_state["authority_lookups"]),
+            "lookups": int(_state["lookups"]),
             "suppressed_requests": len(_suppressed)}
 
 
-def set_offer_switch(enabled) -> dict:
-    """Raise or drop THIS BOOT's offer switch. The dev verb's doing, never a file.
+def _switch_verdict(field, enabled, changed, line) -> dict:
+    """The one validation and logging path both boot switches share.
 
-    Deliberately not an environment variable and not the spill arm: the whole point
-    is that a boot that nobody asked to serve disk restores does not serve them.
-    Accepts a real boolean only - a payload that says `"true"` or `1` is refused
-    rather than obeyed, because a typo in a curl should not change engine behaviour.
+    A real boolean or nothing: a payload that says `"true"` or `1` is REFUSED rather
+    than obeyed, because a typo in a curl must not change engine behaviour in either
+    direction. Both switches are per-boot and neither survives a restart, and the
+    caller's response says so rather than leaving it in the docstring.
+
+    `line` is a TEMPLATE with one `%s`, filled in HERE - after the state has moved -
+    because every one of these sentences ends by naming the resulting `serving_as`, and
+    a caller that formatted it before calling would report the posture the boot is
+    LEAVING. A log line that names the wrong posture is worse than no log line: it is
+    the record an operator trusts at 3 a.m.
     """
     if not isinstance(enabled, bool):
-        return _fail(f"the offer switch wants a JSON true or false, got "
+        return _fail(f"{field} wants a JSON true or false, got "
                      f"{type(enabled).__name__}")
-    changed = bool(_state["offers_enabled"]) != enabled
-    _state["offers_enabled"] = enabled
-    if changed:
-        _state["offer_switch_changes"] += 1
-    _logger.warning("kvtier-dev-plugin: DISK[restore] offers %s for this boot "
-                   "(scope=%s) - a fresh boot starts with them OFF and only this "
-                   "verb changes it", "ENABLED" if enabled else "disabled",
-                   _state["scope"])
-    return _ok(posture=offer_posture(), changed=changed)
+    changed_now = bool(_state[field]) != enabled
+    _state[field] = enabled
+    if changed_now:
+        _state[changed] += 1
+    _logger.warning("kvtier-dev-plugin: %s", line % serving_as())
+    # `field` and `enabled` travel with the verdict because the route op's response is
+    # the operator's receipt: `ok: true` without "which field, to what" is the same
+    # ambiguity the switch was introduced to remove.
+    return _ok(field=field, enabled=enabled, changed=changed_now,
+               posture=disk_posture(),
+               per_boot=True, survives_restart=False)
 
 
-def set_scope(scope) -> dict:
-    """Which requests may be offered at all: `optin` (default) or `all`.
+def set_disk_authority(enabled) -> dict:
+    """THE global disk-authority switch: the disk decides EVERY request's prefix.
 
-    A misspelled scope is refused, not defaulted: silently falling back to `optin`
-    when someone typed `"all"` with a typo would leave a measurement measuring
-    nothing, and the operator would only see it in the results.
+    Boot default False, and this function is the ONLY writer - reached from the `/disk`
+    route op over a POST. Not an environment variable, not a config file, not the spill
+    arm and not any failure-recovery path: an unhealthy boot stays off, and so does a
+    boot nobody asked to serve from SSD. Raising it opens the offer gate by itself, so
+    one POST serves every request from disk; dropping it while `offers_enabled` is down
+    puts the gate back to `serving_as=off`.
     """
-    if not isinstance(scope, str) or scope not in RESTORE_SCOPES:
-        return _fail(f"scope must be one of {list(RESTORE_SCOPES)}, got {scope!r}")
-    changed = _state["scope"] != scope
-    _state["scope"] = scope
-    if changed:
-        _state["scope_changes"] += 1
-    _logger.warning("kvtier-dev-plugin: DISK[restore] scope=%s - %s", scope,
-                   "only a request carrying "
-                   f"kv_transfer_params.{RESTORE_MARKER_KEY}=true is offered" if
-                   scope == RESTORE_SCOPE_OPTIN else
-                   "EVERY request is a candidate, which is a measurement posture")
-    return _ok(posture=offer_posture(), changed=changed)
+    return _switch_verdict(
+        "disk_authority", enabled, "disk_authority_changes",
+        ("DISK[restore] disk_authority=ON for this boot: EVERY request is served from "
+         "disk and its host-RAM hit is given back (serving_as=%s). A fresh boot starts "
+         "with it OFF, only POST /plugins/kvtier/disk {\"op\":\"authority\"} changes "
+         "it, and a restart turns it off")
+        if enabled else
+        # The OFF line has to say what is left serving, because turning this off does
+        # not necessarily stop serving: if the gap-fill switch is up, the boot keeps
+        # offering with RAM leading. A line that only announced "OFF" would read as
+        # "nothing is served from disk" on a boot that still is.
+        ("DISK[restore] disk_authority=OFF for this boot: the disk no longer decides "
+         "any request's prefix and no host-RAM hit is given back (serving_as=%s). A "
+         "fresh boot starts with it OFF, only POST /plugins/kvtier/disk "
+         "{\"op\":\"authority\"} changes it, and a restart turns it off"))
 
 
-def request_flagged(request) -> bool:
-    """Did THIS request ask for a disk restore? One attribute read; never raises.
+def set_offer_switch(enabled) -> dict:
+    """Raise or drop THIS BOOT's gap-fill switch: RAM first, the disk fills the gap.
 
-    Strict on purpose: a real `dict` carrying the marker key with the boolean `True`.
-    `"true"`, `1`, `1.0`, a nested object and a `kv_transfer_params` that is not a
-    dict are all "not asked". A client controls this field, and the cost of being
-    loose about it is disk work on a request that never asked for it.
-
-    This is the first thing the offer path looks at, before the gate and before any
-    file or index access, so an unflagged request in `optin` scope costs the fork's
-    own lookup plus this one attribute read. `tests` pin that with a lookup spy.
+    Deliberately not an environment variable and not the spill arm: the whole point is
+    that a boot nobody asked to serve disk restores does not serve them. Accepts a real
+    boolean only.
     """
+    return _switch_verdict(
+        "offers_enabled", enabled, "offer_switch_changes",
+        # The direction word is concatenated rather than %-substituted because the
+        # template's ONE `%s` belongs to `_switch_verdict`, which fills the posture in
+        # AFTER the write (see there). A half-formatted template is a TypeError.
+        "DISK[restore] offers=" + ("ENABLED" if enabled else "disabled")
+        + " for this boot (serving_as=%s) - a fresh boot starts with them OFF and "
+        "only this verb changes it")
+
+
+def arena_verdict(manager) -> dict:
+    """Can the host-RAM arena THIS process can see service even the smallest offer?
+
+    WHY THE DISK TIER DEPENDS ON THE ARENA AT ALL. Nothing here owns a KV byte. Spill
+    reads bytes OUT of the arena's pinned CPU tensors (`disk_spill.read_slot_bytes`
+    over the worker's `cpu_kv_caches`) and is TRIGGERED by the RAM tier's own
+    store-completion events; restore allocates its destination slots FROM the arena's
+    CPU block pool (`cpu_block_pool`, the same pool whose free count clamps an offer
+    at `no_cpu_slots`) and memmoves into them before the fork DMAs them to GPU. So an
+    arena that is absent, or clamps to a handful of slots per rank (a mis-set
+    `KV_OFFLOAD_SIZE`, a missing `VLLM_USE_SIMPLE_KV_OFFLOAD`, or the fork's own
+    `max(1, ...)` clamp) leaves the disk tier STRUCTURALLY INERT while its arm file
+    still says ARMED - a healthy-looking boot with a dead tier.
+
+    WHAT THIS CAN SEE, AND WHAT IT REFUSES TO GUESS. The pool is the scheduler-side
+    half of the arena and the manager handed in is the connector's own, so the free
+    count is read exactly the way the offer path reads it. The worker's region tensors
+    are NOT visible from EngineCore; their absence is already reported where it is
+    known (`fingerprint_incomplete` in a rank file, `no_worker_proof` in the gate) and
+    this function says `no_manager` rather than inventing a worker-side verdict it
+    cannot take. A pool that cannot hold `CPU_SLOT_RESERVE + 1` free blocks can never
+    pass the offer arithmetic, which is the smallest claim this module ever makes.
+
+    Never raises, and reports its own failure as `unreadable` rather than as `ok`: a
+    boot verdict that swallows its error is how a dead tier reads as a live one.
+    """
+    out = {"state": "no_manager", "pool_total_blocks": None,
+           "free_blocks": None, "cpu_slot_reserve": CPU_SLOT_RESERVE,
+           "blocks_usable_for_an_offer": None,
+           "reason": "no connector manager was handed to the boot verdict, so no "
+                     "CPU block pool can be read here"}
     try:
-        params = getattr(request, "kv_transfer_params", None)
-        return isinstance(params, dict) and params.get(RESTORE_MARKER_KEY) is True
-    except Exception as exc:  # noqa: BLE001 - a hostile request is not a reason to raise
-        snapshot._error(exc, "disk_restore request marker")
-        return False
+        if manager is None:
+            # No connector handed to the boot verdict is a DIFFERENT fact from a
+            # connector with no arena: the first means "this process cannot see an
+            # arena to judge" (a worker, a nested connector), the second means "the
+            # tier has no host-RAM arena", which is a fault. Blaming a class that was
+            # never there would cry wolf on every process that legitimately has no
+            # scheduler.
+            return out
+        pool = getattr(manager, "cpu_block_pool", None)
+        if pool is None:
+            named = (type(manager).__name__ if manager is not None else "nothing")
+            out["reason"] = (f"{named} exposes no `cpu_block_pool`: the disk tier "
+                             "has no host-RAM arena to spill out of or restore "
+                             "into, so it cannot move one byte however firmly its "
+                             "arm is raised")
+            out["state"] = "no_pool"
+            return out
+        free = _int(pool.get_num_free_blocks())
+        total = _int(len(getattr(pool, "blocks", ()) or ()))
+        out["free_blocks"] = free
+        out["pool_total_blocks"] = total
+        if free is None:
+            out["state"] = "unreadable"
+            out["reason"] = ("the CPU block pool exposes no readable "
+                             "`get_num_free_blocks()`, so the arena's size is unknown "
+                             "and an offer cannot be priced against it")
+            return out
+        usable = free - CPU_SLOT_RESERVE
+        out["blocks_usable_for_an_offer"] = int(usable)
+        if usable < 1:
+            out["state"] = "tiny"
+            out["reason"] = (f"the arena has {free} free CPU block(s) and "
+                             f"{CPU_SLOT_RESERVE} are reserved, leaving {usable} for a "
+                             "disk offer: one span needs at least one destination "
+                             "slot, so every offer dies at `no_cpu_slots`. Check "
+                             "KV_OFFLOAD_SIZE / VLLM_USE_SIMPLE_KV_OFFLOAD: a tier "
+                             "whose arena clamps to a slot or two per rank cannot be "
+                             "serviced from disk at any pool size")
+            return out
+        out["state"] = "ok"
+        out["reason"] = (f"the arena has {free} free of "
+                         f"{total if total is not None else '?'} CPU block(s), "
+                         f"{usable} usable once the "
+                         f"{CPU_SLOT_RESERVE}-block reserve is held: an offer can be "
+                         "given a destination slot")
+        return out
+    except Exception as exc:  # noqa: BLE001 - a verdict is never worth a fault
+        snapshot._error(exc, "disk_restore arena verdict")
+        return {"state": "unreadable", "pool_total_blocks": None,
+                "free_blocks": None, "cpu_slot_reserve": CPU_SLOT_RESERVE,
+                "blocks_usable_for_an_offer": None,
+                "reason": f"reading the CPU block pool raised "
+                          f"{type(exc).__name__}"}
 
 
 def gate() -> dict:
@@ -1715,15 +2368,19 @@ def gate() -> dict:
         return _fail("the KV tier itself is disarmed, so the connector schedules "
                      "no load for a disk offer to ride on",
                      reason_kind="tier_disarmed")
-    if not _state["offers_enabled"]:
-        # The boot default. Reaching here means the spill tier is armed AND the RAM
-        # tier is armed, which is a state a *different* experiment puts up - and on
-        # 2026-10-05 that state was enough to put an un-requested 160,000-token disk
-        # offer in front of live traffic 123,474 times. Offering is its own decision,
-        # made per boot with the dev verb, and nothing else can make it.
-        return _fail("this boot has not been told to offer disk restores: arm it "
-                     "with POST /plugins/kvtier/d {\"op\":\"offers\","
-                     "\"enabled\":true} when a measurement actually wants them",
+    if not (_state["disk_authority"] or _state["offers_enabled"]):
+        # The boot default, and the ONLY thing that keeps this gate shut on an armed
+        # box. Reaching here means the spill tier is armed AND the RAM tier is armed,
+        # which is a state a *different* experiment puts up - and on 2026-10-05 that
+        # state was enough to put an un-requested 160,000-token disk offer in front of
+        # live traffic 123,474 times. Which posture serves, and whether any does, is
+        # decided per boot by the dev verb and by nothing else.
+        # Both ops are spelled inside the first 160 characters on purpose: `_fail`
+        # clips a reason at MAX_STRING_CHARS, and a sentence whose second half is
+        # clipped away stops being the answer to "how do I turn this on?".
+        return _fail("neither boot switch is up: {\"op\":\"authority\",\"enabled\":"
+                     "true} serves every request from SSD; {\"op\":\"offers\","
+                     "\"enabled\":true} fills only what host RAM left short",
                      reason_kind="offers_disabled")
     proof = worker_proof()
     if not proof["ok"]:
@@ -1816,6 +2473,53 @@ def worker_service_verdict() -> dict:
     return _ok(root=verdict["root"])
 
 
+def _rank_failure_records(raw) -> list:
+    """Validate the `last_failures` one rank file carried. Defensive, bounded, safe.
+
+    The field arrives from ANOTHER PROCESS, so it is treated as untrusted input of the
+    same kind the reader already treats `reads_applied` as: every string clipped, every
+    number checked with `_int`, the list capped, and anything not shaped like a record
+    dropped. A hostile or half-written file must not be able to put a fake reason in
+    front of the operator, and must not be able to make this reader raise.
+    """
+    out: list = []
+    try:
+        if isinstance(raw, (str, bytes, dict)) or raw is None:
+            return out
+        for item in list(raw)[:MAX_FAILURES_PER_RANK_FILE]:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("kind")
+            row = {"kind": (_failure_text(kind, 48)
+                            if kind in WORKER_FAILURES else "read_failed"),
+                   "kind_as_reported": _failure_text(kind, 48),
+                   "where": _failure_text(item.get("where"), 24),
+                   "request_id": _failure_text(item.get("request_id"), 48),
+                   "span": _failure_text(item.get("span"), 80),
+                   "group": _failure_int(item.get("group")),
+                   "contract": _failure_text(item.get("contract"), 24),
+                   "key16": _failure_text(item.get("key16"), 64),
+                   "gpu_block_id": _failure_int(item.get("gpu_block_id")),
+                   "job_id": _failure_int(item.get("job_id")),
+                   "bytes_needed": _failure_int(item.get("bytes_needed")),
+                   "jobs_needed": _failure_int(item.get("jobs_needed")),
+                   "jobs_fit": _failure_int(item.get("jobs_fit")),
+                   "pool_budget_bytes": _failure_int(item.get("pool_budget_bytes")),
+                   "pool_committed_bytes": _failure_int(
+                       item.get("pool_committed_bytes")),
+                   "reason": _failure_text(item.get("reason"), 200),
+                   "ts": (_failure_int(item.get("ts")) or 0),
+                   "seq": _failure_int(item.get("seq")),
+                   "rank": _failure_text(item.get("rank"), 32),
+                   "source": "rank file",
+                   "block_provenance": None}
+            out.append(row)
+    except Exception as exc:  # noqa: BLE001 - one bad field is not evidence
+        snapshot._error(exc, "disk_restore rank failure records")
+        return out[:MAX_FAILURES_PER_RANK_FILE]
+    return out
+
+
 def _rank_file_proves_restore(path) -> dict | None:
     """What one rank file says about ITS worker: a verdict dict, or None.
 
@@ -1885,10 +2589,20 @@ def _rank_file_proves_restore(path) -> dict | None:
         reads = _int(section.get("reads_applied"))
         if reads is None or reads < 0:
             reads = 0
+        # WHAT ONE READ COSTS THIS RANK (0.2.31): its own `total_bytes_per_file`, the
+        # figure the offer's bounce-buffer cap is priced with. Clamped like every other
+        # number read out of another process, and None when the file predates the field
+        # - which is the mixed-fleet case the fallback price exists for.
+        width = _int(section.get("bytes_per_file"))
+        if width is None or width < 0:
+            width = None
         return {"rank": name, "installed": installed,
                 "worker_fitted": fitted, "service_reason_kind": kind,
                 "armed": installed and armed,
                 "reads_applied": min(reads, MAX_RANK_COUNTER),
+                "bytes_per_file": width,
+                "last_failures": _rank_failure_records(
+                    section.get("last_failures")),
                 "reason": _clip(section.get("reason"), 160)}
     except Exception as exc:  # noqa: BLE001 - one bad file is not evidence, that's all
         snapshot._error(exc, "disk_restore rank file")
@@ -1972,11 +2686,29 @@ def _read_worker_proof() -> dict:
     armed, silent = [], []
     stale_claims = 0
     reads = 0
+    # THE TWO FACTS THE OFFER'S PRICE AND THE OPERATOR'S DIAGNOSIS READ OFF THE SAME
+    # READ (0.2.31). `widths` is every live rank's own `bytes_per_file`, and the offer
+    # cap uses the WIDEST of them: an offer spans every rank, the bounce-buffer pool is
+    # per process, and pricing the widest slot is the only cap that cannot be
+    # optimistic for somebody. `failures` is the load-failure records the files carried,
+    # the transport `reads_applied` already uses, because the reasons live in the worker
+    # and the operator reads the scheduler.
+    widths: list = []
+    failures: list = []
     probed = names[:MAX_RANK_FILES_PROBED]
     for name in probed:
         said = _rank_file_proves_restore(directory / name)
         if said is None:
             continue
+        width = said.get("bytes_per_file")
+        if isinstance(width, int) and not isinstance(width, bool) and width > 0:
+            widths.append(int(width))
+        for record in said.get("last_failures") or []:
+            if len(failures) >= MAX_RANK_FILES_PROBED * MAX_FAILURES_PER_RANK_FILE:
+                break
+            row = dict(record)
+            row["rank"] = said["rank"]
+            failures.append(row)
         if not said["installed"]:
             silent.append(f"{said['rank']}: not fitted")
             continue
@@ -2006,6 +2738,12 @@ def _read_worker_proof() -> dict:
     seen = len(armed) + len(silent)
     _state["ranks_seen"] = seen
     _state["ranks_reads_applied"] = reads
+    _state["ranks_load_failures"] = len(failures)
+    _state["rank_failure_records"] = sorted(
+        failures, key=lambda item: (item.get("ts") or 0, item.get("seq") or 0),
+        reverse=True)[:MAX_FAILURES_PUBLISHED]
+    widest = max(widths) if widths else None
+    _state["ranks_bytes_per_file_max"] = widest
     if not tier_armed:
         # THE ARM FILE OUTRANKS EVERY RANK FILE (0.2.28). No rank file can arm a
         # disarmed tier by claiming `armed: true` - the arm carries the boot fence
@@ -2025,12 +2763,18 @@ def _read_worker_proof() -> dict:
         return {"ok": True, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
                 "reads_applied": reads, "tier_armed": True,
+                "bytes_per_file_max": widest,
+                "bytes_per_file_ranks": len(widths),
+                "load_failures": list(_state["rank_failure_records"]),
                 "stale_arm_claims": stale_claims, "arm_file_reason": None,
                 "reason_kind": None, "reason": None}
     if silent and armed:
         return {"ok": False, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
                 "reads_applied": reads, "tier_armed": True,
+                "bytes_per_file_max": widest,
+                "bytes_per_file_ranks": len(widths),
+                "load_failures": list(_state["rank_failure_records"]),
                 "stale_arm_claims": stale_claims, "arm_file_reason": None,
                 "reason_kind": "scheduler_armed_workers_disarmed",
                 "reason": f"{len(armed)} of {seen} live rank file(s) serve disk and "
@@ -2792,7 +3536,6 @@ def offer(manager, request, num_computed_tokens, ram_result):
     refcounting, pairing and state creation stays the fork's.
     """
     _state["lookups"] += 1
-    _state["requests_seen"] += 1
     try:
         return _offer(manager, request, num_computed_tokens, ram_result)
     except Exception as exc:  # noqa: BLE001 - a restore never breaks a schedule
@@ -2800,29 +3543,6 @@ def offer(manager, request, num_computed_tokens, ram_result):
         snapshot._error(exc, "disk_restore offer")
         _refuse("bad_call", f"the offer path raised {type(exc).__name__}")
         return ram_result
-
-
-def _skip_unless_flagged(request) -> bool:
-    """True when this request must be handed straight back to the fork, at no cost.
-
-    THE CHEAPEST CHECK IN THE PATH, and it has to be first: an unflagged request in
-    `optin` scope must cost the fork's own lookup plus one attribute read - no gate,
-    no arm file, no rank directory, no journal, no allocation. Reading the gate first
-    would put a cached `open()` and a `listdir()` in front of every request the plugin
-    has no business touching, which is the opposite of what a scope switch is for.
-
-    It reports itself only when this boot is actually offering (`offers_enabled`), so
-    a disarmed boot does not fill its counters with `skipped_no_marker` for requests
-    that would have been refused anyway, and `why_no_restore()` keeps answering the
-    gate's question first for anyone who asks it directly.
-    """
-    if not _state["offers_enabled"] or _state["scope"] != RESTORE_SCOPE_OPTIN:
-        return False
-    if request_flagged(request):
-        _state["flagged"] += 1
-        return False
-    _state["skipped_no_marker"] += 1
-    return True
 
 
 def suppression_lookups() -> int:
@@ -2894,11 +3614,149 @@ def _suppressed_span(run) -> str | None:
         return None
 
 
+def _pool_price_bytes(run_keys=None, blocks: int = 0) -> tuple:
+    """(bytes ONE read needs, where that figure came from) - the offer's unit price.
+
+    THREE SOURCES, TRIED IN ORDER OF PRECISION, AND THE ANSWER IS CONSERVATIVE AT
+    EACH STEP: the largest of the shapes actually in play for the identities this
+    offer would read. A read costs one bounce buffer of exactly the file's size, so an
+    under-estimate is exactly the cliff this release exists to remove.
+
+      1. THE EXACT FIGURE, from the index. Every journal line records the size the
+         writer committed (`disk_index.entry_bytes`, which moves no witness counter),
+         so the identities this very offer would read carry their own widths. This is
+         the per-group answer the pool wants, and it is what a store holding TWO shapes
+         looks like from the scheduler: the offer is priced at the bigger one.
+      2. THE RANK WIDTHS, from the rank files: `total_bytes_per_block` as each worker
+         measured it, the widest live one winning. EngineCore cannot measure this
+         itself (it has no KV tensors), an offer spans every rank, and the pool is per
+         process - so the widest rank is the only cap that cannot be optimistic for
+         somebody. The live box measures 11,468,800 B on PP0 and 12,902,400 B on PP1
+         at the same moment.
+      3. THE CONSTANT `POOL_PRICE_BYTES_PER_JOB_FALLBACK`, the larger of those two
+         shapes, for an early offer with neither an indexed identity nor a rank file to
+         ask. Capping a little harder is the safe direction: a missed restore costs a
+         recompute, an over-priced offer costs the request its RAM hit AND a
+         reschedule.
+    """
+    exact: list = []
+    walked = 0
+    truncated = False
+    try:
+        for entry_list in list(run_keys or [])[:max(0, int(blocks))]:
+            for identity in entry_list or []:
+                if walked >= POOL_PRICE_MAX_IDENTITIES:
+                    truncated = True
+                    break
+                size = disk_index.entry_bytes(identity[1])
+                walked += 1
+                if size:
+                    exact.append(int(size))
+            if truncated:
+                break
+    except Exception as exc:  # noqa: BLE001 - a price is never worth a fault
+        snapshot._error(exc, "disk_restore pool price index walk")
+    if exact:
+        return (max(exact),
+                f"exact: {max(exact)} B, the largest file size this index journalled "
+                f"for the {walked} identit(ies) this offer would read"
+                + (f" (walk capped at {POOL_PRICE_MAX_IDENTITIES})" if truncated
+                   else ""))
+    candidates: list = []
+    try:
+        local = _int(disk_spill.slot_width_bytes())
+        if local is not None and local > 0:
+            candidates.append((local, "this process's own fingerprint "
+                                      f"total_bytes_per_block={local}"))
+    except Exception as exc:  # noqa: BLE001 - a price is never worth a fault
+        snapshot._error(exc, "disk_restore pool price local width")
+    try:
+        proof = worker_proof()
+        widest = _int(proof.get("bytes_per_file_max"))
+        if widest is None:
+            # A proof that answered before it read any rank file (no diagnostics
+            # directory, no files yet) carries no width at all; the state the last
+            # real read left behind is the same fact, one cache refresh old.
+            widest = _int(_state.get("ranks_bytes_per_file_max"))
+        if widest is not None and widest > 0:
+            candidates.append((widest, f"the widest slot width published by a live "
+                                       f"rank file ({widest} bytes, "
+                                       f"{int(proof.get('bytes_per_file_ranks') or 0)}"
+                                       " rank(s) published)"))
+    except Exception as exc:  # noqa: BLE001 - as above
+        snapshot._error(exc, "disk_restore pool price rank widths")
+    if candidates:
+        best = max(candidates, key=lambda item: item[0])
+        return (int(best[0]),
+                f"rank width: {int(best[0])} B, measured by {best[1]}; no indexed "
+                "identity named a size for this run")
+    return (POOL_PRICE_BYTES_PER_JOB_FALLBACK,
+            f"fallback: {POOL_PRICE_BYTES_PER_JOB_FALLBACK} B, the larger of the two "
+            f"shapes this build writes (the smaller is 11,468,800), because nothing "
+            "named a size for this run - no indexed identity, no rank file width, no "
+            "local fingerprint")
+
+
+def _offer_pool_view() -> dict:
+    """The bounce-buffer pricing as it stands, plus the last offer that used it.
+
+    Recomputed here rather than stored, because the POOL side moves (buffers are held
+    and returned) while the PRICE side only moves when a rank file changes. A reader
+    that sees `jobs_the_pool_can_carry` below the job count of `last_offer_pool` is
+    looking at an offer made when the pool could carry it and a pool that has since
+    filled - which is the concurrent-offers case this release does NOT yet solve.
+    """
+    price, source = _pool_price_bytes()
+    afford = disk_read.afford_reads(price)
+    return {"bytes_per_job": int(price),
+            "price_source": _clip(source, 160),
+            "pool_budget_bytes": int(afford.get("pool_budget_bytes") or 0),
+            "pool_committed_bytes": int(afford.get("pool_committed_bytes") or 0),
+            "jobs_the_pool_can_carry": int(afford.get("jobs_at_empty_pool") or 0),
+            "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
+            "fallback_price_bytes": POOL_PRICE_BYTES_PER_JOB_FALLBACK,
+            "capped_offers": int(_state["offer_pool_capped"]),
+            "refused_offers": int(_state["offer_pool_refused"]),
+            "last_offer": _state["last_offer_pool"],
+            "note": ("an offer is capped to `jobs_the_pool_can_carry` because a read "
+                     "holds its bounce buffer from issue until the apply point, so "
+                     "ONE offer needs the pool to hold ALL of its buffers at once. "
+                     "Two full-size offers in the same step still divide the pool "
+                     "between them, and the surplus is refused at bind as "
+                     "`buffer_cap`: this view publishes `jobs_that_fit_now` so that "
+                     "case is at least visible")}
+
+
+def _span_parts(run) -> tuple:
+    """(block identity, group_id) of a run's FIRST block, for a record's provenance.
+
+    The same first block `_suppressed_span` keys the span fuse on, so a record and a
+    fuse name one and the same identity.
+
+    The identity is clipped at 128 characters and NOT at the 64 a payload field uses:
+    a run's key is the engine's group-qualified hash (64 digest + 8 group), and a clip
+    at 64 would slice off the group and hand `_identity_pair` a string that is neither
+    a key16 nor a full key - which `split_block_key` then reads as a digest whose group
+    suffix is `9fa0a1a2`, refuses it, and the provenance lookup that follows reports
+    "never seen" about a file this index journalled itself.
+    """
+    try:
+        first = (run.get("keys") or [None])[0]
+        if not first:
+            return None, None
+        group, key_hex = first[0][0], first[0][1]
+        return _failure_text(key_hex, 128), _int(group)
+    except Exception as exc:  # noqa: BLE001 - no identity is only a weaker record
+        snapshot._error(exc, "disk_restore span parts")
+        return None, None
+
+
 def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
-    if _skip_unless_flagged(request):
-        # `optin` scope and this request never asked: not a refusal worth a counter
-        # beyond `skipped_no_marker`, and not one byte of the fork's answer changed.
-        return ram_result
+    # NO REQUEST-SCOPED CHECK COMES FIRST, and that is deliberate. Until 0.2.31 the
+    # first thing here was a read of `request.kv_transfer_params`, because a client
+    # field decided whether this request was served from disk. Nothing about a request
+    # decides that any more: the boot posture decided it when the operator POSTed the
+    # `/disk` verb, and the gate below is the cheapest true statement about that.
     opened = gate()
     if not opened["ok"]:
         kind = opened.get("reason_kind")
@@ -2947,14 +3805,20 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if not _plain_int(ram_tokens) or ram_tokens < 0:
         _refuse("bad_result", f"the fork reported {ram_tokens!r} matched tokens")
         return ram_result
-    # THE MARKER IS THE AUTHORITY OVER THIS REQUEST'S OWN PREFIX (0.2.22). A flagged
-    # request does not get "whatever the RAM tier left over": its host-RAM hit is
-    # treated as ZERO for the offer arithmetic, so the disk index decides the span
+    # DISK AUTHORITY IS A BOOT POSTURE, NOT A REQUEST FIELD (0.2.31). With the switch
+    # up, this request does not get "whatever the RAM tier left over": its host-RAM hit
+    # is treated as ZERO for the offer arithmetic, so the disk index decides the span
     # from the local GPU-computed boundary. Everything downstream reads `ram_tokens`,
     # so this one assignment is the whole change of authority - and `computed` is
     # deliberately NOT touched, because it is the offset the fork's DMA writes at
-    # (see the RESTORE_MARKER_KEY docstring: zeroing it would aim the copy at the
-    # request's already-cached, shared prefix blocks).
+    # (zeroing it would aim the copy at the request's already-cached, shared prefix
+    # blocks). With the switch down the fork's answer stands and the disk only fills
+    # the gap it left, which is what `offers_enabled` alone means.
+    #
+    # There is no per-request input to this decision any more. Until 0.2.31 the line
+    # below read `request.kv_transfer_params`, so a client body chose whether its KV
+    # came off SSD; the answer now comes from `_state`, and no request can raise it,
+    # lower it, or opt out of it.
     #
     # The fork keeps its side of a RAM hit in exactly one place, so ignoring the hit
     # means releasing exactly one thing (`_release_fork_pin`, below). Until that
@@ -2962,10 +3826,10 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     # below still `return ram_result`, and a request that gets no disk offer keeps
     # the RAM hit the fork gave it.
     ram_tokens_reported = int(ram_tokens)
-    disk_authority = request_flagged(request)
+    disk_authority = bool(_state["disk_authority"])
     fork_pending: object = _PIN_UNREAD
     if disk_authority:
-        _state["disk_authority"] += 1
+        _state["authority_lookups"] += 1
         if ram_tokens_reported > 0:
             if not callable(getattr(manager, "_free_pending_cpu_hit", None)):
                 # Refuse BEFORE any allocation, index read or state write: without
@@ -3124,11 +3988,18 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         _refuse("bad_call", floored["reason"])
         return ram_result
     disk_tokens = int(floored["tokens"])
+    # WHICH BOUND SHORTENED THIS OFFER, recorded as it happens. The token ceiling and
+    # the bounce-buffer pool are different constraints with different fixes (raise
+    # `MAX_OFFER_TOKENS_PER_OFFER` vs raise the pool and pay host RAM), so an offer
+    # that came in short has to say WHICH one bit - otherwise a job count is the only
+    # evidence and a job count cannot be read.
+    bounds: list = []
     if disk_tokens > MAX_OFFER_TOKENS_PER_OFFER:
         # Clamped, not truncated mid-span: whole spans only, so the fork's own
         # "one whole block per entry" rule still holds after the clamp. This is the
         # ceiling that 160,000-token offers blew straight through.
         _state["offer_clamped"] += 1
+        bounds.append("offer_cap")
         disk_tokens = whole_block_tokens(MAX_OFFER_TOKENS_PER_OFFER,
                                          block_size)["tokens"]
     if disk_tokens <= 0:
@@ -3174,6 +4045,100 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         blocks = affordable
         needed = blocks * per_span + boundary_slots
         disk_tokens = blocks * block_size
+        bounds.append("cpu_slots")
+    # THE BOUNCE-BUFFER BILL, PRICED BEFORE THE OFFER EXISTS (0.2.31). Every clamp
+    # above asks how many DESTINATIONS the offer can have; none of them asked how many
+    # READS the process can carry. A read lands in a host-RAM bounce buffer taken at
+    # issue and returned at the apply point - one forward pass later - so an offer of
+    # N jobs needs the pool to hold N buffers AT ONCE, and `disk_read` REFUSES rather
+    # than queueing when it cannot (`request_read`'s `buffer_cap`). The consequence of
+    # not pricing it was the 0.2.30 failure: the scheduler offered 13 jobs to a pool
+    # that fits 11, the surplus died at bind, the apply point pruned them into
+    # `invalid_block_ids`, the engine reset the request's computed tokens and resched
+    # uled it, and `note_reported` then read that same set back and fused the request
+    # for good. The refusal reason and the record below carry the byte figures, which
+    # is the part that was never publishable.
+    price_bytes, price_source = _pool_price_bytes(run.get("keys"), blocks)
+    afford = disk_read.afford_reads(price_bytes)
+    jobs_ceiling = int(afford["jobs_at_empty_pool"]) if afford.get("ok") else 0
+    jobs_wanted = int(needed)
+    pool_pricing = {"bytes_per_job": int(price_bytes),
+                    "price_source": _clip(price_source, 160),
+                    "pool_budget_bytes": int(afford.get("pool_budget_bytes") or 0),
+                    "pool_committed_bytes": int(afford.get("pool_committed_bytes")
+                                                or 0),
+                    "jobs_the_offer_needed": jobs_wanted,
+                    "jobs_the_pool_can_carry": jobs_ceiling,
+                    "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
+                    "bytes_the_offer_needs": jobs_wanted * int(price_bytes),
+                    "bounded_by": bounds}
+    _state["last_offer_pool"] = dict(pool_pricing)
+    # ONE SPAN IS THE MINIMUM OFFER, and a span costs `per_span` positional reads plus
+    # the boundary-state reads the run cannot be claimed without. Below that the only
+    # honest answer is NO OFFER AT ALL - not a shorter offer, because a shorter offer
+    # is what got refused at bind last time.
+    if jobs_ceiling < per_span + boundary_slots:
+        _state["offer_pool_refused"] += 1
+        first_key, first_group = _span_parts(run)
+        _note_load_failure("buffer_cap", where="offer",
+                           reason=f"the pool budget {jobs_ceiling} job(s) of "
+                                  f"{price_bytes} B cannot hold one span "
+                                  f"({per_span} positional + {boundary_slots} "
+                                  "boundary-state reads), so no offer is made",
+                           request_id=request_id, span=span, group=first_group,
+                           key16=first_key, bytes_needed=price_bytes,
+                           jobs_needed=jobs_wanted, jobs_fit=jobs_ceiling,
+                           pool_budget_bytes=int(afford.get("pool_budget_bytes")
+                                                 or 0),
+                           pool_committed_bytes=int(afford.get("pool_committed_bytes")
+                                                    or 0))
+        _refuse("no_pool_budget",
+                f"the pool holds {jobs_ceiling} read(s) of {price_bytes} bytes "
+                f"(budget {int(afford.get('pool_budget_bytes') or 0)} B) while one "
+                f"span needs {per_span} positional + {boundary_slots} "
+                f"boundary-state read(s): offering the {jobs_wanted}-job run would "
+                "have it refused at bind as buffer_cap, which costs the request its "
+                f"RAM hit AND a reschedule. Price: {price_source}")
+        return ram_result
+    if jobs_ceiling < needed:
+        capped = (jobs_ceiling - boundary_slots) // max(1, per_span)
+        if capped <= 0:
+            # Same arithmetic as above, reached from the other side. With one or more
+            # positional groups the check above already guarantees `capped >= 1` (a
+            # ceiling of at least `per_span + boundary_slots` leaves a whole span after
+            # the states), so this fires on the one shape where `per_span` is zero: a
+            # model whose every cacheable group is a boundary-state group. Refusing is
+            # still the right answer for it, and the sentence says which half ate the
+            # pool.
+            _state["offer_pool_refused"] += 1
+            first_key, first_group = _span_parts(run)
+            _note_load_failure("buffer_cap", where="offer",
+                               reason="the pool can hold the boundary-state reads but "
+                                      "not one span on top of them",
+                               request_id=request_id, span=span, group=first_group,
+                               key16=first_key, bytes_needed=price_bytes,
+                               jobs_needed=jobs_wanted, jobs_fit=jobs_ceiling,
+                               pool_budget_bytes=int(afford.get("pool_budget_bytes")
+                                                     or 0),
+                               pool_committed_bytes=int(afford
+                                                        .get("pool_committed_bytes")
+                                                        or 0))
+            _refuse("no_pool_budget",
+                    f"the pool holds {jobs_ceiling} read(s) of {price_bytes} bytes "
+                    f"and the {boundary_slots} boundary-state block(s) this run must "
+                    f"claim leave no room for one span's {per_span} positional "
+                    f"read(s) (budget {int(afford.get('pool_budget_bytes') or 0)} B): "
+                    f"no offer is made. Price: {price_source}")
+            return ram_result
+        blocks = capped
+        needed = blocks * per_span + boundary_slots
+        disk_tokens = blocks * block_size
+        bounds.append("pool_budget")
+        pool_pricing["jobs_offered"] = int(needed)
+        pool_pricing["bytes_offered"] = int(needed * price_bytes)
+        pool_pricing["jobs_dropped"] = int(jobs_wanted - needed)
+        _state["offer_pool_capped"] += 1
+        _state["last_offer_pool"] = dict(pool_pricing)
     # THE BOUNDARY-SAFE CUT. Every clamp above shortens the OFFER, and with an
     # align-mode group in the set a shortening is not a truncation: the one real
     # state block rides on the run's LAST block, so a cut that moves the end moves
@@ -3294,6 +4259,14 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                               or {}).get("null") or 0)}
                          for group in groups["groups"][:16]]
     _state["last_groups_required"] = required
+    # The pool pricing, restated with the offer's FINAL shape (the boundary-safe cut
+    # may have shortened it again), so the figures beside `bounded_by` in a payload
+    # describe the offer that happened and not the one first proposed.
+    _state["last_offer_pool"] = dict(pool_pricing,
+                                     jobs_offered=int(needed),
+                                     bytes_offered=int(needed * price_bytes),
+                                     blocks_offered=int(blocks),
+                                     bounded_by=list(bounds))
     # THE OFFER, AS STRUCTURE: a forced-from-disk read and an ordinary one disagree
     # about exactly these numbers, so `last_offer` is what tells them apart in a
     # payload without reading the log.
@@ -4004,6 +4977,13 @@ def note_reported(manager, connector_output) -> dict:
         for request_id in sorted(failed):
             # EXACT attribution: the fork names the request whose load failed.
             record = _loads.get(request_id)
+            _note_load_failure(
+                "failed_recving", where="report",
+                reason="the engine named this request's KV load as failed "
+                       f"(newest local/rank failure kinds: "
+                       f"{sorted(_recent_failure_kinds()) or ['none seen']})",
+                request_id=request_id, span=_span_key_of(record),
+                provenance=False)
             suppress_load(request_id, "the engine reported this request's KV load "
                                       "failed",
                           span=_span_key_of(record))
@@ -4023,6 +5003,16 @@ def note_reported(manager, connector_output) -> dict:
             # where a disk load was in flight these are ours. Deliberately
             # over-broad - a missed restore costs a recompute, a missed failure
             # feeds the loop that starved the box.
+            _note_load_failure(
+                "invalid_block_ids", where="report",
+                reason=(f"{invalid} GPU block id(s) came back as load errors on a "
+                        "step carrying disk slots "
+                        "(blocks: "
+                        f"{(_last_invalid_blocks(8))}; "
+                        "newest local/rank failure kinds: "
+                        f"{sorted(_recent_failure_kinds()) or ['none seen']})"),
+                gpu_block_id=(_last_invalid_blocks(1) or [None])[0],
+                provenance=False)
             for request_id in list(_loads):
                 if _loads[request_id].get("adopted"):
                     suppress_load(request_id, f"{invalid} GPU block id(s) came "
@@ -4108,10 +5098,31 @@ def note_reported(manager, connector_output) -> dict:
 
 
 def _invalid_block_ids(connector_output) -> int:
-    """How many GPU blocks this step reported as load errors. -1 if unreadable."""
+    """How many GPU blocks this step reported as load errors. -1 if unreadable.
+
+    AND WHICH ONES. The count is what the burn decision has always used, but the IDS
+    were thrown away - which is why "were these OUR blocks, and which of our spans do
+    they belong to?" had no answer in any payload while the plugin was the only thing
+    that knew the mapping. They are remembered (bounded, clipped to ints) beside the
+    count; nothing about the decision changes.
+    """
     try:
         ids = getattr(connector_output, "invalid_block_ids", None)
-        return len(ids) if ids else 0
+        if not ids:
+            return 0
+        seen = []
+        for item in list(ids)[:MAX_TRACKED_SLOTS]:
+            value = _int(item)
+            if value is not None:
+                seen.append(int(value))
+        _state["invalid_block_ids_seen"] = int(_state["invalid_block_ids_seen"]) \
+            + len(list(ids))
+        _state["last_invalid_block_ids"] = {
+            "count": len(list(ids)),
+            "blocks": seen[:64],
+            "truncated": len(seen) > 64,
+            "ts": round(time.time(), 6)}
+        return len(ids)
     except Exception as exc:  # noqa: BLE001 - an unreadable report says nothing
         snapshot._error(exc, "disk_restore invalid_block_ids")
         return -1
@@ -4300,6 +5311,13 @@ def _worker_bind(worker, metadata) -> dict:
                             str(opened.get("reason")))
     jobs: dict = {}
     failures: dict = {}
+    # THE REQUEST(S) THIS EVENT BELONGS TO, read BEFORE the loop so a failure can name
+    # one. `load_event_to_reqs` is per EVENT, so when a step put two requests in the
+    # same load event the attribution is genuinely ambiguous and the record says None
+    # rather than guessing the first id and letting it look like evidence.
+    req_ids = _event_req_ids(metadata, event)
+    bind_request_id = (req_ids[0] if len(req_ids) == 1 else None)
+    recorded = 0
     for job_id in indices:
         resolved = _resolve_worker_path(paths[job_id], digest)
         if not resolved["ok"]:
@@ -4307,6 +5325,16 @@ def _worker_bind(worker, metadata) -> dict:
             failures[job_id] = (kind if kind in _state["reads_failed"]
                                 else "bad_path")
             _state["reads_failed"][failures[job_id]] += 1
+            if recorded < MAX_FAILURES_PER_BIND:
+                recorded += 1
+                _note_load_failure(
+                    failures[job_id], where="bind", reason=str(resolved.get("reason")),
+                    request_id=bind_request_id, group=resolved.get("group_id"),
+                    key16=resolved.get("key16"),
+                    job_id=job_id, bytes_needed=expect_bytes,
+                    cpu_block_id=_int(cpu_blocks[job_id]),
+                    gpu_block_id=_int(gpu_blocks[job_id]),
+                    jobs_needed=len(indices), jobs_fit=len(jobs))
             continue
         asked = disk_read.request_read(batch_id, job_id, resolved["path"],
                                        expect_bytes)
@@ -4315,6 +5343,25 @@ def _worker_bind(worker, metadata) -> dict:
             failures[job_id] = (kind if kind in _state["reads_failed"]
                                 else "read_failed")
             _state["reads_failed"][failures[job_id]] += 1
+            if recorded < MAX_FAILURES_PER_BIND:
+                recorded += 1
+                # THE `buffer_cap` FIGURES, from the refusal that made them. This is
+                # the record the 0.2.30 hunt needed: the pool's budget, what was
+                # already committed, what this read cost, and how many jobs the offer
+                # asked the pool to hold against how many fit.
+                _note_load_failure(
+                    failures[job_id], where="bind",
+                    reason=str(asked.get("reason")),
+                    request_id=bind_request_id, group=resolved.get("group_id"),
+                    key16=resolved.get("key16"), job_id=job_id,
+                    bytes_needed=asked.get("bytes_needed") or expect_bytes,
+                    jobs_needed=asked.get("jobs_needed") or len(indices),
+                    jobs_fit=(asked.get("jobs_that_fit") if asked.get("jobs_that_fit")
+                              is not None else len(jobs)),
+                    pool_budget_bytes=asked.get("pool_budget_bytes"),
+                    pool_committed_bytes=asked.get("pool_committed_bytes"),
+                    cpu_block_id=_int(cpu_blocks[job_id]),
+                    gpu_block_id=_int(gpu_blocks[job_id]))
             continue
         jobs[job_id] = {"path": resolved["path"], "key16": resolved["key16"],
                         "group": resolved["group_id"],
@@ -4325,7 +5372,7 @@ def _worker_bind(worker, metadata) -> dict:
     deadline = round(time.monotonic() + RESTORE_DEADLINE_SECONDS, 6)
     _wbatches[batch_id] = {"batch_id": batch_id, "jobs": jobs,
                            "failures": failures, "event": event,
-                           "req_ids": _event_req_ids(metadata, event),
+                           "req_ids": req_ids,
                            "deadline_mono": deadline,
                            # THE OTHER END OF THE WINDOW. `start_load_kv` runs one
                            # CPU-side forward launch after this call in the same step
@@ -4662,6 +5709,45 @@ def _classify_dropped_entry(window: dict, job_id: int) -> str:
     return "dropped_unattributed"
 
 
+def _apply_failure_sentence(kind, window: dict) -> str:
+    """One sentence for an apply-point loss, using the batch's own state table.
+
+    `not_settled` covers two different faults and the window already knows which one
+    this was (see `_classify_dropped_entry`), so the record says QUEUED (the reader
+    never got to it - a wait fixes it) or RUNNING (the kernel read was in flight and
+    lost - only a bigger budget or a faster disk fixes it) rather than re-deriving it
+    from a counter afterwards. Anything else quotes its own classification name.
+    """
+    name = str(kind or "read_failed")
+    if name != "not_settled":
+        return (f"the read was asked for and its bytes were not in a buffer at "
+                f"`start_load_kv`, classified {name}; the GPU block is reported as a "
+                "load error so the engine recomputes it")
+    states = window.get("job_states") or {}
+    return (f"the read had not settled at `start_load_kv` "
+            f"(settled_on_arrival={bool(window.get('settled_on_arrival'))}, "
+            f"waited_ms={window.get('waited_ms')}, bind_to_apply_ms="
+            f"{window.get('bind_to_apply_ms')}; job state "
+            f"{sorted({str(value) for value in states.values()})[:4]})")
+
+
+def _batch_span(batch_jobs: dict) -> str | None:
+    """The span key of a worker batch: its lowest job's `key16:group`.
+
+    The same spelling `_suppressed_span` uses for a scheduler-side run, so a worker's
+    record and the scheduler's fuse name one identity and can be matched by eye.
+    """
+    try:
+        for job_id in sorted(batch_jobs):
+            job = batch_jobs[job_id] or {}
+            key16, group = job.get("key16"), _int(job.get("group"))
+            if key16 and group is not None:
+                return f"{str(key16)[:16]}:{int(group)}"
+        return None
+    except Exception:  # noqa: BLE001 - a missing span is only a weaker record
+        return None
+
+
 def span_shape(batch: dict, failed) -> dict:
     """Group one batch's disk entries into SPANS and say which spans came whole.
 
@@ -4920,6 +6006,13 @@ def _worker_before_load(worker) -> dict:
     window["span_shape"] = shape
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
+    batch_jobs = batch.get("jobs") or {}
+    # THE APPLY-POINT LOSSES, recorded with the numbers. Bytes that were asked for and
+    # did not arrive are the failures the engine then reports as load errors, so this
+    # is the last moment the plugin knows WHY. Bounded per step
+    # (`MAX_FAILURES_PER_BIND`) because one bad step can drop forty entries and a ring
+    # full of the forty-first is a ring that recorded nothing useful.
+    logged = 0
     for job_id in drop:
         if job_id not in already_counted:
             # Bind-time failures were counted when they happened; counting them again
@@ -4928,6 +6021,22 @@ def _worker_before_load(worker) -> dict:
             kind = failed.get(job_id)
             _state["reads_failed"][kind if kind in _state["reads_failed"]
                                    else "read_failed"] += 1
+            if logged < MAX_FAILURES_PER_BIND:
+                logged += 1
+                job = batch_jobs.get(job_id) or {}
+                _note_load_failure(
+                    kind if kind in WORKER_FAILURES else "read_failed",
+                    where="apply",
+                    reason=_clip(_apply_failure_sentence(kind, window), 200),
+                    request_id=(batch.get("req_ids") or [None])[0]
+                    if len(batch.get("req_ids") or []) == 1 else None,
+                    span=_batch_span(batch_jobs), group=job.get("group"),
+                    key16=job.get("key16"),
+                    gpu_block_id=_int(job.get("gpu_block_id")),
+                    cpu_block_id=_int(job.get("cpu_block_id")), job_id=job_id,
+                    bytes_needed=_int(job.get("bytes")),
+                    jobs_needed=len(batch_jobs),
+                    jobs_fit=len(batch_jobs) - len(drop))
         if job_id < len(gpu_blocks):
             gpu_id = _int(gpu_blocks[job_id])
             if gpu_id is not None:
@@ -5366,6 +6475,74 @@ def applied_reads_evidence() -> dict:
                        "this process runs neither half")}
 
 
+def partial_load_verdict() -> dict:
+    """What a PARTIAL load actually does to a request, as data and as a sentence.
+
+    WHY THIS EXISTS. "restore is live ... 0 load(s) reported disk bytes back" printed
+    beside `ranks_reads_applied=42` read as a contradiction, and it was not one: the
+    reads happened and the request still got nothing. The reason is in the apply point
+    and the engine's own recovery, and it is worth stating because it decides what a
+    partial load is WORTH:
+
+      1. Each dropped entry is PRUNED from `load_cpu_blocks`/`load_gpu_blocks`, and its
+         GPU block goes through `get_block_ids_with_load_errors`.
+      2. If ANY entry survived, the fork submits the DMA for the survivors. So the
+         bytes that did arrive really are written into GPU blocks.
+      3. The engine's `_handle_invalid_blocks` then resets the request's computed
+         tokens and RESCHEDULES it. A KV prefix is a prefix: everything from the first
+         invalid block onward is recomputed, so an applied read that sits after a hole
+         is work done for bytes the request will overwrite.
+      4. `note_reported` reads that same invalid set back and FUSES the request
+         (`suppress_load`) and burns its load. So a partial load is not a partial
+         credit for that request: the offer is wasted for it even when the prefix
+         landed, and the next request asking for the same span meets the SPAN fuse.
+
+    The span counters say how much of that was a hole in the middle rather than a
+    missing suffix, which is the shape N reader threads introduced.
+    """
+    reads = applied_reads_evidence()
+    applied = int(reads["reads_applied"])
+    restorations = int(_state["restorations"] or 0)
+    no_read = int(_state["no_read"] or 0)
+    spans_partial = int(_state["spans_partial"] or 0)
+    spans_whole = int(_state["spans_whole"] or 0)
+    spans_empty = int(_state["spans_empty"] or 0)
+    holes = int(_state["spans_hole_in_the_middle"] or 0)
+    dropped = (int(_state["dropped_queued"] or 0)
+               + int(_state["dropped_running"] or 0)
+               + int(_state["dropped_unattributed"] or 0))
+    if not applied:
+        shape = "no_reads_applied"
+        sentence = ("nothing has been memmoved into a CPU slot in this boot, so "
+                    "there is no partial load to talk about")
+    elif restorations:
+        shape = "applied_and_reported"
+        sentence = (f"{applied} read(s) applied from {reads['source']} and "
+                    f"{restorations} load(s) reported disk bytes back: that pairing "
+                    "is the restoration this module counts as a real restore")
+    else:
+        shape = ("applied_but_unreported" if not no_read
+                 else "applied_reported_without_disk")
+        sentence = (
+            f"{applied} read(s) reached a CPU slot from {reads['source']}, "
+            f"{restorations} load(s) reported disk bytes back "
+            f"({no_read} report(s) came back with NO disk read behind them): the "
+            "reads are real work and the restoration is not. A PARTIAL load is the "
+            "likely shape - the survivors were DMA'd and the refused ones were "
+            "reported as load errors, so the engine reset the request's computed "
+            "tokens at the first invalid block and rescheduled it, and "
+            "`suppress_load` then fused the request so it is never offered again. "
+            "That means an offer whose jobs did not all fit is WASTED for the "
+            "request even when its prefix landed: reads after the first hole are "
+            "bytes the request will recompute over.")
+    return {"shape": shape, "reads_applied": applied,
+            "reads_from": reads["source"], "restorations": restorations,
+            "no_read": no_read, "entries_dropped_at_apply": dropped,
+            "spans_whole": spans_whole, "spans_partial": spans_partial,
+            "spans_empty": spans_empty, "hole_in_the_middle": holes,
+            "sentence": sentence}
+
+
 def _refuted_reason(refused: dict, reads: dict) -> str:
     """The first link in the chain that did not hold, named."""
     if _state["offers"] == 0:
@@ -5398,10 +6575,17 @@ def _refuted_reason(refused: dict, reads: dict) -> str:
                 f"({_clip(reads['source'], 60)}) - the reports the fork makes for "
                 "its own host-RAM blocks are not evidence of a restore")
     # Reached only when a partial restoration happened and something else is still
-    # short of the bar; say what the numbers are rather than invent a category.
+    # short of the bar; say what the numbers are rather than invent a category. The
+    # span shape travels into the sentence because "partial" without it cannot be
+    # acted on: a missing suffix is one reader being slow, a hole in the middle is N
+    # readers answering out of order.
+    shape = partial_load_verdict()
     return (f"partial: {int(_state['restorations'])} restoration(s) with "
             f"{int(reads['reads_applied'])} applied read(s) and "
-            f"{int(_state['no_read'])} report(s) with no read behind them")
+            f"{int(_state['no_read'])} report(s) with no read behind them "
+            f"(spans whole={shape['spans_whole']} partial={shape['spans_partial']} "
+            f"empty={shape['spans_empty']} hole_in_middle="
+            f"{shape['hole_in_the_middle']})")
 
 
 def witness_line() -> str:
@@ -5423,7 +6607,8 @@ def witness_line() -> str:
                  f"reads_applied={int(reads['reads_applied'])}",
                  f"no_read={int(_state['no_read'])}",
                  f"suppressed={int(_state['suppressions'])}",
-                 f"scope={_state['scope']}",
+                 f"disk_authority={'on' if _state['disk_authority'] else 'off'}",
+                 f"serving_as={serving_as()}",
                  f"offers_switch={'on' if _state['offers_enabled'] else 'off'}",
                  f"watchdog_fires={int(_state['worker_watchdog_fires'])}",
                  f"phantom_trips={int(_state['phantom_guard_trips'])}"]
@@ -5518,14 +6703,19 @@ def boot_line() -> str:
         parts.append("digest={}".format(_clip(disk_spill.geometry_digest(), 16)
                                         or "none"))
         # THE POSTURE, on the line, because it is the first thing to ask about when
-        # the counters say nothing happened: this boot's offer switch, the scope it
-        # offers under, and the marker an opt-in request has to carry.
-        parts.append(f"offers_switch={'ON' if _state['offers_enabled'] else 'OFF'}")
-        parts.append(f"scope={_state['scope']}")
-        parts.append(f"marker={RESTORE_MARKER_KEY}")
+        # the counters say nothing happened. `disk_authority=ON` is the field that says
+        # "this boot serves EVERY request from SSD and gives its host-RAM hit back" -
+        # a posture an operator must be able to confirm at a glance, and one no request
+        # can influence. `serving_as` is the same two switches read as one verdict, and
+        # `offer_cap`/`ranks_armed` are the bounds that still apply under it.
+        parts.append("disk_authority={}".format(
+            "ON" if _state["disk_authority"] else "OFF"))
+        parts.append(f"serving_as={serving_as()}")
+        parts.append("offers_switch={}".format(
+            "ON" if _state["offers_enabled"] else "OFF"))
         parts.append(f"offer_cap={int(MAX_OFFER_TOKENS_PER_OFFER)}")
-        parts.append("flagged={}".format(int(_state["flagged"])))
-        parts.append("skipped_no_marker={}".format(int(_state["skipped_no_marker"])))
+        parts.append("authority_lookups={}".format(
+            int(_state["authority_lookups"])))
         parts.append("suppressed={}".format(int(_state["suppressions"])))
         parts.append("offers={}".format(int(_state["offers"])))
         parts.append("offered_tokens={}".format(int(_state["offered_tokens"])))
@@ -5599,6 +6789,25 @@ def read_latency() -> tuple:
     except Exception as exc:  # noqa: BLE001 - a missing latency is (0, 0)
         snapshot._error(exc, "disk_restore read latency")
         return 0.0, 0.0
+
+
+def _compact_failure(record: dict) -> dict:
+    """One load-failure record, shrunk to what a rank file's byte budget can carry.
+
+    The rank file's `disk_restore` section is a guest in a `MAX_CONTRIBUTION_BYTES`
+    document that `worker_diag` REFUSES outright when it is exceeded, so the records
+    that cross the process boundary are the small ones: the provenance the worker
+    could not compute anyway (its own index is empty) is dropped and re-derived by the
+    scheduler, which is the process holding the index. The five `buffer_cap` figures
+    are NEVER dropped - they are the reason the record exists.
+    """
+    out: dict = {}
+    for field in ("seq", "ts", "kind", "where", "request_id", "span", "group",
+                  "contract", "key16", "gpu_block_id", "job_id", "bytes_needed",
+                  "jobs_needed", "jobs_fit", "pool_budget_bytes",
+                  "pool_committed_bytes", "reason"):
+        out[field] = record.get(field)
+    return out
 
 
 def worker_report() -> dict:
@@ -5741,6 +6950,17 @@ def worker_report() -> dict:
                            "empty": int(_state["spans_empty"]),
                            "hole_in_middle": int(
                                _state["spans_hole_in_the_middle"])}
+        # WHAT ONE READ COSTS THIS RANK, so the scheduler can price an offer against
+        # its bounce-buffer pool with a real number instead of a guess. The fingerprint
+        # owns the figure; None means this rank has no fingerprint yet and the offer
+        # falls back to the conservative price (`POOL_PRICE_BYTES_PER_JOB_FALLBACK`).
+        report["bytes_per_file"] = disk_spill.slot_width_bytes()
+        # THE REASONS, ACROSS THE PROCESS BOUNDARY. `failed` above counts them; these
+        # say WHICH read, for WHICH request, with WHICH byte figures - the numbers a
+        # scheduler process can never have in its own counters because it does not read
+        # files. Newest first, and few: the byte budget belongs to the whole section.
+        report["last_failures"] = [_compact_failure(item) for item
+                                   in _load_failures[:MAX_FAILURES_PER_RANK_FILE]]
         if len(json.dumps(report, default=str)) > worker_diag.MAX_CONTRIBUTION_BYTES:
             return {"section": "disk_restore", "writer": OWNER_TAG,
                     "truncated": True,
@@ -6399,6 +7619,21 @@ def section() -> dict:
     # `waited_ms` without `read_seconds` beside it is a number with no unit of
     # comparison, and the whole point of the settle-wait fields is to be comparable.
     view["apply_window"] = apply_window()
+    # WHY A READ DID NOT HAPPEN, in the payload. `reads_failed` counts the kinds; this
+    # names the requests, the blocks and - for `buffer_cap` - the five numbers that
+    # decided it. THIS PROCESS ONLY: the cross-process view is `load_failure_report()`
+    # and the scheduler's `recent_load_failures`.
+    view["load_failures"] = {"written": int(_state["load_failures"]),
+                             "overwritten": int(_state["load_failures_overwritten"]),
+                             "ring_depth": MAX_LOAD_FAILURE_RECORDS,
+                             "log_lines": int(_state["failure_log_lines"]),
+                             "log_suppressed": int(_state["failure_log_suppressed"]),
+                             "log_min_seconds": REFUSAL_LOG_MIN_SECONDS,
+                             "recent": load_failures()},
+    # WHAT AN OFFER COSTS THE POOL, as this process currently prices it. The same
+    # arithmetic the offer cap uses, so a reader can check an offer against the pool
+    # without re-deriving `afford_reads` by hand.
+    view["offer_pool"] = _offer_pool_view()
     view["witness"] = witness_verdict()
     view["witness_line"] = witness_line()
     view["index"] = disk_index.section()
@@ -6438,10 +7673,10 @@ def scheduler_section() -> dict:
     proof = worker_proof()
     index = disk_index.section()
     state = _state
-    # THE POSTURE, FROM ITS OWNERS. `offer_posture()` owns the switch/scope/marker and
+    # THE POSTURE, FROM ITS OWNERS. `disk_posture()` owns the two boot switches and
     # `counters()` owns every suppression number; this section re-publishes them and
     # recomputes nothing, so a payload and a verb can never disagree about a posture.
-    posture = offer_posture()
+    posture = disk_posture()
     tally = counters()
     # THE INDEX'S OWN BLINDNESS, computed once for every branch below (0.2.28).
     blindness = _index_blindness()
@@ -6550,6 +7785,23 @@ def scheduler_section() -> dict:
                f"{int(state['restorations'])} load(s) reported disk bytes back. "
                "An offer that is not adopted is a scheduler decision, not this "
                "module's: see lookup_ledger.")
+        # THE SENTENCE MUST NOT STOP BEING TRUE WHEN THE READS MOVE. `restorations`
+        # is the counter that reads as success, and on the live box it sat at 0 next
+        # to `ranks_reads_applied=42` while the sentence explained nothing: the reads
+        # had happened and the requests had still been rescheduled. When those two
+        # disagree, say what a partial load does to a request instead of leaving the
+        # reader to reconcile two numbers from different processes.
+        partial = partial_load_verdict()
+        if partial["reads_applied"] and not partial["restorations"]:
+            why += " " + partial["sentence"]
+            if int(state["offer_pool_refused"]) or int(state["offer_pool_capped"]):
+                why += (f" The bounce-buffer pool has bounded this boot's offers: "
+                        f"{int(state['offer_pool_capped'])} shortened, "
+                        f"{int(state['offer_pool_refused'])} refused outright "
+                        "(see `offer_pool`).")
+            kinds = sorted(_recent_failure_kinds())
+            if kinds:
+                why += f" Worker-side failure kinds seen: {kinds[:6]}."
     return {
         # WHICH PROCESS ANSWERED. The single most important field on the page: a
         # `true` here and a rank file's `installed: true` are different facts about
@@ -6572,14 +7824,24 @@ def scheduler_section() -> dict:
                  "reason_kind": opened.get("reason_kind")},
         # THE POSTURE AS DATA, not as a sentence inside `boot_line`. Until now the only
         # place any of this was printed was that line, and a dashboard cannot grep a
-        # sentence at 3 a.m.: "is the switch up, under what scope, how many ranks are
+        # sentence at 3 a.m.: "is the switch up, which switch, how many ranks are
         # armed, is anything fused" was only answerable by reading prose. Every value
-        # is a pass-through from the function that owns it - `offer_posture()`,
+        # is a pass-through from the function that owns it - `disk_posture()`,
         # `counters()`, `worker_proof()`, and for the cap the module constant the boot
         # line already prints - and none of them is derived here.
+        #
+        # `disk_authority` is the one an operator reads to answer "is this boot serving
+        # EVERY request from SSD?", and `per_boot` / `survives_restart` say what its
+        # lifetime is: raised only by `POST /plugins/kvtier/disk {"op":"authority"}`,
+        # lost by a restart, so a boot that crashed and came back gives disk authority
+        # to nobody.
+        "disk_authority": bool(posture["disk_authority"]),
         "offers_enabled": bool(posture["enabled"]),
-        "scope": posture["scope"],
-        "marker_key": posture["marker_key"],
+        "serving_as": posture["serving_as"],
+        "per_boot": True,
+        "survives_restart": False,
+        "disk_authority_changes": int(posture["disk_authority_changes"]),
+        "offer_switch_changes": int(posture["offer_switch_changes"]),
         "offer_cap": int(MAX_OFFER_TOKENS_PER_OFFER),
         "ranks_armed": int(proof.get("ranks_armed") or 0),
         "ranks_seen": int(proof.get("ranks_seen") or 0),
@@ -6608,37 +7870,48 @@ def scheduler_section() -> dict:
         # the same one call as everything else. `disk_reads_applied` /
         # `ranks_reads_applied` are the scheduler-side per-offer verdict and the
         # worker-attested total; the three `witness_*` are the verdict allowed to use
-        # them. `loads_released` and `skipped_no_marker` complete the ledger: the
-        # reads that finished and were let go, and the lookups that were left alone
-        # because nobody asked.
+        # them. `loads_released` completes the ledger: the reads that finished and were
+        # let go.
         "reads_applied": int(tally["reads_applied"]),
         "disk_reads_applied": int(tally["disk_reads_applied"]),
         "ranks_reads_applied": int(tally["ranks_reads_applied"]),
         "loads_released": int(tally["loads_released"]),
-        "skipped_no_marker": int(tally["skipped_no_marker"]),
-        # THE MARKER'S OWN EVIDENCE (0.2.21). All three existed in `counters()` and in
-        # `counters_view`'s units but were never published here, so PROVING a marker
-        # reached the scheduler meant inventing a control experiment: send a PAIRED
-        # unflagged request and watch `skipped_no_marker` move for the control and not
-        # for the marked one - one extra request through a live engine to learn one
-        # bit. `flagged` rising with the marked request while `requests_seen` rises for
-        # both makes a marked request self-evident from one payload read, which is the
-        # whole purpose of this section.
-        "flagged": int(tally["flagged"]),
-        "requests_seen": int(tally["requests_seen"]),
         "lookups": int(tally["lookups"]),
-        # WHAT THE MARKER DID (0.2.22). A flagged request hands the disk the decision
-        # about its own prefix; these four say whether that rule fired, whether it
+        # WHAT THE AUTHORITY SWITCH DID. The switch hands the disk the decision about
+        # every request's own prefix; these four say whether that rule fired, whether it
         # cost a real host-RAM hit, and how many tokens that was. `last_offer` is the
         # structured proof a forced read and an ordinary one disagree about: a real
         # restore has `ram_tokens_reported` at or below what it used, a forced one
         # shows the hit the disk overrode.
-        "disk_authority": int(tally["disk_authority"]),
+        "authority_lookups": int(tally["authority_lookups"]),
         "local_hit_ignored": int(tally["local_hit_ignored"]),
         "local_hit_tokens_ignored": int(tally["local_hit_tokens_ignored"]),
         "pin_release_failures": int(tally["pin_release_failures"]),
         "last_local_hit_ignored": tally["last_local_hit_ignored"],
         "last_offer": tally["last_offer"],
+        # WHAT THE OFFER COSTS THE BOUNCE-BUFFER POOL (0.2.31). The cap that keeps an
+        # offer inside what THIS process can carry, the arithmetic behind it, and the
+        # two counters that say how often it bound. `offer_cap` above is the TOKEN
+        # ceiling and stays exactly what it always meant; this is the tighter,
+        # byte-denominated constraint beside it, and `last_offer_pool.bounded_by` says
+        # which of the two shortened any given offer.
+        "offer_pool": _offer_pool_view(),
+        "offers_pool_capped": int(tally["offer_pool_capped"]),
+        "offers_pool_refused": int(tally["offer_pool_refused"]),
+        "last_offer_pool": tally["last_offer_pool"],
+        # WHY A READ DID NOT HAPPEN, across the fleet. The records the workers wrote
+        # (carried by their rank files, the `ranks_reads_applied` transport) merged
+        # with this process's own, newest first, each carrying its block provenance.
+        "recent_load_failures": load_failure_report()["records"],
+        "load_failure_kinds": sorted(_recent_failure_kinds()),
+        "load_failures_here": int(tally["load_failures"]),
+        "load_failures_from_ranks": int(tally["ranks_load_failures"]),
+        # THE BLOCK IDS THE FORK BLAMED, kept instead of discarded, so a scheduler-side
+        # burn can be matched to a worker-side record by block id.
+        "invalid_block_ids_seen": int(tally["invalid_block_ids_seen"]),
+        "last_invalid_block_ids": tally["last_invalid_block_ids"],
+        # WHAT A PARTIAL LOAD DOES, in data and in a sentence.
+        "partial_load": partial_load_verdict(),
         # WHAT THE LAST PRICED CLAIM COSTS EVERY CACHEABLE GROUP (item 7, 0.2.25), on
         # the refusal door as well as the offer door: `last_offer` cannot describe an
         # offer that correctly never happened, and this can. `offered: false` plus rows
@@ -6816,20 +8089,51 @@ def scheduler_section() -> dict:
                                   "counters()",
             "ranks_reads_applied": "applied disk reads attested by live worker rank "
                                    "files at the last proof read, from counters()",
+            "offer_pool": "what an offer costs the BOUNCE-BUFFER POOL: the bytes one "
+                          "read needs, the pool's budget, how many jobs it can carry, "
+                          "and the last offer's pricing with `bounded_by` naming which "
+                          "constraint shortened it (`offer_cap` = tokens, `cpu_slots` "
+                          "= CPU blocks, `pool_budget` = bounce buffers)",
+            "offers_pool_capped": "offers SHORTENED to the job count the bounce-buffer "
+                                  "pool can carry, from counters()",
+            "offers_pool_refused": "lookups given NO disk offer because the pool "
+                                   "cannot carry even one span's reads (`no_pool_"
+                                   "budget`), from counters()",
+            "last_offer_pool": "the byte arithmetic of the most recent pricing: price "
+                               "per job and its source, the pool budget, jobs needed "
+                               "versus jobs the pool can carry, and `bounded_by`",
+            "recent_load_failures": "the load-failure records an operator can read "
+                                    "without opening a rank file: this process's ring "
+                                    "merged with what the live rank files carried, "
+                                    "newest first, each with its block provenance",
+            "load_failure_kinds": "the failure kinds seen most recently (this "
+                                  "process's ring plus the live rank files), from "
+                                  "`_recent_failure_kinds`",
+            "load_failures_here": "load-failure records written by THIS process, from "
+                                  "counters()",
+            "load_failures_from_ranks": "load-failure records read from live rank "
+                                        "files, from counters()",
+            "invalid_block_ids_seen": "GPU block ids the fork reported as load errors "
+                                      "over the boot (the count `note_reported` used "
+                                      "to take and discard), from counters()",
+            "last_invalid_block_ids": "the ids themselves from the most recent report "
+                                      "(bounded), so a scheduler-side burn can be "
+                                      "matched to a worker-side record by block id",
+            "partial_load": "what a PARTIAL load does to a request, as data and as a "
+                            "sentence: applied reads, restorations, the span shape, "
+                            "and the statement that bytes after the first hole are "
+                            "recomputed by the engine and the request is fused",
             "loads_released": "loads removed from the ledger, from counters()",
-            "skipped_no_marker": "requests left exactly as the fork would have "
-                                 "left them because they did not ask for a disk "
-                                 "restore (`optin` scope without the marker), from "
-                                 "counters(): the nothing-was-offered-because-nobody-"
-                                 "asked case, kept apart from a refusal",
-            "disk_authority": "flagged lookups where the disk, not the host-RAM "
-                              "tier, decided the span (0.2.22). Every one of these "
-                              "was offered at `computed // block_size`, i.e. the "
-                              "disk span starts where the LOCAL GPU prefix ends - "
-                              "the local hit is the one thing the marker cannot "
+            "authority_lookups": "lookups that ran under disk authority, so the disk "
+                              "and not the host-RAM tier decided the span, from "
+                              "counters(). Every one of these "
+                              "was offered at `computed // block_size`, i.e. "
+                              "the disk span starts where the LOCAL GPU prefix ends - "
+                              "the local hit is the one thing the switch cannot "
                               "un-learn, because the scheduler placed those blocks "
-                              "before it ever asked us",
-            "local_hit_ignored": "offers committed on a flagged request whose "
+                              "before it ever asked us. It stays 0 while "
+                              "`disk_authority` is false (unit: lookups)",
+            "local_hit_ignored": "offers committed under disk authority whose "
                                  "host-RAM hit was non-zero and was discarded; a "
                                  "refusal never moves this, because a refused offer "
                                  "leaves the fork's hit exactly where the fork put "
@@ -6931,18 +8235,9 @@ def scheduler_section() -> dict:
                                                    "either way - the complement of "
                                                    "`disk_gpu_blocks_dma_verified` "
                                                    "(unit: GPU blocks)",
-            "flagged": "requests that reached the offer path CARRYING the "
-                       "kvtier_disk_restore marker, from counters(): the evidence a "
-                       "marker survived the engine's own field-folding and arrived - "
-                       "without it a `flagged: 0` and a `skipped_no_marker` that never "
-                       "moved were the same observation twice",
-            "requests_seen": "lookups observed by the request-scoped gate, from "
-                             "counters(): the population `flagged` and "
-                             "`skipped_no_marker` are drawn from, so the two must sum "
-                             "to it while the scope is `optin`",
             "lookups": "lookups reaching the restore path at all, from counters(): "
-                       "the entry count of the offer path, counted BEFORE the gate and "
-                       "the scope, so a `lookups` that rises while `offers` sits at 0 "
+                       "the entry count of the offer path, counted BEFORE the gate, "
+                       "so a `lookups` that rises while `offers` sits at 0 "
                        "is the refusal vocabulary's job to explain",
             "witness_verdict": "the last restore-posture verdict this process spoke "
                                "(a verdict, not a count). Read it BESIDE "
@@ -6977,14 +8272,31 @@ def scheduler_section() -> dict:
                                 "watchdog reports it as a failure",
             "methods_here": "scheduler methods our layer is on in this process",
             "methods_expected": "scheduler methods it must be on to offer at all",
-            "offers_enabled": "this boot's offer switch, read from "
-                              "offer_posture(): false until the dev verb raises it, "
-                              "so an armed spill tier alone cannot put a disk offer "
-                              "in front of live traffic",
-            "scope": "which requests may be offered at all, from offer_posture(): "
-                     "`optin` (only a request carrying `marker_key`) or `all`",
-            "marker_key": "the `kv_transfer_params` key an opt-in request must carry "
-                          "in `optin` scope, from offer_posture()",
+            "disk_authority": "this boot's DISK-AUTHORITY switch, read from "
+                              "disk_posture(): FALSE at every fresh boot, raised only "
+                              "by `POST /plugins/kvtier/disk {\"op\":\"authority\","
+                              "\"enabled\":true}`, and turned back off by a restart. "
+                              "True means EVERY request this boot is served from disk "
+                              "with the disk deciding its own prefix - no client can "
+                              "ask for it and no client can decline it.",
+            "offers_enabled": "this boot's gap-fill switch, from disk_posture(): "
+                              "false until the dev verb raises it, so an armed spill "
+                              "tier alone cannot put a disk offer in front of live "
+                              "traffic. Up on its own it means RAM first and the disk "
+                              "extending the shortfall.",
+            "serving_as": "the two switches as one verdict, from disk_posture(): "
+                          "`off`, `disk_authority` or `ram_first_gap_fill`",
+            "per_boot": "true, and it is a statement about the switches: both are "
+                        "in-process per-boot state set only by the POST op, so "
+                        "nothing here outlives the process",
+            "survives_restart": "false: a restart - clean or after a crash - gives "
+                                "disk authority to NOBODY, which is why an unhealthy "
+                                "boot cannot come back serving from SSD",
+            "disk_authority_changes": "times the disk-authority switch moved this "
+                                      "boot, from counters(): a posture moved once "
+                                      "per experiment (unit: changes)",
+            "offer_switch_changes": "times the gap-fill switch moved this boot, from "
+                                    "counters() (unit: changes)",
             "offer_cap": "tokens: the most one offer may carry, clamped at "
                          "MAX_OFFER_TOKENS_PER_OFFER (the 160,000-token offers of "
                          "2026-10-05 clamp here)",

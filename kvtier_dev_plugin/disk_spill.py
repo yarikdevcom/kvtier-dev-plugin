@@ -849,6 +849,19 @@ def _slot_width_bytes():
     return int(width)
 
 
+def slot_width_bytes():
+    """PUBLIC reading of this rank's file width, for a caller that must PRICE a read.
+
+    `disk_restore` asks this before it makes an offer: a read costs one bounce buffer
+    of exactly this many bytes, so "how many reads can the pool carry" is arithmetic
+    over this figure and nothing else. Public as a thin wrapper rather than a second
+    implementation - the fingerprint stays the single source, and a process with no
+    fingerprint (an EngineCore, which has no KV tensors to measure) keeps answering
+    None so its caller's conservative fallback stays honest.
+    """
+    return _slot_width_bytes()
+
+
 def capacity_ceiling_bytes():
     """The configured byte ceiling, or None for "no ceiling".
 

@@ -238,14 +238,14 @@ def test_a_disagreement_between_query_and_body_is_a_400_with_no_effect(world):
     arm_for_a_minute()
     disk_restore.set_offer_switch(True)
     before = arm_file_state()
-    posture_before = disk_restore.offer_posture()["enabled"]
+    posture_before = disk_restore.disk_posture()["enabled"]
     response = engine_app(engine).post(f"{DISK}?op=arm", json={"op": "disarm"},
                                        headers=token_headers())
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "op" in detail and "disagree" in detail
     assert arm_file_state() == before
-    assert disk_restore.offer_posture()["enabled"] == posture_before
+    assert disk_restore.disk_posture()["enabled"] == posture_before
     assert engine.calls == [], "the engine was reached: the request was not refused"
 
 
@@ -308,12 +308,12 @@ def test_a_refused_offers_request_leaves_the_offer_switch_exactly_as_it_was(worl
     engine = RealVerbEngine()
     for wanted in (True, False):
         disk_restore.set_offer_switch(wanted)
-        before = disk_restore.offer_posture()
+        before = disk_restore.disk_posture()
         response = engine_app(engine).post(f"{DISK}?op=offers&enabled=maybe",
                                            headers=token_headers())
         assert response.status_code == 400, response.text
         assert "enabled" in response.json()["detail"]
-        assert disk_restore.offer_posture() == before
+        assert disk_restore.disk_posture() == before
         assert engine.calls == []
 
 

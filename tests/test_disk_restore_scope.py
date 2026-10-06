@@ -1,4 +1,4 @@
-r"""The request-scoped gate, the offer posture, and the two incident shapes.
+r"""The boot-scoped switches, the offer posture, and the two incident shapes.
 
 `test_disk_restore.py` asks what the restore path does once it decides to act. This
 file asks the earlier question - WHEN is it allowed to speak at all - plus the two
@@ -13,6 +13,14 @@ failures that took a serving engine down on 2026-10-05:
 
 Both are gate logic, so both are tested through the real door (`offer`) against real
 rank files and a real journal - not against a monkeypatched proof.
+
+THE NAME, AND WHAT IT NO LONGER MEANS. This file was written when the answer to "when
+may it speak?" had a second clause - `scope`, which asked whether a request had to
+carry an opt-in marker. That marker and that scope are gone (0.2.31): a request body
+must not decide whether its KV comes off NVMe. The question now has one answer, which
+is the boot's posture, so what is pinned here is the posture - two per-boot switches,
+both off at boot, both raised only by the dev verb, and nothing a client sends able to
+move either.
 """
 
 from __future__ import annotations
@@ -40,6 +48,8 @@ from kvtier_dev_plugin import (
 # The fixtures live in the sibling module; importing the names is how this suite reuses
 # them (pytest collects fixtures from imported names).
 armed = base.armed  # noqa: F811 - re-exported as a fixture, not shadowed
+armed_gap_fill = base.armed_gap_fill  # noqa: F811 - only the gap-fill switch up
+switches_down = base.switches_down  # noqa: F811 - `armed` with both switches down
 allow_tmp_root = base.allow_tmp_root  # noqa: F811 - autouse: tmp_path is under /tmp
 fresh = base.fresh  # noqa: F811 - autouse: a fresh boot per test, or counters leak
 
@@ -54,12 +64,12 @@ offer = base.offer
 
 @pytest.fixture
 def offering(armed):
-    """The gate open, the switch raised, and scope `all`.
+    """Alias of `armed`, kept for the tests that only need "the gate is open".
 
-    Only for tests about behaviour PAST the posture. The `armed` fixture already raises
-    the switch and leaves the scope at its default `optin`.
+    It used to raise the switch AND set `scope=all`; `armed` now raises disk authority,
+    which opens the same gate, so the two are the same fixture and this name exists only
+    so the incident-shape tests below keep reading as they always did.
     """
-    assert disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)["ok"] is True
     return armed
 
 
@@ -67,7 +77,7 @@ def offering(armed):
 
 def test_a_fresh_boot_offers_nothing_even_with_every_tier_armed(tmp_path,
                                                                 monkeypatch):
-    """`gate()` closes on the offer switch ALONE, with every other switch up.
+    """`gate()` closes on the boot switches ALONE, with every other switch up.
 
     This is the module default, and it is the whole answer to "how did an experiment's
     arm put disk offers in front of live traffic": the restore path used to key off the
@@ -86,30 +96,37 @@ def test_a_fresh_boot_offers_nothing_even_with_every_tier_armed(tmp_path,
                                              "reason_kind": None})
     assert disk_restore._state["offers_enabled"] is False, \
         "the import-time default is the safety property; do not move it"
+    assert disk_restore._state["disk_authority"] is False, \
+        "a fresh boot gives disk authority to NOBODY, and that default is the whole " \
+        "safety argument for making the switch POST-only"
     verdict = disk_restore.gate()
     assert verdict["ok"] is False
     assert verdict["reason_kind"] == "offers_disabled"
-    assert "offers" in verdict["reason"] and "op" in verdict["reason"], \
-        "the refusal has to name the verb that raises the switch"
+    assert '"op":"offers"' in verdict["reason"] \
+        and '"op":"authority"' in verdict["reason"], \
+        "the refusal has to name BOTH verbs that open the gate"
     # ...and it is the FIRST thing the offer path does, so a fresh boot costs the
     # request nothing beyond the fork's own lookup.
     assert offer(Manager(), Req(request_id="fresh", blocks=4)) == (0, False)
     assert disk_restore.counters()["refused"]["offers_disabled"] == 1
 
 
-def test_the_switch_and_the_scope_accept_only_an_explicit_value():
-    """A typo in a payload must not change engine behaviour in either direction."""
-    for junk in ("true", "false", 1, 0, None, [], {}):
-        assert disk_restore.set_offer_switch(junk)["ok"] is False, repr(junk)
-    assert disk_restore.set_offer_switch(True)["ok"] is True
-    for junk in ("Optin", "ALL", "", None, 1, ["all"]):
-        assert disk_restore.set_scope(junk)["ok"] is False, repr(junk)
-    assert disk_restore.set_scope("all")["ok"] is True
-    assert disk_restore.set_scope("optin")["ok"] is True
-    assert disk_restore.offer_posture()["scope"] == "optin"
+def test_both_switches_accept_only_an_explicit_boolean():
+    """A typo in a payload must not change engine behaviour in either direction.
+
+    The `scope` argument used to be validated here too, against two names. It is gone,
+    and what it left behind is stricter rather than looser: a JSON boolean for either
+    switch, and no third way to say "which requests?" - because there is no longer a
+    question that needs asking.
+    """
+    for setter in (disk_restore.set_offer_switch, disk_restore.set_disk_authority):
+        for junk in ("true", "false", 1, 0, None, [], {}, "", "all", "optin"):
+            assert setter(junk)["ok"] is False, (setter.__name__, repr(junk))
+        assert setter(True)["ok"] is True
+        assert setter(False)["ok"] is True
 
 
-def test_no_environment_variable_can_arm_or_scope_anything():
+def test_no_environment_variable_can_arm_or_authorize_anything():
     """The posture is in-process state or nothing.
 
     An env var that arms the restore path would be a distance-spelling of "restart and
@@ -122,8 +139,8 @@ def test_no_environment_variable_can_arm_or_scope_anything():
     assert [name for name in vars(disk_restore)
             if name.startswith("ENV_")] == [], "this module owns no env var"
     tree = ast.parse(inspect.getsource(disk_restore))
-    wanted = {"set_offer_switch", "set_scope", "gate", "offer_posture",
-              "request_flagged", "suppress_load"}
+    wanted = {"set_offer_switch", "set_disk_authority", "gate", "disk_posture",
+              "serving_as", "suppress_load"}
     reading_env = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in wanted:
@@ -134,55 +151,96 @@ def test_no_environment_variable_can_arm_or_scope_anything():
     assert reading_env == [], f"these read the environment: {sorted(set(reading_env))}"
 
 
-def test_arming_the_tiers_does_not_raise_the_offer_switch(armed):
+def test_arming_the_tiers_raises_neither_switch(armed):
+    """The 2026-10-05 confusion, as an assertion: an arm is not consent to serve.
+
+    `armed` arms the spill tier and the RAM tier for every test in this file, and both
+    boot switches still start down - so each has to be raised by name, and each opens
+    the gate BY ITSELF. That second half is the operator-facing property: the README
+    tells them to POST one op, and a gate that needed both would make that command a
+    lie.
+    """
     disk_restore.set_offer_switch(False)
+    disk_restore.set_disk_authority(False)
     assert disk_restore.gate()["reason_kind"] == "offers_disabled"
     disk_restore.set_offer_switch(True)
     assert disk_restore.gate()["ok"] is True
+    disk_restore.set_offer_switch(False)
+    assert disk_restore.gate()["reason_kind"] == "offers_disabled"
+    disk_restore.set_disk_authority(True)
+    assert disk_restore.gate()["ok"] is True, \
+        "disk authority opens the gate by itself: one POST is the whole change"
 
 
-# --- the opt-in marker --------------------------------------------------------
+# --- nothing a client sends is a door ---------------------------------------
 
-def test_only_the_boolean_true_flags_a_request():
-    """Strictness, spelled out: a real dict, the key, and the boolean True.
+def test_the_module_reads_no_request_field_that_could_authorize_a_disk_read():
+    """THE REMOVAL, PINED STRUCTURALLY: a behavioural test cannot prove an absence.
 
-    A client controls this field. The cost of being loose about it is disk work on a
-    request that never asked for it, so `"true"`, `1`, `1.0` and a nested object all
-    mean "not asked", and a request object without the attribute is simply not flagged.
+    The marker used to be read at one place on the offer path, and the module kept a
+    constant naming the key so the route help, the payload and the log could all quote
+    it. All of that is gone, and the way to keep it gone is to name the CODE shapes that
+    must not come back:
+
+      * no attribute read of `kv_transfer_params` anywhere in the module (the read that
+        carried the marker), proved on the syntax tree, not on a string search;
+      * no `RESTORE_MARKER_KEY` / `RESTORE_SCOPE*` constant, so nothing can quote a
+        marker key or a scope name even by accident;
+      * no `request_flagged` / `set_scope` function, so there is no door to re-open;
+      * no counter named for the marker's bookkeeping, because a permanently-zero
+        counter in a payload is a payload that lies.
+
+    Prose about the retired marker is allowed and wanted - the WHY is the part worth
+    keeping - so this checks identifiers and attribute reads, not sentences.
     """
-    request = Req(restore=False)
-    for value in (True,):
-        request.kv_transfer_params = {disk_restore.RESTORE_MARKER_KEY: value}
-        assert disk_restore.request_flagged(request) is True
-    for value in ("true", "True", 1, 1.0, [True], {"y": True}, False, None, 0):
-        request.kv_transfer_params = {disk_restore.RESTORE_MARKER_KEY: value}
-        assert disk_restore.request_flagged(request) is False, repr(value)
-    for params in (None, "yes", 7, [disk_restore.RESTORE_MARKER_KEY], object()):
-        request.kv_transfer_params = params
-        assert disk_restore.request_flagged(request) is False, repr(params)
-    assert disk_restore.request_flagged(object()) is False
-    request.kv_transfer_params = {disk_restore.RESTORE_MARKER_KEY: True,
-                                  "other": 1}
-    assert disk_restore.request_flagged(request) is True
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(disk_restore))
+    read_attrs = {node.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Attribute)}
+    assert "kv_transfer_params" not in read_attrs, \
+        "something reads the engine field the marker travelled in"
+    defined = {node.name for node in ast.walk(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for retired in ("request_flagged", "set_scope", "_skip_unless_flagged"):
+        assert retired not in defined, retired
+    assigned = {target.id for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)}
+    for retired in ("RESTORE_MARKER_KEY", "RESTORE_SCOPE_OPTIN", "RESTORE_SCOPE_ALL",
+                    "RESTORE_SCOPES", "RESTORE_SCOPE_DEFAULT"):
+        assert retired not in assigned, retired
+    counters = disk_restore.counters()
+    for retired in ("flagged", "skipped_no_marker", "requests_seen", "scope",
+                    "scope_changes"):
+        assert retired not in counters, retired
+    assert disk_restore.serving_as() in ("off", "disk_authority",
+                                         "ram_first_gap_fill")
 
 
-def test_an_unflagged_request_touches_no_index_and_no_journal(armed, monkeypatch):
+def test_a_boot_with_the_switches_down_touches_no_index_and_no_journal(switches_down,
+                                                                      monkeypatch):
     """THE COST GUARANTEE: the fork's answer, and no lookup, no refresh, no alloc.
 
-    The marker check is the first thing in the path so an unflagged request cannot pay
-    for a journal refresh or an allocation. A scope switch placed AFTER the expensive
-    work would be a scope switch in name only, so this asserts the ABSENCE of the work
-    rather than the value that came back.
+    The gate is the first thing in the path, so a boot that has not been told to serve
+    cannot pay for a journal refresh or an allocation. A check placed AFTER the
+    expensive work would be a gate in name only, so this asserts the ABSENCE of the work
+    rather
+    than the value that came back - and then raises a switch on the same boot to prove
+    the silence above was the posture and not a broken fixture.
+
+    This is what the retired "unflagged request" version of the test pinned. The
+    population changed (it is now "a boot that was not turned on" rather than "a request
+    that did not ask") and the guarantee did not.
     """
-    fill(armed, blocks=4)
+    fill(switches_down, blocks=4)
     lookups, refreshes = [], []
     real_contains = disk_restore.disk_index.contains
     watching = {"on": True}
 
     def spy_contains(*a, **k):
         lookups.append(a)
-        # Spy during the unflagged call, then let the real index answer so the
-        # flagged half of this test fails only if the restore path really fails.
+        # Spy during the closed-gate call, then let the real index answer so the
+        # open-gate half of this test fails only if the restore path really fails.
         return False if watching["on"] else real_contains(*a, **k)
 
     monkeypatch.setattr(disk_restore.disk_index, "contains", spy_contains)
@@ -193,38 +251,45 @@ def test_an_unflagged_request_touches_no_index_and_no_journal(armed, monkeypatch
         return real_refresh(*a, **k)
 
     monkeypatch.setattr(disk_restore, "_refresh_index", counted_refresh)
-    assert offer(Manager(), Req(request_id="quiet", blocks=4,
-                                restore=False)) == (0, False)
-    assert lookups == [], "an unflagged request must not query the disk index"
-    assert refreshes == [], "an unflagged request must not refresh the journal"
+    assert offer(Manager(), Req(request_id="quiet", blocks=4)) == (0, False)
+    assert lookups == [], "a closed boot must not query the disk index"
+    assert refreshes == [], "a closed boot must not refresh the journal"
     counters = disk_restore.counters()
-    assert counters["skipped_no_marker"] == 1
+    assert counters["refused"]["offers_disabled"] == 1
     assert counters["offers"] == 0
     assert counters["slots_allocated"] == 0
-    # The flagged request on the same boot does the work, so the skip above was the
-    # scope and not a broken fixture.
+    # The same boot, switched on, does the work - so the silence above was the posture.
     watching["on"] = False
     asked = len(lookups)
+    disk_restore.set_disk_authority(True)
     assert offer(Manager(), Req(request_id="loud", blocks=4)) == (4 * BLOCK, True)
-    assert refreshes, "the flagged request must reach the journal"
-    assert len(lookups) > asked, "the flagged request must query the index"
+    assert refreshes, "an open boot must reach the journal"
+    assert len(lookups) > asked, "an open boot must query the index"
 
 
-def test_scope_all_offers_without_a_marker(offering):
-    fill(offering, blocks=4)
-    assert offer(Manager(), Req(request_id="plain", blocks=4,
-                                restore=False)) == (4 * BLOCK, True)
-    assert disk_restore.counters()["skipped_no_marker"] == 0
+def test_the_gap_fill_switch_offers_without_anything_from_the_client(armed_gap_fill):
+    """`scope=all`'s job, now done by a switch: every request is a candidate.
+
+    Same store, same plain request, and the offer happens - because the boot says so.
+    Nothing on the request was consulted, which is the property the whole change bought:
+    what used to need a per-request marker now needs one POST.
+    """
+    fill(armed_gap_fill, blocks=4)
+    assert offer(Manager(), Req(request_id="plain", blocks=4)) == (4 * BLOCK, True)
+    counters = disk_restore.counters()
+    assert counters["offers"] == 1
+    assert counters["authority_lookups"] == 0, \
+        "gap fill is not authority: the counters must keep the two postures apart"
 
 
-def test_the_gate_verdict_outranks_the_scope_verdict(armed, monkeypatch):
-    """(the scheduler half is fitted here, or `why_no_restore` answers a different
-    question than the gate and this test would be about the wrong link)"""
-    """A closed gate outranks an unflagged request in `why_no_restore`.
+def test_the_gate_verdict_outranks_everything_else_in_why_no_restore(armed,
+                                                                     monkeypatch):
+    """A closed gate outranks every other missing link in `why_no_restore`.
 
-    Both are true of the same request, and the operator's question is "could this boot
-    have served it at all". Answering "the request did not ask" while the gate is shut
-    sends them chasing client payloads instead of the arm file.
+    Several things can be true of the same request, and the operator's question is
+    "could this boot have served it at all". Answering with a downstream link while the
+    gate is shut sends them chasing the wrong thing entirely - on 2026-10-05 it sent me
+    into client payloads while the arm file was the answer.
     """
     fill(armed, blocks=2)
     monkeypatch.setattr(disk_restore, "_state", dict(disk_restore._state))
@@ -235,31 +300,47 @@ def test_the_gate_verdict_outranks_the_scope_verdict(armed, monkeypatch):
     why = disk_restore.scheduler_section()["why_no_restore"]
     assert "disarmed" in why, why
     monkeypatch.setattr(backport, "is_armed", lambda: True)
-    disk_restore.set_offer_switch(False)
+    disk_restore.set_disk_authority(False)
     why = disk_restore.scheduler_section()["why_no_restore"]
-    assert "not been told to offer" in why or "offers" in why, why
+    assert "switch" in why or "authority" in why, why
+    disk_restore.set_disk_authority(True)
+    why = disk_restore.scheduler_section()["why_no_restore"]
+    assert "switch" not in why, \
+        f"an open boot must not keep blaming the switch: {why}"
 
 
 def test_the_posture_is_reported_wherever_it_can_be_read(armed):
-    """Switch, scope, marker key, offer cap and the rank split - boot line + payload.
+    """Both switches, the one-word verdict, the offer cap and the rank split.
 
-    A posture that lives only in a config file is a posture nobody finds at 3 a.m.
+    Boot line, witness line, counters and payload. A posture that lives only in a config
+    file - or only in a sentence an operator has to remember the spelling of - is a
+    posture nobody finds at 3 a.m., and `disk_authority` is the one field that answers
+    "is this boot serving everyone from SSD?".
     """
     line = disk_restore.boot_line()
-    for field in ("offers_switch=", "scope=optin",
-                  f"marker={disk_restore.RESTORE_MARKER_KEY}",
-                  "offer_cap=", "ranks_armed=", "suppressed=", "skipped_no_marker="):
+    for field in ("disk_authority=ON", "serving_as=disk_authority",
+                  "offers_switch=OFF", "offer_cap=", "ranks_armed=", "suppressed=",
+                  "authority_lookups="):
         assert field in line, field
-    posture = disk_restore.offer_posture()
-    assert posture["enabled"] is True, "the `armed` fixture raises the switch"
-    assert posture["scope"] == "optin"
-    assert posture["marker_key"] == disk_restore.RESTORE_MARKER_KEY
+    for retired in ("scope=", "marker="):
+        assert retired not in line, retired
+    posture = disk_restore.disk_posture()
+    assert posture["disk_authority"] is True, "the `armed` fixture raises authority"
+    assert posture["enabled"] is False
+    assert posture["serving_as"] == "disk_authority"
+    assert posture["per_boot"] is True and posture["survives_restart"] is False
     counters = disk_restore.counters()
-    for key in ("offers_enabled", "scope", "flagged", "skipped_no_marker",
+    for key in ("disk_authority", "offers_enabled", "serving_as",
+                "authority_lookups", "disk_authority_changes",
+                "offer_switch_changes",
                 "suppressed_hits", "suppressed_spans", "suppressed_requests",
                 "ranks_seen", "no_read", "offer_clamped", "witness_kind"):
         assert key in counters, key
         assert key in counters["units"], key
+    # The witness line, which is what a rank prints when it disagrees.
+    witness = disk_restore.witness_line()
+    assert "disk_authority=on" in witness and "serving_as=disk_authority" in witness
+    assert "scope=" not in witness
 
 
 # --- the posture in the one-call payload, as FIELDS ---------------------------
@@ -276,26 +357,33 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     payload and the verb cannot disagree".
     """
     section = disk_restore.scheduler_section()
-    posture = disk_restore.offer_posture()
+    posture = disk_restore.disk_posture()
     counters = disk_restore.counters()
-    new_keys = ("offers_enabled", "scope", "marker_key", "offer_cap", "ranks_armed",
+    new_keys = ("disk_authority", "offers_enabled", "serving_as", "per_boot",
+                "survives_restart", "disk_authority_changes", "offer_switch_changes",
+                "authority_lookups",
+                "offer_cap", "ranks_armed",
                 "ranks_seen", "suppressed_hits", "suppressed_spans",
                 "suppressed_requests", "suppressions",
                 # THE APPLIED-READ EVIDENCE. `restorations` is the counter that read
                 # as success through the 2026-10-05 livelock; these are the direct
                 # ones, and they existed in `_state` while the payload had none.
                 "reads_applied", "disk_reads_applied", "ranks_reads_applied",
-                "loads_released", "skipped_no_marker", "witness_verdict",
+                "loads_released", "witness_verdict",
                 "witness_reason", "witness_kind")
     for key in new_keys:
         assert key in section, key
         assert str(section["units"].get(key, "")).strip(), \
             f"{key} has no unit: a bare number under a units map"
     # THE VALUES, FROM THEIR OWNERS.
-    assert section["offers_enabled"] is True is posture["enabled"]
-    assert section["scope"] == posture["scope"] == disk_restore.RESTORE_SCOPE_OPTIN
-    assert section["marker_key"] == posture["marker_key"]
-    assert section["marker_key"] == disk_restore.RESTORE_MARKER_KEY
+    assert section["disk_authority"] is True is posture["disk_authority"]
+    assert section["offers_enabled"] is False is posture["enabled"]
+    assert section["serving_as"] == posture["serving_as"] == "disk_authority"
+    # The lifetime is part of the posture, not a footnote: a restart gives disk
+    # authority to nobody, and the payload has to say so for the reader who was not
+    # here when the POST happened.
+    assert section["per_boot"] is True
+    assert section["survives_restart"] is False
     assert section["offer_cap"] == disk_restore.MAX_OFFER_TOKENS_PER_OFFER
     assert section["ranks_armed"] == 1 and section["ranks_seen"] == 1
     for key in ("suppressed_hits", "suppressed_spans", "suppressed_requests",
@@ -306,7 +394,7 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     # read was applied. `proof_reads` is deliberately NOT in this family - it counts
     # rank files opened by `worker_proof()`, not KV reads - and its unit says so.
     applied = ("reads_applied", "disk_reads_applied", "ranks_reads_applied",
-               "loads_released", "skipped_no_marker")
+               "loads_released", "authority_lookups")
     for key in applied:
         assert section[key] == counters[key] == 0, key
     for key in ("witness_verdict", "witness_reason", "witness_kind"):
@@ -325,15 +413,18 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     # and a key that appears only once traffic is allowed is a key that cannot
     # distinguish "off" from "gone".
     for key in ("reads_applied", "disk_reads_applied", "ranks_reads_applied",
-                "loads_released", "skipped_no_marker", "witness_verdict",
+                "loads_released", "authority_lookups", "witness_verdict",
                 "witness_reason", "witness_kind"):
         assert key in off, key
-    # The scope is its own field, and it moves independently of the switch.
-    disk_restore.set_scope(disk_restore.RESTORE_SCOPE_ALL)
-    scoped = disk_restore.scheduler_section()
-    assert scoped["offers_enabled"] is False and scoped["scope"] == "all"
+    # THE OTHER SWITCH, MOVING INDEPENDENTLY of authority: a boot can run the cheap
+    # posture with authority down, and the payload must show exactly that.
+    disk_restore.set_disk_authority(False)
     disk_restore.set_offer_switch(True)
-    assert disk_restore.scheduler_section()["offers_enabled"] is True
+    scoped = disk_restore.scheduler_section()
+    assert scoped["offers_enabled"] is True and scoped["disk_authority"] is False
+    assert scoped["serving_as"] == "ram_first_gap_fill"
+    disk_restore.set_disk_authority(True)
+    assert disk_restore.scheduler_section()["serving_as"] == "disk_authority"
 
 
 def test_the_payload_names_the_armed_ranks_when_only_the_scheduler_is_armed(four_ranks):
@@ -691,70 +782,109 @@ def test_a_real_install_refusal_is_still_a_warning(caplog, monkeypatch):
                for text in warnings), warnings
     assert disk_restore.counters()["install_refusals"] >= 1
 
-# --- the dev verb that raises the switch --------------------------------------
+# --- the dev verb that raises the switches ------------------------------------
 
 def test_the_offers_op_reads_the_posture_without_changing_it(armed):
     """`{"op":"offers"}` alone is a read: an operator checking the state must not
     change it, and every mutating op here is POST-only by the route's own rule."""
     disk_restore.set_offer_switch(False)
-    before = disk_restore.offer_posture()
+    before = disk_restore.disk_posture()
     out = disk_store.disk_for_engine(None, {"op": "offers"})
     assert out["ok"] is True
     assert out["posture"]["enabled"] == before["enabled"] is False
-    assert out["posture"]["scope"] == before["scope"]
+    assert out["posture"]["disk_authority"] == before["disk_authority"]
+    assert out["per_boot"] is True and out["survives_restart"] is False
 
 
-def test_the_offers_op_raises_the_switch_and_sets_the_scope(armed):
-    out = disk_store.disk_for_engine(None, {"op": "offers", "enabled": True,
-                                             "scope": "all"})
+def test_the_authority_op_reads_the_posture_without_changing_it(armed):
+    """Same rule for the new op. A read must be a read."""
+    out = disk_store.disk_for_engine(None, {"op": "authority"})
+    assert out["ok"] is True
+    assert out["posture"]["disk_authority"] is True, "`armed` raised it"
+    assert out["posture"]["serving_as"] == "disk_authority"
+
+
+def test_the_authority_op_turns_the_switch_on_and_off(armed):
+    """ONE POST is the whole change: authority alone opens the gate and serves.
+
+    The gap-fill switch stays down throughout, because the operator's command is the
+    authority op and it must not need a second call. Then back off, without a restart.
+    """
+    disk_restore.set_disk_authority(False)
+    assert disk_restore.gate()["reason_kind"] == "offers_disabled"
+    out = disk_store.disk_for_engine(None, {"op": "authority", "enabled": True})
     assert out["ok"] is True, out
-    posture = disk_store.disk_for_engine(None, {"op": "offers"})["posture"]
-    assert posture["enabled"] is True and posture["scope"] == "all"
+    assert out["disk_authority"]["enabled"] is True
+    assert out["per_boot"] is True and out["survives_restart"] is False
+    posture = disk_store.disk_for_engine(None, {"op": "authority"})["posture"]
+    assert posture["disk_authority"] is True
+    assert posture["enabled"] is False, "the other switch is not this op's business"
+    assert posture["serving_as"] == "disk_authority"
     assert disk_restore.gate()["ok"] is True
     # And back down: a boot can be made inert again without a restart.
-    assert disk_store.disk_for_engine(None, {"op": "offers",
+    assert disk_store.disk_for_engine(None, {"op": "authority",
                                              "enabled": False})["ok"] is True
     assert disk_restore.gate()["reason_kind"] == "offers_disabled"
 
 
-def test_the_offers_op_refuses_a_value_that_is_not_a_boolean_or_a_scope(armed):
-    """A typo must 400-ish, not silently do nothing: the operator has to know the
-    switch did not move."""
+def test_the_authority_op_refuses_a_value_that_is_not_a_boolean(armed):
+    """A typo must answer `ok: false`, not silently do nothing: the operator has to know
+    the switch did not move."""
+    for junk in ("true", 1, "yes", "on", None):
+        out = disk_store.disk_for_engine(None, {"op": "authority", "enabled": junk})
+        assert out["ok"] is False, (junk, out)
+        assert disk_restore.disk_posture()["disk_authority"] is True, \
+            f"{junk!r} was refused but still moved the switch"
+
+
+def test_the_offers_op_refuses_a_value_that_is_not_a_boolean(armed):
     for junk in ("true", 1, "yes"):
         out = disk_store.disk_for_engine(None, {"op": "offers", "enabled": junk})
         assert out["ok"] is False, (junk, out)
-    out = disk_store.disk_for_engine(None, {"op": "offers", "scope": "evryone"})
-    assert out["ok"] is False and "optin" in out["reason"]
+    # `scope` was an accepted key until 0.2.31. It is not one now, and a caller still
+    # sending it must be told rather than served - the route's unknown-key rule does
+    # that at the door; here the op-level handler must not invent a meaning for it.
+    out = disk_store.disk_for_engine(None, {"op": "offers", "scope": "all"})
+    assert out["ok"] is True, "a body this handler ignores is ignored, not obeyed"
+    assert disk_restore.disk_posture().get("scope") is None
 
 
-def test_the_offers_op_is_listed_and_post_only():
+def test_both_switch_ops_are_listed_and_post_only():
     """The route's GET/POST split is the guard on every mutating op, so a new op has
     to be in both lists or it is either unreachable or reachable by a page load."""
-    assert "offers" in disk_store.DISK_OPS
-    assert "offers" in disk_store.MUTATING_DISK_OPS
+    for op in ("offers", "authority"):
+        assert op in disk_store.DISK_OPS, op
+        assert op in disk_store.MUTATING_DISK_OPS, op
     schema = endpoint.ARG_SPECS[config.ROUTE_DISK]
+    assert "authority" in schema["op"]["values"]
     assert "offers" in schema["op"]["values"]
-    assert schema["scope"]["values"] == ("optin", "all")
     assert schema["enabled"]["kind"] == "bool"
+    # The scope argument is gone from the route's accepted vocabulary, so a client still
+    # sending `?scope=all` is refused by the unknown-key rule instead of being obeyed.
+    assert "scope" not in schema
 
 
-def test_the_verb_documentation_names_the_opt_in_key():
-    """The key is only usable if the verb's own help says what to send.
+def test_the_verb_documentation_no_longer_offers_a_request_marker():
+    """The help text is the operator's only source, and a stale one is trusted.
 
-    The opt-in lives in a client request body, not in this repo, so the one place an
-    operator can read it is the route help - where a stale description is worse than
-    none, because it will be trusted.
+    Until 0.2.31 it told them to put `{"kv_transfer_params": {"kvtier_disk_restore":
+    true}}` in the request body. That sentence has to be GONE, not merely added to:
+    an operator who follows it today gets a silently un-marked request and concludes the
+    feature is broken. What replaces it is the op, the boot-only lifetime, and the fact
+    that no client field decides anything - in the route help and in the README.
     """
     doc = endpoint.route_disk_post.__doc__ or ""
-    assert disk_restore.RESTORE_MARKER_KEY in doc
-    assert '"kv_transfer_params": {' in doc, doc
-    # The deployed chat-completions request declares no `extra_args` field and ignores
-    # unknown fields, so telling an operator to nest the marker there would produce a
-    # silently un-flagged request. The help must send the top-level shape.
-    assert '{"extra_args": {"kv_transfer_params"' not in doc
+    assert "kvtier_disk_restore\": true" not in doc, \
+        "the help still tells a client to send the retired marker"
+    assert '"op":"authority"' in doc, doc
+    assert "op: status|arm|disarm|spill-one|ls|contains|offers|authority|failures" \
+        in doc, doc
+    assert "EVERY" in doc and "no client can ask for disk authority or decline it" \
+        in doc, "the posture must be described in operator words"
     readme = (pathlib.Path(__file__).resolve().parent.parent
               / "README.md").read_text()
-    assert '{"kv_transfer_params": {"kvtier_disk_restore": true}}' in readme
+    assert '"op":"authority"' in readme, "the README must name the op"
+    assert '"kv_transfer_params": {"kvtier_disk_restore": true}' not in readme
 
 
 # --- the applied-read evidence reaches the payload ---------------------------
@@ -776,12 +906,12 @@ def test_the_applied_read_counters_reach_the_payload_as_a_pass_through(armed):
     disk_restore._state["disk_reads_applied"] = 3
     disk_restore._state["ranks_reads_applied"] = 11
     disk_restore._state["loads_released"] = 5
-    disk_restore._state["skipped_no_marker"] = 9
+    disk_restore._state["authority_lookups"] = 9
     after = disk_restore.scheduler_section()
     counters = disk_restore.counters()
     for key, value in (("reads_applied", 7), ("disk_reads_applied", 3),
                        ("ranks_reads_applied", 11), ("loads_released", 5),
-                       ("skipped_no_marker", 9)):
+                       ("authority_lookups", 9)):
         assert after[key] == value, key
         # A PASS-THROUGH, not a recomputation: the section and the counters agree.
         assert after[key] == counters[key], key

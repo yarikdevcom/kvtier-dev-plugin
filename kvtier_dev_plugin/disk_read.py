@@ -598,6 +598,75 @@ def buffers_held_bytes() -> int:
         return int(_state["buffers_held_bytes"])
 
 
+def pool_state() -> dict:
+    """The pool's budget in bytes: the ceiling, what is committed, and the headroom.
+
+    WHY A SEPARATE READER EXISTS. `counters()` is the payload view and builds the
+    whole concurrency, throughput and per-thread table (~2 KB of dict, ~40 lock-free
+    reads) - far too much to call once per offered read, and it is not the shape the
+    arithmetic wants either. This reads the three numbers the arithmetic IS: the
+    ceiling from `_limits_now()` (taken BEFORE the lock, the `_take_buffer` idiom, so
+    a caller never queues behind a reader thread for a budget read) and the committed
+    bytes under the lock, which is held work only.
+
+    `committed_bytes` is the number that makes a `buffer_cap` refusal readable: a
+    pool that refused at 128,217,728 of 134,217,728 bytes committed says "the pool is
+    too small for an offer this big", and one that refused at 11,468,800 says
+    "something is holding buffers it is not returning". Those are different operator
+    actions and the refusal cannot be triaged without the number.
+    """
+    limit = int(_limits_now()["buffer_bytes"])
+    try:
+        with _state_lock:
+            held = int(_state["buffers_held_bytes"])
+    except Exception as exc:  # noqa: BLE001 - a budget read never breaks a step
+        snapshot._error(exc, "disk_read pool_state")
+        held = 0
+    return {"budget_bytes": limit,
+            "committed_bytes": held,
+            "headroom_bytes": max(0, limit - held)}
+
+
+def afford_reads(bytes_per_job) -> dict:
+    """How many `bytes_per_job`-byte reads THIS process's pool can carry at once.
+
+    THE ARITHMETIC THE OFFER PATH ASKS FOR, owned here because this module owns the
+    pool. A read takes a buffer at issue and returns it at the apply point (one
+    forward pass later), so an offer whose jobs are all issued before any of them is
+    applied needs the pool to hold the WHOLE offer at once - see the `pool.note` in
+    `counters()`. `jobs_at_empty_pool` is therefore the largest job count ONE offer
+    can ever be serviced with, and `jobs_now` is what still fits at this instant.
+
+    A non-positive or unreadable size is `ok: false` with a reason: a zero would be a
+    number a caller multiplies, and "the pool can carry infinite jobs" is the one
+    answer this function must never give.
+    """
+    size = bytes_per_job
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return {"ok": False,
+                "reason": f"bytes_per_job must be a positive int (unit: bytes per "
+                          f"read), got {size!r}",
+                "jobs_at_empty_pool": 0, "jobs_now": 0}
+    state = pool_state()
+    budget = int(state["budget_bytes"])
+    committed = int(state["committed_bytes"])
+    return {"ok": True,
+            "bytes_per_job": size,
+            "pool_budget_bytes": budget,
+            "pool_committed_bytes": committed,
+            "pool_headroom_bytes": int(state["headroom_bytes"]),
+            # THE HARD CEILING: the whole pool divided by one job. An offer larger
+            # than this can be refused by a pool no other reader is touching.
+            "jobs_at_empty_pool": budget // size,
+            # ...and what fits right now, which is never larger and is the number a
+            # refusal at this instant actually hit.
+            "jobs_now": max(0, budget - committed) // size,
+            "note": ("a bounce buffer is taken at issue and returned at the apply "
+                     "point, so one offer needs the pool to hold the whole offer; "
+                     "the pool is per PROCESS, so N ranks cost N times these bytes "
+                     "of host RAM")}
+
+
 # --- the queue and its thread -------------------------------------------------
 
 _STOP = object()
@@ -1350,11 +1419,27 @@ def request_read(batch_id, job_id, path, expect_bytes: int) -> dict:
                                         "committed file")
         buffer = _take_buffer(int(expect_bytes))
         if buffer is None:
-            return _refused("buffer_cap", f"the bounce-buffer pool cannot hold "
-                                          f"another {expect_bytes}-byte buffer "
-                                          f"(cap {int(_limits_now()['buffer_bytes'])} "
-                                          "bytes): this load is refused, not queued "
-                                          "onto an unbounded pile")
+            # THE FOUR NUMBERS OF A `buffer_cap`, carried out of the refusal rather
+            # than left in a counter. `pool_budget_bytes`/`pool_committed_bytes` say
+            # whether the pool is too small for the offer or is being held by
+            # somebody else, `bytes_needed` is the unit this store writes, and
+            # `jobs_that_fit` is the largest offer THIS pool can ever service - which
+            # is the figure the scheduler's offer cap is supposed to have used, so a
+            # refusal that reaches the log names the ceiling it exceeded instead of
+            # the fact that it exceeded one.
+            pool = pool_state()
+            return _refused("buffer_cap",
+                            f"the bounce-buffer pool cannot hold another "
+                            f"{expect_bytes}-byte buffer "
+                            f"({int(pool['committed_bytes'])} of "
+                            f"{int(pool['budget_bytes'])} bytes committed, cap "
+                            f"{int(_limits_now()['buffer_bytes'])}): this load is "
+                            "refused, not queued onto an unbounded pile",
+                            pool_budget_bytes=int(pool["budget_bytes"]),
+                            pool_committed_bytes=int(pool["committed_bytes"]),
+                            bytes_needed=int(expect_bytes),
+                            jobs_that_fit=max(0, int(pool["headroom_bytes"])
+                                              // int(expect_bytes)))
         job = {"batch": batch_id, "job_id": int(job_id), "path": str(path),
                "expect_bytes": int(expect_bytes), "buffer": buffer,
                "state": QUEUED, "queued_ts": round(time.time(), 6)}

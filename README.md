@@ -219,7 +219,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains` (see `disk_store.py`). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` (see `disk_store.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -1095,45 +1095,48 @@ the file again (~10 ms per 3,200-token span against ~3.2 s to recompute it). The
 worker rebuilds each name with its **own** digest, and a disagreement is a counted
 failure, not a guess.
 
-**A fresh boot offers nothing, and requests have to ask.** Two switches, both
-dev-verb only, both per boot, neither reachable by an environment variable:
+**A fresh boot serves nothing from disk, and one POST says who is served.** Two
+switches, both dev-verb only, both per boot, neither reachable by an environment
+variable, a config file or the spill arm:
 
 ```bash
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"offers"}' $B/disk   # read
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"authority"}' $B/disk  # read
 curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
-     -d '{"op":"offers","enabled":true,"scope":"optin"}' $B/disk             # arm offers
+     -d '{"op":"authority","enabled":true}' $B/disk        # EVERY request from SSD
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
+     -d '{"op":"offers","enabled":true}' $B/disk           # RAM first, disk fills gaps
 ```
 
-`enabled` is this boot's offer switch and it starts **false**: arming the spill tier
-says bytes may be *written*, not that requests may be *served* from disk. `scope`
-decides which requests once it is up - `optin` (the default) serves only a request
-that asked for it, `all` is the whole-workload measurement posture. On 2026-10-05 a
-spill arm raised for a write experiment was enough to put 123,474 un-requested
-160,000-token offers in front of live traffic; these two switches are why an arm is no
-longer one of those things.
+`op=authority` is the global **disk-authority** switch: every request's host-RAM hit is
+treated as **zero tokens** for the offer arithmetic and released back to the pool, so the
+disk index - not the RAM tier - decides where each request's prefix starts. It opens the
+offer gate by itself, so that one POST is the whole change: no second command, no client
+change, and no restart needed to turn it back off.
 
-`optin` rides a field the engine already has, so nothing new has to be plumbed. Send it
-at the TOP LEVEL of the chat-completions body:
+`op=offers` is the cheaper posture: RAM first, the disk extending only what the host-RAM
+tier left short. With both up, authority wins - the disk decides.
 
-```json
-{"kv_transfer_params": {"kvtier_disk_restore": true}}
-```
+Both start **false**, and `restore.serving_as` names the resulting posture as one word
+(`off` / `disk_authority` / `ram_first_gap_fill`). Why the spill arm is not one of these:
+on 2026-10-05 a spill arm raised for a write experiment was enough to put 123,474
+un-requested 160,000-token offers in front of live traffic. Arming says bytes may be
+*written*; these two say requests may be *served*.
 
-That is the shape this engine reads: `kv_transfer_params` is a declared field of the
-chat-completions request (`entrypoints/openai/chat_completion/protocol.py:143`), which
-the engine folds into `extra_args["kv_transfer_params"]` there at `:717-719`, and
-`vllm/v1/request.py:118-119` lifts it onto the `Request` our marker reads. Wrapping it
-in `extra_args` yourself is NOT the same thing on this build: chat-completions declares
-no `extra_args` body field and the request model ignores unknown fields, so
-`{"extra_args": {...}}` is dropped in silence rather than refused. Only
-`/v1/responses` and `/v1/completions` take `vllm_xargs`. The proxy passes either shape
-through untouched, so it is the engine leg that decides - checked against the deployed
-tree, not against upstream.
+**No request field decides any of this (0.2.31).** Until then the authority rule was
+carried by a client-supplied marker, `kv_transfer_params.kvtier_disk_restore`, and a
+`scope` argument (`optin` / `all`) chose whether that marker was required. A request body
+must not decide whether its KV comes off NVMe - it is a payload the caller writes, and a
+measurement rig had to make every probe carry it to get the behaviour an operator wanted.
+So the marker, the `scope` argument and the fields it fed (`flagged`,
+`skipped_no_marker`, `marker_key`, `requests_seen`) are retired: the route refuses
+`scope` as an unsupported request key, `disk_restore` no longer reads
+`request.kv_transfer_params` at all, and a client can neither ask for disk authority nor
+decline it. Sending the old marker is a no-op that changes nothing.
 
-Strictly the JSON boolean `true` - `"true"`, `1` or an absent field mean "not asked",
-and an unasked request is answered by the fork's own lookup with no journal refresh, no
-index query and no allocation. `restore.skipped_no_marker` counts those, so "nothing
-was offered because nobody asked" is readable and is never mixed up with a refusal.
+Eligibility bounds are untouched by the switch - the bounce-buffer pool budget, the
+CPU-slot reserve, `MAX_OFFER_TOKENS_PER_OFFER` and "is this span actually in the index"
+still decide how much any single request is offered. Disk authority removes the *policy*
+stop, not the physical ones.
 
 **A failed disk load is never offered twice.** The engine recovers from a KV load
 failure by resetting the request and rescheduling it, which asks
@@ -1174,21 +1177,23 @@ withheld lines so a quiet log is not mistaken for a dead module.
 fitted in that process, the gate and its reason, the index size and its source, the
 worker proof, and every offer refusal with its meaning - under `restore`, with
 `restore.why_no_restore` naming the first missing link. The boot's **posture** is in
-that section as fields, not only as text in the boot line: `offers_enabled`, `scope`,
-`marker_key`, `offer_cap`, `ranks_armed`/`ranks_seen`, and the fuse counters
+that section as fields, not only as text in the boot line: `disk_authority`,
+`offers_enabled`, `serving_as`, `per_boot`/`survives_restart`,
+`disk_authority_changes`/`offer_switch_changes`, `offer_cap`, `ranks_armed`/`ranks_seen`, and the fuse counters
 `suppressed_hits`/`suppressed_spans`/`suppressed_requests`/`suppressions`. A rank file's
 `disk_restore.installed: true` describes a WORKER and cannot start a restore; only
 the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
 is that verdict at boot.
 
 **A marked request is self-evident, and a closed gate is counted (both 0.2.21).**
-`restore.flagged`, `restore.requests_seen` and `restore.lookups` are published beside
-`restore.skipped_no_marker`, so "did my marker survive the engine's field-folding?" is
-one payload read instead of a control experiment: `requests_seen` moves for every lookup,
-`flagged` only for a request carrying `kv_transfer_params.kvtier_disk_restore: true`,
-`skipped_no_marker` only for one that does not. And a marked request turned away by the
+**The posture is self-evident, and a closed gate is counted.**
+`restore.disk_authority`, `restore.offers_enabled` and `restore.serving_as` are
+published beside `restore.authority_lookups` and `restore.lookups`, so "is this boot
+serving everyone from SSD, and did the rule actually fire?" is one payload read with no
+control experiment: `lookups` moves for every lookup, `authority_lookups` only for one
+that ran while disk authority was up. And a request turned away by the
 **gate** now moves its own bucket - `refused.not_configured`, `refused.disarmed`,
-`refused.tier_disarmed` - in the same region that already counted `offers_disabled`,
+`refused.tier_disarmed`, `refused.offers_disabled` - in the same region that counts
 `workers_not_servicing` and `no_worker_proof`. Before, a gate decline wrote `last_reason`
 and no counter, so an empty `refused` could not be told apart from "nothing refused us":
 that ambiguity is what made an alignment-guard refusal look like the answer on
@@ -1196,29 +1201,26 @@ that ambiguity is what made an alignment-guard refusal look like the answer on
 before (something may parse it), and the value handed back to the scheduler is the fork's
 own tuple, unchanged - the change is bookkeeping, not behaviour.
 
-**The marker makes the disk the authority for that request (0.2.22).** One rule, no new
-field: a request carrying `kv_transfer_params.kvtier_disk_restore: true` has its
-host-RAM hit treated as **zero tokens** for the offer arithmetic, so the disk index
-decides the span from the local GPU-computed boundary. A request without the marker is
-touched by none of it - RAM first, the disk filling the gap, byte-identical to every
-earlier release, which is how a client that never sends the field keeps running on the
-RAM tier.
-
-This is what makes the read path testable at all. With RAM consulted, an ordinary small
+**Disk authority is what makes the read path testable at all (0.2.22 as a marker rule,
+0.2.31 as a boot switch).** With RAM consulted, an ordinary small
 prompt either hit RAM completely (nothing left to offer, `disk_run_below_one_block`) or
 hit it with a remainder (`ram_hit_not_block_aligned`) - so exercising one disk read
 meant making GPU and RAM forget the prefix first, ~1.3M tokens of filler per attempt.
-A marked request now needs only that the span is in the index.
+Under disk authority a request needs only that the span is in the index, which is why
+the operator's one-command way to exercise the read path is now the authority op instead
+of a marker on every probe. The posture is also what a whole-workload SSD measurement
+needs, and it is now one decision an operator makes rather than one every client has to
+cooperate with.
 
 Three limits, stated because they are the ones an operator will hit:
 
-* **The marker does not zero `num_computed_tokens`.** That number is the third field of
+* **Authority does not zero `num_computed_tokens`.** That number is the third field of
   the fork's pending tuple and `update_state_after_alloc` (`manager.py:441-463`) uses it
   as the *offset* into the request's whole block list - it is where the CPU-to-GPU copy
   writes. Zeroing it while the scheduler still counts a cached local prefix would DMA
   disk bytes into the request's already-cached, ref-counted GPU prefix blocks (shared
   with every other request reading them) and leave the newly allocated external region
-  holding whatever was in those slots. So a marked request whose prefix the GPU already
+  holding whatever was in those slots. So a request whose prefix the GPU already
   computed has nothing to restore and recomputes; the disk span starts where the local
   prefix ends, always.
 * **Ignoring the RAM hit means releasing the pin it came with.**
@@ -1235,13 +1237,14 @@ Three limits, stated because they are the ones an operator will hit:
   neither tier covered.
 
 Read it in the payload: `restore.last_offer` carries
-`ram_tokens_reported` (what the fork found) beside `ram_tokens_used` (zero, for a marked
-request), `start_block`, `blocks`, `disk_tokens`; `restore.disk_authority` counts the
+`ram_tokens_reported` (what the fork found) beside `ram_tokens_used` (zero, while disk
+authority is up), `start_block`, `blocks`, `disk_tokens`; `restore.authority_lookups`
+counts the
 lookups the rule fired on; `restore.local_hit_ignored` and
 `restore.local_hit_tokens_ignored` count only OFFERS - a refusal leaves the fork's hit
 exactly where the fork put it, and must not be counted as a sacrifice the request never
 made. A forced read also logs one `DISK[restore] serving ... from DISK against a
-N-token host-RAM hit` warning; a flagged request the disk cannot serve stays silent and
+N-token host-RAM hit` warning; a request the disk cannot serve stays silent and
 leaves no allocation behind.
 
 **The index now reads the newest spill lines first, and publishes how far behind it is
@@ -1250,11 +1253,10 @@ advance a per-journal cursor from byte 0, sharing one
 512 KiB / 8,192-line budget across every rank's journal. On four ~60k-line journals that
 covered about a tenth of one rank per pass, so the lines the restore path was waiting
 for - spills from the last few minutes, which is what "the GPU forgot this and RAM never
-had it" means - were the last thing it would reach, and it was reached only by a flagged
-request that was itself waiting on the answer. Measured consequence: **0 of the 36 newest
+had it" means - were the last thing it would reach, and it was reached only by a request
+that was itself waiting on the answer. Measured consequence: **0 of the 36 newest
 identities in the store were in the index**, while `index.entries` sat at 6,892 claiming
 files the ceiling had long since reclaimed.
-
 The rule now: a refresh spends at most the same caps, but takes its window from the END
 of each journal's unread run, and every journal gets a *share* of the budget rather than
 whatever the previous rank left. Whatever that forfeits is older than everything it
@@ -1695,7 +1697,7 @@ store. Every one of its 29 tests fails against the pre-fix code.
 
 **A disk offer claims every prefix-cacheable group, so it must be able to restore every
 one of them.** This is a correctness fix found on live traffic, not a hardening
-exercise: at 00:08 on 2026-10-06 a flagged request on a 31,826-token prompt got a
+exercise: at 00:08 on 2026-10-06 a disk-authority request on a 31,826-token prompt got a
 mechanically perfect disk read - `reads_started=9 reads_applied=9 failed={}` per rank,
 18 ms, settled on the first settle check - and answered `duct Register Register
 Register...` at `temperature=0`, where the same prompt recomputed from scratch returned
@@ -1794,11 +1796,14 @@ enforces, and it costs production almost literally nothing.
   groups that decided it, instead of leaving a reader at "no offer has been made, read
   `refused`".
 
-**Unflagged traffic is untouched.** `scope=optin` answers the marker question before the
-gate, so a request without `kv_transfer_params.kvtier_disk_restore` never reaches the
-predicate at all - no arithmetic computed, no counter moved, the fork's own answer
-returned identically (`test_the_unflagged_request_never_reaches_the_gate_and_stays_
-untouched`).
+**A boot that was not turned on touches nothing.** Both boot switches are read before
+the gate's expensive work, so a boot with neither up never reaches the predicate at all
+- no arithmetic computed, no index query, no journal refresh, no counter moved beyond
+the one refusal bucket that names both ops, and the fork's own answer returned
+identically (`test_a_boot_with_the_switches_down_touches_no_index_and_no_journal`).
+Since 0.2.31 the population this covers is "a boot nobody switched on" rather than "a
+request that did not carry the marker", and the guarantee is the same one the
+2026-10-05 incident asked for.
 
 Tests: `tests/test_disk_restore_group_gate.py` (the hybrid refusal, the pure-attention
 control, the predicate-not-a-group-list proof, the requirement table on both doors) and
