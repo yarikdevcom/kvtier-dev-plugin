@@ -1145,15 +1145,87 @@ So the marker, the `scope` argument and the fields it fed (`flagged`,
 decline it. Sending the old marker is a no-op that changes nothing.
 
 Eligibility bounds are untouched by the switch - the bounce-buffer pool budget, the
-CPU-slot reserve, the per-offer block bound (`MAX_RESTORE_BLOCKS_PER_OFFER`, **128 spans
-since 0.2.35, 64 before**; the fixed 32,000-token cap that used to sit beside it was
-deleted in 0.2.32) and "is this span actually in the index" still decide how much any
-single request is offered. The block bound is a BACKSTOP and has to stay sized above what
-the bounce-buffer pool can afford, or it stops being a bound and becomes an undisclosed
-throughput limit: the operator's 1 GiB pool affords ~93 buffers, and a 64-block cap sat
-*under* that - which is why 0.2.35 raised it. Raising it does not raise
-`MAX_SLOTS_PER_OFFER` (256 CPU slots), which still binds first for any multi-group model. Disk
-authority removes the *policy* stop, not the physical ones.
+CPU-slot reserve, the reader queue's job count (`disk_read.MAX_QUEUE_DEPTH`, **256 jobs
+since 0.2.35, 64 before**), the price walk's identity cap (`POOL_PRICE_MAX_IDENTITIES`,
+**256 since 0.2.35, 64 before**), the per-offer block bound
+(`MAX_RESTORE_BLOCKS_PER_OFFER`, **128 spans since 0.2.35, 64 before**; the fixed
+32,000-token cap that used to sit beside it was deleted in 0.2.32) and "is this span
+actually in the index" still decide how much any single request is offered. The block
+bound is a BACKSTOP and has to stay sized above what the bounce-buffer pool can afford, or
+it stops being a bound and becomes an undisclosed throughput limit: the operator's 1 GiB
+pool affords ~93 buffers, and a 64-block cap sat *under* that - which is why 0.2.35 raised
+it. Raising it does not raise `MAX_SLOTS_PER_OFFER` (256 CPU slots), which still binds
+first for any multi-group model. Disk authority removes the *policy* stop, not the
+physical ones.
+
+**Every one of those job-shaped bounds is now priced, and `bounded_by` names the one that
+bit.** An offer used to be sized by pool BYTES alone, while the reader enforces a JOB
+count: `disk_read.request_read()` submits into one bounded queue, and the job past
+`MAX_QUEUE_DEPTH` is refused `queue_full` - a `LOAD_CAPACITY_FAILURES` member, which means
+the bytes are fine and the read never happened, so the block **arrives as nothing**. A
+missing block is not a shorter restore, it is a **hole**, and coverage is usable only up to
+the first hole: everything behind it is recomputed however much valid data sits there. That
+is how a 62-block run came home as a 15-block restore and cost ~19,200 tokens. A 128-span
+offer on the live geometry needs 128 + 4 = **132 jobs**, so a 64-job queue made a holed
+restore the *expected* case on exactly the box that raises its pool to 1 GiB - and a
+1 GiB pool tells the offer "~93 jobs fit", which is above 64 and below 132. The offer now
+prices `min(pool jobs, queue jobs)` and `bounded_by` answers `pool_budget` or
+`read_queue` depending on which one cut, because a payload that names the wrong bound
+sends the operator to buy the wrong thing.
+
+**THE THREE NUMBERS COME FROM ONE DERIVATION.** One offer allocates exactly one CPU slot
+per read job (one spilled file fills one destination block), so `MAX_SLOTS_PER_OFFER`
+(256) is the largest job count any offer can carry, and the two bounds that were at 64 are
+now 256:
+
+| constant | value | why that number | below it, the failure is |
+|---|---|---|---|
+| `MAX_SLOTS_PER_OFFER` | 256 slots | the offer's job ceiling: one read per slot | shorter offer, labelled `cpu_slots` |
+| `disk_read.MAX_QUEUE_DEPTH` | 256 jobs | = the job ceiling, so a maximum offer is **submittable** | **a hole** at job 256, `bounded_by: read_queue` |
+| `POOL_PRICE_MAX_IDENTITIES` | 256 lookups | = the job ceiling, so a maximum offer is priced **exactly** | under-priced offer -> over-offer -> **a hole** |
+
+Extra queue slots above 256 buy nothing: only a *second concurrent offer* could fill
+them, and concurrent offers are the open reservation arbiter (TODO 14), not something a
+queue depth fixes. A capped identity walk is still refused the right to be optimistic:
+since 0.2.35 a walk that hits its cap takes the **larger** of its sample and the box's own
+width floor (`rank width:` or the fallback constant) and says `walk capped and widened`,
+because a partial sample's maximum is not a maximum and an under-price is the direction
+that holes a restore. `offers_price_walk_capped` counts it, and zero is the healthy value.
+
+**The memory question, answered, because a queue slot is not free**: `request_read()`
+takes the bounce buffer **before** it queues, so a *queued* job holds its buffer. That is
+not a second memory budget, because every buffer comes out of the pool and `_take_buffer`
+refuses at the pool's byte ceiling first - a 256-slot queue with a 1 GiB pool can never
+make the process hold more than the pool. `test_a_queued_job_holds_its_buffer_so_the_pool_is_the_only_byte_budget`
+pins it by the refusal that arrives (a 4-job pool against the 256-slot queue refuses the
+surplus as `buffer_cap`, never `queue_full`). What the depth costs directly is one
+descriptor plus its batch-ledger entry, ~1.2 KB per slot, so the queue itself is **~0.3 MB
+per rank process** on top of the pool's own bytes (~1 GiB/worker at the operator's
+setting). A 1 GiB pool with a 256-slot queue is therefore coherent in both directions: the
+pool binds at 93 jobs, and the queue only becomes the operative bound on a box whose pool
+exceeds ~2.7 GiB (256 x 11,468,800 B = 2,936,012,800 B) - and if it does, `bounded_by` says so.
+
+**The ordered list of bounds that can shorten a restore**, with what each permits at the
+live geometry (`per_span` = positional groups, four align-mode groups contribute one
+boundary-state read each; block size 3,200 tokens; pool = 1 GiB priced at the 11,468,800 B
+PP0 shape):
+
+| bound | value | one-positional-group model | three-positional-group model |
+|---|---|---|---|
+| store depth (contiguous run in the index) | measured, not a constant | **~11 spans measured live** - the real limit | ~11 spans |
+| bounce-buffer pool | 1 GiB / 11,468,800 B = 93 jobs | 93 - 4 = **89 spans** (284,800 tok) | (93 - 4) / 3 = **29 spans** |
+| CPU slots, live free count | `free - CPU_SLOT_RESERVE(64) - boundary` / per_span | the engine's own pool: ~119 spans at a ~187-block arena | **~39 spans** - binds before 84 |
+| CPU slots, the cap | `MAX_SLOTS_PER_OFFER` = 256 | (256-4)/1 = 252 spans | (256-4)/3 = **84 spans** |
+| reader queue | `MAX_QUEUE_DEPTH` = 256 jobs | 252 spans (ties the slot cap exactly) | 84 spans (ties it) |
+| block cap | `MAX_RESTORE_BLOCKS_PER_OFFER` = 128 | **128 spans** (409,600 tok), reachable only once the pool affords 132 jobs (~1.4 GiB = 1,513,881,600 B) | unreachable (84 < 128) |
+| identity-walk width | `POOL_PRICE_MAX_IDENTITIES` = 256 | 132 identities named (one per job): never truncated | 256 named at 84 spans: exactly at the cap |
+
+Read it as: the pool is the operative bound today on both geometries (89 and 29 spans),
+the store's own depth is what actually shortens a live restore (~11 spans), and the queue
+now ties the CPU-slot cap instead of undercutting it - so for a multi-group model the CPU
+slot bound, at 84 spans (or ~39 once the pool's *live* free count and the 64-slot reserve
+are taken off), is the wall a raised pool will meet next. Nothing in this change moves
+`MAX_SLOTS_PER_OFFER` or its clamp semantics.
 
 **A failed disk load is not offered twice, and since 0.2.32 a raced load is.** The
 engine recovers from a KV load failure by resetting the request and rescheduling it,
@@ -1539,6 +1611,18 @@ memmoved into their CPU slots - forfeited because `incomplete` is a batch-level 
 read; work that had already landed was discarded. **This release does not change that
 rule** - the fix is up-front offer clamping plus per-entry (not per-batch) poison
 inheritance, and that belongs in its own change with its own tests.
+
+**The pool is the byte bound; `MAX_QUEUE_DEPTH` is the reader's JOB bound (256 since
+0.2.35, 64 before).** These are different currencies and the smaller governs: the pool says
+how many buffers exist (`floor(pool / unit)`, the row above) and the queue says how many
+reads the process will accept at all. Since 0.2.35 the offer path prices
+`min(pool jobs, queue jobs)` and `bounded_by` names which one cut it (`pool_budget` /
+`read_queue`) - the ordered bound table sits with the disk-authority switches above. The queue is 256 because the
+offer's own job ceiling is 256 CPU slots (one read per slot), so a maximum 128-span offer -
+128 + 4 = 132 jobs - is submittable; a shallower queue does not shorten a restore, it
+**holes** it at the first refused job. A queued job *does* hold its buffer, but that buffer
+is billed to the pool's byte ceiling, so the queue's own cost is ~1.2 KB of descriptor per
+slot (**~0.3 MB per rank process at 256 slots**), not a second RAM budget.
 
 **Maximum useful thread count, from the code.** Threads do not create units. A buffer is
 held from issue until the apply point, so the number of units that can sit in flight at

@@ -84,7 +84,36 @@ from . import disk_layout, snapshot
 
 # --- the caps, and the unit of every one of them ----------------------------
 
-MAX_QUEUE_DEPTH = 64                  # JOBS queued or in flight
+# JOBS queued or in flight. 0.2.35 raises this from 64, and the NEW number is derived
+# rather than picked: `disk_restore` caps one offer at `MAX_SLOTS_PER_OFFER` = 256 CPU
+# slots, and an offer allocates exactly ONE read job per slot it allocates (one spilled
+# file fills one destination block), so 256 is the largest job count ANY single offer
+# can ever hand to `request_read()`. A queue at that depth can never be the bound that
+# holes an offer while the CPU-slot cap still stands - the offer is cut to 256 slots
+# before the queue is asked to hold 256 jobs. Below it, the surplus is refused
+# `queue_full`, which is a member of `disk_restore.LOAD_CAPACITY_FAILURES`, which means
+# the block arrives as NOTHING - and coverage is usable only up to the FIRST hole, so a
+# 132-job offer into a 64-job queue is not "a smaller restore", it is a restore that
+# stops at job 64 and recomputes everything behind it. That is how a 62-block run became
+# a 15-block restore and cost ~19,200 tokens on 2026-10-08.
+#
+# WHY 256 AND NOT MORE: it is the offer's own job ceiling, so extra slots could only be
+# filled by a SECOND concurrent offer - and concurrent offers are the open reservation
+# arbiter (disk_restore TODO 14), not something a queue depth fixes. Going above the
+# CPU-slot cap would trade a bound the offer path prices for a deeper pile of pinned
+# buffers, and buy nothing.
+#
+# THE MEMORY CONSEQUENCE, because a queued job is not free: `request_read()` takes the
+# bounce buffer BEFORE it queues (see `_take_buffer` above `put_nowait` there), so a
+# QUEUED job HOLDS its buffer. That makes this constant an upper bound on queued host
+# RAM - but NOT a second budget, because every buffer comes out of the pool and
+# `_take_buffer` refuses at the pool's byte ceiling first. At a 1 GiB pool the queue can
+# never hold more than the pool's own 1 GiB no matter how deep it is; the queue is the
+# JOB-COUNT bound and the pool is the BYTE bound. What depth does cost directly is the
+# descriptor and its batch-ledger entry, ~1.2 KB per job, so 256 slots are ~0.3 MB per
+# rank process - noise beside the pool. `disk_restore._offer` prices this bound next to
+# the pool budget and names it `read_queue` in `bounded_by`.
+MAX_QUEUE_DEPTH = 256                 # JOBS queued or in flight
 MAX_BATCHES = 32                      # OPEN batches tracked at once
 MAX_JOBS_PER_BATCH = 4_096            # JOBS one batch may hold (sanity ceiling)
 MAX_JOBS_REPORT = 16                  # FAILURES one status report may name

@@ -279,15 +279,15 @@ permanent, because the fork has no timeout for WAITING_FOR_REMOTE_KVS."""
 
 MAX_RESTORE_BLOCKS_PER_OFFER = 128   # SCHEDULER BLOCKS offered per request
 #
-# THE TOKEN CAP THAT USED TO SIT HERE IS DELETED (0.2.32), and the deletion is the
-# whole change. Up to and including 0.2.31 this module fixed the per-offer ceiling at
-# 32,000 tokens (10 spans of a 3,200-token block), and that number was an ARTIFICIAL
-# ceiling on restoring a prefix from disk: below what the process can carry, below what
-# the bounce-buffer pool can afford at the operator's live 256 MiB setting, and below
-# the run depth the store reaches anyway. It existed for a real reason - the 2026-10-05
-# boot offered EXACTLY 160,000 tokens per request 123,474 times, the engine could not
-# place them, and every one came back as a load failure that rescheduled the request -
-# but since 0.2.31 the offer path PRICES that reason DIRECTLY: the reader's own
+# THE TOKEN CAP THAT USED TO SIT HERE IS DELETED (0.2.32), and the deletion is the whole
+# change. Up to and including 0.2.31 this module fixed the per-offer ceiling at 32,000
+# tokens (10 spans of a 3,200-token block), and that number was an ARTIFICIAL ceiling on
+# restoring a prefix from disk: below what the process can carry, below what the
+# bounce-buffer pool can afford at the operator's live 256 MiB setting, and below the
+# run depth the store reaches anyway. It existed for a real reason - the 2026-10-05 boot
+# offered EXACTLY 160,000 tokens per request 123,474 times, the engine could not place
+# them, and every one came back as a load failure that rescheduled the request - but
+# since 0.2.31 the offer path PRICES that reason DIRECTLY: the reader's own
 # `disk_read.afford_reads()` says how many bounce buffers the pool can hold at once, the
 # offer is cut to it, and `bounded_by` names which bound bit (`pool_budget` /
 # `cpu_slots` / `block_cap`). A crude token constant was only ever the accidental guard,
@@ -331,30 +331,34 @@ MAX_RESTORE_BLOCKS_PER_OFFER = 128   # SCHEDULER BLOCKS offered per request
 #   * THE MISSING ARBITER, which is the real one. There is NO reservation arbiter
 #     between ranks or requests: two simultaneous offers each price affordability
 #     against the pool's CURRENT free bytes, both can believe they fit, and together
-#     they over-commit (the open TODO 14 above). Doubling the cap DOUBLES the worst
-#     case of that over-commit, so it is not free. What keeps it tolerable is measured,
-#     not assumed: 4 offers in 332 lookups on the live box, so overlap is near-zero.
-#     RAISING THE OFFER RATE IS A DIFFERENT TRADE and must not be done on this change's
-#     strength - the arbiter (reserve at adoption, release at `finish_batch`; see
+#     they over-commit (the open TODO 14 above). Doubling the cap DOUBLES the worst case
+#     of that over-commit, so it is not free. What keeps it tolerable is measured, not
+#     assumed: 4 offers in 332 lookups on the live box, so overlap is near-zero. RAISING
+#     THE OFFER RATE IS A DIFFERENT TRADE and must not be done on this change's strength
+#     - the arbiter (reserve at adoption, release at `finish_batch`; see
 #     `disk_read.pool_state()` / `afford_reads()`) has to be scheduled before that.
-#   * THE READER'S QUEUE, sized independently and NOT priced by the offer path. A read
-#     is handed to `disk_read.request_read()` in a tight loop at bind, and that queue is
-#     `MAX_QUEUE_DEPTH` = 64 JOBS queued-or-in-flight; job 65 of one load event is
+#   * THE READER'S QUEUE, sized independently and NOW PRICED BY THE OFFER PATH (0.2.35).
+#     A read is handed to `disk_read.request_read()` in a tight loop at bind, and that
+#     queue is `MAX_QUEUE_DEPTH` jobs queued-or-in-flight; the job past the cap is
 #     refused `queue_full` (returned to the pool, counted in `LOAD_CAPACITY_FAILURES`,
-#     and the block it was for arrives as nothing). The offer prices affordability in
-#     POOL BYTES ONLY (`afford_reads()` -> `budget // size`), so a 1 GiB pool says "93
-#     jobs" to the offer path while the reader's own queue says 64. AT THE LIVE 96 MiB
-#     DEFAULT THIS IS UNREACHABLE (96 MiB affords 8 buffers), and it was already 4 jobs
-#     over at 64 spans x 1 positional group + 4 boundary states = 68; raising the cap to
-#     128 spans moves it to 132 jobs, so the gap becomes the expected case on a box that
-#     raises its pool. IT IS AN OPERATOR DECISION, NOT A TUNE: either the queue rises
-#     with the pool (one bounded pile per rank process, ~11.5 MB of buffer each, already
-#     paid for by the pool budget) or the offer path prices `MAX_QUEUE_DEPTH` next to
-#     the pool budget and the ceiling it names in `bounded_by` stops being a half-
-#     truth. The
-#     second is the honest one; neither belongs in this change unasked.
-#   * CPU SLOTS, unchanged: `MAX_SLOTS_PER_OFFER` (256) is a separate bound and it
-#     binds FIRST on a multi-group hybrid, where 128 blocks x 4 groups is 512 slots and
+#     and the block it was for arrives as NOTHING). A missing block is not a smaller
+#     restore, it is a HOLE, and coverage is usable only up to the first hole -
+#     everything behind it is recomputed however much valid data sits there (that is how
+#     a 62-block run became a 15-block restore and cost ~19,200 tokens). The offer used
+#     to price affordability in POOL BYTES ONLY (`afford_reads()` -> `budget // size`),
+#     so a 1 GiB pool said "93 jobs" to the offer path while the reader's own queue said
+#     64 - unreachable at the live 96 MiB default (96 MiB affords 8 buffers), 4 jobs
+#     over at 64 spans x 1 positional group + 4 boundary states = 68, and 68 over at
+#     this cap's 132. Both halves of the operator's choice are now in: `MAX_QUEUE_DEPTH`
+#     is 256 (= this offer's own job ceiling, `MAX_SLOTS_PER_OFFER`, one read per CPU
+#     slot, so a maximum offer is submittable), AND `_offer` prices the queue beside the
+#     pool and names it `read_queue` in `bounded_by`, so the bound it reports stops
+#     being a half-truth whichever way a pool is configured. The memory question is
+#     answered at `disk_read.MAX_QUEUE_DEPTH`: a queued job holds its buffer, but that
+#     buffer is billed to the pool's byte ceiling, so the queue adds ~1.2 KB of
+#     descriptor per slot and is not a second budget.
+#   * CPU SLOTS, unchanged: `MAX_SLOTS_PER_OFFER` (256) is a separate bound and it binds
+#     FIRST on a multi-group hybrid, where 128 blocks x 4 groups is 512 slots and
 #     `cpu_slots` cuts the offer to 64 blocks anyway. Raising this constant therefore
 #     changes nothing for a 4-group model and everything for the live single-cacheable-
 #     group one (128 + 4 boundary states = 132 slots, inside 256).
@@ -424,7 +428,21 @@ MAX_FAILURES_PER_RANK_FILE = 2       # records ONE rank file may carry (byte bud
 MAX_FAILURES_PUBLISHED = 6           # records a section or an op surfaces
 MAX_FAILURE_STRING_CHARS = 80        # a string inside one failure record
 REFUSAL_LOG_MIN_SECONDS = 30.0       # SECONDS between load-failure lines of one kind
-POOL_PRICE_MAX_IDENTITIES = 64       # index lookups ONE price walk may make
+POOL_PRICE_MAX_IDENTITIES = 256      # index lookups ONE price walk may make.
+# 0.2.35 raises this from 64, and the number is the SAME derivation as the reader's
+# queue: one offer carries at most `MAX_SLOTS_PER_OFFER` (256) jobs, one identity per
+# job, so 256 lookups is the whole offer - a maximum offer is priced EXACTLY and its
+# sample is never truncated. A walk that stops early is a sample of the widths this
+# offer would read, and a store holding TWO shapes (11,468,800 B on PP0, 12,902,400 B on
+# PP1) can hide the wider one in the part not looked at: an under-estimate prices the
+# offer too LARGE, the surplus is refused at bind, and the offer is holed - the same
+# failure class as the queue cap, arriving from the price side instead of the queue
+# side.
+#
+# RAISING THE WIDTH DOES NOT DELETE THAT RISK, it only moves it above every offer this
+# build can make, so the truncation guard in `_pool_price_bytes()` stays: a walk that
+# hits this cap refuses to trust its own sample and takes the conservative floor
+# instead.
 
 # --- the settle wait, and the one number that sizes it -----------------------
 #
@@ -540,7 +558,8 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "no_worker_proof", "offers_disabled", "workers_not_servicing",
                   "suppressed_after_failure",
                   "pin_release_unavailable", "incomplete_group_set",
-                  "no_boundary_anchor", "no_null_block", "no_pool_budget")
+                  "no_boundary_anchor", "no_null_block", "no_pool_budget",
+                  "no_read_queue")
 
 # --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
 #
@@ -739,6 +758,16 @@ OFFER_REFUSAL_WHY = {
                       "too. The reason carries the byte figures (pool budget, price "
                       "per job, jobs the offer needed) because publishing those is "
                       "the whole point: nobody could see them before",
+    "no_read_queue": "the reader's job queue (disk_read.MAX_QUEUE_DEPTH) cannot carry "
+                     "even ONE job of this offer's shape, so no offer is made at all. "
+                     "The same fail-closed rule as `no_pool_budget`, from the other "
+                     "bound: a job past the queue cap is refused `queue_full` at bind, "
+                     "which is a capacity failure, so that block arrives as NOTHING - "
+                     "not a shorter restore but a HOLE, and coverage is usable only up "
+                     "to the first hole while everything behind it is recomputed. A "
+                     "pool is a byte ceiling and the queue is a job ceiling; the offer "
+                     "pays the smaller. Fixed by a deeper reader queue, NOT a bigger "
+                     "pool, which is why it has its own name",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -1100,6 +1129,20 @@ _state: dict = {
     # can state the block bound in tokens in a process that has made no offer yet.
     "offer_block_capped": 0,
     "offer_block_size_seen": None,
+    # HOW OFTEN THE PRICE WAS A SAMPLE (0.2.35). `offer_price_walk_capped` counts offers
+    # whose identity walk hit `POOL_PRICE_MAX_IDENTITIES` and therefore priced itself
+    # from the conservative width floor rather than from every file it was about to
+    # read. At the shipped width one maximum offer is 256 identities and the counter
+    # stays zero for the life of the boot, so ANY non-zero value means a cap moved under
+    # it and offers are being sized on a partial sample - the shape that under-prices
+    # and holes.
+    # sized on a partial sample - the shape that under-prices and holes.
+    "offer_price_walk_capped": 0,
+    # WHICH BOUND CUT AN OFFER BECAUSE THE READER'S QUEUE IS TOO SHALLOW (0.2.35). The
+    # queue is a JOB bound and the pool is a BYTE bound; before this counter existed the
+    # offer priced only the byte one, so a queue-limited offer looked exactly like a
+    # pool-limited one in `bounded_by` and the fix (a deeper queue) was invisible.
+    "offer_queue_capped": 0,
     # THE LOAD-FAILURE RING (0.2.31): what the worker said when a read did not happen,
     # in the process that can READ it. `load_failures` counts records written and
     # `load_failures_overwritten` the ones the ring recycled; `ranks_load_failures`
@@ -1658,6 +1701,7 @@ def reset_state_for_tests() -> None:
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
             "offer_block_capped": 0, "offer_block_size_seen": None,
+            "offer_price_walk_capped": 0, "offer_queue_capped": 0,
             "load_failures": 0, "load_failures_overwritten": 0,
             "ranks_load_failures": 0, "failure_log_lines": 0,
             "failure_log_suppressed": 0,
@@ -2273,6 +2317,22 @@ def counters_view(out: dict) -> dict:
                               "request still had tokens left. The only per-offer CAP "
                               "counter left since 0.2.32 deleted the fixed "
                               "32,000-token clamp (`offer_clamped`)",
+        "offer_queue_capped": "offers SHORTENED to the reader queue's job count "
+                              "(disk_read.MAX_QUEUE_DEPTH) rather than the pool's byte "
+                              "budget: a second bound on how many reads ONE offer "
+                              "may hand to `request_read()`. A job refused there is "
+                              "`queue_full`, a LOAD_CAPACITY_FAILURE, so its block "
+                              "arrives as NOTHING and coverage stops at the first "
+                              "hole - which is why the offer prices this bound "
+                              "instead of discovering it at bind",
+        "offer_price_walk_capped": "offers whose identity walk hit "
+                                   "POOL_PRICE_MAX_IDENTITIES and so were priced from "
+                                   "the conservative width floor, not from every "
+                                   "file they would read. A partial sample's maximum "
+                                   "is not a maximum, and an under-price offers too "
+                                   "much and holes the restore; zero is the expected "
+                                   "value at the shipped width, since 256 identities "
+                                   "is one whole maximum offer",
         "last_offer_pool": "the most recent offer's bounce-buffer arithmetic: bytes "
                            "per job and where that price came from, the pool budget "
                            "and what was committed, jobs needed versus jobs the pool "
@@ -4095,6 +4155,29 @@ def _suppressed_span(run) -> str | None:
         return None
 
 
+def _read_queue_jobs() -> int:
+    """How many read jobs ONE offer may hand to `disk_read` before `queue_full`.
+
+    THE SECOND JOB CEILING, read here because `disk_read` owns the queue and this module
+    owns the offer. A read is submitted into one bounded `queue.Queue` in a loop at
+    bind, and a job past the cap is refused `queue_full` - a `LOAD_CAPACITY_FAILURES`
+    member, so the block arrives as NOTHING and coverage stops at the first hole. The
+    offer therefore cannot be allowed to be sized by the pool alone: the pool is a BYTE
+    ceiling and this is a JOB ceiling, and the smaller of the two is what the reader can
+    actually carry.
+
+    Read live from the module (not cached) so a test - or an operator drop-in - that
+    moves `MAX_QUEUE_DEPTH` moves the price with it. A queue depth this function cannot
+    read yields 0, which means NO OFFER: refusing costs one recompute, while offering a
+    run the queue cannot carry holes it and fuses the request.
+    """
+    try:
+        return max(0, int(disk_read.MAX_QUEUE_DEPTH))
+    except Exception as exc:  # noqa: BLE001 - an unreadable bound means no offer
+        snapshot._error(exc, "disk_restore read queue depth")
+        return 0
+
+
 def _pool_price_bytes(run_keys=None, blocks: int = 0) -> tuple:
     """(bytes ONE read needs, where that figure came from) - the offer's unit price.
 
@@ -4119,6 +4202,15 @@ def _pool_price_bytes(run_keys=None, blocks: int = 0) -> tuple:
          ask. Capping a little harder is the safe direction: a missed restore costs a
          recompute, an over-priced offer costs the request its RAM hit AND a
          reschedule.
+
+    A walk that hits `POOL_PRICE_MAX_IDENTITIES` IS NOT SOURCE 1. `max()` of a partial
+    sample is not a maximum, and a store holding two shapes can keep the wide one in the
+    tail nobody looked at - an under-estimate that prices the offer too BIG and holes it
+    at bind, the same failure class as a queue that is too shallow, arriving from the
+    price side. So a capped walk takes the LARGER of its sample and the source 2/3 floor
+    and says which one won (`walk capped and widened`). At the shipped width - 256
+    identities, one whole maximum offer - nothing is truncated, which is why the width
+    was raised; the guard is what keeps the bound honest if any of these numbers move.
     """
     exact: list = []
     walked = 0
@@ -4137,12 +4229,49 @@ def _pool_price_bytes(run_keys=None, blocks: int = 0) -> tuple:
                 break
     except Exception as exc:  # noqa: BLE001 - a price is never worth a fault
         snapshot._error(exc, "disk_restore pool price index walk")
-    if exact:
+    if exact and not truncated:
+        # THE ONLY SHAPE THAT MAY BE PRICED EXACTLY: a walk that saw EVERY identity this
+        # offer would read. `max()` of a PARTIAL sample is not a maximum, and an
+        # under-estimate here prices the offer too BIG - so the truncation test above is
+        # the difference between a measurement and a guess wearing a measurement's name.
         return (max(exact),
                 f"exact: {max(exact)} B, the largest file size this index journalled "
-                f"for the {walked} identit(ies) this offer would read"
-                + (f" (walk capped at {POOL_PRICE_MAX_IDENTITIES})" if truncated
-                   else ""))
+                f"for the {walked} identit(ies) this offer would read")
+    floor_bytes, floor_source = _width_floor_bytes()
+    if exact:
+        # THE WALK WAS CAPPED, so it cannot prove the largest file this offer reads, and
+        # its sample may be the SMALL shape of a store that also holds the big one.
+        # Refuse to trust it: take the larger of the sample and the box's own width
+        # floor and say which one won. That is the conservative direction - a price too
+        # high shortens the offer, a price too low holes it - and it is the reason
+        # `POOL_PRICE_MAX_IDENTITIES` may stay a bound at all. Counted, because at 256
+        # identities a maximum offer is priced exactly, so a non-zero counter means a
+        # cap moved and the sample is being trusted less than it used to be.
+        _state["offer_price_walk_capped"] += 1
+        sampled = max(exact)
+        if floor_bytes > sampled:
+            return (int(floor_bytes),
+                    f"walk capped and widened: sampled {walked} of more than "
+                    f"{POOL_PRICE_MAX_IDENTITIES} identities and saw {sampled} B, "
+                    f"which a partial sample cannot prove is the largest; priced at "
+                    f"the conservative floor {int(floor_bytes)} B instead "
+                    f"({floor_source})")
+        return (int(sampled),
+                f"walk capped at {POOL_PRICE_MAX_IDENTITIES} and sampled {walked} "
+                f"identities, saw {sampled} B, which already covers the floor "
+                f"{int(floor_bytes)} B")
+    return (int(floor_bytes), floor_source)
+
+
+def _width_floor_bytes() -> tuple:
+    """The conservative width floor: the widest slot size the box itself publishes.
+
+    Sources 2 and 3 of `_pool_price_bytes()`'s ladder, split out so a CAPPED identity
+    walk can borrow the same floor an offer with no indexed identity gets. Deliberately
+    a separate function rather than folded back in: the exact answer and the floor are
+    different claims, and the difference between them is exactly why a truncated walk
+    must not be trusted on its own.
+    """
     candidates: list = []
     try:
         local = _int(disk_spill.slot_width_bytes())
@@ -4189,23 +4318,38 @@ def _offer_pool_view() -> dict:
     """
     price, source = _pool_price_bytes()
     afford = disk_read.afford_reads(price)
+    pool_jobs = int(afford.get("jobs_at_empty_pool") or 0)
+    queue_jobs = _read_queue_jobs()
     return {"bytes_per_job": int(price),
             "price_source": _clip(source, 160),
             "pool_budget_bytes": int(afford.get("pool_budget_bytes") or 0),
             "pool_committed_bytes": int(afford.get("pool_committed_bytes") or 0),
-            "jobs_the_pool_can_carry": int(afford.get("jobs_at_empty_pool") or 0),
+            "jobs_the_pool_can_carry": pool_jobs,
+            # THE QUEUE BESIDE THE POOL, and the minimum the offer is cut to (0.2.35).
+            # Publishing one number and calling it "what the offer can carry" is the
+            # half-truth this field existed to fix; both ceilings and the minimum are
+            # here so a reader can see WHICH bound is the operative one without guessing
+            # from a short restore.
+            "jobs_the_queue_can_carry": queue_jobs,
+            "jobs_affordable": min(pool_jobs, queue_jobs),
             "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
             "fallback_price_bytes": POOL_PRICE_BYTES_PER_JOB_FALLBACK,
+            "identity_walk_cap": POOL_PRICE_MAX_IDENTITIES,
             "capped_offers": int(_state["offer_pool_capped"]),
+            "queue_capped_offers": int(_state["offer_queue_capped"]),
+            "price_walk_capped_offers": int(_state["offer_price_walk_capped"]),
             "refused_offers": int(_state["offer_pool_refused"]),
             "last_offer": _state["last_offer_pool"],
-            "note": ("an offer is capped to `jobs_the_pool_can_carry` because a read "
-                     "holds its bounce buffer from issue until the apply point, so "
-                     "ONE offer needs the pool to hold ALL of its buffers at once. "
-                     "Two full-size offers in the same step still divide the pool "
-                     "between them, and the surplus is refused at bind as "
-                     "`buffer_cap`: this view publishes `jobs_that_fit_now` so that "
-                     "case is at least visible")}
+            "note": ("an offer is capped to the SMALLER of `jobs_the_pool_can_carry` "
+                     "and `jobs_the_queue_can_carry`, because a read holds its bounce "
+                     "buffer from issue until the apply point (so ONE offer needs the "
+                     "pool to hold ALL of its buffers at once) AND because the reader "
+                     "refuses a job past `jobs_the_queue_can_carry` as `queue_full`, "
+                     "which arrives as a HOLE rather than a shorter restore. "
+                     "`bounded_by` names which of the two cut. Two full-size offers "
+                     "in the same step still divide the pool between them, and the "
+                     "surplus is refused at bind as `buffer_cap`: this view publishes "
+                     "`jobs_that_fit_now` so that case is at least visible")}
 
 
 def _span_parts(run) -> tuple:
@@ -4585,7 +4729,42 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     # is the part that was never publishable.
     price_bytes, price_source = _pool_price_bytes(run.get("keys"), blocks)
     afford = disk_read.afford_reads(price_bytes)
-    jobs_ceiling = int(afford["jobs_at_empty_pool"]) if afford.get("ok") else 0
+    pool_jobs = int(afford["jobs_at_empty_pool"]) if afford.get("ok") else 0
+    # THE QUEUE IS THE SECOND JOB COUNT, AND THE OFFER PAYS IT TOO (0.2.35). Everything
+    # above asks how many DESTINATIONS or BYTES the offer may have; the reader also has
+    # a hard limit on how many READS it will accept, `disk_read.MAX_QUEUE_DEPTH` jobs in
+    # one bounded `queue.Queue`, and `request_read()` takes its bounce buffer BEFORE it
+    # queues, so a job that will not fit the queue is refused there and there. That
+    # refusal, `queue_full`, is a member of `LOAD_CAPACITY_FAILURES`: the bytes are fine
+    # and the read was never issued, so the block ARRIVES AS NOTHING. A missing block is
+    # not a smaller restore, it is a HOLE, and coverage is usable only up to the first
+    # hole - everything behind it is recomputed no matter how much valid data sits
+    # there. Pricing only the pool therefore let the offer promise a run the reader
+    # could not carry, converting "short but correct" into "long and holed": a 1 GiB
+    # pool says ~93 jobs while a 64-job queue said 64, and a maximum 128-span offer
+    # needs 132.
+    #
+    # THE ARITHMETIC IS THE SAME SHAPE AS THE POOL'S, AND DELIBERATELY NETS NOTHING
+    # HERE: `needed` already counts the boundary-state blocks, so the single `(ceiling -
+    # boundary_slots) // per_span` cut below spends the queue's slots on the boundary
+    # states first exactly as it spends the pool's. Naming which of the two cut is the
+    # point: `bounded_by` said `pool_budget` for an offer the QUEUE shortened, which is
+    # the half-truth that cost a whole evening this week.
+    queue_jobs = _read_queue_jobs()
+    jobs_ceiling = min(pool_jobs, queue_jobs)
+    # The smaller ceiling is what decided; on a tie the pool is named, because a queue
+    # exactly as roomy as the pool has not cost this offer anything.
+    queue_binds = queue_jobs < pool_jobs
+    jobs_bound = "read_queue" if queue_binds else "pool_budget"
+    jobs_refusal = "no_read_queue" if queue_binds else "no_pool_budget"
+    # The load-failure record's kind is the refusal the bind WOULD have raised, so a
+    # queue-limited offer is counted where a queue refusal is looked for.
+    jobs_failure = "queue_full" if queue_binds else "buffer_cap"
+    jobs_ceiling_words = (
+        f"the reader queue holds {jobs_ceiling} job(s) "
+        f"(disk_read.MAX_QUEUE_DEPTH={queue_jobs})" if queue_binds else
+        f"the pool holds {jobs_ceiling} read(s) of {price_bytes} bytes (budget "
+        f"{int(afford.get('pool_budget_bytes') or 0)} B)")
     jobs_wanted = int(needed)
     pool_pricing = {"bytes_per_job": int(price_bytes),
                     "price_source": _clip(price_source, 160),
@@ -4593,7 +4772,14 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                     "pool_committed_bytes": int(afford.get("pool_committed_bytes")
                                                 or 0),
                     "jobs_the_offer_needed": jobs_wanted,
-                    "jobs_the_pool_can_carry": jobs_ceiling,
+                    "jobs_the_pool_can_carry": pool_jobs,
+                    # THE QUEUE'S ANSWER, BESIDE THE POOL'S (0.2.35). Both ceilings are
+                    # published because `bounded_by` names only the one that bound: a
+                    # reader who sees `read_queue` needs the pool figure to know the
+                    # pool was NOT the problem, and vice versa. `jobs_affordable` is the
+                    # minimum actually applied - the number an offer was cut against.
+                    "jobs_the_queue_can_carry": queue_jobs,
+                    "jobs_affordable": jobs_ceiling,
                     "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
                     "bytes_the_offer_needs": jobs_wanted * int(price_bytes),
                     # THE PER-OFFER BOUND THAT STOOD WHEN THIS OFFER WAS PRICED, beside
@@ -4612,9 +4798,8 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if jobs_ceiling < per_span + boundary_slots:
         _state["offer_pool_refused"] += 1
         first_key, first_group = _span_parts(run)
-        _note_load_failure("buffer_cap", where="offer",
-                           reason=f"the pool budget {jobs_ceiling} job(s) of "
-                                  f"{price_bytes} B cannot hold one span "
+        _note_load_failure(jobs_failure, where="offer",
+                           reason=f"{jobs_ceiling_words} cannot hold one span "
                                   f"({per_span} positional + {boundary_slots} "
                                   "boundary-state reads), so no offer is made",
                            request_id=request_id, span=span, group=first_group,
@@ -4624,13 +4809,12 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                                  or 0),
                            pool_committed_bytes=int(afford.get("pool_committed_bytes")
                                                     or 0))
-        _refuse("no_pool_budget",
-                f"the pool holds {jobs_ceiling} read(s) of {price_bytes} bytes "
-                f"(budget {int(afford.get('pool_budget_bytes') or 0)} B) while one "
-                f"span needs {per_span} positional + {boundary_slots} "
-                f"boundary-state read(s): offering the {jobs_wanted}-job run would "
-                "have it refused at bind as buffer_cap, which costs the request its "
-                f"RAM hit AND a reschedule. Price: {price_source}")
+        _refuse(jobs_refusal,
+                f"{jobs_ceiling_words} while one span needs {per_span} positional + "
+                f"{boundary_slots} boundary-state read(s): offering the "
+                f"{jobs_wanted}-job run would have it refused at bind as "
+                f"{jobs_failure}, which costs the request its RAM hit AND a "
+                f"reschedule. Price: {price_source}")
         return ram_result
     if jobs_ceiling < needed:
         capped = (jobs_ceiling - boundary_slots) // max(1, per_span)
@@ -4641,12 +4825,13 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
             # the states), so this fires on the one shape where `per_span` is zero: a
             # model whose every cacheable group is a boundary-state group. Refusing is
             # still the right answer for it, and the sentence says which half ate the
-            # pool.
+            # ceiling.
             _state["offer_pool_refused"] += 1
             first_key, first_group = _span_parts(run)
-            _note_load_failure("buffer_cap", where="offer",
-                               reason="the pool can hold the boundary-state reads but "
-                                      "not one span on top of them",
+            _note_load_failure(jobs_failure, where="offer",
+                               reason=f"{jobs_ceiling_words} can hold the "
+                                      "boundary-state reads but not one span on top "
+                                      "of them",
                                request_id=request_id, span=span, group=first_group,
                                key16=first_key, bytes_needed=price_bytes,
                                jobs_needed=jobs_wanted, jobs_fit=jobs_ceiling,
@@ -4655,21 +4840,27 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                pool_committed_bytes=int(afford
                                                         .get("pool_committed_bytes")
                                                         or 0))
-            _refuse("no_pool_budget",
-                    f"the pool holds {jobs_ceiling} read(s) of {price_bytes} bytes "
-                    f"and the {boundary_slots} boundary-state block(s) this run must "
-                    f"claim leave no room for one span's {per_span} positional "
-                    f"read(s) (budget {int(afford.get('pool_budget_bytes') or 0)} B): "
-                    f"no offer is made. Price: {price_source}")
+            _refuse(jobs_refusal,
+                    f"{jobs_ceiling_words} and the {boundary_slots} boundary-state "
+                    f"block(s) this run must claim leave no room for one span's "
+                    f"{per_span} positional read(s): no offer is made. Price: "
+                    f"{price_source}")
             return ram_result
         blocks = capped
         needed = blocks * per_span + boundary_slots
         disk_tokens = blocks * block_size
-        bounds.append("pool_budget")
+        # NAME THE BOUND THAT ACTUALLY CUT. `pool_budget` and `read_queue` are different
+        # fixes - a bigger pool versus a deeper reader queue - and until 0.2.35 the
+        # queue was applied by nobody, so a queue-shaped offer was mislabelled as a
+        # pool-shaped one and the payload pointed at the wrong knob.
+        bounds.append(jobs_bound)
         pool_pricing["jobs_offered"] = int(needed)
         pool_pricing["bytes_offered"] = int(needed * price_bytes)
         pool_pricing["jobs_dropped"] = int(jobs_wanted - needed)
-        _state["offer_pool_capped"] += 1
+        if queue_binds:
+            _state["offer_queue_capped"] += 1
+        else:
+            _state["offer_pool_capped"] += 1
         _state["last_offer_pool"] = dict(pool_pricing)
     # THE BOUNDARY-SAFE CUT. Every clamp above shortens the OFFER, and with an
     # align-mode group in the set a shortening is not a truncation: the one real
@@ -8513,8 +8704,8 @@ def scheduler_section() -> dict:
         # worth, with the block size and its source so a reader can see the token figure
         # is derived, not measured. `offer_block_capped` is the counter of offers that
         # bound here, and for every offer that came in short for a DIFFERENT reason,
-        # `bounded_by` names the one that bit (`pool_budget` / `cpu_slots` /
-        # `block_cap`).
+        # `bounded_by` names the one that bit (`pool_budget` / `read_queue` /
+        # `cpu_slots` / `block_cap`).
         # THE HONEST READING, and the payload says it because the number invites the
         # opposite one: this bound is not what makes a long prefix restorable. Pool
         # affordance binds far below it in practice, and on the live store the depth the
@@ -8578,8 +8769,14 @@ def scheduler_section() -> dict:
         # is the normal answer for a long prefix - and the ONLY guard against the
         # 2026-10-05 shape of un-placeable offers, since nothing arbitrates two
         # simultaneous offers against the pool's current free bytes (TODO 14).
+        # THE SECOND JOB CEILING (0.2.35): the pool is bytes,
+        # `disk_read.MAX_QUEUE_DEPTH`
+        # is jobs, and the offer is cut to the smaller. `offers_queue_capped` is the one
+        # that says the QUEUE was the problem - a bigger pool would not have helped it.
         "offer_pool": _offer_pool_view(),
         "offers_pool_capped": int(tally["offer_pool_capped"]),
+        "offers_queue_capped": int(tally["offer_queue_capped"]),
+        "offers_price_walk_capped": int(tally["offer_price_walk_capped"]),
         "offers_pool_refused": int(tally["offer_pool_refused"]),
         "last_offer_pool": tally["last_offer_pool"],
         # WHY A READ DID NOT HAPPEN, across the fleet. The records the workers wrote
@@ -8786,17 +8983,29 @@ def scheduler_section() -> dict:
                           "read needs, the pool's budget, how many jobs it can carry, "
                           "and the last offer's pricing with `bounded_by` naming which "
                           "constraint shortened it (`pool_budget` = bounce buffers, "
+                          "`read_queue` = the reader's job queue, a JOB bound the byte "
+                          "budget does not imply, and a job refused there arrives as a "
+                          "HOLE rather than a shorter restore, "
                           "`cpu_slots` = CPU blocks, `block_cap` = the per-offer block "
                           "walk). `offer_cap` is RETIRED with the fixed 32,000-token "
                           "cap: no configured token cap exists to bound an offer",
             "offers_pool_capped": "offers SHORTENED to the job count the bounce-buffer "
                                   "pool can carry, from counters()",
+            "offers_queue_capped": "offers SHORTENED to the reader queue's job count "
+                                   "(disk_read.MAX_QUEUE_DEPTH) instead of the pool's: "
+                                   "the counter that says a bigger pool would not have "
+                                   "helped this offer, from counters()",
+            "offers_price_walk_capped": "offers priced on a SAMPLE of their "
+                                        "identities: the walk hit its identity cap, "
+                                        "so the width floor stood in. Zero is "
+                                        "healthy, from counters()",
             "offers_pool_refused": "lookups given NO disk offer because the pool "
                                    "cannot carry even one span's reads (`no_pool_"
                                    "budget`), from counters()",
             "last_offer_pool": "the byte arithmetic of the most recent pricing: price "
                                "per job and its source, the pool budget, jobs needed "
-                               "versus jobs the pool can carry, and `bounded_by`",
+                               "versus jobs the pool AND the queue can carry, and "
+                               "`bounded_by`",
             "recent_load_failures": "the load-failure records an operator can read "
                                     "without opening a rank file: this process's ring "
                                     "merged with what the live rank files carried, "

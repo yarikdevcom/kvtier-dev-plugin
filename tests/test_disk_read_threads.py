@@ -408,13 +408,24 @@ def test_the_pool_publishes_the_thread_count_it_could_actually_feed(tmp_path,
 
 def test_queue_depth_cap_is_unchanged_and_still_bounds_the_queue(monkeypatch,
                                                                  tmp_path):
-    """N threads drain the queue N-at-a-time, so 64 is if anything roomier. Pin it.
+    """N threads drain the queue N-at-a-time, so a deeper cap is if anything roomier.
 
-    Four threads do not get to make the cap do something different: the cap is about
-    how much UNBOUNDED work the process may be holding, and that argument does not
-    mention the thread count at all.
+    Four threads do not get to make the cap do something different: the cap is about how
+    much UNBOUNDED work the process may be holding, and that argument does not mention
+    the thread count at all.
+
+    0.2.35 raises the pinned value from 64 to 256, and the value below is derived, not
+    copied: `disk_restore` cuts one offer at `MAX_SLOTS_PER_OFFER` = 256 CPU slots and
+    an offer allocates one read job per slot, so 256 is the largest job count ANY offer
+    can hand this queue. Below that the surplus is refused `queue_full` - a capacity
+    failure, so the block arrives as NOTHING and coverage stops at the first hole. The
+    cap is still a cap: the assertions below issue MORE jobs than it holds and require
+    the refusals.
     """
-    assert disk_read.MAX_QUEUE_DEPTH == 64
+    assert disk_read.MAX_QUEUE_DEPTH == 256
+    assert disk_read.MAX_QUEUE_DEPTH >= disk_restore.MAX_SLOTS_PER_OFFER, (
+        "one offer allocates one CPU slot per read job, so a queue shallower than the "
+        "offer's own slot cap holes the restore instead of shortening it")
     monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "4")
     gate = _Gated(block=True)
     monkeypatch.setattr(disk_read, "_read_file", gate)
@@ -429,6 +440,88 @@ def test_queue_depth_cap_is_unchanged_and_still_bounds_the_queue(monkeypatch,
     assert disk_read.counters()["queue_depth_peak"] <= disk_read.MAX_QUEUE_DEPTH
     gate.hold.set()
     disk_read.cancel_batch("deep", "test teardown")
+
+
+def test_a_maximum_offer_fits_the_queue_so_no_job_of_it_is_ever_refused(monkeypatch,
+                                                                        tmp_path):
+    """THE HOLE THIS CAP EXISTS TO PREVENT, tested at the queue itself.
+
+    A maximum offer names `MAX_RESTORE_BLOCKS_PER_OFFER` spans plus one boundary-state
+    block in each of the four align-mode groups: 128 + 4 = 132 reads, handed to
+    `request_read()` in a tight loop at bind. A job past the queue cap is refused
+    `queue_full`, and `disk_restore` classifies that as a CAPACITY failure - the bytes
+    are fine and the read was never issued, so the block arrives as NOTHING. A missing
+    block is not a shorter restore, it is a HOLE, and coverage is usable only up to the
+    first hole: everything behind it is recomputed no matter how much valid data sits
+    there. At the 64-job cap this offer was holed at job 64 on the box that raises its
+    pool, which is strictly worse than the short-but-correct restore it replaced.
+
+    THE READER IS PARKED behind a gate so the jobs must physically SIT in the queue:
+    with a draining reader the test would pass at any depth, which is the kind of test
+    that proves nothing. The offer-side arithmetic that prices this bound is in
+    `test_disk_offer_job_ceiling.py`.
+    """
+    # 128 spans plus the 4 boundary-state blocks of the live geometry.
+    jobs = disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER + 4
+    assert jobs == 132, "the live geometry: one positional group plus four states"
+    assert jobs <= disk_read.MAX_QUEUE_DEPTH, (
+        "a maximum offer must be SUBMITTABLE: the surplus of an unsubmittable one is a "
+        "hole at job MAX_QUEUE_DEPTH, not a smaller restore")
+    gate = _Gated(block=True)
+    monkeypatch.setattr(disk_read, "_read_file", gate)
+    paths = paths_for(tmp_path, jobs)
+    assert disk_read.begin_batch("max-offer", len(paths))["ok"] is True
+    accepted, refused = issue("max-offer", paths)
+    assert refused == [], [item["reason_kind"] for item in refused]
+    assert len(accepted) == jobs
+    assert disk_read.counters()["refused"]["queue_full"] == 0
+    # What is actually sitting in the queue is every job this offer named (one may have
+    # been picked up by the parked reader and is not counted as queued).
+    assert disk_read.counters()["queue_depth_peak"] >= jobs - 1
+    gate.hold.set()
+    disk_read.cancel_batch("max-offer", "test teardown")
+
+
+def test_a_queued_job_holds_its_buffer_so_the_pool_is_the_only_byte_budget(monkeypatch,
+                                                                            tmp_path):
+    """THE MEMORY SEMANTICS OF A QUEUED JOB, pinned by which refusal arrives.
+
+    `request_read()` takes the bounce buffer BEFORE `put_nowait`, so a job sitting in
+    the queue is holding a buffer - which makes `MAX_QUEUE_DEPTH` an upper bound on
+    queued host RAM. It is NOT a second budget: every buffer comes out of the pool and
+    `_take_buffer` refuses at the pool's byte ceiling first, so a queue deeper than the
+    pool can never make the process hold more than the pool. This test forces exactly
+    that shape and reads WHICH refusal arrives: 4 jobs of pool against a 256-slot queue.
+
+    Why the refusal name is the proof: if queued jobs held only descriptors, the queue
+    would accept 256 of these and the byte bound would never be reached at issue. The
+    surplus arrives as `buffer_cap` instead, and `queue_full` stays at zero - so the
+    byte ceiling is the pool's, at every queue depth.
+
+    What the depth DOES cost is visible in the same counters: a descriptor plus its
+    batch-ledger entry, ~1.2 KB per slot, so 256 slots are ~0.3 MB per rank process
+    beside the pool's own bytes. """
+    jobs_of_pool = 4
+    monkeypatch.setenv(config.ENV_DISK_READ_BUFFER_BYTES, str(jobs_of_pool * UNIT))
+    disk_read.reset_state_for_tests()
+    assert jobs_of_pool < disk_read.MAX_QUEUE_DEPTH, (
+        "the queue must be roomier than the pool for this to be a byte-bound test")
+    gate = _Gated(block=True)
+    monkeypatch.setattr(disk_read, "_read_file", gate)
+    paths = paths_for(tmp_path, jobs_of_pool * 3)
+    assert disk_read.begin_batch("held", len(paths))["ok"] is True
+    accepted, refused = issue("held", paths)
+    assert len(accepted) == jobs_of_pool, (
+        "the pool's byte ceiling is what stops this batch, not the queue")
+    assert {item["reason_kind"] for item in refused} == {"buffer_cap"}, refused
+    counters = disk_read.counters()
+    assert counters["refused"]["queue_full"] == 0, counters["refused"]
+    # Every accepted job holds its buffer whether it is queued or being read, so the
+    # committed bytes are the whole budget - that is the queue holding buffers, not the
+    # disk, and it cannot exceed the pool at any queue depth.
+    assert counters["buffers_held_bytes"] == jobs_of_pool * UNIT, counters
+    gate.hold.set()
+    disk_read.cancel_batch("held", "test teardown")
 
 
 # --- 4: N readers really read at once -----------------------------------------

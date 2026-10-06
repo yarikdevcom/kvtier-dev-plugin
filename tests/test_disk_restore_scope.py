@@ -39,6 +39,7 @@ from kvtier_dev_plugin import (
     backport,
     config,
     disk_layout,
+    disk_read,
     disk_restore,
     disk_spill,
     disk_store,
@@ -570,8 +571,25 @@ def test_the_bound_that_survives_is_the_block_walk_and_says_block_cap(armed,
     """
     blocks = disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER + 8
     fill(armed, blocks=blocks)
-    monkeypatch.setattr(disk_restore, "MAX_SLOTS_PER_OFFER",
-                        (blocks + 8) * len(base.CACHEABLE))
+    # THREE BOUNDS ARE DENOMINATED IN JOBS, and this fixture's model needs 128 spans x 3
+    # positional groups = 384 of them, so ALL THREE must be lifted to leave the walk as
+    # the only bound standing:
+    #   * `MAX_SLOTS_PER_OFFER` (256 CPU slots) - the one the paragraph above explains.
+    #   * `disk_read.MAX_QUEUE_DEPTH` (256 jobs since 0.2.35) - the reader's queue; a
+    #     384-job offer into a 256-job queue is a HOLE at job 256, so the offer path now
+    #     prices it and cuts here.
+    # * `POOL_PRICE_MAX_IDENTITIES` (256 lookups since 0.2.35) - a walk that cannot see
+    # every identity refuses to trust its sample and prices at the conservative floor
+    #     (12,902,400 B instead of this fixture's 4,096 B), which cuts the offer to what
+    # the pool affords. That refusal is the point of the guard; here it is lifted for
+    #     the same reason the slot cap is.
+    # The shipped interaction of all three is pinned by
+    # `test_disk_offer_job_ceiling.py::
+    # test_the_three_numbers_are_sized_from_the_offers_own_job_ceiling`.
+    spans_free = (blocks + 8) * len(base.CACHEABLE)
+    monkeypatch.setattr(disk_restore, "MAX_SLOTS_PER_OFFER", spans_free)
+    monkeypatch.setattr(disk_read, "MAX_QUEUE_DEPTH", spans_free)
+    monkeypatch.setattr(disk_restore, "POOL_PRICE_MAX_IDENTITIES", spans_free)
     tokens, flag = offer(Manager(), Req(request_id="walk", blocks=blocks))
     assert flag is True
     assert tokens == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER * BLOCK
