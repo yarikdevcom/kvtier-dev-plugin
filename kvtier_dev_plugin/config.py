@@ -70,10 +70,12 @@ the file contract the proxy host's reader expects):
                                  directory is created, no thread starts, no byte
                                  is written. tmpfs roots are refused.
   VLLM_E2_TIER_DISK_BYTES        the tier's byte ceiling in bytes; above it files
-                                 are shed LRU by st_mtime. Unset = no ceiling,
-                                 NEVER zero. Neither variable ARMS the tier: the
-                                 arm is `disk_spill.arm()`, which expires by
-                                 itself, exactly like the raw-byte dump's.
+                                 are shed LRU by st_mtime - a TOUCH clock since
+                                 0.2.29 (a write, or a restore read that produced
+                                 usable bytes). Unset = no ceiling, NEVER zero.
+                                 Neither variable ARMS the tier: the arm is
+                                 `disk_spill.arm()`, which expires by itself,
+                                 exactly like the raw-byte dump's.
   VLLM_E2_TIER_DISK_JOURNAL_DIR  where the spill JOURNAL lives, apart from the rest
                                  of the diagnostics directory. UNSET = fall back to
                                  VLLM_E2_TIER_DIAG (the pre-0.2.19 behaviour).
@@ -105,6 +107,32 @@ the file contract the proxy host's reader expects):
                                       pinned-adjacent anonymous memory. See
                                       `disk_read_env` and README's
                                       *Reading the spill in parallel*.
+
+  THE CEILING PASS'S TIME BUDGET (`disk_spill.py`) -- one line, because it protects
+  the queue rather than the disk:
+
+  VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS
+                                      SECONDS one enforcement pass may spend walking
+                                      and unlinking on the spill writer thread.
+                                      UNSET = `disk_spill.CEILING_PASS_BUDGET_SECONDS`
+                                      (1.5 s). When it expires the pass stops early
+                                      and reports `plan_truncated`; the next spill
+                                      continues the work. A value that is not a
+                                      positive number means "the operator said
+                                      nothing" and is reported in
+                                      `spill.ceiling_measurement.env_problems`.
+                                      0 is REFUSED (it would make every pass do
+                                      nothing, which is how a ceiling stops being a
+                                      ceiling).
+
+  VLLM_E2_TIER_DISK_EVICT_THREADS  how many threads unlink at once inside one
+                                      ceiling pass. UNSET or `1` = ONE, the serial
+                                      behaviour of every release before 0.2.29.
+                                      Clamped to [1, `disk_spill.MAX_EVICT_THREADS`];
+                                      the pool is built ONCE PER PROCESS, so changing
+                                      this needs a restart (the payload reports
+                                      `evict_threads_requested` beside
+                                      `evict_threads_configured` when they differ).
 
   THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
   is installed in every worker whenever the plugin is on, and its per-step cost
@@ -275,6 +303,31 @@ ENV_DISK_READ_THREADS = "VLLM_E2_TIER_DISK_READ_THREADS"
 # Unset = `disk_read.MAX_BUFFERS_BYTES` exactly, so the default boot allocates the
 # same bytes it allocated in 0.2.23.
 ENV_DISK_READ_BUFFER_BYTES = "VLLM_E2_TIER_DISK_READ_BUFFER_BYTES"
+
+# THE CEILING PASS'S TIME BUDGET (`disk_spill.py`, 0.2.29) --------------------
+# SECONDS one capacity-enforcement pass may spend. The pass runs on the SPILL WRITER
+# THREAD after every committed write, and until now it had no deadline at all: up to
+# `MAX_WALK_ENTRIES` (100,000) directory entries read TWICE (count and measure),
+# `MAX_WALK_FILES` (20,000) `stat` calls, and up to `MAX_EVICTION_PLAN` (4,096)
+# unlinks. That is potentially seconds, and the writer thread is the only thing that
+# drains the spill queue - so while it walks, the queue (256 jobs / 256 MiB) backs up
+# and new spills are DROPPED at exactly the moment the disk is fullest.
+# A budget does not make the work disappear: the pass stops early, reports itself
+# partial (`plan_truncated`), and the next committed spill runs the next pass, which
+# is the same partial-plan convergence rule the walk has always used on a store
+# bigger than its caps. Set it from the experiment's own
+# `spill.ceiling_measurement.pass_seconds`.
+ENV_DISK_CEILING_BUDGET_SECONDS = "VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS"
+# HOW MANY THREADS UNLINK AT ONCE inside one ceiling pass (`disk_spill.py`, 0.2.29).
+# The SAME knob shape as `VLLM_E2_TIER_DISK_READ_THREADS`: a per-process thread count,
+# resolved once per process (the pool is built once and is never rebuilt mid-boot),
+# clamped, and reported when clamped. `1` is the serial behaviour of every release
+# before 0.2.29 and is the shipped default: parallel unlink is METADATA work, and the
+# measurement in this release's notes decides whether more than one is worth anything
+# on this array. It changes WHICH thread does an unlink, never WHICH files are chosen
+# or HOW MANY: the plan is partitioned across the workers, so no path is ever attempted
+# twice and the pass's accounting does not depend on this number.
+ENV_DISK_EVICT_THREADS = "VLLM_E2_TIER_DISK_EVICT_THREADS"
 
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
@@ -645,6 +698,67 @@ def disk_read_env() -> dict:
     return {"threads": integer(ENV_DISK_READ_THREADS),
             "buffer_bytes": integer(ENV_DISK_READ_BUFFER_BYTES),
             "problems": problems}
+
+
+def ceiling_env() -> dict:
+    """The ceiling pass's time budget, parsed and NOT interpreted.
+
+    The same split as `settle_env` and `disk_read_env`: the grammar lives here, the
+    policy that spends the number (`disk_spill._enforce_ceiling`'s deadline and its
+    clamp) lives with the pass. Unreadable means None, which the consumer reads as
+    "the operator said nothing" and answers with its own default constant - so a typo
+    in a systemd drop-in gives the shipped budget, never a pass with no deadline and
+    never a pass with none at all.
+
+    Zero is REFUSED rather than honoured. A budget of 0 would make every pass do
+    nothing, which reads as "the ceiling is configured" while shedding nothing - the
+    exact silent-failure shape this tier has been bitten by before. A floor of 0 is
+    therefore part of the grammar, not of the policy.
+
+    `evict_threads` rides along in the same report because it belongs to the same
+    pass: it is the unlink worker count, and the budget is how long that pass may run.
+    Grammar only - the ceiling on the count (`disk_spill.MAX_EVICT_THREADS`) is policy
+    and lives with the pool that clamps it and reports the clamp.
+    """
+    problems: list = []
+    raw = os.environ.get(ENV_DISK_CEILING_BUDGET_SECONDS, "").strip()
+    budget: float | None = None
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            problems.append(f"{ENV_DISK_CEILING_BUDGET_SECONDS}={raw!r} is not a "
+                            "number and was ignored")
+            value = None
+        if value is not None:
+            if value != value or value <= 0.0:
+                problems.append(
+                    f"{ENV_DISK_CEILING_BUDGET_SECONDS}={raw!r} is not a finite "
+                    "number above 0 and was ignored (0 would make every ceiling "
+                    "pass do nothing)")
+            else:
+                budget = value
+    # THE UNLINK WORKER COUNT, same grammar, same "a typo means the shipped default"
+    # rule. It rides along with the budget because both belong to the ONE pass: this is
+    # how many threads do the unlinks, that is how long the pass may run. The ceiling
+    # on the value is policy and lives with the pool that clamps it.
+    evict_raw = os.environ.get(ENV_DISK_EVICT_THREADS, "").strip()
+    evict_threads: int | None = None
+    if evict_raw:
+        try:
+            wanted = int(evict_raw)
+        except ValueError:
+            problems.append(f"{ENV_DISK_EVICT_THREADS}={evict_raw!r} is not an "
+                            "integer and was ignored")
+            wanted = None
+        if wanted is not None:
+            if wanted < 1:
+                problems.append(f"{ENV_DISK_EVICT_THREADS}={evict_raw!r} is below 1 "
+                                "and was ignored (0 workers could unlink nothing)")
+            else:
+                evict_threads = wanted
+    return {"budget_seconds": budget, "problems": problems,
+            "evict_threads": evict_threads}
 
 
 def canonical_policy_path() -> Path:

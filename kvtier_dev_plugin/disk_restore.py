@@ -5709,7 +5709,32 @@ def worker_report() -> dict:
             "starved_polls": int(read_state["reader_starved_polls"]),
             "buffer_refusals": int((read_state["refused"] or {})
                                    .get("buffer_cap") or 0),
-            "out_of_order": int(read_state["completions_out_of_order"])}
+            "out_of_order": int(read_state["completions_out_of_order"]),
+            # THE RECENCY PROMOTION (0.2.29), in the place a rank can report it: the
+            # tier's LRU clock only moves if these numbers move, so "is promotion
+            # working?" is one field rather than a guess during a load run.
+            "recency_promotions": int(read_state.get("recency_promotions") or 0),
+            "recency_promotions_throttled": int(
+                read_state.get("recency_promotions_throttled") or 0),
+            "recency_promotion_failures": int(
+                read_state.get("recency_promotion_failures") or 0),
+        }
+        # THE UNLINK POOL (0.2.29), beside the reader threads it is modelled on: the
+        # spill tier's eviction workers live in this same process, and "did parallel
+        # eviction run?" belongs next to "did parallel reads run?".
+        spill_state = disk_spill.counters()
+        report["evict"] = {
+            "configured": int(spill_state.get("evict_threads_configured") or 0),
+            "alive": disk_spill.evict_thread_count_alive(),
+            "batches_submitted": int(
+                spill_state.get("evict_batches_submitted") or 0),
+            "files_unlinked": int(spill_state.get("evict_files_unlinked") or 0),
+            "files_failed": int(spill_state.get("evict_files_failed") or 0),
+            "pool_fallbacks": int(spill_state.get("evict_fallbacks") or 0),
+            # The boot total, not the last pass's bool: a rank that once ran out of
+            # time has told the operator the ceiling is not keeping up with the fill.
+            "deadline_hits": int(spill_state.get("ceiling_deadline_hits") or 0),
+        }
         report["spans"] = {"seen": int(_state["spans_observed"]),
                            "whole": int(_state["spans_whole"]),
                            "partial": int(_state["spans_partial"]),

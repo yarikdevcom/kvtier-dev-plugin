@@ -78,6 +78,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 
 from . import disk_layout, snapshot
 
@@ -119,6 +120,41 @@ MAX_BUFFERS_BYTES_CEILING = 8 * 1024 * 1024 * 1024  # the LATEST word on the poo
 # operator like an engine hang. Expiring a batch costs a recompute; it never
 # releases a destination that is still being written (see `cancel_batch`).
 LOAD_DEADLINE_SECONDS = 30.0
+
+# --- recency: a read that lands MOVES THE EVICTION CLOCK (0.2.29) ------------
+#
+# The capacity ceiling ranks spill files by `st_mtime` (see
+# `disk_layout.lru_eviction_plan`), which until now moved on WRITE ONLY. The
+# consequence, measured against what the tier is for: a span restored a hundred
+# times was evicted by a span written an hour later and never read, because the
+# eviction clock could not see a read at all. A restore is a TOUCH, and the
+# operator's policy for the tier is "most read + most written, i.e. most touched,
+# has priority" - so a successful read now bumps the file's mtime and the single
+# existing clock keeps working. No new durable state, no replay after a restart:
+# the promotion IS the mtime, and it survives a reboot exactly as well as the
+# file does.
+#
+# `TOUCH_MIN_INTERVAL_SECONDS` is what makes that affordable. A `utime` is a
+# metadata write to the same device the restore just read from, and a hot span is
+# restored many times a minute, so an unthrottled promotion would add one
+# filesystem transaction per read to a path that today does none. One promotion
+# per file per interval, measured on the MONOTONIC clock (a wall-clock jump must
+# not be able to freeze or flood the promotions).
+#
+# `MAX_TOUCH_TRACKED` bounds the throttle map itself, LRU-evicting its own
+# entries. It is a THROTTLE, not a whitelist: dropping a path's entry costs the
+# next read of that file one extra `utime`, and nothing else - so the map cannot
+# become a second, larger, unbounded structure pretending to be a bound.
+TOUCH_MIN_INTERVAL_SECONDS = 60.0
+MAX_TOUCH_TRACKED = 4096
+
+# The four verdicts of one promotion attempt, in the module's closed-vocabulary
+# idiom. `skipped` is "this is not a file we may touch" (a bad name, a `.part`),
+# never "something went wrong".
+TOUCH_PROMOTED = "promoted"
+TOUCH_THROTTLED = "throttled"
+TOUCH_SKIPPED = "skipped"
+TOUCH_FAILED = "failed"
 
 # Why a read did not happen, or why a file's bytes are not usable. A closed
 # vocabulary, one counter each: the witness and the boot line print these names.
@@ -164,6 +200,16 @@ _state: dict = {
     "last_read_mono": None,          #   over; both monotonic, both boot-wide
     "completions_recorded": 0,       # completions that got a sequence number
     "completions_out_of_order": 0,   # ...completed BEFORE a lower-numbered job did
+    # THE RECENCY PROMOTION (0.2.29). `recency_promotions` is the number that proves
+    # the LRU clock is being moved by reads; `recency_promotions_throttled` is the
+    # number that proves the throttle is doing its job (a high ratio is the expected
+    # shape for a hot span - it means one metadata write per interval, not one per
+    # read). `recency_promotion_failures` is `os.utime` raising: a read that landed
+    # is still a good read when the bump fails, so this counter costs capacity
+    # knowledge and nothing else.
+    "recency_promotions": 0,
+    "recency_promotions_throttled": 0,
+    "recency_promotion_failures": 0,
     "last_reason": None,
     "last_error": None,
     "last_path": None,
@@ -177,6 +223,15 @@ _state: dict = {
 _batches: dict = {}
 _buffers: list = []          # free (ctypes array, size) pairs, pooled
 _state_lock = threading.Lock()
+# The recency throttle: path -> monotonic seconds of its LAST promotion attempt,
+# oldest-first so the map can evict its own LRU entry. Its OWN lock, deliberately:
+# a promotion takes a filesystem metadata write, and `_state_lock` is the lock the
+# engine's own `batch_status`/`get_finished` path waits on - holding it across a
+# syscall is the one thing this module's design forbids. Order of acquisition is
+# one-way (`_touch_lock` is never held while taking `_state_lock`), so the two
+# cannot deadlock.
+_touch_map: "OrderedDict[str, float]" = OrderedDict()
+_touch_lock = threading.Lock()
 _queue = None
 _reader_thread = None        # slot 0, kept as the name-of-record for the ledger
 _threads: list = []          # slot -> Thread | None; bounded by MAX_READ_THREADS
@@ -235,9 +290,17 @@ def reset_state_for_tests() -> None:
             "units_in_flight": 0, "units_in_flight_peak": 0,
             "first_read_mono": None, "last_read_mono": None,
             "completions_recorded": 0, "completions_out_of_order": 0,
+            "recency_promotions": 0, "recency_promotions_throttled": 0,
+            "recency_promotion_failures": 0,
         })
         _limits = _default_limits()
         _limits_resolved = False
+    # The throttle map belongs to a boot too: a leftover entry would let the next
+    # test's first read of the same path be throttled by a promotion this test never
+    # made. Cleared OUTSIDE `_state_lock` - the map has its own lock and the two are
+    # never held together.
+    with _touch_lock:
+        _touch_map.clear()
     with _thread_lock:
         _queue = None
         _reader_thread = None
@@ -355,12 +418,28 @@ def _announce_limits(limits: dict) -> None:
                   "pool bytes x rank count in resident memory.")
 
 
+def _touch_map_entries() -> int:
+    """How many paths the throttle currently remembers. Locked, cheap, never raises.
+
+    Read OUTSIDE `_state_lock` by both payload builders: the map has its own lock and
+    the two must never be held together.
+    """
+    try:
+        with _touch_lock:
+            return len(_touch_map)
+    except Exception:  # noqa: BLE001 - a witness is never worth a fault
+        return 0
+
+
 def counters() -> dict:
     """A copy for a payload. Never the batch table, only its size."""
     with _state_lock:
         out = dict(_state)
         out["batches_open"] = len(_batches)
         out["queued"] = int(_state["queue_depth"])
+    out["recency_promotion_map_entries"] = _touch_map_entries()
+    out["recency_promotion_interval_seconds"] = TOUCH_MIN_INTERVAL_SECONDS
+    out["recency_promotion_map_cap"] = MAX_TOUCH_TRACKED
     limits = _limits_now()
     out["threads_requested"] = limits["threads_requested"]
     out["threads_configured"] = int(limits["threads"])
@@ -922,6 +1001,20 @@ def _handle_read(job, slot: int = 0) -> None:
                 record["bytes_read"] = int(record["bytes_read"]) + size
     _finish_in_flight(slot)
     _settle(job, outcome)
+    if outcome["ok"]:
+        # THE RECENCY PROMOTION (0.2.29). HERE, and for one reason: this is the
+        # single place a reader knows a file produced usable bytes, and it runs on a
+        # reader thread - `_reader_loop` -> `_handle_read` -> here - so the metadata
+        # write can never land on `get_finished`, on the scheduler step, or on any
+        # engine thread. It sits AFTER `_settle` so a slow `utime` cannot delay the
+        # job's completion (the apply point sees the bytes the moment they are read)
+        # and after `_finish_in_flight` so it does not inflate `units_in_flight`,
+        # which measures kernel reads. A failed bump is counted inside
+        # `promote_recency` and changes nothing about this job: the restore already
+        # succeeded. A FAILED outcome (`file_missing`, `size_mismatch`, `short_read`,
+        # `not_ours`, `read_error`) deliberately does not reach this line: keeping a
+        # wrong-sized or unreadable file alive is worse than evicting it.
+        promote_recency(path)
 
 
 def _finish_in_flight(slot: int) -> None:
@@ -980,6 +1073,111 @@ def _read_file(path, buffer, size: int) -> dict:
     if got != size:
         return _failed("short_read", f"the read returned {got} of {size} bytes")
     return _ok(bytes=size, buffer=buffer)
+
+
+def _touch_clock() -> float:
+    """The throttle's clock: `time.monotonic()`, behind a NAME a test can rebind.
+
+    Two clocks, deliberately, and mixing them up is a silent inversion of the whole
+    feature. THIS one is monotonic (it answers "how long since the last promotion?",
+    and a wall-clock adjustment must never be able to freeze the promotions for an
+    hour or release one per read). The timestamp WRITTEN to the file is wall-clock
+    `now`, by `os.utime`'s own current-time form: the eviction comparator compares
+    these mtimes against the mtimes of files written by a spill at a real date, so a
+    monotonic value written into `st_mtime` would land every promoted file in 1970 and
+    evict the hottest spans FIRST. Keep the two apart.
+
+    Tests rebind this function rather than sleeping: a suite that waits out a 60 s
+    window to prove a 60 s window is a suite that never runs.
+    """
+    return time.monotonic()
+
+
+def promote_recency(path, now: float | None = None) -> str:
+    """Move one spilled file to the FRONT of the eviction queue. Never raises.
+
+    THE CONTRACT, in the direction that matters: this is called for a read that
+    ALREADY produced usable bytes, and it is the only place the tier admits that a
+    file was just used. Eviction ranks by `st_mtime`, so bumping it IS the
+    promotion - no new durable state, nothing to replay after a restart, and no new
+    input to `disk_layout.lru_eviction_plan`.
+
+    THREE RULES, each with a failure it exists to prevent:
+
+    1. THROTTLED: at most one `utime` per file per `TOUCH_MIN_INTERVAL_SECONDS`, on
+       the monotonic clock. A hot span is restored many times a minute and an
+       unthrottled bump adds a metadata transaction to the device on the same path
+       that just paid a 11.4 MB read - the promotion would compete with the reads it
+       is meant to serve.
+    2. BOUNDED: the map remembers `MAX_TOUCH_TRACKED` paths and evicts its own oldest
+       entry. Forgetting a path costs one extra `utime` on its next read, so the
+       bound degrades to slightly more metadata writes and never to a wrong answer.
+    3. FAIL-CLOSED ON THE NAME: a path that does not parse as one of our committed
+       spill files, or that parses as an in-flight `.part`, is not touched at all.
+       The CALLER owns the byte-level rule (only an `ok` read promotes), so a
+       `size_mismatch`, `short_read`, `file_missing`, `not_ours` or `read_error`
+       never reaches here; this check is the second lock on the door, because moving
+       the clock of a wrong-sized or unreadable file keeps dead weight alive.
+
+    The map is updated BEFORE the syscall on purpose, and the failure counter beside
+    it: a path whose `utime` raises (evicted in the gap between the read and the
+    bump, most likely) is then retried at most once per interval instead of once per
+    read, which is the whole point of the throttle. A failed bump costs capacity
+    knowledge and never a read - the bytes are already applied by the time this runs.
+
+    Returns a verdict NAME (`promoted` | `throttled` | `skipped` | `failed`) so a
+    caller can count it; nothing here raises into a reader thread.
+    """
+    text = None
+    try:
+        if not isinstance(path, (str, os.PathLike)):
+            return TOUCH_SKIPPED
+        parsed = disk_layout.parse_path(path)
+        if not parsed["ok"] or parsed["partial"]:
+            return TOUCH_SKIPPED
+        text = os.fspath(path)
+        moment = _touch_clock() if now is None else float(now)
+        with _touch_lock:
+            previous = _touch_map.get(text)
+            if (previous is not None
+                    and moment - float(previous)
+                    < TOUCH_MIN_INTERVAL_SECONDS):
+                # A hit inside the window. `move_to_end` keeps a hot file hot in the
+                # map: the bound then evicts the paths nobody read, which is exactly
+                # the population the throttle exists to serve.
+                _touch_map.move_to_end(text)
+                verdict = TOUCH_THROTTLED
+            else:
+                _touch_map[text] = moment
+                _touch_map.move_to_end(text)
+                while len(_touch_map) > MAX_TOUCH_TRACKED:
+                    _touch_map.popitem(last=False)
+                verdict = TOUCH_PROMOTED
+        if verdict != TOUCH_PROMOTED:
+            with _state_lock:
+                _state["recency_promotions_throttled"] += 1
+            return verdict
+        # `os.utime(path, None)` is the API's own "both timestamps to the current
+        # time", in the clock that OWNS st_mtime (wall). An explicit `ns` built from
+        # the monotonic throttle clock would date every promoted file to 1970 - see
+        # `_touch_clock`. (`os.utimes` is the name the task named; it is NOT in this
+        # interpreter - Python removed the alias - so `os.utime` is what works, and it
+        # is the same syscall with the same current-time form.)
+        os.utime(text, None, follow_symlinks=False)
+        with _state_lock:
+            _state["recency_promotions"] += 1
+        return verdict
+    except Exception as exc:  # noqa: BLE001 - a bump is never worth losing a read
+        with _state_lock:
+            _state["recency_promotion_failures"] += 1
+            _state["last_error"] = (
+                f"recency promotion: {type(exc).__name__}")[:MAX_STRING_CHARS]
+        _notice_once("recency-failure",
+                     f"DISK[read] a recency promotion could not be written for "
+                     f"{os.path.basename(str(text or path))[:60]}: "
+                     f"{type(exc).__name__}. The read itself landed; eviction will "
+                     f"see this file's old mtime.")
+        return TOUCH_FAILED
 
 
 def _note_completion_locked(batch, job_id: int) -> None:
@@ -1461,6 +1659,9 @@ def section() -> dict:
     with _state_lock:
         snapshot_state = dict(_state)
         snapshot_state["batches_open"] = len(_batches)
+    snapshot_state["recency_promotion_map_entries"] = _touch_map_entries()
+    snapshot_state["recency_promotion_interval_seconds"] = TOUCH_MIN_INTERVAL_SECONDS
+    snapshot_state["recency_promotion_map_cap"] = MAX_TOUCH_TRACKED
     limits = _limits_now()
     snapshot_state["thread_alive"] = thread_alive()
     snapshot_state["threads_alive"] = thread_alive_count()

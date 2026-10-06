@@ -94,6 +94,8 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S` | the engine's prefill rate, used for one published number and nothing else: `recompute_ms`, the cost a wait is racing. Default `9400/2.4` ≈ `3916.7`, from the measured 9,400 tokens recomputed in 2.4 s. |
 | `VLLM_E2_TIER_DISK_READ_THREADS` | **how many threads issue spill reads at once (0.2.24). Unset or `1` = ONE thread**, which is every boot before 0.2.24, byte-identically and pinned by a test. Clamped to `[1, 16]`; anything that is not a positive integer means "the operator said nothing" and is reported in `read.env_problems`. It is a thread count and nothing else - the queue stays FIFO, so dispatch order is submission order. **Raise the pool with it or it buys nothing on a big prompt**: in-flight bytes are bounded by the pool, not by the threads. See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | the bounce-buffer pool's byte ceiling, PER PROCESS. **Unset = `disk_read.MAX_BUFFERS_BYTES` = 96 MiB**, today's value, which holds **8** units of 11,468,800 B (7 of the 12,902,400 B width). This is what actually bounds in-flight work: a buffer is taken at *issue* and only returned at the apply point, so **one offer needs the pool to hold the whole offer at once** - and a big-prompt offer is 10 units, so the default misses it by two. **128 MiB (134217728) is the smallest setting that holds a whole 10-unit offer on both widths.** HOST-RAM COST: the pool is per process and every engine rank is a process, so 128 MiB here is 512 MiB of resident bytes on a 4-rank boot. Clamped at 8 GiB and says so (`pool.clamped`). See *Reading the spill in parallel*. |
+| `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS` | **how many seconds one capacity-enforcement pass may spend (0.2.29). Unset = `disk_spill.CEILING_PASS_BUDGET_SECONDS` = 1.5 s.** The pass runs on the spill WRITER thread - the only thing draining the 256-job / 256 MiB spill queue - and before this release its worst case (100,000 directory entries read twice, 20,000 `stat`s, up to 4,096 unlinks) was bounded in files but not in TIME, so a full store could stall the queue and DROP spills at the moment the disk was fullest. When the budget expires the pass stops early and says so (`spill.ceiling_measurement.deadline_hit`, `plan_truncated`), and the next committed spill continues - a partial pass is this tier's normal shape, not an error. **`0` is refused** (a pass that does nothing reads as a configured ceiling that is not one) and a value that will not parse means the shipped default, reported in `env_problems`. See *The eviction clock is a touch clock, and nobody's neighbour is capacity*. |
+| `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 
@@ -2150,6 +2152,91 @@ boot-fence refusals), `tests/test_disk_index_catchup.py` (rewritten to pin the d
 spelled `worker_fitted: false`; the old `armed: false` spelling is pinned as the
 lockout it was).
 
+### The eviction clock is a touch clock, and nobody's neighbour is capacity (0.2.29)
+
+**What was asked**: "is the disk cache LRU, and does eviction happen non-blockingly?"
+**What the source said**: no, and no - in three separate ways.
+
+**1. The clock only ever saw writes.** Eviction ranks by `st_mtime` (`/home` is
+mounted `relatime`, so `st_atime` is not a clock anyone can trust here), and until now
+nothing moved `st_mtime` except a spill. A span restored a hundred times was therefore
+evicled by a span written an hour later and never read - the tier preferentially threw
+away the bytes its own restore path had just proven valuable. A restore now *promotes*:
+`disk_read.promote_recency` bumps the file's mtime, so **recency means last touch, and a
+touch is a write OR a successful restore read**. Three rules make that safe, and all
+three are tested: it is **throttled** to one metadata write per file per
+`TOUCH_MIN_INTERVAL_SECONDS` (60 s, on the monotonic clock; the timestamp *written* is
+wall clock - writing the monotonic value would date every promoted file to 1970 and
+evict the hottest spans first), the throttle map is **bounded** at 4,096 paths and
+evolves its own oldest entry, and it is **fail-closed on the verdict** - `file_missing`,
+`size_mismatch`, `short_read`, `not_ours` and `read_error` never promote, because
+keeping a wrong-sized or unreadable file alive is strictly worse than evicting it. It
+runs on the **reader thread** (`_reader_loop` → `_handle_read` → here, after the job has
+settled), never on `get_finished` or the scheduler step. Promotion is an mtime and not a
+side table on purpose: there is no new durable state and nothing to replay after a
+restart. Watch it work in `read.recency_promotions` /
+`read.recency_promotions_throttled` / `read.recency_promotion_failures`.
+
+**2. Every rank shed its siblings' live data first.** Four ranks share ONE spill root,
+and `lru_eviction_plan` was called without the `peer_digests` parameter it already
+accepts. A digest that is not this boot's classifies as `stale_geometry` - "this boot can
+never read it, it is pure capacity, **shed it first**" - so each rank's cheapest file to
+delete was one of its three peers' live, loadable, hottest spans. Four evictors running
+that rule against one shared root is a mutual-destruction loop, and a fill test is exactly
+when it bites. The shed order is now
+`stale_geometry`/`stale_key_shape` → **this boot's own files, oldest touch first** → a
+**live peer rank's** files, and a rank *learns* its siblings' digests from the store walk
+it already performs: a foreign digest with at least two committed files written inside
+`PEER_DIGEST_FRESH_SECONDS` (120 s) is a rank that is writing right now. **The fail-safe
+direction is deliberate**: if no digest qualifies, the pass behaves exactly as 0.2.28 did
+(foreign first) and counts the fact as `peer_ranks.decisions_without_peers`. Too
+conservative here can never mean *unable to release capacity*, because this boot's own
+files and the genuinely unreadable ones stay sheddable whatever the peer map says - the
+opposite bias (assume every foreign digest is a live sibling) would make a store of old
+boots' geometry unsheddable and turn the ceiling into a comment.
+
+**3. The pass had no deadline and one hand.** Up to 100,000 directory entries read
+twice, 20,000 `stat` calls and 4,096 unlinks, serially, on the writer thread that is the
+only thing draining a spill queue of 256 jobs / 256 MiB - so a full store dropped spills
+while its evictor walked. The pass now has a **time budget** (`1.5 s`,
+`VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS`) honoured by the walk and the unlink loop
+alike. Truncation happens **between whole per-directory batches**, never inside one, so
+no plan is ever half-applied; the **first batch always runs**, because a pass that
+released nothing only defers the work to a spill that will arrive into the same full
+queue; and a submitted unlink is **always awaited and always collected**, so a truncated
+pass can never strand a deleted file without its removal-journal record. The pass reports
+`ceiling_measurement.pass_seconds`, `.deadline_hit`, `.deadline_hits` and
+`.budget_seconds` so "is the ceiling keeping up with this fill rate?" is a reading and
+not a hope.
+
+**4. The pool, and why its default is 1.** The unlink batches (already grouped by shard
+directory, which is both the filesystem-friendly shape and the partition that guarantees
+no path is attempted twice) can fan out to a small named worker pool,
+`kvtier-disk-evict`, built once per process. **Measured before shipping, on 20,000 files
+across 64 subdirectories, three paired runs**: 1 thread deleted them in **0.402 s** and 4
+threads in **0.557 s** - parallel `unlink()` is metadata work, and here it is ~38%
+**SLOWER**, not faster. So the mechanism ships and the default stays serial
+(`VLLM_E2_TIER_DISK_EVICT_THREADS`, unset = 1). *Caveat worth repeating*: that measurement
+ran on the development host's `btrfs`/NVMe, because the serving box was not touched; if a
+measurement on the serving array's `/dev/md1` (XFS) ever shows a real win, the knob is
+there and the tests already pin that 1 worker and 4 workers shed identical files.
+
+**No direct I/O anywhere, confirmed rather than assumed.** The read path is plain
+buffered `open(path, "rb")` + `readinto`, and the write path is buffered
+`O_WRONLY|O_CREAT|O_EXCL` + `os.replace`; there is no `O_DIRECT`/`O_SYNC`/`O_DSYNC` in
+the spill or read path, and this release adds none. That is a deliberate choice kept
+checked: this store reads at **25.4 GB/s from the page cache against 6.65 GB/s cold**, so
+the page cache is the tier's largest single asset and `O_DIRECT` would discard it.
+
+Tests: `tests/test_touch_promotion_and_peer_eviction.py` (the operator's request as a
+behaviour - the read file survives the merely-written one; the throttle and its fake
+clock; every failure verdict refusing to promote; the bounded map; a known peer's live
+file not being the first thing shed, and an unconfirmable digest keeping the old
+behaviour *and* being counted; a single sighting not being enough; the deadline stopping
+the submission, releasing bytes, marking itself, and re-running to convergence without
+deleting anything twice; the pool at 1 and 4 shedding the same files and never handing a
+path to two workers).
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 
@@ -3088,8 +3175,10 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-1413 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
-count in this README is a snapshot - trust `pytest --collect-only`). They cover:
+2060 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+count in this README is a snapshot - trust `pytest --collect-only`). The 0.2.29
+touch-clock / peer-rank / deadline / evict-pool behaviour is in
+`tests/test_touch_promotion_and_peer_eviction.py`. They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
 loopback-only, malformed entries that neither raise nor admit, cache invalidation

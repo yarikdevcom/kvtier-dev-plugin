@@ -236,8 +236,15 @@ WHAT IS CAPPED, AND IN WHAT UNIT
     set exists to prevent (see `_enforce_ceiling`), and the bound stays small on
     purpose: this walk runs inside the spill writer's enforcement path, and a walk
     that stats hundreds of thousands of files is its own I/O storm.
-  * the capacity ceiling (bytes, configured) - LRU by `st_mtime`; `st_atime` is
-    NOT usable because `/home` is mounted `relatime` here.
+  * the capacity ceiling (bytes, configured) - LRU by `st_mtime`, which since 0.2.29
+    is a TOUCH clock: a spill writes it and a restore that produced usable bytes bumps
+    it (`disk_read.promote_recency`, throttled). `st_atime` is NOT usable because
+    `/home` is mounted `relatime` here, so recency is promoted explicitly rather than
+    hoped for. Shed order is unreadable bytes, then this boot's own oldest touch, then
+    a live PEER RANK's files - see `disk_layout.SHED_ORDER_BY_CLASSIFICATION`. The pass
+    that enforces the ceiling is bounded in TIME as well as in files
+    (`CEILING_PASS_BUDGET_SECONDS`, `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS`) and
+    unlinks on a small worker pool (`VLLM_E2_TIER_DISK_EVICT_THREADS`).
 
 Stdlib only (`ctypes`, `os`, `queue`, `threading`, `time`, `hashlib`, `json`). No
 torch and no vllm: the tensors are addressed through the attributes the fork's
@@ -255,6 +262,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from . import blockdump, config, disk_index, disk_layout, snapshot
 
@@ -317,6 +325,48 @@ MAX_WALK_FILES = 20_000              # FILES a capacity walk will stat
 # (12.9 MB) is 1.2 TiB, and past that the count extrapolates and says so.
 MAX_WALK_ENTRIES = 100_000           # directory entries a capacity walk will read
 EVICT_TARGET_FRACTION = 0.9          # FRACTION of the ceiling eviction aims under
+
+# THE CEILING PASS'S TIME BUDGET (0.2.29). One enforcement pass walks the store and
+# then unlinks, and it runs on the SPILL WRITER THREAD - the only thing that drains
+# `MAX_QUEUE_DEPTH`/`MAX_QUEUED_BYTES`. Its worst case was unbounded in TIME: two
+# passes of `MAX_WALK_ENTRIES` (100,000) directory entries, `MAX_WALK_FILES` (20,000)
+# `stat` calls and up to `MAX_EVICTION_PLAN` (4,096) unlinks, i.e. seconds, during
+# which the queue backs up and spills are DROPPED - on the one path (a full disk)
+# where dropping spills is most expensive. So the pass now gets a deadline and stops
+# early when it expires, reporting itself partial. A partial pass is the shape this
+# module already relies on for a store bigger than its caps: enforcement runs after
+# EVERY committed write, so the next spill runs the next pass against a store whose
+# directory slots the last pass just freed, and the passes converge. Truncation only
+# ever SHRINKS the destructive set, and it happens between whole per-directory
+# `execute_unlink_plan` calls - never inside one, so no plan is half-applied.
+# The overshoot is bounded: the first directory's unlinks always run (at most
+# `MAX_UNLINK_PLAN` of them), because a pass that released nothing has to be
+# re-run by something else, and only a committed spill re-runs it.
+CEILING_PASS_BUDGET_SECONDS = 1.5    # SECONDS one pass may spend, by default
+CEILING_BUDGET_SECONDS_MAX = 60.0    # the clamp: an env typo must not restore an
+                                     # unbounded pass while claiming to bound it
+
+# THE LIVE PEER RANKS (0.2.29). Four ranks share ONE spill root and each rank's
+# evictor sees the other three's committed files as names carrying a digest that is
+# not its own. `disk_layout.classify_name` can call those files `peer_rank` (live
+# data, shed LAST) instead of `stale_geometry` (pure capacity, shed FIRST) - but only
+# if it is TOLD the sibling digests, and nothing in the engine hands them over.
+# They are therefore LEARNED from the walk this pass already does: a foreign digest
+# with committed files written inside `PEER_DIGEST_FRESH_SECONDS` is a rank that is
+# WRITING RIGHT NOW, which is the only definition of "live" this module can observe.
+#
+# FAIL-SAFE DIRECTION, and it is deliberate: if no digest qualifies, the pass behaves
+# exactly as it did before 0.2.29 (foreign first). The worst case of being too
+# conservative is therefore the old behaviour - peers' live files get shed - and it is
+# NEVER "cannot release capacity", because this boot's own files and the truly
+# unreadable ones stay sheddable whatever the peer map says. The opposite direction
+# (assume every foreign digest is a live sibling) is the dangerous one: a store of
+# dead geometry from old boots would become unsheddable and the ceiling would stop
+# being a ceiling. A digest is only believed with `PEER_DIGEST_MIN_SIGHTINGS` fresh
+# files, so one stray recent file from an old boot cannot protect a whole digest.
+PEER_DIGEST_FRESH_SECONDS = 120.0    # SECONDS a foreign digest counts as "writing now"
+PEER_DIGEST_MIN_SIGHTINGS = 2        # FRESH committed files before a digest is believed
+MAX_PEER_DIGESTS = 32                # DIGESTS remembered (a 4-rank fleet needs 3)
 
 # The group-collision witness: which group ids this process has seen spill each
 # `key16`. Three caps, because this is a witness and not a database. The map is
@@ -429,6 +479,51 @@ _state: dict = {
     "walk_basis": None,
     "plan_truncated": False,
     "ceiling_checks": 0,
+    # THE PASS'S OWN CLOCK (0.2.29). `ceiling_budget_seconds` is the budget in force
+    # (env or default), `ceiling_pass_seconds` how long the LAST pass actually took,
+    # `ceiling_deadline_hit` whether it ran out of time. The three together answer the
+    # only question that matters during a fill test: "is the ceiling keeping up, or is
+    # every pass being cut off before it finishes?" A `plan_truncated` that is True
+    # with `ceiling_deadline_hit` False is the plan cap; with it True, the deadline.
+    "ceiling_budget_seconds": None,
+    "ceiling_pass_seconds": 0.0,
+    "ceiling_deadline_hit": False,
+    # ...and the boot total behind the last-pass bool: `ceiling_deadline_hits` is how
+    # many passes this process has ever had to cut off, which is the number that says
+    # "the budget is too small for this store" rather than "one pass was unlucky".
+    "ceiling_deadline_hits": 0,
+    "walk_deadline_hit": False,
+    # THE LIVE PEER RANKS (0.2.29), as observed by the walks this module runs.
+    # `peer_digest_sightings` counts every foreign-digest committed file the measuring
+    # pass saw; `peer_digest_learned` counts digests that ever qualified as a live
+    # sibling's; `peer_digests_live` is how many were believed live at the LAST
+    # ceiling decision; `peer_digests_unconfirmed` counts the ceiling decisions taken
+    # with NONE (today's behaviour, and the number that says "this rank could not tell
+    # its peers' live data from dead capacity"); `peer_files_planned` how many files
+    # the last plan nevertheless chose to shed from a live sibling; `peer_digests_
+    # dropped` how many were forgotten because the map is bounded.
+    "peer_digest_sightings": 0,
+    "peer_digest_learned": 0,
+    "peer_digests_live": 0,
+    "peer_digests_unconfirmed": 0,
+    "peer_digests_dropped": 0,
+    "peer_files_planned": 0,
+    # THE UNLINK POOL (0.2.29). The count is the shape of the mechanism; the rest are
+    # its evidence. `evict_threads_requested` is what the environment asked for and
+    # `evict_threads_configured` what the pool built (they differ across a restart, and
+    # the pool is deliberately built once), `evict_threads_alive` how many of its worker
+    # threads exist right now, `evict_fallbacks` how often the pool could not be built
+    # (or a submission failed) and the batch ran on the spill thread instead - the
+    # count that says "parallel eviction was configured and did not happen".
+    "evict_threads_requested": None,
+    "evict_threads_configured": 0,
+    "evict_threads_alive": 0,
+    "evict_batches_submitted": 0,
+    "evict_batches_serial": 0,
+    "evict_files_unlinked": 0,
+    "evict_files_failed": 0,
+    "evict_fallbacks": 0,
+    "evict_peak_in_flight": 0,
     # A FRESH PROCESS DOES NOT KNOW THE STORE IT BOOTED INTO. `estimated_bytes` is a
     # per-process counter of THIS process's own committed writes and starts at 0, and
     # the walk that could correct it only runs once that counter alone reaches the
@@ -495,6 +590,19 @@ def reset_state_for_tests() -> None:
         "walk_measured_bytes": 0, "walk_entries_examined": 0,
         "walk_skipped_files": 0, "walk_count_truncated": False,
         "walk_basis": None, "plan_truncated": False, "ceiling_checks": 0,
+        # The pass's own clock and the live-peer witness: a reset that left these
+        # behind would let one test read another test's deadline as its own.
+        "ceiling_budget_seconds": None, "ceiling_pass_seconds": 0.0,
+        "ceiling_deadline_hit": False, "ceiling_deadline_hits": 0,
+        "walk_deadline_hit": False,
+        "peer_digest_sightings": 0, "peer_digest_learned": 0,
+        "peer_digests_live": 0, "peer_digests_unconfirmed": 0,
+        "peer_digests_dropped": 0, "peer_files_planned": 0,
+        # The eviction pool (0.2.29): shut it down and forget its shape, exactly as
+        # the reader threads are dropped, so no worker of one test mutates another's.
+        "evict_threads_configured": 0, "evict_threads_alive": 0,
+        "evict_batches_submitted": 0, "evict_files_unlinked": 0,
+        "evict_files_failed": 0, "evict_fallbacks": 0, "evict_serial_batches": 0,
         "estimate_seed_key": None, "estimate_seed_walks": 0,
         "group_collisions": 0, "group_collision_samples": [],
         "digest_groups": {}, "digest_groups_dropped": 0,
@@ -502,6 +610,13 @@ def reset_state_for_tests() -> None:
         "journal_records": 0, "journal_failures": 0, "journal_removals": 0,
         "last_path": None, "last_reason": None, "last_error": None,
     })
+    # The peer witness belongs to a boot: a digest remembered from an earlier test
+    # would let that test's store protect this test's files from eviction.
+    with _peer_lock:
+        _peer_sightings.clear()
+    # And so does the eviction pool: a worker left alive would unlink files the next
+    # test believes it is only planning about.
+    shutdown_evict_pool()
 
 
 def counters() -> dict:
@@ -1606,6 +1721,7 @@ def _publish_walk(walk: dict) -> None:
     _state["walk_entries_examined"] = int(walk["entries_examined"])
     _state["walk_skipped_files"] = int(walk["skipped_files"])
     _state["walk_basis"] = str(walk["measurement_basis"])
+    _state["walk_deadline_hit"] = bool(walk.get("deadline_hit"))
 
 
 def _maybe_seed_estimate() -> None:
@@ -1655,8 +1771,132 @@ def _maybe_seed_estimate() -> None:
     _state["estimated_bytes"] = int(walk["estimated_total_bytes"])
 
 
+# --- the live peer ranks: learning which foreign digests are somebody's data ---
+
+# digest -> {"sightings": int, "fresh_sightings": int, "last_mtime_s": float}.
+# Its OWN lock, never nested with anything else in this module: `_walk_store` is
+# called from the spill writer thread AND from a polled utility verb (`disk_store`'s
+# `ls`), so this map can have two authors, while `_state` itself keeps the
+# single-writer posture it has always had.
+_peer_sightings: dict = {}
+_peer_lock = threading.Lock()
+
+
+def _observe_peer_digest(seen_digest, mtime_ns: int) -> None:
+    """Record that a file under a FOREIGN digest exists and when it was written.
+
+    Called from the walk's measuring pass for every capacity-visible file whose parsed
+    digest is not this boot's. Cost: one dict lookup per such file, no syscall - the
+    `stat` and the parse the pass already paid are the only real work here.
+
+    This only OBSERVES. Whether a digest is believed to belong to a LIVE sibling is
+    `_live_peer_digests`' decision, made at the moment the plan is built, so a digest
+    learned at 10:00 cannot still be protecting a peer's files at 18:00 after that
+    rank stopped writing.
+    """
+    own = _state["geometry_digest"]
+    if not isinstance(seen_digest, str) or not seen_digest \
+            or seen_digest == own:
+        return
+    key = seen_digest.lower()
+    wall_now = time.time()
+    written = int(mtime_ns) / 1_000_000_000.0
+    with _peer_lock:
+        row = _peer_sightings.get(key)
+        if row is None:
+            if len(_peer_sightings) >= MAX_PEER_DIGESTS:
+                # Bounded witness. Dropping a sighting costs the fail-safe direction
+                # (the digest is not believed, so its files shed first), never the
+                # dangerous one.
+                _state["peer_digests_dropped"] += 1
+                return
+            row = {"sightings": 0, "fresh_sightings": 0, "last_mtime_s": 0.0,
+                   "learned": False}
+            _peer_sightings[key] = row
+        row["sightings"] = int(row["sightings"]) + 1
+        if written > float(row["last_mtime_s"]):
+            row["last_mtime_s"] = written
+        if wall_now - written <= PEER_DIGEST_FRESH_SECONDS:
+            row["fresh_sightings"] = int(row["fresh_sightings"]) + 1
+    _state["peer_digest_sightings"] += 1
+
+
+def _live_peer_digests() -> tuple:
+    """Which foreign digests this rank may call a LIVE sibling's, as a sorted tuple.
+
+    TWO conditions, both required, and both observable rather than assumed: at least
+    `PEER_DIGEST_MIN_SIGHTINGS` committed files seen inside the freshness window, and
+    the most recently written of them inside it. A digest that stops being written
+    ages out of the map here - a rank that died an hour ago is no longer a live
+    sibling, and its files go back to being the pure capacity they actually are.
+
+    Empty means "I cannot tell", and the caller must then pass NOTHING to
+    `disk_layout`: that is today's behaviour, the fail-safe direction, and it is
+    counted (`peer_digests_unconfirmed`) rather than left as a silence.
+    """
+    wall_now = time.time()
+    live: list = []
+    with _peer_lock:
+        for digest, row in list(_peer_sightings.items()):
+            fresh = int(row["fresh_sightings"])
+            age = wall_now - float(row["last_mtime_s"])
+            if fresh >= PEER_DIGEST_MIN_SIGHTINGS \
+                    and age <= PEER_DIGEST_FRESH_SECONDS:
+                live.append(digest)
+                if not row.get("learned"):
+                    # First time this digest has qualified. The counter is the number
+                    # of siblings this rank has ever recognised, so `peer_digests_live`
+                    # (a snapshot) and `peer_digest_learned` (a boot total) answer
+                    # different questions and neither is a guess.
+                    row["learned"] = True
+                    _state["peer_digest_learned"] += 1
+                continue
+            # Forget it. A dead rank's digest must not sit in the map vetoing the
+            # shedding of its now-dead files forever after it stopped writing.
+            _peer_sightings.pop(digest, None)
+        _state["peer_digests_live"] = len(live)
+        if not live:
+            _state["peer_digests_unconfirmed"] += 1
+    return tuple(sorted(live))
+
+
+def _ceiling_budget_seconds() -> dict:
+    """The pass's time budget in force: the operator's, else the shipped default.
+
+    Read per pass, like this module's other env readers (`disk_root`,
+    `capacity_ceiling_bytes`), so a test's monkeypatch and an operator's drop-in both
+    take effect without a restart. An unusable value is NOT a second default here -
+    `config.ceiling_env` already refused it and said why - it is the constant, which
+    is the behaviour the release shipped with.
+    """
+    problems: list = []
+    budget = CEILING_PASS_BUDGET_SECONDS
+    try:
+        env = config.ceiling_env()
+        problems = list(env.get("problems") or [])
+        if env.get("budget_seconds") is not None:
+            budget = float(env["budget_seconds"])
+    except Exception as exc:  # noqa: BLE001 - a budget is never worth a fault
+        snapshot._error(exc, "disk_spill ceiling budget")
+        problems = [f"the environment could not be read: {type(exc).__name__}"]
+    clamped = budget > CEILING_BUDGET_SECONDS_MAX
+    if clamped:
+        budget = CEILING_BUDGET_SECONDS_MAX
+    return {"seconds": budget, "clamped": clamped, "problems": problems}
+
+
+def _deadline_expired(deadline) -> bool:
+    """Has the pass's budget run out? `None` (no budget) never expires.
+
+    ONE place, so the count pass, the measure pass and the unlink loop all answer the
+    same question with the same clock. `time.monotonic()`: a wall-clock adjustment
+    must never be able to stretch or cut a pass that is already running.
+    """
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def _enforce_ceiling() -> None:
-    """Shed files, oldest mtime first, when the estimate crosses the ceiling.
+    """Shed files, oldest TOUCH first, when the estimate crosses the ceiling.
 
     THE NUMBER THIS DECIDES ON IS AN ESTIMATE OF THE WHOLE STORE, not the bytes the
     walk happened to `stat`. A walk that hits `MAX_WALK_FILES` reports `truncated`
@@ -1707,10 +1947,290 @@ def _enforce_ceiling() -> None:
     root = _state["root"]
     if not root:
         return
-    walk = _walk_store(root)
+    # THE PASS'S DEADLINE, started here - after the gates, so a pass that was going to
+    # do nothing does not spend a clock - and honoured by BOTH halves: the walk (which
+    # stops sampling) and the unlink loop (which stops between whole per-directory
+    # plans). It is a bound on the WORK, not a cancellation: whatever was measured is
+    # still a measurement and whatever was unlinked was journalled.
+    started = time.monotonic()
+    budget = _ceiling_budget_seconds()
+    deadline = started + float(budget["seconds"])
+    _state["ceiling_budget_seconds"] = round(float(budget["seconds"]), 6)
+    # False at the start of every pass: the witness must describe THIS pass, not last
+    # pass's timeout. The two places that set it True are inside the pass (the walk
+    # sampling, the unlink loop), which is where the fact is actually discovered.
+    _state["ceiling_deadline_hit"] = False
+    for problem in budget["problems"]:
+        _state["last_reason"] = str(problem)[:MAX_STRING_CHARS]
+    try:
+        _run_ceiling_pass(root, int(ceiling), deadline, budget)
+    finally:
+        # Published on EVERY exit - including the early returns inside - because a
+        # witness that only described the passes that reached the end is a witness for
+        # the happy path only.
+        _state["ceiling_pass_seconds"] = round(time.monotonic() - started, 6)
+        if _state["ceiling_deadline_hit"]:
+            _state["ceiling_deadline_hits"] = (
+                int(_state["ceiling_deadline_hits"]) + 1)
+
+
+# --- the unlink pool: the ceiling pass's hands (0.2.29) ----------------------
+#
+# WHY A POOL HERE AND NOT A BIGGER QUEUE. The pass unlinks up to `MAX_EVICTION_PLAN`
+# files, grouped by shard directory, and until now it did them one at a time on the
+# spill writer thread. `unlink()` is a metadata operation: on a journaling filesystem
+# the interesting part is that several deletions can be IN FLIGHT at once instead of
+# each one being waited for, which is exactly what `os.unlink` in N threads gives you
+# and what a serial loop cannot. No direct I/O is involved anywhere in this tier and
+# none is added here: the read path is plain buffered `open()`/`readinto` and that is
+# deliberate (this store reads at 25.4 GB/s from the page cache against 6.65 GB/s
+# cold, so the page cache is the tier's biggest asset and `O_DIRECT` would discard it).
+#
+# WHY THE PLAN IS PARTITIONED AND NOT SHARED. One path is attempted by exactly one
+# worker: the plan is split by shard directory (the grouping the serial loop already
+# had, which is also the right shape for the filesystem) and each batch is handed to
+# one worker whole. Nothing races on a path, so `evictions`/`evicted_bytes` cannot
+# double-count, and the pass computes the SAME bytes for 1 worker and for 8.
+#
+# WHY THE WORKERS DO NO BOOKKEEPING. A worker calls `disk_layout.execute_unlink_plan`
+# (pure: validate, unlink, return its own report) and touches NO module state. Every
+# `_state` update and every journal write happens on the spill thread that collected
+# the results, in submission order. That is what keeps this change from turning the
+# writer thread's single-writer counters into a race, and it is why the journalling
+# order is unchanged whether the unlinks ran in parallel or not.
+MAX_EVICT_THREADS = 8                # workers one process may build
+EVICT_THREADS_DEFAULT = 1            # 1 = today's serial behaviour, measured first
+EVICT_THREAD_PREFIX = "kvtier-disk-evict"
+
+_evict_pool: ThreadPoolExecutor | None = None
+_evict_pool_size = 0
+_evict_pool_lock = threading.Lock()
+
+
+def evict_thread_count_alive() -> int:
+    """How many `kvtier-disk-evict` worker threads exist in this process right now.
+
+    A count, not a bool, and read from the thread table rather than from a counter:
+    the same posture as `disk_read.thread_alive_count()`, so a payload cannot report
+    workers that a shutdown already took away.
+    """
+    try:
+        return sum(1 for thread in threading.enumerate()
+                   if thread.name.startswith(EVICT_THREAD_PREFIX)
+                   and thread.is_alive())
+    except Exception:  # noqa: BLE001 - a witness is never worth a fault
+        return 0
+
+
+def _evict_worker_count() -> dict:
+    """The worker count to build, from the environment, clamped and explained."""
+    wanted = EVICT_THREADS_DEFAULT
+    problems: list = []
+    try:
+        env = config.ceiling_env()
+        problems = list(env.get("problems") or [])
+        if env.get("evict_threads") is not None:
+            wanted = int(env["evict_threads"])
+    except Exception as exc:  # noqa: BLE001 - a thread count is never worth a fault
+        snapshot._error(exc, "disk_spill evict threads")
+        problems = [f"the environment could not be read: {type(exc).__name__}"]
+    clamped = wanted > MAX_EVICT_THREADS
+    configured = max(1, min(MAX_EVICT_THREADS, wanted))
+    return {"requested": wanted, "configured": configured, "clamped": clamped,
+            "problems": problems}
+
+
+def _get_evict_pool() -> ThreadPoolExecutor | None:
+    """The process's unlink pool, built on first use. ONE pool, never rebuilt.
+
+    Built lazily because a boot that never crosses its ceiling must not start threads
+    it never uses, and built ONCE because a pool is a thread-count commitment:
+    rebuilding it per pass would pay thread creation inside the pass the pool exists
+    to shorten and would make the reported count mean nothing. If the operator changes
+    the env var, the payload shows `evict_threads_requested` against
+    `evict_threads_configured` and the next restart honours it.
+
+    None means "no pool": the caller runs the batch inline on the spill thread, which is
+    today's behaviour and the fallback for a machine that will not start a thread.
+    """
+    global _evict_pool, _evict_pool_size
+    with _evict_pool_lock:
+        if _evict_pool is not None:
+            return _evict_pool
+        want = _evict_worker_count()
+        _state["evict_threads_requested"] = int(want["requested"])
+        for problem in want["problems"]:
+            _state["last_reason"] = str(problem)[:MAX_STRING_CHARS]
+        if want["requested"] <= 1:
+            # The serial default. Recorded so "configured 1" is a fact a payload can
+            # distinguish from "the pool failed to build" (`evict_fallbacks`).
+            _state["evict_threads_configured"] = 1
+            _state["evict_threads_alive"] = 0
+            return None
+        try:
+            _evict_pool = ThreadPoolExecutor(
+                max_workers=want["configured"],
+                thread_name_prefix=EVICT_THREAD_PREFIX)
+            _evict_pool_size = want["configured"]
+        except Exception as exc:  # noqa: BLE001 - no pool means serial, not no eviction
+            snapshot._error(exc, "disk_spill evict pool")
+            _state["evict_fallbacks"] += 1
+            _state["last_error"] = (
+                f"evict pool: {type(exc).__name__}")[:MAX_STRING_CHARS]
+            _evict_pool = None
+            _evict_pool_size = 0
+            _state["evict_threads_configured"] = 1
+            return None
+        _state["evict_threads_configured"] = int(_evict_pool_size)
+        _state["evict_threads_alive"] = evict_thread_count_alive()
+        return _evict_pool
+
+
+def shutdown_evict_pool() -> None:
+    """Drop the pool, waiting for every submitted unlink. For a reset and shutdown.
+
+    Waits, never cancels: an unlink that was submitted has to be tracked, and a file
+    that vanishes without the journal hearing about it is the exact index error this
+    tier treats as its worst outcome (it costs a reported load failure rather than a
+    plain recompute). The pool is then dropped so the next boot re-reads the count.
+    """
+    global _evict_pool, _evict_pool_size
+    with _evict_pool_lock:
+        pool = _evict_pool
+        _evict_pool = None
+        _evict_pool_size = 0
+    if pool is not None:
+        try:
+            pool.shutdown(wait=True, cancel_futures=False)
+        except Exception as exc:  # noqa: BLE001 - a shutdown is best-effort
+            snapshot._error(exc, "disk_spill evict pool shutdown")
+    _state["evict_threads_configured"] = 0
+    _state["evict_threads_alive"] = evict_thread_count_alive()
+
+
+def _run_evict_batches(batches: list, *, peers, deadline) -> tuple:
+    """Unlink every batch, on the pool if there is one. Returns per-batch reports.
+
+    `batches` is a list of `(directory, paths)` pairs, DISJOINT by construction (they
+    came from grouping one plan by `os.path.dirname`), which is what makes "no path is
+    attempted twice" a structural fact rather than a hope.
+
+    Returns `(reports, attempted, truncated_by_deadline)` where `reports` is a list of
+    `(directory, execute_unlink_plan_report | None)` IN SUBMISSION ORDER, `attempted`
+    the number of paths actually handed to an executor, and the third whether the pass's
+    TIME budget stopped the submission.
+
+    THE DEADLINE AND THE ORDERING THAT MAKES TRUNCATION SAFE. The budget is checked
+    BEFORE A SUBMISSION, never after: a batch that has been submitted is ALWAYS awaited
+    and ALWAYS collected, because a submitted-but-uncollected unlink is a deleted file
+    the journal never heard about. So "stop early" means "stop handing out new work",
+    and the in-flight wave is awaited whole. Work advances in waves of at most
+    `pool size` batches, each wave fully collected before the next is considered, which
+    bounds both the futures alive at once and the amount of work that can outrun the
+    deadline (one wave, each batch capped at `MAX_UNLINK_PLAN` unlinks).
+
+    A worker NEVER touches module state. It calls `execute_unlink_plan`, which
+    validates and unlinks and returns its own report; every counter and every journal
+    write happens in the caller, on the spill thread, in submission order - so the
+    journalled removal
+    order is the plan order whether the unlinks ran in parallel or not, and the writer
+    thread's counters stay single-writer.
+    """
+    reports: list = []
+    attempted = 0
+    truncated = False
+    pool = _get_evict_pool()
+    wave = max(1, int(_evict_pool_size)) if pool is not None else 1
+    index = 0
+    while index < len(batches):
+        if pool is None:
+            # No pool: inline, one batch at a time, deadline honoured between batches.
+            # The FIRST batch always runs, exactly as the serial loop always did, so a
+            # pass that was cut off still releases bytes.
+            directory, paths = batches[index]
+            index += 1
+            attempted += len(paths)
+            _state["evict_batches_serial"] += 1
+            reports.append((directory, _unlink_batch(directory, paths, peers)))
+            if _deadline_expired(deadline):
+                truncated = bool(batches[index:])
+                break
+            continue
+        chunk = batches[index:index + wave]
+        index += len(chunk)
+        futures: list[tuple[str, Future, int]] = []
+        for directory, paths in chunk:
+            try:
+                futures.append((directory,
+                                pool.submit(_unlink_batch, directory, paths, peers),
+                                len(paths)))
+            except Exception as exc:  # noqa: BLE001 - no pool means inline, not no work
+                snapshot._error(exc, "disk_spill evict submit")
+                _state["evict_fallbacks"] += 1
+                attempted += len(paths)
+                _state["evict_batches_serial"] += 1
+                reports.append((directory, _unlink_batch(directory, paths, peers)))
+        if futures:
+            _state["evict_batches_submitted"] += len(futures)
+            _state["evict_peak_in_flight"] = max(
+                int(_state["evict_peak_in_flight"]), len(futures))
+        attempted += sum(size for _d, _f, size in futures)
+        # THE WAIT. In submission order, so `reports` is in plan order whatever order
+        # the unlinks finished in. `future.result()` re-raises a worker's exception on
+        # this thread; `_unlink_batch` catches everything itself, so the only thing that
+        # can arrive here is a failure of the pool machinery, which is reported as a
+        # batch that did nothing rather than being allowed to break the pass.
+        for directory, future, _size in futures:
+            try:
+                reports.append((directory, future.result()))
+            except Exception as exc:  # noqa: BLE001 - a lost worker loses its batch
+                snapshot._error(exc, "disk_spill evict batch")
+                _state["evict_files_failed"] += 1
+                reports.append((directory, None))
+        if index < len(batches) and _deadline_expired(deadline):
+            truncated = True
+            break
+    return reports, attempted, truncated
+
+
+def _unlink_batch(directory, paths, peers) -> dict | None:
+    """ONE directory's unlink batch, on whatever thread owns it. Never raises.
+
+    `execute_unlink_plan` re-validates every path against the CURRENT digest and the
+    peer digests before it deletes anything, and a directory that is itself a symlink is
+    refused outright; none of that is weakened by running it on a worker. The peer list
+    is a tuple, handed in, so a worker never reads the mutable witness map.
+    """
+    try:
+        return disk_layout.execute_unlink_plan(
+            directory, paths, dry_run=False,
+            geometry_digest=_state["geometry_digest"], peer_digests=peers,
+            for_capacity=True)
+    except Exception as exc:  # noqa: BLE001 - a worker that raises loses its own batch
+        snapshot._error(exc, "disk_spill unlink batch")
+        return None
+
+
+def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
+    """One enforcement pass: walk, decide, shed. Deadline-aware, partial by design.
+
+    Split out of `_enforce_ceiling` so the deadline bookkeeping has exactly one owner
+    (the caller's `finally`) and this body reads as the three steps it performs.
+    """
+    walk = _walk_store(root, deadline=deadline)
     if not walk["ok"]:
         _state["last_reason"] = str(walk["reason"])[:MAX_STRING_CHARS]
         return
+    if walk.get("deadline_hit"):
+        # Say it where the plan's own truncation is recorded, so one field answers
+        # "why is this pass partial" and it is never mistaken for the plan cap.
+        _state["plan_truncated"] = True
+        _state["ceiling_deadline_hit"] = True
+    # THE SIBLING DIGESTS, decided NOW (freshness is the point) and handed to the
+    # planner AND the executor. Empty is the fail-safe direction: the plan then sees a
+    # foreign digest as `stale_geometry` and sheds it first, exactly as it did before
+    # 0.2.29, and `peer_digests_unconfirmed` counts the fact.
+    peers = _live_peer_digests()
     # THE DECISION NUMBER. `estimated_total_bytes` equals `used_bytes` whenever the
     # walk measured the whole store, so a store inside the caps cannot tell this
     # from the old code; on a truncated walk it is the sample scaled to the store.
@@ -1733,7 +2253,7 @@ def _enforce_ceiling() -> None:
     plan = disk_layout.lru_eviction_plan(
         walk["entries"], geometry_digest=_state["geometry_digest"],
         ceiling_bytes=int(ceiling), used_bytes=decision_bytes,
-        target_fraction=EVICT_TARGET_FRACTION)
+        target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers)
     _state["ceiling_checks"] = int(_state["ceiling_checks"]) + 1
     _state["estimated_bytes"] = decision_bytes
     # Publish HOW the decision was made, not just what it was. A reader of
@@ -1749,27 +2269,75 @@ def _enforce_ceiling() -> None:
             f"{decision_bytes}")
     if not plan["ok"] or not plan["paths"]:
         return
+    _state["peer_files_planned"] = int(plan.get("peer_rank") or 0)
     by_directory: dict = {}
     for path in plan["paths"]:
         by_directory.setdefault(os.path.dirname(path), []).append(path)
+    # THE BATCHES, in plan order. Grouping by directory is both the filesystem-friendly
+    # shape (a shard's entries leave one directory) and the partition that guarantees no
+    # path is attempted by two workers: the groups are disjoint by construction.
+    batches = list(by_directory.items())
+    reports, attempted, cut_off = _run_evict_batches(batches, peers=peers,
+                                                     deadline=deadline)
     freed = 0
-    for directory, paths in by_directory.items():
-        done = disk_layout.execute_unlink_plan(
-            directory, paths, dry_run=False,
-            geometry_digest=_state["geometry_digest"], for_capacity=True)
-        if done["ok"]:
-            freed += int(done["counts"].get("planned_bytes") or 0)
-            # EVERY file this plan actually deleted is journalled, so the
-            # scheduler's index stops offering it within one refresh. Without this
-            # half the journal the index would keep offering files whose bytes the
-            # ceiling already reclaimed - the one direction of index error that
-            # costs a reported load failure instead of a plain recompute.
-            for action in done.get("actions") or []:
-                if isinstance(action, dict) and action.get("action") == "unlinked":
-                    _journal_write(action.get("path"),
-                                   int(action.get("size_bytes") or 0),
-                                   removal=True)
-    _state["evictions"] = int(_state["evictions"]) + int(plan["planned"])
+    unlinked = 0
+    failed = 0
+    for directory, done in reports:
+        # COLLECTION, on the spill thread, in submission order. This is where every
+        # counter and every journal write happens, so the removal journal is written in
+        # plan order whether the unlinks ran on one thread or on eight, and the writer
+        # thread's counters stay single-writer.
+        if not isinstance(done, dict) or not done.get("ok"):
+            # A batch that did not report: nothing was proved deleted, so nothing is
+            # journalled and nothing is counted as freed. Counted, never silent.
+            failed += 1
+            _state["last_reason"] = (
+                f"an unlink batch for {os.path.basename(str(directory))} returned no "
+                "report; its files were not journalled as removed")[:MAX_STRING_CHARS]
+            continue
+        for action in done.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            outcome = action.get("action")
+            if outcome == "unlinked":
+                unlinked += 1
+                # EVERY file this plan actually deleted is journalled, so the
+                # scheduler's index stops offering it within one refresh. Without this
+                # half the journal the index would keep offering files whose bytes the
+                # ceiling already reclaimed - the one direction of index error that
+                # costs a reported load failure instead of a plain recompute.
+                _journal_write(action.get("path"),
+                               int(action.get("size_bytes") or 0), removal=True)
+            elif outcome in ("refused", "gone", "error"):
+                failed += 1
+    freed = sum(int(row["counts"].get("planned_bytes") or 0)
+                for _d, row in reports
+                if isinstance(row, dict) and row.get("ok"))
+    _state["evict_files_unlinked"] = int(_state["evict_files_unlinked"]) + unlinked
+    _state["evict_files_failed"] = int(_state["evict_files_failed"]) + failed
+    if cut_off:
+        # THE DEADLINE, at BATCH GRANULARITY, and never before the first batch has run.
+        # One batch is the unit that is all-or-nothing (one `execute_unlink_plan` call
+        # re-validates and deletes its own list), so stopping BETWEEN batches can only
+        # ever drop whole directories from the destructive set - a half-applied plan is
+        # the one thing this pass must never be. The first batch always runs so a pass
+        # that was cut off still RELEASES BYTES, and a submitted batch is always awaited
+        # and collected, so a truncation can never strand a deleted file without its
+        # journal record.
+        _state["plan_truncated"] = True
+        _state["ceiling_deadline_hit"] = True
+        _state["last_reason"] = (
+            f"the ceiling pass stopped at its {budget['seconds']}s budget after "
+            f"{len(reports)} of {len(batches)} directory batch(es) of a "
+            f"{int(plan['planned'])}-file plan; the next spill continues"
+        )[:MAX_STRING_CHARS]
+    # `evictions` counts the files this pass ATTEMPTED, which is exactly
+    # `plan["planned"]` whenever the whole plan ran - the pre-0.2.29 number,
+    # unchanged. With a deadline it counts what was really handed to a worker rather
+    # than what was planned and never touched: the alternative would inflate the
+    # eviction count by every file the budget declined to attempt. `evicted_bytes` was
+    # always the bytes actually freed.
+    _state["evictions"] = int(_state["evictions"]) + int(attempted)
     _state["evicted_bytes"] = int(_state["evicted_bytes"]) + freed
     # The estimate comes DOWN by what was really freed, off the DECISION number: on
     # a full walk that is the measurement, exactly as it always was.
@@ -1808,7 +2376,8 @@ def _name_is_ours(name) -> bool:
             and name.endswith(disk_layout.SUFFIX_DATA))
 
 
-def _count_store(root, *, cap_dirs: int, max_entries: int) -> dict:
+def _count_store(root, *, cap_dirs: int, max_entries: int,
+                 deadline=None) -> dict:
     """How many capacity-visible files the store holds, WITHOUT one `stat()`.
 
     WHY A SECOND PASS EXISTS. The measuring pass stats at most `MAX_WALK_FILES`, so
@@ -1852,8 +2421,19 @@ def _count_store(root, *, cap_dirs: int, max_entries: int) -> dict:
     tally = 0
     full_shards = 0
     counting_stopped = False
+    deadline_hit = False
     for shard in walked:
         if counting_stopped:
+            counts.append(None)
+            continue
+        if _deadline_expired(deadline):
+            # The pass's TIME budget, not its entry budget. Same treatment on
+            # purpose: shards we did not read are UNKNOWN, never zero, and are
+            # extrapolated from the mean of the ones we did - so a deadline truncates
+            # the COUNT exactly as an entry cap does and the caller's honesty witness
+            # (`count_truncated`) covers both.
+            deadline_hit = True
+            counting_stopped = True
             counts.append(None)
             continue
         count = 0
@@ -1862,6 +2442,10 @@ def _count_store(root, *, cap_dirs: int, max_entries: int) -> dict:
             with os.scandir(shard.path) as children:
                 for child in children:
                     if examined >= max_entries:
+                        unknown = True
+                        break
+                    if _deadline_expired(deadline):
+                        deadline_hit = True
                         unknown = True
                         break
                     if child.is_symlink() or not child.is_file(follow_symlinks=False):
@@ -1908,7 +2492,8 @@ def _count_store(root, *, cap_dirs: int, max_entries: int) -> dict:
                shard_dirs_walked=len(walked),
                shard_dirs_counted=int(full_shards),
                mean_files_per_shard=int(mean),
-               count_truncated=bool(truncated), reason=None)
+               count_truncated=bool(truncated), deadline_hit=bool(deadline_hit),
+               reason=None)
 
 
 def _sample_quotas(count: dict, cap_files: int) -> list:
@@ -1967,7 +2552,7 @@ def _walk_absence(reason) -> dict:
 
 
 def _walk_store(root, *, max_files=None, max_shard_dirs=None,
-                max_entries=None) -> dict:
+                max_entries=None, deadline=None) -> dict:
     """Measure the store, bounded, across the WHOLE shard space. No links followed.
 
     Three caps rather than one - shard DIRECTORIES (288; the space is 256, so the
@@ -2002,7 +2587,8 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
         else min(MAX_SHARD_DIRS, int(max_shard_dirs))
     cap_entries = MAX_WALK_ENTRIES if max_entries is None \
         else min(MAX_WALK_ENTRIES, int(max_entries))
-    count = _count_store(root, cap_dirs=cap_dirs, max_entries=cap_entries)
+    count = _count_store(root, cap_dirs=cap_dirs, max_entries=cap_entries,
+                         deadline=deadline)
     if not count["ok"]:
         return _walk_absence(count["reason"])
     entries: list[dict] = []
@@ -2010,6 +2596,7 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
     counted = 0
     measured_entries = 0
     entries_capped = False
+    deadline_hit = bool(count.get("deadline_hit"))
     budget = cap_files
     for path, quota in zip(count["shard_paths"], _sample_quotas(count, cap_files),
                            strict=True):
@@ -2025,6 +2612,14 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
                     if measured_entries >= cap_entries:
                         entries_capped = True
                         break
+                    if _deadline_expired(deadline):
+                        # The pass ran out of TIME. Half a shard measured is a partial
+                        # measurement, which is the same fact an OSError below records
+                        # - `counted < total_files` is what marks it - so the walk
+                        # reports itself truncated and the caller's partial-plan rule
+                        # takes over. Nothing here is a zero for an absent measurement.
+                        deadline_hit = True
+                        break
                     if child.is_symlink() or not child.is_file(follow_symlinks=False):
                         continue
                     measured_entries += 1
@@ -2033,7 +2628,8 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
                     # Parsed BEFORE the stat, which the old walk did the other way
                     # round: a shard of names that are not ours must not buy a
                     # syscall each, and the accepted SET is identical either way.
-                    if not _capacity_visible(disk_layout.parse_path(child.name)):
+                    parsed = disk_layout.parse_path(child.name)
+                    if not _capacity_visible(parsed):
                         continue
                     try:
                         info = child.stat(follow_symlinks=False)
@@ -2043,6 +2639,13 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
                     got += 1
                     budget -= 1
                     used += int(info.st_size)
+                    # THE SIBLING WITNESS (0.2.29): a committed file under a digest that
+                    # is not this boot's, with the time it was written. This is the only
+                    # place the tier learns that a peer rank is alive on this root, and
+                    # it costs no extra syscall - the parse and the `stat` are both
+                    # already paid above.
+                    _observe_peer_digest(parsed.get("geometry_digest"),
+                                         int(info.st_mtime_ns))
                     entries.append({"path": os.path.join(path, child.name),
                                     "filename": child.name,
                                     "size_bytes": int(info.st_size),
@@ -2058,7 +2661,7 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
             continue
     total_files = int(count["total_files"])
     truncated = bool(count["count_truncated"]) or entries_capped \
-        or counted < total_files
+        or deadline_hit or counted < total_files
     if not truncated:
         # The walk saw every capacity-visible file. The estimate IS the measurement,
         # byte for byte, which is the property every store inside the caps rests on.
@@ -2092,6 +2695,7 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
                shard_dirs_walked=int(count["shard_dirs_walked"]),
                truncated=bool(truncated),
                count_truncated=bool(count["count_truncated"]),
+               deadline_hit=bool(deadline_hit),
                measurement_basis=basis, reason=None)
 
 
@@ -2444,8 +3048,20 @@ def section() -> dict:
             "walk_truncated": bool(_state["walk_truncated"]),
             "count_truncated": bool(_state["walk_count_truncated"]),
             # The last plan hit `disk_layout.MAX_EVICTION_PLAN`: the pass was
-            # partial by design and the next spill runs another one.
+            # partial by design and the next spill runs another one. Since 0.2.29 it is
+            # ALSO true when the pass ran out of TIME - `deadline_hit` says which.
             "plan_truncated": bool(_state["plan_truncated"]),
+            # THE PASS'S OWN CLOCK (0.2.29). `budget_seconds` is the bound in force,
+            # `pass_seconds` how long the last pass actually took, `deadline_hit`
+            # whether it was cut off. With `plan_truncated` these three answer "is the
+            # ceiling keeping up with the fill rate, or is every pass being truncated at
+            # its budget?" - which during a load experiment is the difference between a
+            # tier that is shedding and one that is pretending.
+            "budget_seconds": _state["ceiling_budget_seconds"],
+            "pass_seconds": round(float(_state["ceiling_pass_seconds"]), 6),
+            "deadline_hit": bool(_state["ceiling_deadline_hit"]),
+            "deadline_hits": int(_state["ceiling_deadline_hits"]),
+            "walk_deadline_hit": bool(_state["walk_deadline_hit"]),
             "ceiling_checks": int(_state["ceiling_checks"]),
             # The FIRST walk of a boot, which is what lets a fresh process see a
             # store it did not write. Zero here with a full store and a quiet
@@ -2454,7 +3070,60 @@ def section() -> dict:
             "units": disk_layout._units("measured_bytes", "sampled_files",
                                         "total_files", "entries_examined",
                                         "skipped_files", "ceiling_checks",
-                                        "seed_walks"),
+                                        "seed_walks", "deadline_hits",
+                                        "budget_seconds", "pass_seconds"),
+        },
+        # THE PEERS THIS RANK CAN SEE, and the pool that does the unlinks (0.2.29).
+        # Both belong beside the ceiling witness because both only mean anything next
+        # to a decision: a peer digest you never showed the planner protected nothing,
+        # and a thread count you never measured is a wish.
+        "peer_ranks": {
+            "live_digests": int(_state["peer_digests_live"]),
+            "learned_digests": int(_state["peer_digest_learned"]),
+            "foreign_files_seen": int(_state["peer_digest_sightings"]),
+            "decisions_without_peers": int(_state["peer_digests_unconfirmed"]),
+            "files_planned_last_pass": int(_state["peer_files_planned"]),
+            "peer_digests_dropped": int(_state["peer_digests_dropped"]),
+            "fresh_seconds": PEER_DIGEST_FRESH_SECONDS,
+            "min_sightings": PEER_DIGEST_MIN_SIGHTINGS,
+            "peer_digest_cap": MAX_PEER_DIGESTS,
+            "note": ("`live_digests` are foreign digests whose committed files are "
+                     "being written now, so their files shed LAST instead of first. "
+                     "`decisions_without_peers` counts the ceiling decisions taken "
+                     "with none known, which is the pre-0.2.29 behaviour (foreign "
+                     "first) and the fail-safe direction: it never means unable to "
+                     "evict, because this rank's own files always remain sheddable."),
+            "units": disk_layout._units("live_digests", "learned_digests",
+                                        "foreign_files_seen",
+                                        "decisions_without_peers",
+                                        "files_planned_last_pass",
+                                        "peer_digests_dropped", "fresh_seconds",
+                                        "min_sightings", "peer_digest_cap"),
+        },
+        "evict_pool": {
+            "evict_threads_requested": _state["evict_threads_requested"],
+            "evict_threads_configured": int(_state["evict_threads_configured"]),
+            "evict_threads_alive": int(evict_thread_count_alive()),
+            "evict_threads_cap": MAX_EVICT_THREADS,
+            "batches_submitted": int(_state["evict_batches_submitted"]),
+            "batches_serial": int(_state["evict_batches_serial"]),
+            "files_unlinked": int(_state["evict_files_unlinked"]),
+            "files_failed": int(_state["evict_files_failed"]),
+            "pool_fallbacks": int(_state["evict_fallbacks"]),
+            "peak_in_flight_batches": int(_state["evict_peak_in_flight"]),
+            "note": ("the pool unlinks the plan's per-directory batches; "
+                     "`evict_threads_configured` 1 means the serial path of every "
+                     "release before 0.2.29. `pool_fallbacks` is the count that says "
+                     "parallel eviction was asked for and did not happen; "
+                     "`files_failed` counts refusals, vanished files and errors, "
+                     "exactly as the serial loop always reported them."),
+            "units": disk_layout._units("evict_threads_requested",
+                                        "evict_threads_configured",
+                                        "evict_threads_alive", "evict_threads_cap",
+                                        "batches_submitted", "batches_serial",
+                                        "files_unlinked", "files_failed",
+                                        "pool_fallbacks",
+                                        "peak_in_flight_batches"),
         },
         "errors": int(_state["errors"]),
         # The collision witness and the journal, next to the counters they qualify:

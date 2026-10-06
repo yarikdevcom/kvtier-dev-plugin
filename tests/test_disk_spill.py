@@ -1106,9 +1106,13 @@ def test_the_module_imports_only_the_standard_library():
             pulled.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             pulled.add(node.module.split(".")[0])
-    assert pulled <= {"__future__", "ctypes", "hashlib", "json", "os", "queue",
-                      "threading", "time", "blockdump", "config", "disk_layout",
-                      "snapshot"}, sorted(pulled)
+    # `concurrent.futures` joined the list in 0.2.29 for the eviction unlink pool. It
+    # is stdlib (`concurrent.futures.thread`), so the rule - no torch, no vllm, no
+    # third-party dependency in a plugin that must install into a live vllm venv
+    # without touching any other package - still holds exactly as before.
+    assert pulled <= {"__future__", "concurrent", "ctypes", "hashlib", "json",
+                      "os", "queue", "threading", "time", "blockdump", "config",
+                      "disk_layout", "snapshot"}, sorted(pulled)
     for module in ("torch", "vllm", "numpy"):
         assert module not in sys.modules
 

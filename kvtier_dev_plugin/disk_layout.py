@@ -103,11 +103,15 @@ which is the whole point.
 
 CAPACITY IS A CEILING AND A CLOCK
 ---------------------------------
-``st_mtime`` is the LRU clock. ``st_atime`` is NOT: ``/home`` is mounted
-``relatime`` here, so a read does not reliably move it and an LRU built on it
-would evict the most-recently-read file. Deleting a file is always safe (the cost
-is a recompute), so the plan is: shed files this boot can never read first, then
-this boot's own oldest-first, until the used estimate is back under the ceiling.
+``st_mtime`` is the LRU clock, and it is a TOUCH clock: a spill writes it, and a
+restore that produced usable bytes bumps it (``disk_read.promote_recency``,
+throttled to one write per file per interval). ``st_atime`` is NOT the clock:
+``/home`` is mounted ``relatime`` here, so a read does not reliably move it, and an
+LRU built on it would rank a file read a million times ago as "cold". Shedding
+order is: bytes this boot can never read and no live sibling claims, then this
+boot's own oldest-first, then a live peer rank's files - deleting a file is always
+safe (the cost is a recompute), but a peer's live file is the last thing this rank
+should reach for. See ``lru_eviction_plan`` for the whole contract.
 
 NEVER A ZERO FOR AN ABSENT MEASUREMENT
 --------------------------------------
@@ -225,7 +229,11 @@ NAME_CLASSIFICATIONS = (NAME_CURRENT, NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
 # not proof the file is OURS, and the cost of deleting someone's
 # `kvslot-backup-notes.bin` is infinite next to the cost of leaving it. A
 # peer-rank file is not stale either: it is another rank's LIVE data, sitting in
-# the same store, and only capacity eviction may touch it (see the plan order).
+# the same store, and only capacity eviction may touch it - and it is shed LAST, not
+# first (see `lru_eviction_plan`'s shed order). That ordering is the whole reason
+# `peer_digests` exists: with four ranks on one root, an evictor that treats foreign
+# names as the cheapest thing to delete is four evictors deleting each other's live
+# restores.
 #
 # `stale_key_shape` IS ours and IS unlinkable, and that is deliberately the
 # opposite of the malformed rule: a 2-field `kvslot-<key16>-<geodigest12>.bin` is
@@ -238,6 +246,25 @@ NAME_CLASSIFICATIONS = (NAME_CURRENT, NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
 UNLINKABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE)
 EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
                              NAME_CURRENT, NAME_PEER_RANK)
+
+# THE SHED ORDER, as data (see `lru_eviction_plan`). LOWER SHEDS FIRST.
+#
+# 0 - bytes that are pure capacity: a digest this boot can never read (a stale
+#     geometry, including an in-flight `.part`) or the pre-group key shape whose
+#     group is unattributable. Nobody can load them; deleting them costs nothing.
+# 1 - this boot's own committed files, oldest touch first.
+# 2 - a LIVE PEER RANK's files: readable, loadable data belonging to a sibling that
+#     shares this root. Reachable only when buckets 0 and 1 could not reach the
+#     target, because every rank on the box runs this same plan and a rule that put
+#     a peer's file first meant each rank preferred its three peers' hottest spans
+#     over its own cold ones - a mutual-destruction loop, not an LRU.
+#
+# A classification absent from this table sheds FIRST (the `.get` default): the
+# unknown-digest case is the pre-0.2.29 behaviour, and the fail-safe direction of
+# this feature is "still able to release capacity", never "unable to evict".
+SHED_ORDER_BY_CLASSIFICATION = {NAME_STALE_GEOMETRY: 0, NAME_STALE_KEY_SHAPE: 0,
+                                NAME_CURRENT: 1, NAME_PEER_RANK: 2}
+SHED_ORDER_UNKNOWN = 0
 
 # Directory states. A missing directory and an unreadable one are different facts
 # and are never collapsed into "no files".
@@ -335,6 +362,32 @@ UNITS_BY_NAME = {
     "journal_seq_seed": "lines",
     "journal_writes": "lines",
     "journal_write_errors": "writes",
+    # THE LIVE PEER RANKS and the UNLINK POOL (0.2.29), as published in the spill
+    # section's `peer_ranks` / `evict_pool` blocks. Declared explicitly because a
+    # payload that reports `"units": {"live_digests": "unknown"}` is a payload a reader
+    # cannot interpret, and `_units` makes that visible rather than guessing.
+    "live_digests": "digests",
+    "learned_digests": "digests",
+    "peer_digests_dropped": "digests",
+    "foreign_files_seen": "files",
+    "decisions_without_peers": "passes",
+    "deadline_hits": "passes",
+    "budget_seconds": "seconds",
+    "pass_seconds": "seconds",
+    "fresh_seconds": "seconds",
+    "min_sightings": "files",
+    "peer_digest_cap": "digests",
+    "files_planned_last_pass": "files",
+    "evict_threads_requested": "threads",
+    "evict_threads_configured": "threads",
+    "evict_threads_alive": "threads",
+    "evict_threads_cap": "threads",
+    "batches_submitted": "batches",
+    "batches_serial": "batches",
+    "files_unlinked": "files",
+    "files_failed": "files",
+    "pool_fallbacks": "events",
+    "peak_in_flight_batches": "batches",
     "key_chars": "chars",
     "key_count_mismatch": "refusals",
     "length_bytes": "bytes",
@@ -1545,20 +1598,37 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                       used_bytes=None, peer_digests=(),
                       target_fraction: float = 0.9,
                       max_plan: int = MAX_EVICTION_PLAN) -> dict:
-    """Which files to delete, oldest-first, to get back under a byte ceiling.
+    """Which files to delete, oldest-touch-first, to get back under a byte ceiling.
 
-    THE CLOCK IS ``st_mtime``. ``/home`` on the box is mounted ``relatime``, so a
-    read does not reliably move ``st_atime``: an LRU built on it would rank a
-    file read a million times ago as "cold" and evict the newest written file -
-    the opposite of an LRU. mtime moves on write, which is the only signal we
-    generate for a KV slot, so it is both honest and sufficient.
+    THE CLOCK IS ``st_mtime``, and since 0.2.29 it is a TOUCH clock, not a write
+    clock. ``/home`` on the box is mounted ``relatime``, so a read does not reliably
+    move ``st_atime`` and an LRU built on it would rank a file read a million times
+    ago as "cold" - the opposite of an LRU. Rather than trust a mount option,
+    ``disk_read.promote_recency`` now BUMPS ``st_mtime`` on a read that produced
+    usable bytes, so recency means last touch (a write OR a successful restore read),
+    which is what the tier is for. The rules that make that safe belong to the
+    reader, not to this function, and are restated here because this is where the
+    clock is spent: at most one promotion per file per
+    ``disk_read.TOUCH_MIN_INTERVAL_SECONDS`` (a metadata write to the same device the
+    restore just read from is not free), a bounded in-memory throttle map, and
+    fail-closed on the verdict - a ``file_missing``, ``size_mismatch``, ``short_read``,
+    ``not_ours`` or ``read_error`` result never promotes, because keeping a
+    wrong-sized or unreadable file alive is strictly worse than evicting it.
+    Restart survival is why promotion is an mtime and not a side table: there is
+    nothing to replay, and a promoted file is exactly as durable as the file is.
 
-    ORDER: files whose digest is not this boot's are shed FIRST (this boot can
-    never read them, so they are pure capacity), then this boot's own files oldest
-    first. ``target_fraction`` (default 0.9) is the hysteresis: the plan aims at
-    ``ceiling * target_fraction`` rather than at the ceiling, because a plan that
-    targets the line it is standing on deletes nothing and the next spill trips
-    the same check again.
+    ORDER: shed by ``SHED_ORDER_BY_CLASSIFICATION`` - files this boot can never read
+    (and no live sibling claims) first, then this boot's own files oldest-touch first,
+    then a live PEER RANK's files. ``peer_digests`` is what moves a sibling's files
+    out of the "pure capacity" bucket: the four ranks share one root, so an evictor
+    that cannot name its siblings' digests sees their live data as foreign and sheds
+    it first. Pass them in. When they cannot be determined with confidence, pass
+    nothing and today's behaviour is exactly preserved - too-conservative here must
+    never mean unable-to-evict, and it does not: a rank always keeps its own files as
+    the capacity it can release. ``target_fraction`` (default 0.9) is the hysteresis:
+    the plan aims at ``ceiling * target_fraction`` rather than at the ceiling, because
+    a plan that targets the line it is standing on deletes nothing and the next spill
+    trips the same check again.
 
     Input is a LIST of ``{"path", "size_bytes", "mtime_ns", "filename"}`` mappings
     (what a sweep or an `os.scandir` walk gives you), so this stays a pure
@@ -1612,11 +1682,12 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     target = int(ceiling_bytes * float(target_fraction))
     verdict = _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
                                "planned_bytes", "freed_bytes", "planned",
-                               "stale_first", "lru_files", "skipped", "files"),
+                               "stale_first", "peer_rank", "lru_files",
+                               "skipped", "files"),
                   needed=False, ceiling_bytes=int(ceiling_bytes),
                   used_bytes=measured, target_bytes=target,
                   paths=[], planned=0, planned_bytes=0, freed_bytes=0,
-                  stale_first=0, lru_files=0, skipped=skipped,
+                  stale_first=0, peer_rank=0, lru_files=0, skipped=skipped,
                   files=len(usable), truncated=False,
                   reason=("the store is under its target, so nothing is "
                           "evictable yet"))
@@ -1624,9 +1695,12 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
         return verdict
 
     def rank(item):
-        # Foreign digests first, then oldest mtime, then the path, so two boots
-        # with the same directory produce the SAME plan byte for byte.
-        return (0 if item["classification"] != NAME_CURRENT else 1,
+        # Shed order, then oldest touch, then the path, so two boots with the same
+        # directory produce the SAME plan byte for byte. See
+        # `SHED_ORDER_BY_CLASSIFICATION` for why a live peer rank's file is LAST and
+        # an unrecognised digest is FIRST.
+        return (SHED_ORDER_BY_CLASSIFICATION.get(item["classification"],
+                                                 SHED_ORDER_UNKNOWN),
                 int(item["mtime_ns"]), item["path"])
 
     ordered = sorted(usable, key=rank)
@@ -1645,21 +1719,32 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
         remaining -= int(item["size_bytes"])
     stale_first = sum(1 for item in planned
                       if item["classification"] != NAME_CURRENT)
+    # THE PEER COUNT IS THE POINT OF `peer_digests`. A plan that names a live
+    # sibling's file is a plan that reached the last bucket, i.e. one that could not
+    # meet its target from pure capacity plus this boot's own files: that is the fact
+    # an operator needs next to `stale_first`, because a non-zero count here with
+    # empty `stale_first` says the sibling digests were known and STILL not enough
+    # could be shed, while a plan full of foreign files says they were never learned.
+    peer_rank = sum(1 for item in planned
+                    if item["classification"] == NAME_PEER_RANK)
     reason = None
     if planned:
         reason = (f"{len(planned)} file(s) shed the measured "
                   f"{measured} bytes toward the {target}-byte target "
-                  f"({stale_first} of them under a foreign digest)")
+                  f"({stale_first} of them under a foreign digest, "
+                  f"{peer_rank} of them a live peer rank's)")
     elif truncated:
         reason = f"the plan cap {limit} was reached before the target was met"
     return _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
                             "planned_bytes", "freed_bytes", "planned",
-                            "stale_first", "lru_files", "skipped", "files"),
+                            "stale_first", "peer_rank", "lru_files", "skipped",
+                            "files"),
                needed=True, ceiling_bytes=int(ceiling_bytes),
                used_bytes=measured, target_bytes=target,
                paths=[item["path"] for item in planned],
                entries=planned, planned=len(planned), planned_bytes=freed,
                freed_bytes=freed, stale_first=stale_first,
+               peer_rank=peer_rank,
                lru_files=len(planned) - stale_first, skipped=skipped,
                files=len(usable), truncated=truncated, reason=reason)
 

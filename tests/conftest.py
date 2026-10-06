@@ -47,7 +47,14 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # reason, and more sharply: the DEFAULT of both is the claim that this
             # release changes nothing, so a test that inherited `=4` from the shell it
             # ran in would be measuring a boot the plugin does not ship.
-            config.ENV_DISK_READ_THREADS, config.ENV_DISK_READ_BUFFER_BYTES)
+            config.ENV_DISK_READ_THREADS, config.ENV_DISK_READ_BUFFER_BYTES,
+            # The ceiling pass's time budget and its unlink worker count. Same rule,
+            # and a sharper one: a test that inherited a 0.001 s budget would "prove"
+            # the deadline fires on a store far too small to need it, and one that
+            # inherited EVICT_THREADS=4 would be testing a pool the release does not
+            # ship by default.
+            config.ENV_DISK_CEILING_BUDGET_SECONDS,
+            config.ENV_DISK_EVICT_THREADS)
 
 
 @pytest.fixture(autouse=True)
