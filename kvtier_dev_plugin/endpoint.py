@@ -689,6 +689,27 @@ def blockdump_capability(deployed: bool, armed) -> str:
 
 
 def status_payload(dev_state: dict | None = None) -> dict:
+    # HOW FULL THE SSD TIER IS, built BEFORE the payload so a failure cannot take the
+    # route down with it. THE SAME BLOCK as `snapshot.disk_fill`, deliberately: the
+    # operator asked for one answer reachable from either read route, not two dialects
+    # of it. `/status` makes NO engine call and never will - this is a rank-file read
+    # behind the rollup's one-second cache, which is the same cost `worker_proof`
+    # already accepts on a polled path, and it is the only fleet-wide fill number
+    # available to a process whose own spill counters are structurally zero.
+    try:
+        from . import disk_store  # noqa: PLC0415 - the fill block lives with the tier
+        disk_fill_block = disk_store.disk_fill()
+    except Exception as exc:  # noqa: BLE001 - /status must always answer
+        logger.warning("kvtier-dev-plugin: /status disk_fill failed: %s: %s",
+                       type(exc).__name__, exc)
+        try:  # the block's OWN key set, all null, if the module came in at all
+            disk_fill_block = disk_store.disk_fill_unavailable(type(exc).__name__)
+        except Exception:  # noqa: BLE001 - the import itself is what failed
+            # The only shape that is honest here: there is no skeleton to reuse, so
+            # say `not available` and name the reason, and let `available` stay the
+            # flag a caller must check before touching any other key.
+            disk_fill_block = {"available": False,
+                               "reason": f"did not build: {type(exc).__name__}"[:160]}
     try:
         target = str(config.validate_policy_target(config.canonical_policy_path()))
         loadable = True
@@ -739,6 +760,10 @@ def status_payload(dev_state: dict | None = None) -> dict:
         "lookup_ledger_armed": mirrored.get("lookup_ledger_armed"),
         "blockdump_armed": mirrored.get("blockdump_armed"),
         "dev_state": mirrored,
+        # THE SSD TIER'S FILL, from the rank files the workers write. See
+        # `disk_store.disk_fill` for why the flat per-process counters beside it (the
+        # `disk` block below) cannot answer this question at all.
+        "disk_fill": disk_fill_block,
         "worker_diagnostics": {
             "env": config.ENV_DIAG_DIR,
             "configured": config.diagnostics_dir() is not None,

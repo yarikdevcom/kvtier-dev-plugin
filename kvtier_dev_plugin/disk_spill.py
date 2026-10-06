@@ -69,6 +69,28 @@ consulting it there would disarm a healthy tier. A surviving arm file is therefo
 harmless wherever it lives, and the journal can be moved to persistent storage
 without arming anything (`VLLM_E2_TIER_DISK_JOURNAL_DIR`, `disk_index`).
 
+WHAT CHANGED IN 0.2.30: the ceiling stopped being able to be spent four times. The
+store is ONE directory shared by every rank whose geometry digest appears in its file
+names, and until now each rank compared the WHOLE store's bytes against the WHOLE
+ceiling. Measured on the live box on 2026-10-22: four ranks, 92 files written each, and
+2,106 / 2,106 / 1,872 / 1,872 files evicted - 7,956 files, 156 GiB down to 68 GiB, under
+a 148 GiB ceiling whose one-pass target was 133 GiB. Nothing miscounted: each rank
+measured 156 GiB correctly, each correctly wanted 133 GiB, and all four then acted on
+the same directory, so the effective capacity of the store was `ceiling / rank_count`
+and the more ranks a boot had, the more of its own cache it destroyed. A rank now sizes
+only the bytes it is ACCOUNTABLE for - its own digest's files, plus the dead geometry no
+live rank owns (a mismatched file can never be applied, so those bytes are worth zero to
+everybody and shed first) - against `ceiling / n_effective`, where `n_effective` is 1
+plus the live peer digests this rank's walks already learn (0.2.29). A live sibling's
+bytes are then neither counted nor sheddable: the sibling owns them. The fail-safe
+direction is stated because it is the first question this change will be asked: with NO
+peer learned, `n_effective` is 1 and the share is the WHOLE ceiling - every release's
+behaviour, byte for byte - and the old store-wide trigger is kept as a floor so a pass
+can only ever start SOONER than before, never later: too timid is not a direction this
+exposes. See
+`disk_spill._attribute_walk_bytes`, `_share_of_ceiling`, `_ceiling_trigger` and
+`ceiling_share` in the section payload.
+
 WHAT CHANGED IN 0.2.25: the capacity ceiling stopped being able to relax itself.
 The store reached 334.9 GiB under a 192 GiB ceiling (29,532 files, ~145 GiB grown in
 the hour after boot and ~4 GiB/min - 240 GiB/hour - in the burst measured as `/home`
@@ -368,6 +390,58 @@ PEER_DIGEST_FRESH_SECONDS = 120.0    # SECONDS a foreign digest counts as "writi
 PEER_DIGEST_MIN_SIGHTINGS = 2        # FRESH committed files before a digest is believed
 MAX_PEER_DIGESTS = 32                # DIGESTS remembered (a 4-rank fleet needs 3)
 
+# THE FAIR SHARE: ONE CEILING IS NOT FOUR CEILINGS (0.2.30)
+# -----------------------------------------------------------------------------
+# THE DEFECT, MEASURED ON THE LIVE BOX (the night of 2026-10-22). Four ranks share ONE
+# spill root, and every one of them ran a ceiling pass whose decision number was the
+# WHOLE STORE'S bytes compared against the WHOLE CEILING. Measured, per rank, from the
+# rank files: 92 files written each and 2,106 / 2,106 / 1,872 / 1,872 files evicted -
+# 7,956 files, 156 GiB -> 68 GiB, against a 148 GiB ceiling with
+# `EVICT_TARGET_FRACTION = 0.9`, i.e. ONE pass should have shed ~23 GiB and four passes
+# shed ~4 x 23 GiB. Nothing miscounted: each rank correctly measured a 156 GiB store,
+# each correctly wanted 133 GiB, and all four then acted on the same directory. The
+# effective capacity of a shared store enforced this way is `ceiling / rank_count`, and
+# the more ranks a boot has, the more of its own cache it destroys.
+#
+# THE RULE NOW. A rank sizes only the bytes it is ACCOUNTABLE for - its own geometry
+# digest's files, plus the files that belong to nobody live (dead geometry from a
+# previous boot, which no rank can read and every rank may shed) - against
+# `ceiling / n_effective`, where `n_effective = 1 + (live peer digests learned)`. The
+# CONVERGENCE is arithmetic, not tuning: if every rank holds `own + dead/n <= 0.9 * C/N`
+# then the store holds `sum(own) + dead <= 0.9 * C`. Tonight's four ranks each get 33.3
+# GiB of budget instead of 133 GiB, and the store lands on the target instead of a
+# quarter past it.
+#     WHY THE DEAD BYTES ARE COUNTED IN FULL AGAINST EVERY RANK (rather than as a 1/N
+# share): a dead file is worth zero to every rank - the reader enforces an exact byte
+# size and digest match, so a mismatched file can NEVER be applied - and counting it
+# fully makes every rank shed the worthless bytes first, which is the eager direction.
+# The cost is that N ranks can over-shed a large dead population, and every byte of
+# that over-shed is a byte nobody could ever have read back. Counting it not at all
+# would be the dangerous choice: a store full of old geometry would stop triggering the
+# ceiling, which is 0.2.25's bug wearing a new hat.
+#     WHY A LIVE PEER'S BYTES ARE NOT COUNTED AND NOT SHEDDABLE: a live sibling is
+# accounting for exactly those bytes under its OWN share. Counting them here would
+# charge them twice and shed them twice; keeping them in the planner's entry list would
+# let a scaled estimate (which is deliberately conservative) reach into them. A rank
+# therefore cannot now delete a live peer's file at all - the peer's entries are removed
+# from the plan (`peer_entries_excluded`) - and if a sibling misbehaves and overruns its
+# share, the `MIN_FREE_BYTES` statvfs floor is what protects the filesystem, which is
+# the invariant the brief refuses to let regress.
+#     THE FAIL-SAFE DIRECTION, stated because it is the question the change will be
+# asked: with NO peer learned, `n_effective` is 1 and the share is the WHOLE ceiling -
+# i.e. every release's behaviour, byte for byte, never a timid hole at boot. The trigger
+# keeps the old store-wide clause as a floor (`estimated_bytes >= ceiling` still starts
+# a pass) so the new rule can only ever make a pass EARLIER, never later: capacity
+# safety cannot regress by construction. The worst case that permits is a 4-rank boot
+# whose ranks are mutually invisible - each holding up to 0.9 x ceiling of bytes it
+# cannot attribute to a live sibling, so the store up to ~3.6 x ceiling - bounded in
+# practice by the fact that the very pass that decides runs a walk that learns its peers
+# (so the window is one spill wide), and bounded hard by the `no_free_space` refusal.
+SHARE_SOURCE_PEERS = "peers_learned"       # n_effective = 1 + live peers
+SHARE_SOURCE_NO_PEERS = "no_live_peer_seen"  # n_effective = 1: today's behaviour
+SHARE_SOURCE_NO_DIGEST = "no_geometry_digest"  # cannot attribute: whole ceiling
+SHARE_SOURCE_UNATTRIBUTED = "not_measured_yet"  # no walk has run in this boot
+
 # The group-collision witness: which group ids this process has seen spill each
 # `key16`. Three caps, because this is a witness and not a database. The map is
 # what makes a collision observable in O(1) per spill with no directory scan on the
@@ -396,6 +470,47 @@ MAX_EPOCH_CHARS = 128
 
 WRITER_TAG = "kvtier-dev-plugin/disk-spill-1"
 PROTOCOL_VERSION = 1
+
+# EVERY COUNTER HERE IS ONE PROCESS'S, AND A READER MUST BE TOLD (0.2.30).
+# `disk_spill`'s state is a module global, and the writer thread and the ceiling pass
+# run in the process that COMMITS writes - a WORKER, four of them on a PP2xTP2 boot.
+# The process that answers `/snapshot` is a different process, which runs no writer
+# thread, so its `spilled`, `evictions` and `bytes_written` are zero BY CONSTRUCTION.
+# On 2026-10-22 an operator read `disk_spill.spilled: 0` while four ranks had written
+# 92 files each and evicted 7,956 between them, and was misled by it twice. The fix is
+# not a shared counter (no new IPC and no shared memory on a serving box); it is a RANK
+# ROLLUP beside these numbers, plus this label on them, so a zero that is true of one
+# process cannot be read as a zero that is true of the tier.
+PER_PROCESS_SCOPE_NOTE = (
+    "PER-PROCESS: every counter in this block is THIS process's own `disk_spill` "
+    "state. The writer thread and the ceiling pass run in the WORKER processes, so a "
+    "zero here says 'this process spilled nothing', never 'the tier spilled nothing' "
+    "- on the API or EngineCore process these are zero by construction. For the "
+    "fleet's numbers read the rank rollup beside this block (`disk_fill.per_rank` / "
+    "`disk_fill.totals` in /snapshot, `spill_rollup` in `op:status`), which sums each "
+    "rank's own counters from the rank files and names which ranks it summed and how "
+    "stale each one was.")
+PER_PROCESS_COUNTERS = ("requests", "accepted", "spilled", "duplicates",
+                        "bytes_written", "write_seconds", "read_seconds", "drops",
+                        "evictions", "evicted_bytes", "estimated_bytes", "errors",
+                        "queue_depth", "queue_depth_peak", "queue_bytes",
+                        "queue_bytes_peak", "window_files", "thread_started",
+                        "group_collisions", "journal_records", "journal_removals",
+                        "journal_failures", "journal_write_errors", "write_errors")
+
+
+def _per_process_units(units: dict) -> dict:
+    """The unit map, with the PER-PROCESS label written into the units themselves.
+
+    A reader that only looks at `units` (a dashboard's habit) still cannot mistake
+    `spilled: 0` for "nothing spilled": the dimension it is labelled with says whose
+    zero it is.
+    """
+    out = dict(units)
+    for name in PER_PROCESS_COUNTERS:
+        if name in out:
+            out[name] = f"{out[name]} (this process only)"
+    return out
 
 # Refusal reasons are a closed vocabulary: a counter per reason, so "nothing
 # happened" is always attributable rather than inferred.
@@ -508,6 +623,39 @@ _state: dict = {
     "peer_digests_unconfirmed": 0,
     "peer_digests_dropped": 0,
     "peer_files_planned": 0,
+    # THE FAIR SHARE (0.2.30): WHOSE BYTES THIS RANK IS ACCOUNTABLE FOR. Split out of
+    # the one store-wide `estimated_bytes`, because that single number is what the four
+    # ranks each read as "156 GiB, over my 148 GiB ceiling" and each acted on.
+    # `own_bytes` is this geometry digest's files, `foreign_dead_bytes` belongs to no
+    # geometry, shed first by everyone), `peer_live_bytes` is a live sibling's and is
+    # neither counted nor shed. `accountable = own + dead` is the number the ceiling is
+    # compared against, and `share_bytes` is its budget.
+    "estimated_own_bytes": 0,
+    "estimated_foreign_dead_bytes": 0,
+    "estimated_peer_live_bytes": 0,
+    "estimated_unattributed_bytes": 0,
+    # False until a walk has attributed the store's bytes by ownership. While False the
+    # rank cannot know its own share of a store it did not write, so it decides on
+    # `estimated_bytes` against the WHOLE ceiling - every earlier release's behaviour,
+    # which is the eager direction and the fail-safe one.
+    "bytes_attributed": False,
+    "share_bytes": None,
+    "share_divisor": None,
+    "share_source": None,
+    "share_target_bytes": None,
+    # THE "ANOTHER RANK GOT THERE FIRST" WITNESS. This runs on the writer thread, so it
+    # is a counter and not a log line: "four ranks, one pass did the work, three
+    # declined" is the signature of the fair share working, and it has to be readable
+    # live during a fill test rather than reconstructed from four files by hand.
+    "ceiling_passes_declined": 0,
+    "ceiling_declined_accountable_bytes": None,
+    "ceiling_declined_target_bytes": None,
+    # Entries the pass REMOVED from the destructive set because a live peer owns them:
+    # the counter that says "a rank had work to do and deliberately did not do it".
+    "peer_entries_excluded": 0,
+    # A pass that found itself over its target and had nothing it was allowed to shed.
+    # Distinct from `ceiling_passes_declined`, which means "already under".
+    "ceiling_passes_nothing_sheddable": 0,
     # THE UNLINK POOL (0.2.29). The count is the shape of the mechanism; the rest are
     # its evidence. `evict_threads_requested` is what the environment asked for and
     # `evict_threads_configured` what the pool built (they differ across a restart, and
@@ -598,11 +746,22 @@ def reset_state_for_tests() -> None:
         "peer_digest_sightings": 0, "peer_digest_learned": 0,
         "peer_digests_live": 0, "peer_digests_unconfirmed": 0,
         "peer_digests_dropped": 0, "peer_files_planned": 0,
+        # The fair share (0.2.30). Left behind by a reset, one test's peer count would
+        # hand the next test a share of 1/N it never earned, and a share that is too
+        # small over-evicts - the exact defect this release exists to remove.
+        "estimated_own_bytes": 0, "estimated_foreign_dead_bytes": 0,
+        "estimated_peer_live_bytes": 0, "estimated_unattributed_bytes": 0,
+        "bytes_attributed": False, "share_bytes": None,
+        "share_divisor": None, "share_source": None,
+        "share_target_bytes": None, "ceiling_passes_declined": 0,
+        "ceiling_declined_accountable_bytes": None,
+        "ceiling_declined_target_bytes": None, "peer_entries_excluded": 0,
+        "ceiling_passes_nothing_sheddable": 0,
         # The eviction pool (0.2.29): shut it down and forget its shape, exactly as
         # the reader threads are dropped, so no worker of one test mutates another's.
         "evict_threads_configured": 0, "evict_threads_alive": 0,
         "evict_batches_submitted": 0, "evict_files_unlinked": 0,
-        "evict_files_failed": 0, "evict_fallbacks": 0, "evict_serial_batches": 0,
+        "evict_files_failed": 0, "evict_fallbacks": 0, "evict_batches_serial": 0,
         "estimate_seed_key": None, "estimate_seed_walks": 0,
         "group_collisions": 0, "group_collision_samples": [],
         "digest_groups": {}, "digest_groups_dropped": 0,
@@ -1700,6 +1859,12 @@ def _handle_job(job) -> None:
                                     + float(result["elapsed_seconds"]), 6)
     _state["estimated_bytes"] = int(_state["estimated_bytes"]) + int(
         result["bytes_written"])
+    # Every byte THIS process commits is written under THIS rank's geometry digest, so
+    # the fair-share's own-bytes bucket tracks the same writes the store-wide counter
+    # does (0.2.30). Without this the share would only ever be re-measured by a walk and
+    # a rank would fly blind between passes about how much of its budget it had spent.
+    _state["estimated_own_bytes"] = int(_state["estimated_own_bytes"]) + int(
+        result["bytes_written"])
     _state["last_path"] = result["path"]
     # A fresh process knows nothing about the store it booted into; give the ceiling
     # that knowledge ONCE before it decides, or it cannot see a store it did not fill.
@@ -1743,8 +1908,9 @@ def _maybe_seed_estimate() -> None:
     THE COST IS ONE WALK. It happens on the first committed spill of a (root, ceiling)
     pair - 0.224 s measured replaying the live 34,896-file store, on the writer thread,
     where the walk's whole cost model already lives - and after that the fast path is
-    exactly what it was: no walk, no plan, no unlink until the estimate crosses the
-    ceiling. A reconfigure (a different root or ceiling) re-seeds; a steady boot does
+    exactly what it was: no walk, no plan and no unlink until this rank's accountable
+    bytes cross its share of the ceiling (or the store crosses the whole ceiling). A
+    reconfigure (a different root or ceiling) re-seeds; a steady boot does
     not walk twice. A walk that could not measure anything (a missing store, or the
     entry-bound starved `sample_unmeasured`) leaves the running estimate alone rather
     than writing a 0 into it - the same rule `_enforce_ceiling` applies to its own walk.
@@ -1768,7 +1934,16 @@ def _maybe_seed_estimate() -> None:
     _publish_walk(walk)
     if walk["truncated"] and int(walk["files"]) == 0:
         return
-    _state["estimated_bytes"] = int(walk["estimated_total_bytes"])
+    # THE SEED DOES THE APPORTIONMENT TOO (0.2.30). A rank booting into a store the
+    # filled must learn its share before it decides anything, and the walk that measures
+    # the store is the same walk that learns which foreign digests are alive - so the
+    # first ceiling decision of a boot is a fair-share decision, not a store-wide one.
+    # That ordering is the whole reason the fail-safe direction is cheap: by the time a
+    # pass is expensive enough to matter, this rank has already walked the store once.
+    attribution = _attribute_walk_bytes(walk, _live_peer_digests())
+    _apply_attribution(attribution, int(walk["estimated_total_bytes"]),
+                       _share_of_ceiling(int(ceiling), attribution["divisor"],
+                                         attribution["source"]))
 
 
 # --- the live peer ranks: learning which foreign digests are somebody's data ---
@@ -1860,6 +2035,174 @@ def _live_peer_digests() -> tuple:
     return tuple(sorted(live))
 
 
+# --- the fair share: whose bytes is this rank accountable for? ---------------
+
+def _scale_to_store(sample: int, used: int, scaled_total: int) -> int:
+    """One class's sample bytes, scaled by the walk's OWN scaling factor.
+
+    The walk already publishes the number the whole-store estimate came from
+    (`estimated_total_bytes`) and the number it was scaled out of (`used_bytes`), so
+    reusing that ratio for the per-owner classes cannot disagree with it: for a full
+    measurement the two are equal and every class comes back byte for byte, which is the
+    property every store inside the walk's caps rests on.
+    """
+    if used <= 0 or scaled_total <= used:
+        return int(sample)
+    return int(int(sample) * int(scaled_total) // int(used))
+
+
+def _attribute_walk_bytes(walk: dict, peers) -> dict:
+    """WHO owns the bytes one walk measured, and therefore what this rank's share is.
+
+    Returns the per-owner byte totals (scaled to the store the way the walk scaled its
+    own total), the entries this rank is ALLOWED to shed, and the divisor for the share.
+    Never raises and never plans: this is the measurement half of the decision, and
+    `disk_layout.lru_eviction_plan` stays the only owner of the ORDER.
+
+    THE FOUR BUCKETS, and the rule for each:
+      * `current` (this geometry digest) -> OWN. Counted in full against this rank's
+        share: these are the bytes this rank wrote for its own readers.
+      * `stale_geometry` / `stale_key_shape` -> DEAD. Belongs to no live rank: a reader
+        enforces an exact digest AND byte-size match, so a mismatched file can never be
+        applied by anybody, and every rank may shed them. Counted against EVERY rank's
+        share, so the worthless bytes go first whoever wakes up (the constant block
+        above says why a 1/N share of them is the wrong trade).
+      * `peer_rank` (a digest learned to be a live sibling's) -> NEITHER counted NOR
+        sheddable. The sibling accounts for those bytes under its own share; charging
+        them here as well would make two ranks shed one file's worth of pressure, and
+        leaving them in the planner's entry list would let a deliberately conservative
+        scaled estimate reach into a live sibling's data.
+      * anything else (a name this tier cannot classify) -> UNATTRIBUTED: counted as
+        capacity, never handed to the planner, which would only refuse it.
+    """
+    digest = _state["geometry_digest"]
+    entries = [row for row in (walk.get("entries") or []) if isinstance(row, dict)]
+    used = int(walk.get("used_bytes") or 0)
+    scaled_total = int(walk.get("estimated_total_bytes") or 0)
+    if not isinstance(digest, str) or not digest:
+        # No fingerprint means no ownership can be established for ANY file here, so
+        # there is nothing to apportion. Fall back to the whole store against the whole
+        # ceiling - what every release before 0.2.30 did, and the direction that can
+        # only ever shed MORE, never less.
+        return {"attributed": False, "own_bytes": 0, "dead_bytes": 0,
+                "peer_bytes": 0, "unattributed_bytes": scaled_total,
+                "accountable_bytes": scaled_total, "peers": tuple(peers or ()),
+                "divisor": 1, "source": SHARE_SOURCE_NO_DIGEST,
+                "sheddable_entries": entries, "peer_entries": 0}
+    own = dead = peer = unattributed = 0
+    sheddable: list = []
+    peer_entries = 0
+    for row in entries:
+        size = int(row.get("size_bytes") or 0)
+        name = row.get("filename") or os.path.basename(str(row.get("path") or ""))
+        kind = disk_layout.classify_name(name, digest, peers)["classification"]
+        if kind == disk_layout.NAME_CURRENT:
+            own += size
+            sheddable.append(row)
+        elif kind in (disk_layout.NAME_STALE_GEOMETRY,
+                      disk_layout.NAME_STALE_KEY_SHAPE):
+            dead += size
+            sheddable.append(row)
+        elif kind == disk_layout.NAME_PEER_RANK:
+            peer += size
+            peer_entries += 1
+        else:
+            unattributed += size
+    return {"attributed": True,
+            "own_bytes": _scale_to_store(own, used, scaled_total),
+            "dead_bytes": _scale_to_store(dead, used, scaled_total),
+            "peer_bytes": _scale_to_store(peer, used, scaled_total),
+            "unattributed_bytes": _scale_to_store(unattributed, used, scaled_total),
+            "accountable_bytes": _scale_to_store(own + dead + unattributed, used,
+                                                 scaled_total),
+            "peers": tuple(peers or ()), "divisor": 1 + len(peers or ()),
+            "source": SHARE_SOURCE_PEERS if peers else SHARE_SOURCE_NO_PEERS,
+            "sheddable_entries": sheddable, "peer_entries": int(peer_entries)}
+
+
+def _share_of_ceiling(ceiling, divisor: int, source: str) -> dict:
+    """This rank's slice of a ceiling that `divisor` ranks share. Pure: pinnable.
+
+    `divisor == 1` returns the ceiling and the target UNCHANGED, byte for byte, which is
+    what makes the single-rank case (one rank on the box, or a boot that cannot see a
+    sibling) identical to every release before this one. The floor division is
+    deliberate: a share rounded UP would hand N ranks a combined budget larger than the
+    ceiling they were configured with.
+    """
+    safe = max(1, int(divisor))
+    share = int(int(ceiling) // safe)
+    if share <= 0:
+        # A ceiling smaller than the rank count is a misconfiguration, not a licence to
+        # evict everything: 1 byte is a budget, 0 means "delete the store".
+        share = 1
+    return {"ceiling_bytes": int(ceiling), "divisor": safe,
+            "share_bytes": share,
+            "target_bytes": int(share * EVICT_TARGET_FRACTION), "source": source}
+
+
+def _apply_attribution(attribution: dict, decision_bytes: int,
+                       share: dict) -> None:
+    """Publish WHOSE bytes these are, so the next trigger and every payload agree.
+
+    ONE place, because the trigger (`_ceiling_trigger`) and the decision
+    (`_run_ceiling_pass`) must read the same split; two writers of these counters is how
+    a share and a measurement start disagreeing.
+    """
+    _state["estimated_bytes"] = int(decision_bytes)
+    _state["bytes_attributed"] = bool(attribution["attributed"])
+    _state["estimated_own_bytes"] = int(attribution["own_bytes"])
+    _state["estimated_foreign_dead_bytes"] = int(attribution["dead_bytes"])
+    _state["estimated_peer_live_bytes"] = int(attribution["peer_bytes"])
+    _state["estimated_unattributed_bytes"] = int(attribution["unattributed_bytes"])
+    _state["share_bytes"] = int(share["share_bytes"])
+    _state["share_divisor"] = int(share["divisor"])
+    _state["share_source"] = str(share["source"])
+    _state["share_target_bytes"] = int(share["target_bytes"])
+
+
+def _accountable_bytes() -> int:
+    """The bytes THIS rank is accountable for. Never a walk, never a syscall.
+
+    Before the first attribution the rank cannot tell its own bytes from a store it did
+    not write, so it reports the store-wide number - the pre-0.2.30 behaviour, and the
+    eager direction.
+    """
+    if not _state["bytes_attributed"]:
+        return int(_state["estimated_bytes"])
+    return (int(_state["estimated_own_bytes"])
+            + int(_state["estimated_foreign_dead_bytes"])
+            + int(_state["estimated_unattributed_bytes"]))
+
+
+def _ceiling_trigger() -> dict:
+    """Should a pass run, and against which number? Reads counters only, no walk.
+
+    TWO clauses, and the second is the whole reason this cannot regress capacity safety:
+      * `over_share` - the new fair share: my accountable bytes reached my slice.
+      * `over_store_ceiling` - the pre-0.2.30 rule, kept verbatim: the store-wide
+        estimate reached the WHOLE ceiling. With no peers learned the share IS the
+        whole ceiling, so the two clauses coincide; with peers learned the first one
+        fires strictly EARLIER. A pass can therefore only ever start sooner than it did
+        in every release before this one, never later.
+    """
+    ceiling = _state["ceiling_bytes"]
+    if not ceiling:
+        return {"run": False, "reason": "no ceiling configured"}
+    accountable = _accountable_bytes()
+    share = (int(_state["share_bytes"]) if (_state["bytes_attributed"]
+                                            and _state["share_bytes"])
+             else int(ceiling))
+    over_share = accountable >= share
+    over_store = int(_state["estimated_bytes"]) >= int(ceiling)
+    return {"run": bool(over_share or over_store),
+            "ceiling_bytes": int(ceiling), "share_bytes": share,
+            "accountable_bytes": accountable, "over_share": over_share,
+            "over_store_ceiling": over_store,
+            "reason": ("fair share reached" if over_share else
+                       ("store-wide ceiling reached" if over_store else
+                        "under the fair share and the store-wide ceiling"))}
+
+
 def _ceiling_budget_seconds() -> dict:
     """The pass's time budget in force: the operator's, else the shipped default.
 
@@ -1940,9 +2283,28 @@ def _enforce_ceiling() -> None:
     every file it deletes is journalled (`_journal_write(..., removal=True)`) - an
     un-journalled removal makes the index offer a dead file, which costs a reported
     load failure instead of a plain recompute.
+
+    WHAT CHANGED IN 0.2.30: the number above is no longer the number the ceiling is
+    compared against. Four ranks sharing ONE root each measured the WHOLE store (156
+    GiB), each compared it against the WHOLE ceiling (148 GiB) and each shed down to
+    0.9 x that target, so one pass's worth of relief was paid FOUR times over: 7,956
+    files evicted and 156 GiB -> 68 GiB where 23 GiB was the plan. A shared store
+    enforced that way has an effective capacity of `ceiling / rank_count`. A rank now
+    sizes only the bytes it is ACCOUNTABLE for - its own digest's files plus the dead
+    geometry no live rank owns - against `ceiling / n_effective`, where `n_effective`
+    is 1 plus the live peer digests this rank's walks have learned (0.2.29 already
+    learns them, so the rank count comes from work the pass was doing anyway). See
+    `_attribute_walk_bytes`, `_share_of_ceiling` and `_ceiling_trigger`; the fail-safe
+    direction (no peers learned => the whole ceiling, exactly as before) and its worst
+    case are documented on the constant block above.
     """
     ceiling = _state["ceiling_bytes"]
-    if not ceiling or int(_state["estimated_bytes"]) < int(ceiling):
+    if not ceiling:
+        return
+    # THE GATE, and it is a fair share now rather than the store-wide total. The
+    # store-wide clause is kept INSIDE the trigger, so this can only ever run a pass
+    # SOONER than every release before 0.2.30 did, never later.
+    if not _ceiling_trigger()["run"]:
         return
     root = _state["root"]
     if not root:
@@ -2211,6 +2573,28 @@ def _unlink_batch(directory, paths, peers) -> dict | None:
         return None
 
 
+def _owner_of_name(path, peers) -> str:
+    """Which owner's bucket one deleted path came out of: own / dead / peer / other.
+
+    Name-only, so it costs a parse and nothing else, and it is the same classification
+    the planner used a moment earlier. Used for the post-pass bookkeeping only: the
+    decision was already made against `_attribute_walk_bytes`'s split.
+    """
+    try:
+        name = os.path.basename(str(path or ""))
+        kind = disk_layout.classify_name(name, _state["geometry_digest"],
+                                        peers)["classification"]
+    except Exception:  # noqa: BLE001 - a bookkeeping helper never breaks a pass
+        return "unattributed"
+    if kind == disk_layout.NAME_CURRENT:
+        return "own"
+    if kind in (disk_layout.NAME_STALE_GEOMETRY, disk_layout.NAME_STALE_KEY_SHAPE):
+        return "dead"
+    if kind == disk_layout.NAME_PEER_RANK:
+        return "peer"
+    return "unattributed"
+
+
 def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     """One enforcement pass: walk, decide, shed. Deadline-aware, partial by design.
 
@@ -2229,7 +2613,10 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # THE SIBLING DIGESTS, decided NOW (freshness is the point) and handed to the
     # planner AND the executor. Empty is the fail-safe direction: the plan then sees a
     # foreign digest as `stale_geometry` and sheds it first, exactly as it did before
-    # 0.2.29, and `peer_digests_unconfirmed` counts the fact.
+    # 0.2.29, and `peer_digests_unconfirmed` counts the fact. Since 0.2.30 the same
+    # tuple does a second job: it IS the rank count, because `n_effective` is 1 plus the
+    # live peers, and that is what turns a 148 GiB ceiling shared by four ranks into
+    # four 37 GiB budgets instead of four ranks each defending 148 GiB of one directory.
     peers = _live_peer_digests()
     # THE DECISION NUMBER. `estimated_total_bytes` equals `used_bytes` whenever the
     # walk measured the whole store, so a store inside the caps cannot tell this
@@ -2250,24 +2637,62 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
             f"({int(walk['skipped_files'])} not measurable by this tier), so the "
             "estimate was kept and nothing was planned")
         return
-    plan = disk_layout.lru_eviction_plan(
-        walk["entries"], geometry_digest=_state["geometry_digest"],
-        ceiling_bytes=int(ceiling), used_bytes=decision_bytes,
-        target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers)
+    # WHOSE BYTES THESE ARE, and therefore what this rank's slice of the ceiling is.
+    # This is the half the 2026-10-22 over-eviction was missing: four ranks, one
+    # directory, one store-wide number each read as its own problem.
+    attribution = _attribute_walk_bytes(walk, peers)
+    share = _share_of_ceiling(int(ceiling), attribution["divisor"],
+                              attribution["source"])
+    accountable = int(attribution["accountable_bytes"])
+    target = int(share["target_bytes"])
     _state["ceiling_checks"] = int(_state["ceiling_checks"]) + 1
-    _state["estimated_bytes"] = decision_bytes
+    _apply_attribution(attribution, decision_bytes, share)
+    _state["peer_entries_excluded"] = int(_state["peer_entries_excluded"]) + int(
+        attribution["peer_entries"])
     # Publish HOW the decision was made, not just what it was. A reader of
     # `estimated_bytes` must be able to tell "the store is 170 GiB" from "I stat-ed
     # 20,000 of 29,532 files and extrapolated 170 GiB from them": see `section()`.
     _publish_walk(walk)
-    _state["plan_truncated"] = bool(plan.get("truncated"))
     if walk["truncated"]:
         _state["last_reason"] = (
             f"ceiling decided on {walk['measurement_basis']}: "
             f"{int(walk['files'])} of {int(walk['total_files'])} file(s) stat-ed, "
             f"{int(walk['used_bytes'])} measured bytes scaled to "
             f"{decision_bytes}")
+    if accountable <= target:
+        # THE DECLINE, counted and not logged, because this runs on the spill writer
+        # thread and the signature it needs to show is arithmetic: "four ranks, one pass
+        # did the work, three declined". It means THIS rank's accountable bytes (its own
+        # files plus the dead geometry no live rank owns) are already at or under its
+        # slice - usually because a sibling's pass got there first, which is precisely
+        # the behaviour the fair share exists to produce.
+        _state["ceiling_passes_declined"] = int(_state["ceiling_passes_declined"]) + 1
+        _state["ceiling_declined_accountable_bytes"] = int(accountable)
+        _state["ceiling_declined_target_bytes"] = int(target)
+        _state["last_reason"] = (
+            f"the pass declined: {accountable} accountable byte(s) "
+            f"(own {attribution['own_bytes']} + dead "
+            f"{attribution['dead_bytes']}) are at or under this rank's "
+            f"{target}-byte share of a {int(ceiling)}-byte ceiling across "
+            f"{share['divisor']} rank(s), so nothing was shed")[:MAX_STRING_CHARS]
+        return
+    plan = disk_layout.lru_eviction_plan(
+        attribution["sheddable_entries"],
+        geometry_digest=_state["geometry_digest"],
+        ceiling_bytes=int(share["share_bytes"]), used_bytes=accountable,
+        target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers)
+    _state["plan_truncated"] = bool(plan.get("truncated"))
     if not plan["ok"] or not plan["paths"]:
+        # Over its share and nothing it is ALLOWED to shed: a different fact from the
+        # decline above, and the one case where the filesystem floor (`MIN_FREE_BYTES`,
+        # refusal `no_free_space`) is the control that keeps the box alive. Counted, and
+        # said, because "the tier wanted to shed and could not" must never be quiet.
+        _state["ceiling_passes_nothing_sheddable"] = (
+            int(_state["ceiling_passes_nothing_sheddable"]) + 1)
+        why = str(plan.get("reason") or "no evictable entry named")[:96]
+        _state["last_reason"] = (
+            f"over the {target}-byte share by {accountable - target} byte(s) but the "
+            f"plan named nothing: {why}")[:MAX_STRING_CHARS]
         return
     _state["peer_files_planned"] = int(plan.get("peer_rank") or 0)
     by_directory: dict = {}
@@ -2282,6 +2707,11 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     freed = 0
     unlinked = 0
     failed = 0
+    # FREED BYTES BY OWNER, so the fair-share estimate comes down by the right amount.
+    # A rank that shed 10 of its OWN files must not have its `dead` estimate shrink, and
+    # a byte shed from a live sibling (which the plan can no longer name) would show up
+    # here as a fact rather than as a silent miscount.
+    freed_by_owner = {"own": 0, "dead": 0, "peer": 0, "unattributed": 0}
     for directory, done in reports:
         # COLLECTION, on the spill thread, in submission order. This is where every
         # counter and every journal write happens, so the removal journal is written in
@@ -2301,6 +2731,8 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
             outcome = action.get("action")
             if outcome == "unlinked":
                 unlinked += 1
+                freed_by_owner[_owner_of_name(action.get("path"), peers)] += int(
+                    action.get("size_bytes") or 0)
                 # EVERY file this plan actually deleted is journalled, so the
                 # scheduler's index stops offering it within one refresh. Without this
                 # half the journal the index would keep offering files whose bytes the
@@ -2340,8 +2772,20 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     _state["evictions"] = int(_state["evictions"]) + int(attempted)
     _state["evicted_bytes"] = int(_state["evicted_bytes"]) + freed
     # The estimate comes DOWN by what was really freed, off the DECISION number: on
-    # a full walk that is the measurement, exactly as it always was.
+    # a full walk that is the measurement, exactly as it always was. The per-owner
+    # estimates come down by the same rule, each against its OWN bucket: the fair share
+    # is only honest if the number it was decided on tracks the bytes that left.
     _state["estimated_bytes"] = max(0, decision_bytes - freed)
+    _state["estimated_own_bytes"] = max(
+        0, int(_state["estimated_own_bytes"]) - freed_by_owner["own"])
+    _state["estimated_foreign_dead_bytes"] = max(
+        0, int(_state["estimated_foreign_dead_bytes"])
+        - freed_by_owner["dead"])
+    _state["estimated_peer_live_bytes"] = max(
+        0, int(_state["estimated_peer_live_bytes"]) - freed_by_owner["peer"])
+    _state["estimated_unattributed_bytes"] = max(
+        0, int(_state["estimated_unattributed_bytes"])
+        - freed_by_owner["unattributed"])
 
 
 def _capacity_visible(parsed: dict) -> bool:
@@ -2984,6 +3428,9 @@ def section() -> dict:
     journal_index = disk_index.counters()
     return {
         "capability": capability(),
+        # WHICH PROCESS these numbers belong to, placed beside the counters themselves
+        # because the mistake it prevents was made twice on one night.
+        "scope": PER_PROCESS_SCOPE_NOTE,
         "configured": bool(state["configured"]),
         "root": state["root"],
         "ceiling_bytes": state["ceiling_bytes"],
@@ -3072,6 +3519,67 @@ def section() -> dict:
                                         "skipped_files", "ceiling_checks",
                                         "seed_walks", "deadline_hits",
                                         "budget_seconds", "pass_seconds"),
+        },
+        # THE FAIR SHARE (0.2.30): THE NUMBER THE CEILING WAS ACTUALLY COMPARED
+        # AGAINST, and who else is sharing it. This is the block that makes tonight's
+        # over-eviction readable while it is happening: four ranks sharing a root each
+        # used to defend the WHOLE ceiling over one directory, and the only way to see
+        # that is broken is to see the share each rank believes it owns.
+        "ceiling_share": {
+            # The bytes this rank is accountable for, and the budget they are measured
+            # against. `share_bytes` is `ceiling / n_effective`; `target_bytes` is that
+            # share times `EVICT_TARGET_FRACTION`, which is what a pass sheds toward.
+            "accountable_bytes": _accountable_bytes(),
+            "own_bytes": int(_state["estimated_own_bytes"]),
+            "dead_bytes": int(_state["estimated_foreign_dead_bytes"]),
+            "peer_live_bytes": int(_state["estimated_peer_live_bytes"]),
+            "unattributed_bytes": int(_state["estimated_unattributed_bytes"]),
+            "share_bytes": _state["share_bytes"],
+            "target_bytes": _state["share_target_bytes"],
+            "share_divisor": _state["share_divisor"],
+            # 1 + live peers, which is the ONLY honest rank count this module can get
+            # without an engine change: the walk that measures the store is the walk
+            # that learns who is writing to it. `no_live_peer_seen` means the rank
+            # behaves exactly as every release before 0.2.30 did (the whole ceiling).
+            "n_effective": (1 + int(_state["peer_digests_live"]) if
+                            _state["bytes_attributed"] else None),
+            "share_source": _state["share_source"],
+            "attributed": bool(_state["bytes_attributed"]),
+            # THE "ONE RANK DID THE WORK, THREE DECLINED" WITNESS. A counter, not a log
+            # line, because the pass runs on the spill writer thread and the signature
+            # has to be watchable live across four rank files.
+            "passes_declined": int(_state["ceiling_passes_declined"]),
+            "declined_accountable_bytes": _state["ceiling_declined_accountable_bytes"],
+            "declined_target_bytes": _state["ceiling_declined_target_bytes"],
+            "passes_nothing_sheddable": int(
+                _state["ceiling_passes_nothing_sheddable"]),
+            "peer_entries_excluded": int(_state["peer_entries_excluded"]),
+            "store_estimate_bytes": int(_state["estimated_bytes"]),
+            "note": ("the store is SHARED by every rank whose fingerprint digest "
+                     "appears in it, so a rank that sizes the WHOLE store against the "
+                     "WHOLE ceiling makes the effective capacity ceiling/rank_count: "
+                     "measured on the live box on 2026-10-22, four ranks each shed "
+                     "~23 GiB of the same 23 GiB (7,956 files, 156 GiB -> 68 GiB under "
+                     "a 148 GiB ceiling whose one-pass target was 133 GiB). "
+                     "`accountable_bytes` = this rank's own files + the dead geometry "
+                     "no live rank owns, and `peer_live_bytes` is deliberately "
+                     "EXCLUDED from it: a live sibling accounts for those under its "
+                     "own share, and they are no longer in this rank's destructive set "
+                     "at all (`peer_entries_excluded` counts what was withheld). With "
+                     "no peer learned, `n_effective` is 1 and the share is the whole "
+                     "ceiling - every earlier release's behaviour, so the fail-safe "
+                     "direction is 'sheds like before', never 'too timid to protect "
+                     "the filesystem'."),
+            "units": disk_layout._units("accountable_bytes", "own_bytes",
+                                        "dead_bytes", "peer_live_bytes",
+                                        "unattributed_bytes", "share_bytes",
+                                        "target_bytes", "share_divisor",
+                                        "n_effective", "passes_declined",
+                                        "declined_accountable_bytes",
+                                        "declined_target_bytes",
+                                        "passes_nothing_sheddable",
+                                        "peer_entries_excluded", "store_estimate_bytes",
+                                        "ceiling_bytes"),
         },
         # THE PEERS THIS RANK CAN SEE, and the pool that does the unlinks (0.2.29).
         # Both belong beside the ceiling witness because both only mean anything next
@@ -3217,21 +3725,22 @@ def section() -> dict:
         "last_path": _clip(_state["last_path"]),
         "last_reason": _clip(_state["last_reason"]),
         "last_error": _clip(_state["last_error"]),
-        "units": disk_layout._units("bytes_written", "evicted_bytes",
-                                    "estimated_bytes", "write_seconds",
-                                    "read_seconds", "ceiling_bytes", "requests",
-                                    "accepted", "spilled", "duplicates",
-                                    "drops", "evictions", "errors", "queue_depth",
-                                    "queue_depth_peak", "queue_bytes",
-                                    "queue_bytes_peak", "queue_max", "window_files",
-                                    "thread_started", "thread_alive",
-                                    "group_collisions", "digest_groups_tracked",
-                                    "digest_groups_cap",
-                                    "digest_groups_dropped",
-                                    "digest_group_overflow",
-                                    "sibling_probe_failures", "journal_records",
-                                    "journal_removals", "journal_failures",
-                                    "journal_write_errors", "write_errors"),
+        "units": _per_process_units(disk_layout._units(
+            "bytes_written", "evicted_bytes",
+            "estimated_bytes", "write_seconds",
+            "read_seconds", "ceiling_bytes", "requests",
+            "accepted", "spilled", "duplicates",
+            "drops", "evictions", "errors", "queue_depth",
+            "queue_depth_peak", "queue_bytes",
+            "queue_bytes_peak", "queue_max", "window_files",
+            "thread_started", "thread_alive",
+            "group_collisions", "digest_groups_tracked",
+            "digest_groups_cap",
+            "digest_groups_dropped",
+            "digest_group_overflow",
+            "sibling_probe_failures", "journal_records",
+            "journal_removals", "journal_failures",
+            "journal_write_errors", "write_errors")),
     }
 
 

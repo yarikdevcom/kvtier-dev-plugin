@@ -362,6 +362,35 @@ UNITS_BY_NAME = {
     "journal_seq_seed": "lines",
     "journal_writes": "lines",
     "journal_write_errors": "writes",
+    # THE FAIR SHARE (0.2.30), as published in the spill section's `ceiling_share`
+    # block and in the `/snapshot` `disk_fill` block. Declared explicitly for the same
+    # reason as the peer-rank fields below: an undeclared name reaches a dashboard
+    # dimensionless, and `tests/test_disk_spill.py` fails the build on it.
+    "accountable_bytes": "bytes",
+    "own_bytes": "bytes",
+    "dead_bytes": "bytes",
+    "peer_live_bytes": "bytes",
+    "unattributed_bytes": "bytes",
+    "share_bytes": "bytes",
+    "share_divisor": "ranks",
+    "share_target_bytes": "bytes",
+    "n_effective": "ranks",
+    "store_estimate_bytes": "bytes",
+    "used_fraction": "fraction of the ceiling",
+    "passes_declined": "passes",
+    "declined_accountable_bytes": "bytes",
+    "declined_target_bytes": "bytes",
+    "peer_entries_excluded": "files",
+    "passes_nothing_sheddable": "passes",
+    "files_written": "files",
+    "file_age_seconds": "seconds",
+    "age_seconds": "seconds",
+    "ranks_expected": "ranks",
+    "ranks_reported": "ranks",
+    "ranks_with_evictions": "ranks",
+    "ranks_declining": "ranks",
+    "recency_promotions": "reads",
+    "recency_promotions_throttled": "reads",
     # THE LIVE PEER RANKS and the UNLINK POOL (0.2.29), as published in the spill
     # section's `peer_ranks` / `evict_pool` blocks. Declared explicitly because a
     # payload that reports `"units": {"live_digests": "unknown"}` is a payload a reader

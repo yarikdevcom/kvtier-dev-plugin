@@ -2237,8 +2237,99 @@ the submission, releasing bytes, marking itself, and re-running to convergence w
 deleting anything twice; the pool at 1 and 4 shedding the same files and never handing a
 path to two workers).
 
-## Steering and vetoing the tier at runtime (`store_hook.py`)
+### Four ranks, one ceiling: the fair share, and `disk_fill` (0.2.30)
 
+**What the operator measured**: a four-rank boot sharing one spill root wrote 92 files
+per rank and evicted **2,106 / 2,106 / 1,872 / 1,872** files - **7,956 files, 156 GiB
+down to 68 GiB** - under a **148 GiB** ceiling whose `EVICT_TARGET_FRACTION` of 0.9 made
+the one-pass target 133 GiB. One pass owed ~23 GiB. Four passes shed ~23 GiB each.
+
+**What was wrong**: nothing miscounted. Every rank measured the WHOLE store (156 GiB),
+every rank correctly wanted it at 133 GiB, and all four then acted on the SAME
+directory. A shared store enforced per-rank against the whole ceiling has an effective
+capacity of `ceiling / rank_count`, so the more ranks a boot has, the more of its own
+cache it destroys.
+
+**The rule now.** A rank sizes only the bytes it is ACCOUNTABLE for - its own geometry
+digest's files, plus the files that belong to no live rank (`stale_geometry` /
+`stale_key_shape`: a reader enforces an exact digest and byte-size match, so a mismatched
+file can never be applied by anybody and every rank may shed it) - against
+`ceiling / n_effective`, where `n_effective = 1 + (live peer digests its own walks
+learned)`. A live sibling's bytes are then **neither counted nor sheddable**: its
+entries leave the planner's input entirely (`peer_entries_excluded` counts what was
+withheld), because the sibling accounts for them under its own share. The convergence is
+arithmetic, not tuning: if every rank holds `own + dead <= 0.9 x C/N`, the store holds
+`<= 0.9 x C`.
+
+**The fail-safe direction, stated because it is the first question asked.** With no peer
+learned, `n_effective` is 1, the share IS the whole ceiling, and the pass sheds byte for
+byte what every release before this one shed - including a single-rank boot. The old
+store-wide clause is kept INSIDE `_ceiling_trigger` (`estimated_bytes >= ceiling` still
+starts a pass), so the new rule can only ever make a pass start SOONER, never later:
+capacity safety cannot regress by construction, and `too timid` is not a direction this
+exposes. The worst case it permits is a boot whose ranks are mutually invisible - each
+holding up to `0.9 x ceiling` of unattributed bytes - which is bounded in practice by the
+walk the deciding pass itself performs, and hard-bounded by the unchanged `statvfs`
+floor (`MIN_FREE_BYTES`, refusal `no_free_space`).
+
+**The witnesses.** `disk_spill.section().ceiling_share` publishes `accountable_bytes`,
+`own_bytes`, `dead_bytes`, `peer_live_bytes`, `unattributed_bytes`, `share_bytes`,
+`target_bytes`, `share_divisor`/`n_effective`, `share_source`, and
+**`passes_declined`** - the count of passes that walked, found their accountable bytes
+already inside their share, and shed nothing. That is the "one rank did the work and
+three declined" signature, counted rather than logged, because the pass runs on the
+spill writer thread. `passes_nothing_sheddable` is the different fact: over its share and
+nothing it is allowed to shed (where the filesystem floor is the control).
+
+**`disk_fill`: one block that answers "how full is the SSD tier, and is that a
+problem"**, at the top level of `GET|POST /plugins/kvtier/snapshot` and `GET
+/plugins/kvtier/status`. It is built from the rank files the WORKERS write (behind
+`rank_rollup`'s one-second cache, keyed on a content signature, so a rank that wrote is
+visible on the next read), it makes no engine call, and it emits rank entries only -
+capped at `DISK_FILL_RANK_CAP` with `per_rank_truncated` said out loud. The keys a proxy
+should write against:
+
+| key | meaning |
+|-----|---------|
+| `used_bytes`, `ceiling_bytes`, `used_fraction`, `target_fraction`, `target_bytes`, `headroom_bytes`, `over_target`, `over_ceiling` | the fill, as arithmetic - no caller-side maths |
+| `basis` | **how the size was measured**: `full_measurement`, `sample_scaled: n of m`, `no_rank_files`, `no_rank_reported_a_measurement` |
+| `read_basis` / `ceiling_basis` | how complete the READ was / whose ceiling this is (`ranks_agree`, `ranks_disagree`, `this_process_env_only`) |
+| `used_bytes_source`, `used_bytes_spread_bytes` | which rank the number came from, and how far the ranks' views were apart |
+| `ranks_expected`, `ranks_reported`, `missing_ranks` | fleet coverage. `ranks_expected`/`missing_ranks` are **null, not `[]`**, when this process cannot know the rank set |
+| `per_rank[]` | `rank`, `file_age_seconds`, `files_written`/`spilled`, `bytes_written`, `evictions`, `journal_removals`, `drops`, `queue_depth`, `recency_promotions`, `recency_promotions_throttled`, `ceiling_share_bytes`, `share_divisor`, `declined_because_already_under`, `estimated_bytes`, `walk_basis`, `writer_thread_alive` |
+| `totals`, `totals_are_lower_bound`, `lower_bound_reason` | the fleet sum over FRESH ranks only, with the ranks it could not see named |
+| `cross_process_verdict` | `shared_share` / `single_rank_share` / `ranks_disagree_on_the_share` / `no_ranks_reported`, with `ranks_acting`, `ranks_declining_names`, `declines_total`, `n_effective` |
+| `per_process_note` | the sentence that says the flat `disk_spill` / `disk_store` counters beside it are THIS process's own and read zero on the API process |
+
+`used_bytes` is the FRESHEST rank's estimate and NEVER a sum: four ranks measuring one
+directory produced four views of one number, and adding them would be the same mistake
+the ceiling just stopped making. A store nobody has measured is `used_bytes: null`, never
+`0` - "empty" and "unmeasured" are different facts, and on a polled dashboard only one of
+them is a lie.
+
+**The flat sections now label themselves.** The zeros an operator reads at 03:00 are
+usually not wrong, just mis-scoped, so `disk_spill.scope` and `disk_store.scope` state in
+the payload that every counter in those blocks is THIS process's own - the writer thread,
+the ceiling pass and the spill hook all live in the process that steps tokens, so on the
+API process they are zero *by construction* - and point at `disk_fill` / `spill_rollup`
+for the fleet's numbers.
+
+Tests: `tests/test_ceiling_fair_share_multi_rank.py` (four ranks that all measured the
+same pre-shed store and then all acted on it, the incident's interleaving: the store
+lands at or under `0.9 x ceiling` AND the bytes freed are within ~1x of the overshoot -
+the pre-0.2.30 code frees **4.0x** it, which is what the incident was; the second round
+declines and deletes nothing; a lone rank still sheds to 9/10 of the whole ceiling, byte
+for byte as before; the share's floor arithmetic; and the trigger firing no later than
+the store-wide rule ever did), `tests/test_disk_fill_block.py` (the fill as arithmetic,
+the `basis`/`read_basis`/`ceiling_basis` distinction, nulls instead of invented numbers,
+missing ranks named, a stale rank aged, the size cap at 24 ranks, and the signature
+cache reparsing when a rank file changes), and eleven tests in `tests/test_routes.py`
+(the proxy peer on `192.168.2.64` reading the block with the token, a 403 without it, a
+token not bypassing the allowlist, loopback needing no token, a spoofed
+`X-Forwarded-For` buying nothing, the block travelling on `/snapshot` too, and an inert
+plugin 503-ing before any fill read).
+
+## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 The offload tier is steered by wrapping one method of the scheduler-side
 manager, `vllm/v1/simple_kv_offload/manager.py:932`:
@@ -3175,8 +3266,10 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2060 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
-count in this README is a snapshot - trust `pytest --collect-only`). The 0.2.29
+2093 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+count in this README is a snapshot - trust `pytest --collect-only`). The 0.2.30
+fair-share ceiling is in `tests/test_ceiling_fair_share_multi_rank.py`, the fill block in
+`tests/test_disk_fill_block.py` and its access rules in `tests/test_routes.py`; the 0.2.29
 touch-clock / peer-rank / deadline / evict-pool behaviour is in
 `tests/test_touch_promotion_and_peer_eviction.py`. They cover:
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote

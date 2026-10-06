@@ -21,13 +21,14 @@ import argparse
 import asyncio
 import contextlib
 import ipaddress
+import json
 import socket
 import threading
 import time
 
 import pytest
 
-from kvtier_dev_plugin import config, endpoint
+from kvtier_dev_plugin import config, disk_store, endpoint
 from kvtier_dev_plugin.endpoint import TOKEN_HEADER, KVTierDevEndpointPlugin
 
 fastapi = pytest.importorskip("fastapi")
@@ -508,6 +509,238 @@ def test_spoofed_forwarded_for_from_a_peer_not_on_the_allowlist_is_403(
     ):
         assert response.status_code == 403, response.text
     assert engine.calls == []
+
+
+# --- THE SSD TIER'S FILL BLOCK, read from off the box (0.2.30) ---------------
+#
+# WHY THIS IS A ROUTE TEST AND NOT ONLY A BLOCK TEST. `disk_fill` exists because the
+# proxy on `192.168.2.64` is going to poll it every few seconds, and the live box's
+# allowlist is now `192.168.2.64,192.168.2.120`. A block that is correct in a unit test
+# and unreachable from the one peer that will read it is not a feature. So the whole
+# peer matrix runs against THIS block: allowlisted plus token reads it, allowlisted
+# without a token does not, a token does not bypass the allowlist, loopback needs no
+# token at all, and a spoofed `X-Forwarded-For` buys nothing.
+
+FILL_CEILING = 148 * 1024 ** 3
+FILL_USED = 156 * 1024 ** 3     # over the ceiling, as the store was on 2026-10-22
+
+
+def fill_rank_file(directory, rank="PP0_TP0", *, used=FILL_USED,
+                   ceiling=FILL_CEILING, age=0.0, evictions=2106):
+    """One rank file, as `worker_diag` writes it, carrying the 0.2.30 fill fields."""
+    document = {"version": 1, "epoch": "aabbccdd",
+                "ts": round(time.time() - age, 6), "role": "worker", "rank": rank,
+                "error": None,
+                "disk": {"installed": True, "armed": True,
+                         "ceiling_bytes": ceiling,
+                         "ceiling_share_bytes": ceiling // 4,
+                         "ceiling_divisor": 4, "ceiling_passes_declined": 0,
+                         "estimated_bytes": used,
+                         "ceiling_measurement_basis": "full_measurement",
+                         "files_written": 92, "bytes_written": 92 * 13_142_016,
+                         "evictions": evictions, "journal_removals": evictions,
+                         "drops": 0, "queue_depth": 0,
+                         "writer_thread_alive": True},
+                "disk_restore": {"readers": {"recency_promotions": 4100,
+                                             "recency_promotions_throttled": 585}}}
+    (directory / f"rank-{rank}.json").write_text(json.dumps(document),
+                                                 encoding="utf-8")
+
+
+@pytest.fixture
+def fill_store(tmp_path, monkeypatch):
+    """A diagnostics directory with rank files in it, and no leaked rollup cache."""
+    directory = tmp_path / "diag"
+    directory.mkdir()
+    monkeypatch.setenv(config.ENV_DIAG_DIR, str(directory))
+    disk_store.reset_rank_rollup_cache_for_tests()
+    yield directory
+    disk_store.reset_rank_rollup_cache_for_tests()
+
+
+def test_the_proxy_peer_reads_the_fill_block_with_the_token(enabled, monkeypatch,
+                                                            fill_store):
+    """THE DEPLOYMENT CASE, with the live box's actual allowlist.
+
+    `192.168.2.64` is the proxy that will poll this; `192.168.2.120` is the workstation.
+    Both are on the list, the token is set, and the answer must be the block - not a
+    redacted status payload, and not an engine call: `/status` makes none, and the fill
+    comes from the rank files the workers write on this host.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    engine = FakeEngineCoreClient()
+    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
+    response = client.get(STATUS, headers=token_headers("tk"))
+    assert response.status_code == 200, response.text
+    fill = response.json()["disk_fill"]
+    assert fill["available"] is True, fill["reason"]
+    assert fill["used_bytes"] == FILL_USED
+    assert fill["ceiling_bytes"] == FILL_CEILING
+    assert fill["target_bytes"] == int(FILL_CEILING * 0.9)
+    assert fill["over_ceiling"] is True and fill["over_target"] is True
+    assert fill["basis"] == "full_measurement", fill["basis"]
+    assert fill["per_rank"][0]["journal_removals"] == 2106
+    assert fill["per_rank"][0]["recency_promotions"] == 4100
+    assert fill["per_rank"][0]["file_age_seconds"] < 60
+    assert fill["per_process_note"], "the label must travel INSIDE the block"
+    # ... and the block did not make `/status` talk to the engine.
+    assert engine.calls == []
+
+
+def test_the_workstation_peer_reads_the_same_block(enabled, monkeypatch, fill_store):
+    """Both allowlisted peers, one dialect: the block is not peer-specific."""
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                      WORKSTATION).get(STATUS, headers=token_headers("tk")).json()
+    assert body["disk_fill"]["used_bytes"] == FILL_USED
+
+
+def test_the_fill_block_is_not_served_without_the_token(enabled, monkeypatch,
+                                                        fill_store):
+    """Allowlisted is necessary, not sufficient: a read of the fill needs the token."""
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    client = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())), PROXY)
+    for headers in ({}, token_headers("wrong"), {"x-kvtier-dev-token": ""}):
+        response = client.get(STATUS, headers=headers)
+        assert response.status_code == 403, (headers, response.text)
+        assert "disk_fill" not in response.text, response.text
+
+
+def test_a_token_does_not_bypass_the_allowlist_for_the_fill_block(enabled,
+                                                                  monkeypatch,
+                                                                  fill_store):
+    """The proxy's token, from a host that is not on the list: 403, no fill, no leak."""
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                          ("10.9.8.7", 1)).get(STATUS, headers=token_headers("tk"))
+    assert response.status_code == 403
+    assert "disk_fill" not in response.text
+
+
+def test_loopback_reads_the_fill_block_with_no_token_at_all(enabled, monkeypatch,
+                                                            fill_store):
+    """The operator at the box: `/status` on loopback stays token-free even with an
+    allowlist set, which is what makes a plain curl a usable reflex."""
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))).get(
+        STATUS).json()
+    assert body["disk_fill"]["used_bytes"] == FILL_USED
+    assert body["disk_fill"]["ranks_reported"] == 1
+
+
+def test_a_spoofed_forwarded_for_does_not_unlock_the_fill_block(enabled, monkeypatch,
+                                                                fill_store):
+    """The same attack as the existing spoof test, aimed at the new block.
+
+    `X-Forwarded-For: 127.0.0.1` from a host that is not allowlisted must not turn a 403
+    into a read of the tier's fill, with or without a valid token.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    engine = FakeEngineCoreClient()
+    client = client_for(build_app(FakeAsyncLLM(engine)), ("203.0.113.9", 51234))
+    for response in (
+        client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1"}),
+        client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1",
+                                   **token_headers("tk")}),
+        client.get(STATUS, headers={"x-real-ip": "192.168.2.64",
+                                   **token_headers("tk")}),
+        client.get(SNAPSHOT, headers={"x-forwarded-for": "192.168.2.64",
+                                     **token_headers("tk")}),
+    ):
+        assert response.status_code == 403, response.text
+        assert "disk_fill" not in response.text, response.text
+    assert engine.calls == []
+
+
+def test_the_snapshot_route_carries_the_fill_block_to_the_proxy_peer(enabled,
+                                                                    monkeypatch,
+                                                                    fill_store):
+    """The engine-side view reaches the proxy too.
+
+    `/snapshot` is the ENGINE's payload (the utility call), and `dev_state_sections()` -
+    where `disk_fill` is built - is embedded at its top level. The fake engine here
+    returns what the real handler would embed, so this proves the ROUTE carries the
+    block to an authorised off-box peer; building it is `test_disk_fill_block.py`.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    engine = FakeEngineCoreClient(result={"version": 1,
+                                          "disk_fill": disk_store.disk_fill()})
+    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
+    response = client.get(SNAPSHOT, headers=token_headers("tk"))
+    assert response.status_code == 200, response.text
+    fill = response.json()["disk_fill"]
+    assert fill["used_bytes"] == FILL_USED
+    # The rank file above claims a 4-way share, which is what a rank on the live
+    # 4-rank boot publishes: the verdict reads that, not the number of files on disk.
+    assert fill["cross_process_verdict"]["verdict"] == "shared_share", fill
+    assert fill["cross_process_verdict"]["n_effective"] == 4, fill
+    assert engine.calls == [(config.METHOD_SNAPSHOT, ())]
+
+
+def test_the_fill_block_is_bounded_over_the_wire(enabled, monkeypatch, fill_store):
+    """A dashboard polls this every few seconds, so its SIZE is the contract.
+
+    Twenty-four rank files, one capped entry list, and a response that stays well under
+    the verb's own ceiling: rank entries only, never an inventory.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    for pp in range(6):
+        for tp in range(4):
+            fill_rank_file(fill_store, rank=f"PP{pp}_TP{tp}", age=float(pp))
+    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                      PROXY).get(STATUS, headers=token_headers("tk")).json()
+    fill = body["disk_fill"]
+    assert fill["ranks_reported"] == 24, fill["ranks_reported"]
+    assert len(fill["per_rank"]) == disk_store.DISK_FILL_RANK_CAP
+    assert fill["per_rank_truncated"] is True
+    assert len(json.dumps(fill)) < 64 * 1024, len(json.dumps(fill))
+
+
+def test_no_rank_files_reports_a_null_fill_rather_than_an_empty_tier(enabled,
+                                                                    monkeypatch):
+    """An unmeasured store is `null`, over the wire too.
+
+    `used_bytes: 0` would render as "the tier is empty" on a dashboard at exactly the
+    moment the workers have not written a rank file yet - the most misleading possible
+    reading of a cold boot.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                      PROXY).get(STATUS, headers=token_headers("tk")).json()
+    fill = body["disk_fill"]
+    assert fill["available"] is False
+    assert fill["used_bytes"] is None
+    assert fill["basis"] == "no_rank_files", fill["basis"]
+    assert fill["used_fraction"] is None
+
+
+def test_an_inert_plugin_learns_the_fill_block_never_ran(enabled, monkeypatch,
+                                                         fill_store):
+    """peer -> enabled -> token: the 503 comes before any fill read."""
+    monkeypatch.delenv(config.ENV_ENABLE, raising=False)
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    fill_rank_file(fill_store)
+    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                          PROXY).get(STATUS, headers=token_headers("tk"))
+    assert response.status_code == 503
+    assert "disk_fill" not in response.text
 
 
 def test_a_refused_peer_does_not_learn_the_allowlist_contents(enabled,

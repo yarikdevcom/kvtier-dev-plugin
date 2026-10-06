@@ -273,6 +273,16 @@ MAX_RANK_ROLLUP_ROWS = 16               # per-rank rows in one rollup payload
 MAX_RANK_ROLLUP_EXCLUDED = 16           # excluded files NAMED in one rollup payload
 RANK_ROLLUP_COUNTER_MAX = 1_000_000_000_000  # 1 TiB: past this a counter is not a fact
 RANK_ROLLUP_FRESH_SECONDS = 900.0       # the same heartbeat bar as disk_restore's proof
+# HOW OFTEN THE RANK FILES ARE RE-READ. One second, the SAME idiom and the same number
+# as `disk_restore.PROOF_CACHE_SECONDS`: `/snapshot` and `/status` are polled by a
+# dashboard every few seconds, and both now carry a rank-derived view, so without a
+# cache every poll would open up to `MAX_RANK_ROLLUP_FILES` JSON files. The cache is
+# keyed on a CONTENT SIGNATURE (the directory plus each rank file's size and mtime), not
+# on the clock alone, so a rank that writes is picked up on the very next read and a
+# burst of polls against a quiet fleet costs one parse. Bounded staleness is the point:
+# a signature miss reparses immediately, and a hit is never older than this.
+RANK_ROLLUP_CACHE_SECONDS = 1.0
+DISK_FILL_RANK_CAP = 16                 # rank entries in ONE `disk_fill` block
 
 MAX_LS_FILES = 200                  # ENTRIES in an `ls` response
 MAX_LS_LIMIT_DEFAULT = 50
@@ -1896,15 +1906,32 @@ def _op_contains(body: dict) -> dict:
 # LOWER BOUND with the ranks it is missing named - the same rule that stopped a
 # truncated ceiling walk reporting its floor as a measurement.
 
-# (published name, the key in the rank file's `disk` section, unit). `files_written`
-# is the worker's name for `disk_spill`'s `spilled` counter - see
-# `worker_report`, which is the writer of that key.
-RANK_ROLLUP_FIELDS = (("evictions", "evictions", "files"),
-                      ("spilled", "files_written", "files"),
-                      ("spill_queued", "spill_queued", "requests"),
-                      ("spill_errors", "spill_errors", "writes"),
-                      ("bytes_written", "bytes_written", "bytes"),
-                      ("queue_depth", "queue_depth", "requests waiting NOW"))
+# (published name, WHERE in the rank document to read it, unit). `files_written` is the
+# worker's name for `disk_spill`'s `spilled` counter - see `worker_report`, which is the
+# writer of that key - and the read-path counters live one section DOWN, in
+# `disk_restore.readers`, because `disk_read`'s state is reported by the restore layer's
+# rank contribution (it is the layer that owns the reader threads and the LRU touch).
+# A source is therefore a PATH of keys into the rank document, so one reader serves both
+# sections and no field gets a bespoke read that skips the bounds.
+RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
+                      ("spilled", ("disk", "files_written"), "files"),
+                      ("spill_queued", ("disk", "spill_queued"), "requests"),
+                      ("spill_errors", ("disk", "spill_errors"), "writes"),
+                      ("bytes_written", ("disk", "bytes_written"), "bytes"),
+                      ("queue_depth", ("disk", "queue_depth"),
+                       "requests waiting NOW"),
+                      # THE 0.2.30 ADDITIONS, all of them fields the operator asked to
+                      # be able to see without opening four files: what the ceiling pass
+                      # did (`journal_removals` is the journalled half of an eviction,
+                      # `drops` the spills that never became files) and whether the LRU
+                      # clock is actually moving (`recency_promotions`).
+                      ("journal_removals", ("disk", "journal_removals"), "files"),
+                      ("drops", ("disk", "drops"), "jobs"),
+                      ("recency_promotions",
+                       ("disk_restore", "readers", "recency_promotions"), "reads"),
+                      ("recency_promotions_throttled",
+                       ("disk_restore", "readers",
+                        "recency_promotions_throttled"), "reads"))
 
 RANK_ROLLUP_MEANINGS = {
     "evictions": "files THIS RANK's ceiling pass removed from the store (monotonic "
@@ -1915,9 +1942,25 @@ RANK_ROLLUP_MEANINGS = {
     "spill_queued": "requests this rank handed to its writer thread",
     "spill_errors": "writes this rank's thread failed",
     "bytes_written": "bytes this rank wrote since its boot - NOT the store's current "
-                     "size: an eviction removes bytes this counter never subtracts",
+                     "size: an eviction removes bytes this counter never subtracts. "
+                     "For how full the store IS, read `disk_fill.used_bytes`, which is "
+                     "the ranks' measured estimate, not this write total",
     "queue_depth": "requests waiting in this rank's queue RIGHT NOW (a gauge, summed "
                    "as a fleet-wide instantaneous depth)",
+    "journal_removals": "removal lines this rank wrote to the restore journal, "
+                        "i.e. the files its ceiling pass deleted AND told the index "
+                        "about; it tracks `evictions` and lags it only when the "
+                        "journal refused",
+    "drops": "spills this rank's tier REFUSED to queue (queue full, byte cap, arm "
+             "off): a spill that never became a file, so `spilled` alone cannot see "
+             "it",
+    "recency_promotions": "reads that moved a file's eviction clock "
+                          "(disk_read.promote_recency): if this is not moving, the "
+                          "tier is running a write-ordered LRU and shedding what it "
+                          "keeps reading",
+    "recency_promotions_throttled": "promotions skipped by the per-file throttle - the "
+                                    "count that says promotion is working and bounded, "
+                                    "as opposed to absent",
 }
 RANK_ROLLUP_GAUGES = ("queue_depth",)
 """Fields that are INSTANTANEOUS, not monotonic-since-boot. Summing a gauge across
@@ -1931,6 +1974,22 @@ def _rank_rollup_int(value):
     if number is None or number < 0 or number > RANK_ROLLUP_COUNTER_MAX:
         return None
     return number
+
+
+
+def _dig(document, path):
+    """One value out of a rank document by KEY PATH, or None. Never raises.
+
+    The rank file is UNTRUSTED input written by another process: every level has to
+    be a mapping before it can be indexed, and a `disk_restore` that turned out to be
+       a string is an absent field rather than a TypeError on a polled path.
+    """
+    node = document
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
 
 
 def _rank_file_rollup_row(path, name: str) -> tuple:
@@ -1988,13 +2047,32 @@ def _rank_file_rollup_row(path, name: str) -> tuple:
            "epoch": _clip(epoch, 40) if isinstance(epoch, str) else None}
     rejected = []
     for field, source, _unit in RANK_ROLLUP_FIELDS:
-        value = _rank_rollup_int(section.get(source))
+        # A SOURCE IS A KEY PATH now (`disk_restore.readers` holds the read-side
+        # counters), so one walk of the untrusted document serves both sections under
+        # the same bounds.
+        raw_value = _dig(document, source)
+        value = _rank_rollup_int(raw_value)
         row[field] = value
-        if value is None and section.get(source) is not None:
+        if value is None and raw_value is not None:
             rejected.append(field)
     alive = section.get("writer_thread_alive")
     row["writer_thread_alive"] = alive if isinstance(alive, bool) else None
     row["ceiling_bytes"] = _rank_rollup_int(section.get("ceiling_bytes"))
+    # THE FAIR SHARE, AS THAT RANK SAW IT (0.2.30). NOT summed - a share is a budget,
+    # and summing four ranks' budgets re-invents the number that over-evicted the store.
+    # Published per rank so "four ranks, one did the work, three declined" is one glance
+    # rather than four files opened by hand.
+    row["ceiling_share_bytes"] = _rank_rollup_int(
+        section.get("ceiling_share_bytes"))
+    row["share_divisor"] = _rank_rollup_int(section.get("ceiling_divisor"))
+    row["declined_because_already_under"] = _rank_rollup_int(
+        section.get("ceiling_passes_declined"))
+    # HOW FULL THE STORE IS, per the rank that last measured it, and on what basis -
+    # "the store is 68 GiB" and "I stat-ed 20,000 files and scaled" are different
+    # claims, and `disk_fill` must carry the distinction through, so the file must.
+    row["estimated_bytes"] = _rank_rollup_int(section.get("estimated_bytes"))
+    basis = section.get("ceiling_measurement_basis")
+    row["walk_basis"] = _clip(basis, 48) if isinstance(basis, str) else None
     row["fields_rejected"] = rejected
     if rejected:
         row["fields_rejected_note"] = _clip(
@@ -2006,7 +2084,80 @@ def _rank_file_rollup_row(path, name: str) -> tuple:
     return row, "counted", None
 
 
-def rank_rollup() -> dict:
+# --- the one-second cache: what a polled path is allowed to cost -------------
+#
+# `worker_proof()` set the pattern this copies (`disk_restore.PROOF_CACHE_SECONDS`,
+# 1.0 s): the rank files are the ONLY way a process knows what the other processes did,
+# and `/snapshot` and `/status` are polled. Reading them per request would put up to
+# `MAX_RANK_ROLLUP_FILES` JSON parses on a polled path; reading them never would make
+# the view a lie. So: one parse per second AT MOST, keyed on a CONTENT SIGNATURE (each
+# rank file's name, size and mtime) so that a rank which wrote is reparsed on the very
+# next read rather than up to a second later. A clock-only TTL would be the wrong shape
+# here: it would make a test (and an operator) wait for a value that is already on disk.
+_rollup_cache: dict = {"mono": None, "signature": None, "result": None}
+
+
+def _rank_file_signature():
+    """(directory, ((name, size, mtime_ns), ...)) for the rank files, or None.
+
+    None means "the directory cannot be listed", in which case NOTHING is cached: an
+    unreadable diagnostics directory must stay as cheap to re-check as it is to
+    check, and a cached failure would make a directory that came back look broken for
+    a second.
+    """
+    directory = config.diagnostics_dir()
+    if directory is None:
+        return ("no-dir", ())
+    rows = []
+    try:
+        with os.scandir(str(directory)) as entries:
+            for entry in entries:
+                if not (entry.name.startswith(RANK_FILE_PREFIX)
+                        and entry.name.endswith(RANK_FILE_SUFFIX)):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+                rows.append((entry.name, int(stat.st_size),
+                             int(stat.st_mtime_ns)))
+    except OSError:
+        return None
+    return (str(directory), tuple(sorted(rows)))
+
+
+def rank_rollup(force: bool = False) -> dict:
+    """THE CROSS-PROCESS VIEW of the spill tier, behind the one-second rank cache.
+
+    `force=True` re-reads (the `op:status` door is a human asking a question right
+    now); the polled paths (`/snapshot`, `/status`, and therefore `disk_fill`) take
+    the cached answer when the rank files have not changed. Neither path can raise.
+    """
+    signature = None
+    try:
+        signature = _rank_file_signature()
+    except Exception as exc:  # noqa: BLE001 - a cache key is never worth a fault
+        snapshot._error(exc, "disk_store rank rollup signature")
+    now = time.monotonic()
+    cached = _rollup_cache.get("result")
+    if (not force and cached is not None and signature is not None
+            and _rollup_cache.get("signature") == signature
+            and isinstance(_rollup_cache.get("mono"), (int, float))
+            and (now - float(_rollup_cache["mono"])) < RANK_ROLLUP_CACHE_SECONDS):
+        return cached
+    result = _rank_rollup_guarded()
+    _rollup_cache["mono"] = now
+    _rollup_cache["signature"] = signature
+    _rollup_cache["result"] = result
+    return result
+
+
+def reset_rank_rollup_cache_for_tests() -> None:
+    """Drop the one-second cache. A test that rewrites rank files must not be served a
+    previous test's fleet, and a reset is the only honest way to guarantee that."""
+    _rollup_cache["mono"] = None
+    _rollup_cache["signature"] = None
+    _rollup_cache["result"] = None
+
+
+def _rank_rollup_guarded() -> dict:
     """THE CROSS-PROCESS VIEW of the spill tier: what every rank's own counters saw.
 
     The public entry point, and the only thing about it that is not a reading: it
@@ -2255,7 +2406,12 @@ def _fill_rank_rollup(out: dict) -> dict:
             record.update({key: row[key] for key in
                            ("rank", "age_seconds", "evictions", "spilled",
                             "spill_queued", "spill_errors", "bytes_written",
-                            "queue_depth", "ceiling_bytes",
+                            "queue_depth", "journal_removals", "drops",
+                            "recency_promotions",
+                            "recency_promotions_throttled", "ceiling_bytes",
+                            "ceiling_share_bytes", "share_divisor",
+                            "declined_because_already_under",
+                            "estimated_bytes", "walk_basis",
                             "writer_thread_alive")})
         elif worker_diag._valid_rank(claimed):
             # The CONTENT told us nothing, but the NAME still claims a rank, and a
@@ -2344,6 +2500,333 @@ def _fill_rank_rollup(out: dict) -> dict:
             f"exist, but the rank set is unknown here ({expected_source}), so a rank "
             "that never wrote a file is invisible to this view", 400)
     return out
+
+
+DISK_FILL_RANK_FIELDS = ("files_written", "bytes_written", "evictions",
+                         "journal_removals", "recency_promotions",
+                         "recency_promotions_throttled", "drops", "queue_depth",
+                         "declined_because_already_under")
+"""THE RANK ENTRY'S COUNTERS, and the whole list on purpose: this block is polled by a
+   dashboard, so it carries per-rank counters and nothing else - no file lists, no
+   sample arrays, no paths. A rank entry is ~10 short fields; `DISK_FILL_RANK_CAP`
+   bounds how many entries one response can carry."""
+
+DISK_FILL_PER_PROCESS_NOTE = (
+    "THE FLAT `disk_spill` / `disk_store` COUNTERS BESIDE THIS BLOCK ARE THIS "
+    "PROCESS'S OWN, and on the process that answers /snapshot they read zero by "
+    "construction: the writer thread and the ceiling pass run in the WORKER "
+    "processes. `disk_fill` is the fleet's answer, summed from the per-rank files. "
+    "`disk_spill.spilled: 0` next to `disk_fill.totals.spilled: 368` is not a "
+    "contradiction - it is one idle process and four busy ones. Never add the two "
+    "views, and never read the flat one as the tier.")
+
+
+def _disk_fill_row_entry(row: dict) -> dict:
+    """ONE rank's entry: the counters, the age, and the fair-share verdict. Capped."""
+    entry = {"rank": row["rank"],
+             "file_age_seconds": row.get("age_seconds")}
+    for field in DISK_FILL_RANK_FIELDS:
+        entry[field] = row.get(field)
+    # `files_written` is what the RANK FILE and the operator's question call it; the
+    # rollup row publishes the same number as `spilled`. BOTH names are published, in
+    # this entry and in `totals`, because per-rank and fleet-wide views that use
+    # different names for one counter is how a consumer starts adding them twice. The
+    # two are the same integer or both null - never one and not the other.
+    entry["spilled"] = row.get("spilled")
+    entry["files_written"] = row.get("spilled")
+    # The fair-share verdict, per rank: what budget this rank thought it owned, over how
+    # many ranks, and how many times it declined because a sibling got there first.
+    entry["ceiling_share_bytes"] = row.get("ceiling_share_bytes")
+    entry["share_divisor"] = row.get("share_divisor")
+    entry["declined_because_already_under"] = row.get(
+        "declined_because_already_under")
+    entry["estimated_bytes"] = row.get("estimated_bytes")
+    entry["walk_basis"] = row.get("walk_basis")
+    entry["writer_thread_alive"] = row.get("writer_thread_alive")
+    return entry
+
+
+def _disk_fill_verdict(rows: list, ceilings: list, shares: list,
+                       divisors: list) -> dict:
+    """DO THE RANKS' PASSES AGREE? The `cross_process_verdict` block.
+
+    This is how the 0.2.30 fix is WATCHED rather than assumed. Before the fix, four
+    ranks each defended the whole ceiling over one directory and all four shed; after
+    it, the ranks report the same share (`ceiling / n_effective`), usually exactly
+    one of them has work to do, and the other three COUNT the decline.
+
+    `declined_because_already_under` climbing across three of four rank files while
+    `evictions` climbs in one is the signature of the fix working; four ranks
+    evicting the same bytes with no declines is the signature of it not.
+    """
+    counted = [row for row in rows if isinstance(row, dict)]
+    with_evictions = [row for row in counted
+                      if (row.get("evictions") or 0) > 0]
+    declining = [row for row in counted
+                 if (row.get("declined_because_already_under") or 0) > 0]
+    declines = sum(int(row.get("declined_because_already_under") or 0)
+                   for row in counted)
+    if not counted:
+        return {"verdict": "no_ranks_reported",
+                "ranks_with_evictions": 0, "ranks_declining": 0,
+                "declines_total": 0,
+                "note": ("no fresh rank file reported, so no claim is made about the "
+                         "fleet: this is not evidence that the ranks agree")}
+    if len(shares) > 1 or len(ceilings) > 1:
+        return {"verdict": "ranks_disagree_on_the_share",
+                "ranks_with_evictions": len(with_evictions),
+                "ranks_declining": len(declining),
+                "declines_total": int(declines),
+                "share_bytes_values": sorted(shares),
+                "ceiling_bytes_values": sorted(ceilings),
+                "note": ("the ranks report DIFFERENT shares (or ceilings) for what "
+                         "should be one store: at least one rank is running a "
+                         "different build or a different ceiling, and a shared store "
+                         "with two budgets is the state where one rank keeps writing "
+                         "while another evicts")}
+    solo = bool(divisors) and max(divisors) <= 1
+    n_effective = max(divisors) if divisors else None
+    if solo:
+        note = ("every rank sized the store against the WHOLE ceiling: either this "
+                "is a single-rank boot (correct) or the ranks cannot see each other's "
+                "digests, which is the fail-safe direction and costs capacity")
+    elif declining and len(with_evictions) <= max(1, len(counted) // 2):
+        note = (f"the ceiling is split {n_effective} ways, one rank's pass did the "
+                f"work and {len(declining)} declined because the store was already "
+                f"under their share - the 0.2.30 fix visible in the counters")
+    else:
+        note = (f"the ceiling is split {n_effective} ways and "
+                f"{len(with_evictions)} of {len(counted)} ranks are over their own "
+                "share: normal while the store fills, and not the old defect (which "
+                "had ALL of them over the WHOLE ceiling and zero declines)")
+    return {"verdict": ("single_rank_share" if solo else "shared_share"),
+            "ranks_with_evictions": len(with_evictions),
+            "ranks_declining": len(declining),
+            "ranks_acting": [row["rank"] for row in with_evictions][:8],
+            "ranks_declining_names": [row["rank"] for row
+                                      in declining][:8],
+            "declines_total": int(declines),
+            "share_bytes": shares[0] if shares else None,
+            "n_effective": n_effective,
+            "note": _clip(note, 400),
+            }
+
+
+def _fill_skeleton() -> dict:
+    """ONE KEY SET, built once. Both the healthy and the degraded fill come
+    through here, so a reader can never meet two shapes of this block.
+
+    The degraded block has the SAME keys with null values: `available: false`
+    plus a `reason` is the only difference, because a caller that reads
+    `fill["ceiling_bytes"]` on a route must not KeyError on the one day the
+    read failed.
+    """
+    return {"available": False, "reason": None,
+                 # THE FILL, in the currency the ceiling is configured in.
+                 "used_bytes": None, "ceiling_bytes": None,
+                 "used_fraction": None, "target_fraction": None,
+                 "target_bytes": None, "headroom_bytes": None,
+                 "over_target": None, "over_ceiling": None,
+                 # HOW the fill was measured. THE OPERATOR ASKED FOR THIS FIELD BY NAME
+                 # and the distinction is the whole reason it is here: "the store is 68
+                 # GiB" and "I stat-ed 20,000 of 34,896 files and scaled" are different
+                 # claims, so the basis travels WITH the number, exactly as
+                 # `disk_spill.ceiling_measurement.basis` does. `read_basis` says how
+                 # COMPLETE the read was and `ceiling_basis` where the ceiling came
+                 # from, because a fill number has three claims behind it and folding
+                 # them into one word is how a partial read starts looking like a
+                 # measurement.
+                 "basis": None, "read_basis": None, "ceiling_basis": None,
+                 "used_bytes_source": None, "used_bytes_spread_bytes": None,
+                 # WHO REPORTED. A count and a list, so "3 of 4 ranks reported" is a
+                 # field rather than something a reader infers from a missing key.
+                 # `ranks_expected` / `missing_ranks` are null (never empty) when this
+                 # process cannot know the rank set: absence of knowledge is not a fact
+                 # about the fleet, and a `[]` here would be a lie.
+                 "ranks_expected": None, "ranks_reported": 0,
+                 "missing_ranks": None, "ranks_stale": [],
+                 "ranks_unusable": [], "ranks_unusable_total": 0,
+                 "per_rank": [], "per_rank_truncated": False,
+                 "totals": {field: None for field, _s, _u in RANK_ROLLUP_FIELDS},
+                 "totals_are_lower_bound": True,
+                 "lower_bound_reason": None,
+                 "cross_process_verdict": None,
+                 "fresh_seconds": RANK_ROLLUP_FRESH_SECONDS,
+                 "per_process_note": DISK_FILL_PER_PROCESS_NOTE,
+                 "scope": ("fleet-wide, read from the rank files the WORKERS write; "
+                           "see per_process_note for what the flat per-process "
+                           "counters beside this block do and do not mean"),
+                 "note": ("the SSD tier's fill as the ranks themselves measured it: "
+                          "`used_fraction` over `target_fraction` is the one "
+                          "comparison that matters, and `ranks_reported` / "
+                          "`missing_ranks` say how much of the fleet it covers"),
+                 "units": {"used_bytes": "bytes", "ceiling_bytes": "bytes",
+                           "used_fraction": "fraction of the ceiling",
+                           "target_fraction": "fraction of the ceiling",
+                           "target_bytes": "bytes", "headroom_bytes": "bytes",
+                           "used_bytes_spread_bytes": "bytes",
+                           "ranks_expected": "ranks", "ranks_reported": "ranks"},
+                 }
+
+
+def disk_fill_unavailable(reason: str) -> dict:
+    """The fill block for a caller that could not build it at all - same keys."""
+    out = _fill_skeleton()
+    out["basis"] = "fill_failed"
+    out["read_basis"] = "fill_failed"
+    out["reason"] = _clip(f"the fill could not be built: {reason}",
+                          MAX_STRING_CHARS)
+    return out
+
+
+def disk_fill() -> dict:
+    """HOW FULL IS THE SSD TIER, AND IS THAT A PROBLEM - in one read-only block.
+
+    THE QUESTION THIS EXISTS TO ANSWER WITHOUT ARITHMETIC ACROSS SECTIONS. The
+    operator's words on 2026-10-22, after a night of reading four rank files by hand:
+    "I just want to see fill." Everything the answer needs is here: how many bytes
+    the store holds (as the ranks measured it, with the basis they measured it on),
+    the ceiling and the 0.9 target it is kept under, one entry per rank that reported
+    with the age of its file, which ranks did NOT report, and whether the ranks'
+    ceiling passes agree with each other.
+
+    READ-ONLY and CAPPED: it is a view over `rank_rollup()`'s already-cached rank read
+    (no new file I/O per request, no walk, no statvfs), it emits rank entries only - no
+    file lists, no samples - and it cannot raise: a failure returns the same keys with
+    nulls and a `reason`, never a 500 on a polled door.
+
+    `used_bytes` is the FRESHEST rank's store estimate, not a sum: four ranks
+    measuring one directory produced four views of one number, and adding them would
+    be the same mistake the ceiling pass just stopped making.
+    `used_bytes_spread_bytes` says how far apart those four views were, because a
+    wide spread means the ranks are measuring at different times or one is running a
+    different walk bound.
+    """
+    out = _fill_skeleton()
+    try:
+        rollup = rank_rollup()
+        _fill_disk_fill(out, rollup)
+        return out
+    except Exception as exc:  # noqa: BLE001 - a polled door answers 200 with nulls
+        snapshot._error(exc, "disk_store disk fill")
+        out["basis"] = "fill_failed"
+        out["read_basis"] = "fill_failed"
+        out["reason"] = _clip(f"the fill could not be built: "
+                              f"{type(exc).__name__}", MAX_STRING_CHARS)
+        return out
+
+
+def _fill_disk_fill(out: dict, rollup: dict) -> None:
+    """Fill the skeleton from ONE rollup. Mutates `out`, and never raises upward."""
+    rows = [row for row in (rollup.get("per_rank") or []) if isinstance(row, dict)]
+    out["ranks_expected"] = (len(rollup["ranks_expected"])
+                             if isinstance(rollup.get("ranks_expected"),
+                                           (list, tuple)) else None)
+    # WHO REPORTED. THE COUNT COMES FROM THE ROLLUP'S COUNTED RANKS, not from the length
+    # of the (capped) entry list: a 24-rank boot whose entries are capped at 16 must
+    # still say 24 reported, because a short list that also lowers the count is the
+    # "missing rank folded into a low total" mistake this block exists to avoid.
+    counted = rollup.get("ranks_counted")
+    out["ranks_reported"] = (len(counted) if isinstance(counted, (list, tuple))
+                             else len(rows))
+    out["missing_ranks"] = (list(rollup["ranks_missing"])
+                            if isinstance(rollup.get("ranks_missing"),
+                                          (list, tuple)) else None)
+    # HOW COMPLETE THE READ WAS, in the same vocabulary `rank_rollup` publishes, so a
+    # caller that reads either block sees one word for one fact.
+    out["read_basis"] = rollup.get("basis")
+    out["ranks_stale"] = [{"rank": entry.get("rank"),
+                           "file_age_seconds": entry.get("age_seconds"),
+                           "evictions": entry.get("evictions"),
+                           "files_written": entry.get("spilled"),
+                           "reason": _clip(entry.get("reason"), 96)}
+                          for entry in (rollup.get("stale_ranks") or [])
+                          if isinstance(entry, dict)][:DISK_FILL_RANK_CAP]
+    excluded = [entry for entry in (rollup.get("excluded_files") or [])
+                if isinstance(entry, dict)]
+    out["ranks_unusable_total"] = int(rollup.get("excluded_total") or 0)
+    out["ranks_unusable"] = [{"file": entry.get("file"),
+                              "rank": entry.get("rank"),
+                              "status": entry.get("status"),
+                              "reason": _clip(entry.get("reason"), 96)}
+                             for entry in excluded][:DISK_FILL_RANK_CAP]
+    for field, _source, _unit in RANK_ROLLUP_FIELDS:
+        out["totals"][field] = (rollup.get("totals") or {}).get(field)
+    # The same two names for one counter, here as in `per_rank`: `spilled` is the
+    # rollup's name, `files_written` is the rank file's, and neither view may use only
+    # one of them.
+    out["totals"]["files_written"] = out["totals"]["spilled"]
+    out["totals_are_lower_bound"] = bool(rollup.get("totals_are_lower_bound"))
+    out["lower_bound_reason"] = _clip(rollup.get("lower_bound_reason"), 400)
+    entries = [_disk_fill_row_entry(row) for row in rows][:DISK_FILL_RANK_CAP]
+    out["per_rank"] = entries
+    out["per_rank_truncated"] = (len(rows) > DISK_FILL_RANK_CAP
+                                 or bool(rollup.get("per_rank_truncated")))
+    # THE FILL. The ceiling is the ranks' configured value when they agree on it, and
+    # this process's environment otherwise (labelled either way, because a ceiling read
+    # from the answering process is a weaker claim than one every rank agrees on).
+    ceilings = sorted({int(row["ceiling_bytes"]) for row in rows
+                       if row.get("ceiling_bytes") is not None})
+    env_ceiling = disk_spill.capacity_ceiling_bytes()
+    if len(ceilings) == 1:
+        out["ceiling_bytes"] = ceilings[0]
+        out["ceiling_basis"] = "ranks_agree"
+    elif len(ceilings) > 1:
+        out["ceiling_bytes"] = max(ceilings)
+        out["ceiling_basis"] = "ranks_disagree"
+    elif env_ceiling:
+        out["ceiling_bytes"] = int(env_ceiling)
+        out["ceiling_basis"] = "this_process_env_only"
+    else:
+        out["ceiling_basis"] = "no_ceiling_known"
+    # THE MEASUREMENT, from the freshest rank that has one. NEVER a sum, NEVER a zero:
+    # four ranks measuring one directory produced four views of one number, and a rank
+    # that has not walked reports NO estimate rather than a 0 that would read as an
+    # empty store.
+    measured = [row for row in rows if row.get("estimated_bytes") is not None]
+    if measured:
+        freshest = min(measured, key=lambda row: float(
+            row.get("age_seconds") or 0.0))
+        out["used_bytes"] = int(freshest["estimated_bytes"])
+        # THE OPERATOR'S `basis`: "the store is 68 GiB" versus "I stat-ed 20,000 of
+        # 34,896 files and scaled them". It comes from the SAME rank the number came
+        # from, because a basis from a different rank is a different measurement.
+        out["basis"] = freshest.get("walk_basis") or "basis_not_reported"
+        out["used_bytes_source"] = {"rank": freshest["rank"],
+                                    "file_age_seconds":
+                                        freshest.get("age_seconds"),
+                                    "walk_basis": freshest.get("walk_basis")}
+        values = [int(row["estimated_bytes"]) for row in measured]
+        out["used_bytes_spread_bytes"] = max(values) - min(values)
+        out["available"] = True
+    elif rows:
+        out["basis"] = "no_rank_reported_a_measurement"
+        out["reason"] = (f"{len(rows)} rank(s) reported counters but none carried a "
+                         "store estimate: either no rank has run a ceiling pass yet "
+                         "or its rank file predates the 0.2.30 fields. `used_bytes` "
+                         "is null, not 0, because an empty store and an unmeasured "
+                         "one are different facts")
+    else:
+        out["basis"] = "no_rank_files"
+        out["reason"] = ("no fresh rank file exists, so the store's size is UNKNOWN "
+                         "here - which is a different claim from `disk_spill."
+                         "estimated_bytes: 0` in the per-process block")
+    ceiling = out["ceiling_bytes"]
+    if ceiling:
+        fraction = disk_spill.EVICT_TARGET_FRACTION
+        out["target_fraction"] = fraction
+        out["target_bytes"] = int(int(ceiling) * fraction)
+        if out["used_bytes"] is not None:
+            out["used_fraction"] = round(out["used_bytes"] / float(ceiling), 6)
+            out["headroom_bytes"] = int(ceiling) - int(out["used_bytes"])
+            out["over_target"] = bool(out["used_bytes"] > int(out["target_bytes"]))
+            out["over_ceiling"] = bool(out["used_bytes"] > int(ceiling))
+    shares = sorted({int(row["ceiling_share_bytes"]) for row in rows
+                     if row.get("ceiling_share_bytes") is not None})
+    divisors = [int(row["share_divisor"]) for row in rows
+                if row.get("share_divisor") is not None]
+    out["cross_process_verdict"] = _disk_fill_verdict(rows, ceilings, shares,
+                                                      divisors)
 
 
 def _op_status(_body: dict) -> dict:
@@ -2573,6 +3056,25 @@ def worker_report() -> dict:
                   "armed": bool(disk_spill.is_armed()),
                   "root": _clip(disk_spill.disk_root(), 120),
                   "ceiling_bytes": disk_spill.capacity_ceiling_bytes(),
+                  # THE FAIR SHARE AS THIS RANK LAST SIZED IT (0.2.30). Published per
+                  # rank on purpose: "four ranks, one pass did the work, three declined"
+                  # is only checkable if each rank says what budget it thought it owned.
+                  # `ceiling_divisor` is `n_effective` (this rank plus the live siblings
+                  # its own walk learned); 1 means it saw no sibling - the fail-safe
+                  # value, and the one an operator must be able to spot from the door.
+                  "ceiling_share_bytes": (int(state["share_bytes"])
+                                          if state.get("share_bytes") else None),
+                  "ceiling_divisor": (int(state["share_divisor"])
+                                      if state.get("share_divisor") else None),
+                  "ceiling_passes_declined": int(
+                      state.get("ceiling_passes_declined") or 0),
+                  # HOW FULL THE STORE IS, per this rank's last walk, and on what basis:
+                  # `disk_fill` cannot publish `used_bytes` unless a rank file carries
+                  # it, and cannot label the claim unless the basis travels with it.
+                  "estimated_bytes": (int(state["estimated_bytes"])
+                                      if state.get("estimated_bytes") is not None
+                                      else None),
+                  "ceiling_measurement_basis": _clip(state.get("walk_basis"), 48),
                   "digest": _state["geometry_digest"],
                   "fingerprint_ready": _state["fingerprint"] is not None,
                   "fingerprint_missing": missing,
@@ -3014,6 +3516,18 @@ def hook_section(include_fingerprint: bool = True) -> dict:
                      "poll_interval_seconds": POLL_INTERVAL_SECONDS}}
 
 
+DISK_STORE_PROCESS_SCOPE_NOTE = (
+    "PER-PROCESS: the wiring counters in this block (wraps, binds, steps_idle, "
+    "completions, slots_offered, spill_queued, refusals_total, fallbacks, and the "
+    "`spill` sub-block) belong to THIS process's own module state. The hook wraps the "
+    "scheduler-side manager, so they are non-zero only in the process that steps the "
+    "tokens; on the API process - and on any process that never served a step - they "
+    "are zero BY CONSTRUCTION, which is not a claim that the tier spilled nothing. "
+    "For the fleet's numbers read the rank rollup: `disk_fill` (in /snapshot and "
+    "/status), which sums each rank's own counters from the rank files it wrote, names "
+    "the ranks it summed, and says how stale each one was.")
+
+
 def section() -> dict:
     """The snapshot section: the wiring's state, and whether THIS BOOT can name a
     file. Reads no files and walks no directory, like `disk_spill.section()`.
@@ -3029,6 +3543,13 @@ def section() -> dict:
     root = disk_spill.disk_root()
     fields = engine_fields()
     return {"role": ROLE, "writer": WRITER_TAG,
+            # THE LABEL THAT COST AN OPERATOR A NIGHT OF READING ZEROS (2026-10-22).
+            # Every number in this block is THIS process's own wiring state, and the
+            # hook runs where the scheduler runs - so on the API process, and on any
+            # process that never stepped a token, they are zero BY CONSTRUCTION. The
+            # fleet's numbers are in `disk_fill` beside it. Say this in the payload
+            # rather than in a README a reader has already given up on.
+            "scope": DISK_STORE_PROCESS_SCOPE_NOTE,
             "protocol_version": PROTOCOL_VERSION,
             "installed": bool(_state["installed"]),
             "class": _state["class"], "skip_reason": _state["skip_reason"],

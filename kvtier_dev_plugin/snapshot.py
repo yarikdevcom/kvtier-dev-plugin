@@ -1079,6 +1079,20 @@ def dev_state_sections() -> dict:
         out["disk_store"] = {"error": f"{type(exc).__name__}"[:200]}
         out["disk_store_installed"] = None
     try:
+        # HOW FULL THE SSD TIER IS, answered once, for the process answering THIS call.
+        # That is the API process, whose own `disk_spill` counters above read zero
+        # because the writer threads live in the workers. Everything here is summed from
+        # the rank files the workers already write, behind their one-second cache, so
+        # this is the ONLY fill view a polled path may carry:
+        # `disk_spill.estimated_bytes` would be a per-process zero and a store walk
+        # would be a filesystem sweep on a door that a dashboard hits every few seconds.
+        # Rank entries only, capped - no file lists.
+        out["disk_fill"] = disk_store.disk_fill()
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk fill block")
+        out["disk_fill"] = {"available": False,
+                            "reason": f"did not build: {type(exc).__name__}"[:160]}
+    try:
         # THE RESTORE PATH'S SCHEDULER HALF, in the payload a poller already reads.
         # The rank files answer "did a WORKER fit its half" and nothing else, so a
         # boot whose scheduler fitted nothing looked healthy from every angle this

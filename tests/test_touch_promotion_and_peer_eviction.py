@@ -502,7 +502,13 @@ def test_a_known_peers_live_file_is_not_the_first_thing_shed(tier, channel):
     peer_a = make_file(root, PEER_GEO, 32, when=now - 1.0, group=4)
     peer_b = make_file(root, PEER_GEO, 33, when=now - 2.0, group=5)
 
-    set_ceiling(12_000)                    # 12,288 used, target 10,800: one file goes
+    set_ceiling(8_000)                     # 0.2.30: the FAIR SHARE makes this rank's
+    # budget ceiling/2 = 4,000 (one live peer learned), target 3,600, so its 4,096 own
+    # bytes are over that and exactly one file goes. The pre-0.2.30 figure was 12,000 -
+    # a store-wide ceiling, which is the defect: at 12,000 this rank's share target is
+    # 5,400 and it DECLINES the pass outright, because the 8,192 bytes above the line
+    # belong to a live sibling that owns its own share. See
+    # tests/test_ceiling_fair_share_multi_rank.py for that decline, pinned.
     disk_spill._state["estimated_bytes"] = 12_000
     disk_spill._enforce_ceiling()
 
