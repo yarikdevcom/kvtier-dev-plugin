@@ -3,12 +3,15 @@ r"""The global disk-authority switch: what the brief asks for, in one file.
 The feature is one boolean with four properties, and each one gets its own test rather
 than being inferred from the offer path's behaviour:
 
-1. **Boot default OFF.** A process that nobody told has no disk authority, and the
-   default is a module constant that these tests refuse to let drift.
-2. **Only the route op turns it on.** Not an environment variable, not a config file,
-   not the spill arm, not the gap-fill switch, not a request field, not a failure or a
-   recovery path. Proved by scanning every assignment to the field in the module's own
-   syntax tree and naming each writer.
+1. **Its import-time value is OFF.** A process that has run no boot has no disk
+   authority, and the value is a module constant these tests refuse to let drift. Since
+   0.2.33 a BOOT may raise it - by calling this module's own setter, at connector
+   creation, from the plugin's own boot default (`disk_boot.py`) - which is a CALLER of
+   the writer, not a second writer, and is pinned as such below.
+2. **The writers are the two public setters, and every caller in the package is named.**
+   Not a config file, not the spill arm, not the gap-fill switch, not a request field,
+   not a failure or a recovery path. Proved by scanning every assignment to the field in
+   the module's own syntax tree and naming each caller in the rest of the package.
 3. **When it is on, it applies to every request.** Not "to requests that ask": two
    different requests with different fields get the same posture, and neither can opt
    out.
@@ -52,11 +55,18 @@ offer = base.offer
 # --- 1. the boot default ------------------------------------------------------
 
 def test_the_boot_default_is_off_and_says_so():
-    """A fresh process gives disk authority to nobody, and every surface agrees.
+    """A process that has run NO BOOT gives disk authority to nobody, and every surface
+    agrees.
 
-    This is the property the whole design rests on, so it is asserted with NOTHING set
-    up: no fixture, no arm, no store. If a future change moves the default, this fails
-    before any behaviour test gets a chance to pass for the wrong reason.
+    Still the property the design rests on, and asserted with NOTHING set up: no
+    fixture, no arm, no store. What 0.2.33 changed is that a BOOT may now raise the
+    switch - by calling this module's own public setter at connector creation, because
+    `KVTIER_DISK_BOOT_ENABLE` defaults to ON. The IMPORT-TIME default below is what a
+    process is before any boot has decided anything, and it stays False: an import that
+    turned serving behaviour on would make the plugin's import a side effect, and
+    `disk_boot`'s fail-safe direction ("every outcome except ARMED leaves the boot
+    disarmed") is only expressible against a default-off start. The boot-time half of
+    the story is `tests/test_disk_boot_default.py`.
     """
     assert disk_restore.DISK_AUTHORITY_DEFAULT is False
     posture = disk_restore.disk_posture()
@@ -179,11 +189,21 @@ def test_the_only_writer_of_the_switch_is_the_setters_shared_body():
 
 
 def test_nothing_outside_the_module_turns_it_on():
-    """The same claim about the REST of the package: the setter has exactly one caller.
+    """The same claim about the REST of the package: the setter has TWO callers, and
+    each one is named.
 
-    `disk_store._op_authority` is that caller. If a boot-recovery path, a config
-    loader or a test helper ever grows a call, the posture stops being a single
-    operator's decision and this fails naming the file.
+    `disk_store._op_authority` is the operator's door. Since 0.2.33 `disk_boot
+    .boot_enable` is the other: this package's own BOOT DEFAULT, which calls the same
+    setter because the operator asked for a boot that comes up serving by default, and
+    whose flag (`KVTIER_DISK_BOOT_ENABLE`) can only ever turn that back off. Both are
+    accounted for here, and the assertion is what keeps the pair small: a boot-recovery
+    path, a config loader or a test helper that grows a call means the posture stops
+    being a decision anybody made, and this fails naming the file.
+
+    The two callers are not equally powerful, and the extras keep it that way: the boot
+    default reaches the switch through the public setter and nowhere else, never touches
+    the cheaper switch, and the module that owns the switch still reads no environment -
+    the flag is resolved in `config`, turned into a real boolean, and handed over.
     """
     import pathlib
     import re
@@ -195,26 +215,72 @@ def test_nothing_outside_the_module_turns_it_on():
         text = path.read_text()
         if re.search(r"\bset_disk_authority\b", text):
             found.append(path.name)
-    assert found == ["disk_store.py"], found
+    assert found == ["disk_boot.py", "disk_store.py"], found
     # ...and there it sits in exactly the one handler that answers the op.
     source = (root / "disk_store.py").read_text()
     assert source.count("set_disk_authority") == 1, \
         "one call site: the op handler; two means a second door"
     assert "_op_authority" in source
+    # THE BOOT DEFAULT'S CALL: exactly one CALL SITE (not one mention - the module's
+    # docstring names the setter on purpose), and the function that makes it is the
+    # boot's own decision, not a helper a later path can reach. The cheaper switch is
+    # is untouched, because the boot default makes ONE decision ("come up serving") and
+    # not one per posture - a boot that raised both switches would quietly retire the
+    # distinction the 2026-10-05 incident made worth having.
+    boot_source = (root / "disk_boot.py").read_text()
+    assert "set_offer_switch" not in boot_source, \
+        "the boot default raises one posture, not both"
+    tree = ast.parse(boot_source)
+    sites = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for call in ast.walk(fn):
+            if isinstance(call, ast.Call) \
+                    and getattr(call.func, "attr", None) == "set_disk_authority":
+                sites.append(fn.name)
+    assert sites == ["boot_enable"], sites
+    assert "disk_restore.set_disk_authority(True)" in boot_source, \
+        "the one call raises the switch - reusing the setter, not a third way in"
+    # And the module that owns the switch stays free of the environment: the flag is
+    # resolved in `config`, and `disk_restore` is handed a real boolean or nothing.
+    assert "os.environ" not in inspect.getsource(disk_restore), \
+        "the switch's own module must stay free of the environment"
 
 
 def test_no_environment_variable_or_config_key_names_the_switch():
-    """An env var would make "restart and it is live" true again.
+    """No configuration vocabulary names the switch - including the new boot flag.
 
     `config.py` owns every environment name in this plugin, so the check is: no config
-    constant mentions authority, and `config.apply`/reload cannot produce one. A key
-    that is not in the accepted config vocabulary is refused by the reload route's own
-    rule, so there is no silent path either.
+    constant mentions the switch, `config`'s source never mentions it either, and
+    `config.apply`/reload cannot produce one. A key that is not in the accepted config
+    vocabulary is refused by the reload route's own rule, so there is no silent path
+    either.
+
+    SINCE 0.2.33 THERE IS ONE MORE ENV VAR IN THIS AREA (`KVTIER_DISK_BOOT_ENABLE`), and
+    this is where the distinction has to be pinned rather than argued: that variable
+    names a BOOT POSTURE ("come up armed and serving, or don't"), not the switch. It
+    reaches the switch the way a human does - by calling the public setter from
+    `disk_boot.boot_enable` - while `config.py` still never names the field, still holds
+    no key that could raise it, and still has no path that writes engine state.
     """
     names = [name for name in vars(config) if name.startswith(("ENV_", "DEFAULT_"))]
     assert [name for name in names if "AUTHORITY" in name.upper()] == []
     source = inspect.getsource(config)
     assert "authority" not in source.lower()
+    # The boot flag exists, is named for the BOOT and not for the switch, and its
+    # resolver reads the environment and nothing else: no file, no persisted posture, no
+    # write of any state. That last clause is the 2026-10-03 prohibition, enforced
+    # where the flag is read.
+    assert config.ENV_DISK_BOOT_ENABLE == "KVTIER_DISK_BOOT_ENABLE"
+    assert "AUTHORITY" not in config.ENV_DISK_BOOT_ENABLE
+    resolver = inspect.getsource(config.disk_boot_enable)
+    assert "os.environ" in resolver
+    for forbidden in ("open(", "disk-spill-arm", "ARM_FILE", "_read_arm_file",
+                      "set_disk_authority", "_state", "arm_state"):
+        assert forbidden not in resolver, (
+            f"the boot flag's resolver must read the environment and nothing else, "
+            f"but it mentions {forbidden!r}")
 
 
 def test_the_spill_arm_raises_nothing(armed):

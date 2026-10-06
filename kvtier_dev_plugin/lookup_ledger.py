@@ -780,7 +780,6 @@ def _attribution_section() -> dict:
 
 LOOKUPS_OPS = ("read", "arm", "disarm", "clear", "status", "verdict",
                "requests", "depth", "order", "rates")
-MUTATING_LOOKUPS_OPS = ("arm", "disarm", "clear")
 
 
 def lookups_for_engine(engine, args=None) -> dict:

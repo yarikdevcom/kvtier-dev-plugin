@@ -2836,7 +2836,10 @@ def _fill_disk_fill(out: dict, rollup: dict) -> None:
 
 
 def _op_status(_body: dict) -> dict:
-    from . import worker_diag  # noqa: PLC0415 - one rank rule, not two
+    from . import (
+        disk_boot,  # noqa: PLC0415 - it imports disk_restore, which imports us
+        worker_diag,  # noqa: PLC0415 - one rank rule, not two
+    )
     rank, source = worker_diag.rank_id()
     state = disk_spill.counters()
     # ONE read of the index's journal view, reused by the fields below.
@@ -2850,6 +2853,12 @@ def _op_status(_body: dict) -> dict:
             "root": disk_spill.disk_root(),
             "ceiling_bytes": disk_spill.capacity_ceiling_bytes(),
             "arm_state": disk_spill.arm_state(),
+            # THE SSD TIER'S BOOT DEFAULT (0.2.33), on the door an operator reads first:
+            # whether the flag asked for a boot that comes up armed and serving, whether
+            # this boot honoured it, whether renewal has run, and whether a manual
+            # disarm has latched. `disk_boot.view()` builds every key on every path, so
+            # a degraded boot's answer has the same shape as a healthy one.
+            "disk_boot_default": disk_boot.view(),
             "geometry_digest": disk_spill.geometry_digest(),
             "engine_fields": engine_fields(),
             "worker_fingerprint": fingerprint_report(),
@@ -2914,12 +2923,33 @@ def _op_arm(body: dict) -> dict:
     function takes a scalar has to be adapted here rather than handed the dict: a
     body passed where `seconds` belongs fails closed (`seconds must be a number`),
     which is safe but leaves an operator arming a tier with a message about types.
+
+    THE BOOT DEFAULT'S OTHER HALF (0.2.33): a hand arm LIFTS the operator's disarm
+    latch. This door is the human's, so an operator who disarmed and then armed by hand
+    has asked for the tier back, and leaving the latch set would switch renewal off for
+    the rest of the boot on a box he just chose to serve from disk - the two-hour dark
+    tier again, wearing a latch. A refused arm lifts nothing.
     """
-    return disk_spill.arm(body.get("seconds"))
+    from . import disk_boot  # noqa: PLC0415 - it owns the boot default's latch
+    verdict = disk_spill.arm(body.get("seconds"))
+    if verdict.get("armed"):
+        disk_boot.note_operator_arm("POST {\"op\":\"arm\"}")
+    return verdict
 
 
 def _op_disarm(_body: dict) -> dict:
-    return disk_spill.disarm()
+    """`disk_spill.disarm`, and the operator's veto over the boot default (0.2.33).
+
+    A manual disarm is an INSTRUCTION, and since 0.2.33 there is a boot default for it
+    to override - so this door latches `disk_boot`, and renewal then refuses to re-arm
+    this boot for the rest of its life. That is the non-negotiable ordering: a human at
+    the verb always beats the plugin's own boot posture, and there is no path that
+    re-arms a box an operator has just disarmed.
+    """
+    from . import disk_boot  # noqa: PLC0415 - it owns the boot default's latch
+    verdict = disk_spill.disarm()
+    disk_boot.note_operator_disarm("POST {\"op\":\"disarm\"}")
+    return verdict
 
 
 def _op_offers(body: dict) -> dict:
@@ -2960,11 +2990,25 @@ def _op_authority(body: dict) -> dict:
 
     And the lifetime, stated in the response because "is this posture sticky?" is the
     first question a posture this expensive deserves: per boot, lost by a restart, and
-    raised by nothing except this POST - not an env var, not a config file, not the
-    spill arm, not a recovery path.
+    raised by nothing except this POST - or, since 0.2.33, by this boot's own DEFAULT
+    (`KVTIER_DISK_BOOT_ENABLE`, on unless the operator turned it off), which is the same
+    setter and is reported beside it.
+
+    LOWERING IT IS AN OPERATOR'S VETO (0.2.33). `enabled: false` latches `disk_boot`, so
+    the boot default's renewal will not put the arm back under an operator who has just
+    taken the box out of disk service. A manual disarm always beats the boot default.
     """
-    from . import disk_restore  # noqa: PLC0415 - it imports this module
-    return _apply_switch(body, "disk_authority", disk_restore.set_disk_authority)
+    from . import (
+        disk_boot,  # noqa: PLC0415 - it owns the boot default's latch
+        disk_restore,  # noqa: PLC0415 - it imports this module
+    )
+    verdict = _apply_switch(body, "disk_authority",
+                            disk_restore.set_disk_authority)
+    applied = verdict.get("disk_authority") or {}
+    if applied.get("changed") and applied.get("enabled") is False:
+        disk_boot.note_operator_disarm(
+            "POST {\"op\":\"authority\",\"enabled\":false}")
+    return verdict
 
 
 def _apply_switch(body: dict, field: str, apply_switch) -> dict:

@@ -89,15 +89,15 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DIAG_MIN_INTERVAL_SECONDS` | the rate floor between writes, in seconds. Default `1.0`, clamped to `[0, 3600]`; `0` means "no floor". |
 | `VLLM_E2_TIER_DIAG_EPOCH` | pin the per-boot `epoch` string the reader uses to prove two facts came from the same boot. Unset = derived once per process and stable for its lifetime. |
 | `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
-| `VLLM_E2_TIER_DISK_SETTLE_MS` | **the cap on one settle wait, in milliseconds (0.2.23). Unset or `0` = never wait**, which is every boot before 0.2.23: an unsettled read was dropped and its tokens recomputed. It is a CAP on a budget that is proportional to the bytes still in flight (`disk_restore.settle_budget`), not the budget, and NOT an arm - the restore path still needs the disk root, both arms, this boot's offer switch and a proven worker before it reads a byte. A value that will not parse means OFF and is logged once. See *The restore race, measured*. |
-| `VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S` | the assumed sequential READ throughput of the spill store, the number that turns bytes-in-flight into milliseconds. Default `11500000000` - **the measured WRITE rate, because the read side has never been measured**; set it from a boot's `settle.read_seconds_max` and the budget tracks the hardware. |
-| `VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S` | the engine's prefill rate, used for one published number and nothing else: `recompute_ms`, the cost a wait is racing. Default `9400/2.4` ≈ `3916.7`, from the measured 9,400 tokens recomputed in 2.4 s. |
+| `VLLM_E2_TIER_DISK_SETTLE_MS` | **how long one apply point may wait for the bytes it is about to apply, in milliseconds. Unset = `5000` since 0.2.32** (it was unset-means-never-wait through 0.2.31, which is why a default boot used to lose every raced read); `0` = never wait, and that is still reachable. It is a FLAT allowance - `min(SETTLE_MS, the load's own remaining deadline)` - and no arithmetic on bytes or throughput takes part in it; see *The restore race, measured, and the wait that stopped guessing* below. It is an allowance and NOT an arm - the restore path still needs the disk root, both arms, this boot's offer switch and a proven worker before it reads a byte. A value that will not parse falls back to the 5,000 ms default, says so in the log and on the payload (`env_problems`), and only that line names the variable that was ignored. |
+| ~~`VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S`~~, ~~`VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S`~~ | **DELETED in 0.2.32.** These two fed the settle formula (`SETTLE_READ_BPS_DEFAULT`, `PREFILL_TOKENS_PER_S_DEFAULT`, `SETTLE_SAFETY_MARGIN`, `SETTLE_MIN_MS` are gone with them); the rule is flat now, so there is nothing left for a throughput assumption to compute. Reading them is a no-op - they were guesses, and the box proved it. See *The restore race, measured, and the wait that stopped guessing*. |
 | `VLLM_E2_TIER_DISK_READ_THREADS` | **how many threads issue spill reads at once (0.2.24). Unset or `1` = ONE thread**, which is every boot before 0.2.24, byte-identically and pinned by a test. Clamped to `[1, 16]`; anything that is not a positive integer means "the operator said nothing" and is reported in `read.env_problems`. It is a thread count and nothing else - the queue stays FIFO, so dispatch order is submission order. **Raise the pool with it or it buys nothing on a big prompt**: in-flight bytes are bounded by the pool, not by the threads. See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | the bounce-buffer pool's byte ceiling, PER PROCESS. **Unset = `disk_read.MAX_BUFFERS_BYTES` = 96 MiB**, today's value, which holds **8** units of 11,468,800 B (7 of the 12,902,400 B width). This is what actually bounds in-flight work: a buffer is taken at *issue* and only returned at the apply point, so **one offer needs the pool to hold the whole offer at once** - and a big-prompt offer is 10 units, so the default misses it by two. **128 MiB (134217728) is the smallest setting that holds a whole 10-unit offer on both widths.** HOST-RAM COST: the pool is per process and every engine rank is a process, so 128 MiB here is 512 MiB of resident bytes on a 4-rank boot. Clamped at 8 GiB and says so (`pool.clamped`). See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS` | **how many seconds one capacity-enforcement pass may spend (0.2.29). Unset = `disk_spill.CEILING_PASS_BUDGET_SECONDS` = 1.5 s.** The pass runs on the spill WRITER thread - the only thing draining the 256-job / 256 MiB spill queue - and before this release its worst case (100,000 directory entries read twice, 20,000 `stat`s, up to 4,096 unlinks) was bounded in files but not in TIME, so a full store could stall the queue and DROP spills at the moment the disk was fullest. When the budget expires the pass stops early and says so (`spill.ceiling_measurement.deadline_hit`, `plan_truncated`), and the next committed spill continues - a partial pass is this tier's normal shape, not an error. **`0` is refused** (a pass that does nothing reads as a configured ceiling that is not one) and a value that will not parse means the shipped default, reported in `env_problems`. See *The eviction clock is a touch clock, and nobody's neighbour is capacity*. |
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
+| `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier for the full 7,200 s and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. It is renewed while the posture stays up, and a human's `{"op":"disarm"}` latches: renewal never re-arms a box the operator just disarmed. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
@@ -974,8 +974,11 @@ configuration change makes the old files un-findable rather than mis-readable:
   non-empty value that disagrees with a rank's own digest is a counted refusal.
 
 **Off, twice over.** `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the tmpfs
-roots are refused by `disk_layout`) **and** the tier must be armed - no env var arms
-it, and an arm expires. Unarmed, the two wrapped methods cost two `os.environ.get`
+roots are refused by `disk_layout`) **and** this boot must have armed the tier. Since
+0.2.33 the boot does arm it by default (`KVTIER_DISK_BOOT_ENABLE`, ON unless the operator
+turned it off - see *The SSD tier's boot default*); what has not changed is that **no
+runtime knob reaches the arm except the `/disk` verb**, and that an arm expires on its own
+(7,200 s) whoever put it up. Unarmed, the two wrapped methods cost two `os.environ.get`
 calls per step: no stat, no open, no copy, no queue, no writer thread.
 
 **It needs the engine patch, and says whether it has it.** A file needs a key, and
@@ -1095,9 +1098,12 @@ the file again (~10 ms per 3,200-token span against ~3.2 s to recompute it). The
 worker rebuilds each name with its **own** digest, and a disagreement is a counted
 failure, not a guess.
 
-**A fresh boot serves nothing from disk, and one POST says who is served.** Two
-switches, both dev-verb only, both per boot, neither reachable by an environment
-variable, a config file or the spill arm:
+**A boot with the tier env set serves from disk, and one POST changes who is served.**
+Since 0.2.33 the boot default raises the serve posture for you (`KVTIER_DISK_BOOT_ENABLE`,
+ON unless the operator turned it off - see *The SSD tier's boot default*); the switches
+themselves stay dev-verb only, per boot, and unreachable by a config file or the spill
+arm, and `KVTIER_DISK_BOOT_ENABLE=0` restores the pre-0.2.33 posture where **a fresh boot
+serves nothing from disk until you POST**:
 
 ```bash
 curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"authority"}' $B/disk  # read
@@ -1116,7 +1122,9 @@ change, and no restart needed to turn it back off.
 `op=offers` is the cheaper posture: RAM first, the disk extending only what the host-RAM
 tier left short. With both up, authority wins - the disk decides.
 
-Both start **false**, and `restore.serving_as` names the resulting posture as one word
+Both start **false** in a process - a boot that *honours* the default raises one of them
+by calling this module's own setter, and a boot that does not (or a box where the flag is
+`0`) leaves them down - and `restore.serving_as` names the resulting posture as one word
 (`off` / `disk_authority` / `ram_first_gap_fill`). Why the spill arm is not one of these:
 on 2026-10-05 a spill arm raised for a write experiment was enough to put 123,474
 un-requested 160,000-token offers in front of live traffic. Arming says bytes may be
@@ -1134,21 +1142,24 @@ So the marker, the `scope` argument and the fields it fed (`flagged`,
 decline it. Sending the old marker is a no-op that changes nothing.
 
 Eligibility bounds are untouched by the switch - the bounce-buffer pool budget, the
-CPU-slot reserve, `MAX_OFFER_TOKENS_PER_OFFER` and "is this span actually in the index"
-still decide how much any single request is offered. Disk authority removes the *policy*
-stop, not the physical ones.
+CPU-slot reserve, the per-offer block bound (`MAX_RESTORE_BLOCKS_PER_OFFER`, 64 spans;
+the fixed 32,000-token cap that used to sit beside it was deleted in 0.2.32) and "is this
+span actually in the index" still decide how much any single request is offered. Disk
+authority removes the *policy* stop, not the physical ones.
 
-**A failed disk load is never offered twice.** The engine recovers from a KV load
-failure by resetting the request and rescheduling it, which asks
-`get_num_new_matched_tokens` again - and the journal has not changed, so an amnesiac
-restore answers with the same offer and the same failure. That loop is what starved
-the box. `suppress_load` fuses the **request** (named exactly by
+**A failed disk load is not offered twice, and since 0.2.32 a raced load is.** The
+engine recovers from a KV load failure by resetting the request and rescheduling it,
+which asks `get_num_new_matched_tokens` again - and the journal has not changed, so an
+amnesiac restore answers with the same offer and the same failure. That loop is what
+starved the box. `suppress_load` fuses the **request** (named exactly by
 `connector_output.failed_recving`) and the **span** (its first block's key, so a
-replayed prompt under a fresh request id is refused too), on any of: a failed load,
-invalid block ids on a step that carried our slots, a load that outlived
-`RESTORE_DEADLINE_SECONDS`, or a request returning at or before the point where it was
-last offered. `suppressed_after_failure` is the refusal; `suppressed_hits` /
-`suppressed_spans` / `suppressions` say which half fired. The table is bounded
+replayed prompt under a fresh request id is refused too), on any of: a failed load whose
+kinds say DATA, invalid block ids on a step that carried our slots with the same kinds,
+a load that outlived `RESTORE_DEADLINE_SECONDS`, or a request returning at or before the
+point where it was last offered with no re-offer left. `suppressed_after_failure` is the
+refusal; `suppressed_hits` / `suppressed_spans` / `suppressions` say which half fired,
+and `races_not_fused` / `fuses_on_data_kinds` / `fuses_on_unknown_kinds` say WHY a report
+did or did not fuse (see *What a failed load costs*). The table is bounded
 (`MAX_SUPPRESSED_REQUESTS`, oldest-first), because a fuse that grows without limit is
 its own leak.
 
@@ -1179,8 +1190,14 @@ worker proof, and every offer refusal with its meaning - under `restore`, with
 `restore.why_no_restore` naming the first missing link. The boot's **posture** is in
 that section as fields, not only as text in the boot line: `disk_authority`,
 `offers_enabled`, `serving_as`, `per_boot`/`survives_restart`,
-`disk_authority_changes`/`offer_switch_changes`, `offer_cap`, `ranks_armed`/`ranks_seen`, and the fuse counters
-`suppressed_hits`/`suppressed_spans`/`suppressed_requests`/`suppressions`. A rank file's
+`disk_authority_changes`/`offer_switch_changes`, the per-offer block bound
+(`offer_block_cap_blocks`/`offer_block_cap_tokens`, which replaced the retired
+`offer_cap` when 0.2.32 deleted the fixed 32,000-token cap),
+`ranks_armed`/`ranks_seen`, the fuse counters
+`suppressed_hits`/`suppressed_spans`/`suppressed_requests`/`suppressions`, and what the
+last failure reports decided - `races_not_fused`, `fuses_on_data_kinds`,
+`fuses_on_unknown_kinds`, `race_reoffers_granted`, `last_fuse_decision` and the
+`failure_kind_classes` partition itself, so "why did this one fuse?" is a payload read. A rank file's
 `disk_restore.installed: true` describes a WORKER and cannot start a restore; only
 the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
 is that verdict at boot.
@@ -1281,8 +1298,8 @@ which classifies `file_missing`/`size_mismatch` and reports the GPU block as a l
 error, and the scheduler recomputes. That is the cheap honest gate, and it costs one
 wasted load round trip per stale entry, never wrong KV.
 
-**The restore race, measured, and a wait sized in bytes rather than in optimism
-(0.2.23).** Reads are queued at `bind_connector_metadata` and applied at
+**The restore race, measured, and the wait that stopped guessing (0.2.23, flat since
+0.2.32).** Reads are queued at `bind_connector_metadata` and applied at
 `start_load_kv`, and the fork calls **both inside one engine step**
 (`kv_connector_model_runner_mixin.py:80-93`). Because every disk hit is offered with
 `load_kv_async=True`, `has_sync_kv_loads` stays false and the fork defers
@@ -1297,7 +1314,9 @@ recent batch as the engine saw it: `elapsed_ms`, `accepted`/`expected`, `running
 `queued`, `settled`, the **measured bind→apply gap** (`bind_to_apply_ms`, stamped at the
 first line of `_worker_bind`), `bytes_asked` beside `bytes_at_stake` (the bytes still in
 flight, which is what a wait is waiting for), `budget_ms`, `waited_ms`, `bound`,
-`settled_after_wait`, and the recompute cost it was racing. `windows` carries
+`settled_after_wait`, and `allowance_spent` (did this batch use the whole grant and still
+have bytes in flight - the field that replaced the arithmetic-based `over_recompute`,
+which could not see a dropped load). `windows` carries
 `min`/`max` **boot-wide**, an `avg`, and a `median` over the last `MAX_SETTLE_SAMPLES`
 (512) observations that publishes `median_samples` so a truncated median can never be
 misread as the boot's. `read_seconds_avg`/`read_seconds_max` sit beside
@@ -1312,49 +1331,64 @@ fixes if the budget beats the read); an unreadable per-job state table is
 counts the entries the box already wins for free, so `settled_after_wait` over it is the
 wait's hit rate.
 
-The wait itself is **opt-in, proportional, and bounded four ways by construction** - an
-unbounded wait inside an engine step is a hang wearing a performance patch. The rule,
-as it reads in `disk_restore.settle_budget`:
+The wait itself is **flat, bounded, and an allowance rather than an arm** - an unbounded
+wait inside an engine step is a hang wearing a performance patch. The rule, as it reads
+in `disk_restore.settle_budget`:
 
 ```
-proportional_ms = bytes_in_flight / read_bytes_per_s * 1000 * SETTLE_SAFETY_MARGIN
-budget_ms       = clamp(proportional_ms, SETTLE_MIN_MS, VLLM_E2_TIER_DISK_SETTLE_MS)
-budget_ms       = min(budget_ms, the batch's own seconds_left)   # LOAD_DEADLINE_SECONDS
+granted_ms = min(VLLM_E2_TIER_DISK_SETTLE_MS, the batch's own seconds_left)
+             # the read's expiry, from LOAD_DEADLINE_SECONDS: the same clock that
+             # cancels the read, so a wait can never outlive the bytes it waits for
 ```
 
-with `SETTLE_MIN_MS = 0.5` (one scheduler tick: a shorter wait cannot be observed),
-`SETTLE_SAFETY_MARGIN = 2.0` (the read time is the FLOOR of the budget - queue hand-off,
-thread wakeup and the bounce-buffer copy are on top of it),
-`SETTLE_READ_BPS_DEFAULT = 11.5 GB/s` (**the measured WRITE rate, because the read side
-has never been measured** - which is what these fields exist to measure; override it with
-`VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S` once a boot has told you the truth),
-`SETTLE_POLL_SECONDS = 0.0005` (a poll, never a condition wait: the reader thread owns
-those bytes and the engine thread must not queue behind its lock), and `SETTLE_MS_MAX =
-60000` (above that, a cap is a typo, and `ceiling_clamped` says the clamp happened).
-Every batch names which bound decided - `off`, `min`, `proportional`, `cap`, `deadline`
-- and the three counts are published as `wait.bound`, so "my cap is too small" and "the
-floor is all this batch was worth" are different, checkable claims.
+That is the whole formula - one number the operator sets (`SETTLE_MS_DEFAULT`, **5,000
+ms**, overridable by `VLLM_E2_TIER_DISK_SETTLE_MS`) and the load's own deadline, the only
+other clock with a claim on the wait. `SETTLE_POLL_SECONDS = 0.0005` is a poll and never
+a condition wait (the reader thread owns those bytes and the engine thread must not queue
+behind its lock), `SETTLE_MS_MAX = 60000` clamps a typo with `ceiling_clamped` saying it
+happened, and `0` is still reachable and still means never wait.
 
-**Why proportional, with the live box's numbers.** A 9,400-token prompt was measured at
-2.4 s of recompute through the proxy, so the engine's prefill rate is
-`PREFILL_TOKENS_PER_S_DEFAULT = 9400 / 2.4 ≈ 3,917` tokens/s (overridable with
-`VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S`, used for nothing else). A spilled
-(span, group) is 11,468,800 B per rank, so a 3-span × 5-group offer is ~172 MB against
-~9,600 tokens of recompute and a 10-span offer is ~573 MB against ~32,000 tokens:
-**~2.45 s and ~8.17 s of recompute, against ~30 ms and ~100 ms of budget.** A flat
-budget generous enough for the big offer would be a several-fold loss on every small
-one, paid inside the step by requests that never asked for disk - which is why the
-published `recompute_ms` comes with `budget_over_recompute`, and why batches granted a
-wait **longer than the recompute they avoid** are counted
-(`settle_budget_over_recompute`) instead of being left for a human to notice at 3 a.m.
+**Every term of the old formula was a guess, and the live box said so.** Through 0.2.31
+the allowance was `clamp(bytes_in_flight / read_bytes_per_s * 1000 * safety_margin,
+SETTLE_MIN_MS, cap)` - an assumed read throughput (it was the *write* rate, because the
+read side had never been measured), an assumed safety margin, a floor of one scheduler
+tick, and an assumed prefill rate used only to publish the cost a wait was racing. On
+2026-10-06 a live request with a 28,583-token prompt had 12 jobs / 137.6 MB offered and
+the formula granted **23.6 ms**; the measured bind→apply race gap for the batches it
+lost was **89.7 / 97.1 / 129.7 / 135.8 ms**; the request recomputed **28,583 tokens
+(12.26 s, `cached_tokens: 0`)** to save 23.6 ms, and the loss was `drop_running` - a
+kernel read mid-flight, bytes perfectly good underneath it. A budget that gambles
+against a 12-second recompute has no winning side, so the arithmetic is deleted:
+`SETTLE_MIN_MS`, `SETTLE_SAFETY_MARGIN`, `SETTLE_READ_BPS_DEFAULT`,
+`PREFILL_TOKENS_PER_S_DEFAULT`, `VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S` and
+`VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S` are gone, and `bytes_at_stake` is PUBLISHED
+beside the grant while deciding nothing - it is the quantity a reader of
+`last_apply_window` wants, not an input. Which bound applied is published per batch as
+`wait.bound` in exactly three values - `flat` (the allowance decided it), `deadline` (the
+read's own expiry did, so a drop here is a deadline problem and not an allowance
+problem), `off` (this boot does not wait) - and the three are counted boot-wide.
 
-**Default 0 means the boot does not wait, byte-identically to 0.2.22.** The cap is a cap
-and not an arm: the restore path still needs the disk root, the spill tier's arm file,
-the tier's arm, this boot's offer switch and a proven worker rank before it reads one
-byte, and a value that will not parse means OFF and is logged once as
-`DISK[settle] IGNORED: VLLM_E2_TIER_DISK_SETTLE_MS=...`. When it is on, the setting is
-announced once per boot (`DISK[settle] wait=ON cap_ms=... read_bps=...`), never once per
-step, and the same line is in `apply_window.wait.notice` for a poller.
+**The counter that could not see the loss is replaced by one that can.**
+`budget_over_recompute` compared a grant with the arithmetic that produced it, so the
+23.6 ms grant above reported `over_recompute: 0` the whole time it was costing twelve
+seconds. `wait.allowance_spent` asks the only question a flat allowance can answer - did
+this batch consume the WHOLE granted allowance and still have bytes in flight? - and
+`settle_allowance_spent` is its boot-wide count. It is the field that says "5 s is not
+enough on this box" without anyone measuring a throughput.
+
+**The default is ON, which is a behaviour change on an unchanged command line.** Before
+0.2.32 an unset variable meant never wait; now it means a 5 s ceiling, so a boot started
+the old way will wait where it used to drop. The bound is the load's deadline, not the
+cap, so a wait can never outlive the read - but a step that used to cost 0 ms of waiting
+can now cost up to the race gap, which is exactly the trade the operator asked for ("give
+it up to 5 s to read; only when something bad happens do we ignore"). `0` puts the old
+boot back. An unset `VLLM_E2_TIER_DISK_SETTLE_MS` therefore announces what it settled on
+once per boot (`DISK[settle] wait=ON allowance_ms=5000 (VLLM_E2_TIER_DISK_SETTLE_MS is
+unset; the default since 0.2.32 is 5000 ms - set it to 0 for the pre-0.2.32
+never-wait boot)`) - the line NAMING the ignored variable is mandatory, because "the
+operator wrote 40 and the box waited 5 s" must never be a silent reading. A value that
+will not parse falls back to the default and says so, naming the variable and the value,
+once per boot, in `env_problems` as well as the log.
 
 **What the counters exposed on the way.** Every failure on the live box arrived as
 `invalid_block_ids` with an EMPTY `failed_recving`, and that path retired its ledger
@@ -1362,21 +1396,83 @@ entry with a hand-rolled `_loads.pop()` instead of `_drop_load` - so `loads_rele
 never moved (the honest-looking reading was "the load was never registered" rather than
 "it was registered and burned") and the load's slot→path mappings outlived it, which is
 a slot the next `build_load_paths` will emit a path for while the fork may already be
-using it as a host-RAM source. Both failure shapes now go through `_drop_load`; the
-suppression decision is unchanged, and `no_read` deliberately does **not** move at burn
-time (the load is already counted as a failure - moving both would double-book one
+using it as a host-RAM source. Both failure shapes now close the ledger through
+`_drop_load` (or `_burn_load`, when the loss is a data failure and the request is fused
+- see *What a failed load costs* below), and `no_read` deliberately does **not** move at
+burn time (the load is already counted as a failure - moving both would double-book one
 release). A `finished_recving` that arrives *after* a burn is counted as `no_read`
 rather than vanishing, because it is the fork calling a load finished whose bytes this
 plugin knows it never delivered.
 
 **Running the experiment.** Boot as usual and read `apply_window.windows.bind_to_apply_ms`
-- that distribution is the answer to "how big is the window", and it is gathered by a
-boot that waits for nothing. Then set `VLLM_E2_TIER_DISK_SETTLE_MS` to a ceiling you
-would be willing to pay inside a step (200-2000 ms covers the budgets the arithmetic
-above asks for) and read `wait.settled_after_wait` against
-`wait.dropped_after_wait`, `wait.bound`, and `wait.budget_over_recompute`. Raising the
-cap only helps while the losses are `dropped_queued`; a loss that is `dropped_running`
-with the budget already above its `elapsed_ms` is a disk, not a cap.
+- that distribution is the answer to "how big is the window", and since 0.2.32 the
+default boot gathers it *while waiting*, so the same boot answers both "how big is the
+race" and "did the wait win". Read `wait.settled_after_wait` against
+`wait.dropped_after_wait`, `wait.bound` and `wait.allowance_spent`. A loss that is
+`dropped_queued` is the wait doing its job late; a loss that is `dropped_running` with
+`allowance_spent` true is a device slower than the allowance, and `settle_bound_deadline`
+rising with it says the read's own expiry, not the cap, ended the wait.
+
+### What a failed load costs: a race may lose its tokens, a fault loses the offer (0.2.32)
+
+Through 0.2.31 every failure report called `suppress_load`, which black-holes the
+**request** and fuses the **span** for the rest of the boot - whatever the failure was.
+The reason string handed to that call already contained
+`sorted(_recent_failure_kinds())`: the code had the answer in its hand and decided
+without looking. The night the settle formula was measured, that meant a span that lost a
+135.8 ms race in one group of one span cost a 28,583-token recompute **and**
+`suppressed_requests: 3` - a boot-length fuse for a millisecond-scale timing loss, with
+no expiry to wait out.
+
+**The 26 failure kinds are partitioned, and the partition is the policy.**
+`LOAD_TIMING_FAILURES` (`not_settled`, `deadline_expired`) and `LOAD_CAPACITY_FAILURES`
+(`queue_full`, `buffer_cap`) say *the bytes are fine and the moment went wrong*; every
+other name is `LOAD_DATA_FAILURES` - a wrong digest, a short read, a size mismatch, a
+failed copy, a step whose lists disagree, a broken read path, or a loss nobody
+attributed. `failure_kind_classes()` publishes the three lists with the decision rule
+beside them so an operator can argue with the partition instead of reading source, and
+`test_disk_restore_races.py` pins every name into exactly one class.
+
+**The rule.** Any data kind visible means the fuse stays exactly where the 2026-10-05
+incident put it (request and span, forever). Only timing/capacity kinds mean the request
+keeps its next offer and the span is not implicated. NOTHING visible means `unknown`, and
+`unknown` fuses: the scheduler learns a worker's kinds through the rank file, which lags
+(`PROOF_CACHE_SECONDS`), so guessing "race" when the evidence has not arrived is how the
+loop that starved the box comes back. Every decision is counted - `races_not_fused`,
+`fuses_on_data_kinds`, `fuses_on_unknown_kinds`, `race_reoffers_granted` - and the last
+one is written as a sentence in `last_fuse_decision`, because "why is `races_not_fused`
+zero?" has to be answerable without a control experiment.
+
+**The engine's report shape is not evidence.** `failed_recving` and `invalid_block_ids`
+named the CHANNEL the bad news arrived on; `_note_load_failure` files any name outside
+the `WORKER_FAILURES` vocabulary under `read_failed`, which is a data kind. A classifier
+reading the plain ring would therefore see a corruption on every report ever written and
+would never spare a race - the fix would be inert while looking alive. The classifier
+reads only what the code that touched the bytes wrote (`where` = `apply`, `bind`,
+`offer`, locally or carried by a live rank file) and excludes `where="report"`.
+
+**The loop stays bounded without the permanent fuse.** A spared request gets exactly one
+re-offer (`MAX_RACE_REOFFERS_PER_REQUEST`, spent when used, never refilled), so no
+request is ever offered more than TWICE per boot whether its losses are races or faults -
+against the 123,474 offers in 3.9 minutes that starved the box on 2026-10-05.
+
+**The engine blocker, named rather than worked around: on this box a hole costs the whole
+prompt, and a RACE costs it too.** The plugin-side half of the shrink is in place - an
+entry without bytes is pruned, its GPU block reported, and the entries that landed stay in
+the step, so the contiguous prefix survives the hole. What the engine does with the
+reported blocks is not ours to choose: under
+`--kv-transfer-config '{"kv_load_failure_policy":"recompute"}'` the scheduler
+(`vllm/v1/core/sched/scheduler.py:3193-3215`) keeps `num_computed_tokens = 0` (the
+assignment is at `:3205`) for a
+request whose KV cache config has MORE THAN ONE group - this box runs 5 serviceable
+groups, so all 12 reported blocks collapse to one contiguous prefix of ZERO tokens and
+the whole prompt recomputes. The shrink-to-a-prefix mechanism exists only on the
+single-group path (`scheduler.py:3217-3252`, with the truncation in
+`_get_blocked_tp_blocks`). So on this deployment the flat allowance is not a way to
+recompute a little less - it is the reason to wait at all: a race lost costs the full
+recompute either way, and a 5 s wait costs the tokens only when it fails. `partial_load_verdict`
+publishes that reading beside the counts.
+
 
 ### Reading the spill in parallel: threads, the pool, and the ordering question (0.2.24)
 
@@ -1402,9 +1498,14 @@ A job takes its bounce buffer at *issue* (`request_read`) and gives it back at t
   len(groups['groups'])` (`disk_restore.py:2260`), and on the live boot that
   is **1**, not 5: g4 fails the block-size match and g0-g3 are excluded by
   `_group_positionally_stable`, so the offer names g5 alone (`last_offer.groups = [5]`).
-  Spans are capped by `MAX_OFFER_TOKENS_PER_OFFER = 32_000` tokens = **10 spans**, so
-  the largest offer a rank can be asked to read today is **10 units** - one file per
-  span. If g0-g3 return to positional stability, `per_block` becomes 5 and the same
+  Spans are bounded by `MAX_RESTORE_BLOCKS_PER_OFFER = 64` blocks (0.2.32 deleted the
+  fixed `MAX_OFFER_TOKENS_PER_OFFER = 32_000`-token cap: the pool budget below is the
+  bound that actually protects the engine, and the block walk is the principled one -
+  how many spans one offer can name and stream inside its deadline). In practice neither
+  number is what limits a live offer: the deepest contiguous run the store held on the
+  boot the operator measured was **~11 spans**, because spill follows RAM-tier parking
+  and the CPU arena is ~187 blocks per rank, so a rank is asked for ~11 units - one file
+  per span. If g0-g3 return to positional stability, `per_block` becomes 5 and the same
   offer becomes 50 units; everything below says which number moves.
 * **bytes per unit** = one rank's CPU slot: 11,468,800 B (the 3,200-token groups) or
   12,902,400 B otherwise. The live `bytes_applied / reads_applied` = 412,876,800 / 36 =
@@ -2645,6 +2746,17 @@ nothing. Both halves are now handled at the one moment the class exists:
      **and** the guard is a layer of every entry point the class actually has.
   3. Anything else leaves the tier disarmed and puts the reason in
      `pr56810.boot.refusals` - never a silent no.
+  4. **Then the disk tier's own boot default runs** (`KVTIER_DISK_BOOT_ENABLE`, ON by
+     default since 0.2.33): it arms the SSD spill tier for the full 7,200 s and raises
+     this boot's serve posture, so the box comes up `serving_as=disk_authority` with no
+     POST. It calls the same two functions the `/disk` verb calls - `disk_spill.arm()` and
+     `disk_restore.set_disk_authority()` - invents no third way to arm, runs after the
+     RAM tier's arm (a disk arm on a boot that armed no tier is refused), and rolls the
+     pair back to uniformly disarmed if either half fails. Its verdict is
+     `pr56810.boot.disk_boot`, its token is `disk_boot=` on the BOOT line, its own log
+     line is `KVTIER disk boot default=...`, and the whole design is in *The SSD tier's
+     boot default (0.2.33)* below; `disk_restore.boot_default` in the snapshot (and
+     `restore.boot_default` on every `/disk` answer) is where a poller reads it.
 
   Guard before arm is not a style preference: arming the tier without the guard
   means the first real tier bug is an EngineCore death instead of a recorded
@@ -2653,15 +2765,20 @@ nothing. Both halves are now handled at the one moment the class exists:
 * **One line says all of it.** `pr56810.boot.line`, also written to the engine log
   at WARNING so it survives without curling anything:
 
-  `BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=DISARMED tier=ARMED faults=0 guard_over=... not_covered=...`
+  `BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=ARMED tier=ARMED faults=0 journal_dir=tmpfs arena=OK disk_boot=ARMED guard_over=... not_covered=... restore=YES restore_gate=closed restore_ranks=0 captures=...`
 
   `tier=` is the **RAM/host tier** and stays exactly as it was - the restart verifier
   greps it as a PASS criterion - while `ram_tier=` repeats that verdict under an
-  unambiguous name and `disk_tier=` reports the **disk spill tier**, whose arm file
-  lives on tmpfs and is gone after every reboot. A boot can therefore legitimately
-  print `tier=ARMED` next to a restore refusal reading "the disk tier is disarmed":
-  two tiers, two arms, one line. The two named fields are printed *before* `tier=` so
-  that a `grep -oE 'tier=[A-Za-z_]+' | tail -1` still lands on the bare field.
+  unambiguous name and `disk_tier=` reports the **disk spill tier's arm**, whose file
+  lives on tmpfs and is gone after every reboot. **What changed in 0.2.33 is what that
+  field says on a default boot: `ARMED`, not `DISARMED`**, because the boot default armed
+  it - and `disk_boot=` names the boot default's own verdict (`ARMED` / `OFF` /
+  `NO_STORE` / `INERT` / `REFUSED` / `UNDECIDED`). A boot can still legitimately print
+  `disk_tier=ARMED` next to a restore refusal (the worker proof is a separate gate -
+  `restore_gate=closed` above says so): arming says bytes may be written, the serve
+  posture says requests may be served, and the worker proof says a worker will fill the
+  slots. The two named fields are printed *before* `tier=` so that a
+  `grep -oE 'tier=[A-Za-z_]+' | tail -1` still lands on the bare field.
 
   `mode` is `auto` or `inert` and says which env posture ran; `refused=` names each
   gate that failed with its reason; `not_covered=` lists the methods the guard does
@@ -2671,12 +2788,14 @@ nothing. Both halves are now handled at the one moment the class exists:
   when you read the payload later.
 
 ```bash
-# 1. boot the engine (tier env set, VLLM_E2_TIER_DEV_BOOT_INERT unset). Expect
-#    BOTH lines in /tmp/vllm-serve.log:
+# 1. boot the engine (tier env set, VLLM_E2_TIER_DEV_BOOT_INERT unset). Expect THREE
+#    lines in /tmp/vllm-serve.log:
 #    "kvtier-dev-plugin: connector-creation hook fitted on KVConnectorFactory..."
-#    "kvtier-dev-plugin: BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=DISARMED tier=ARMED faults=0 ..."
+#    "kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset -> default ON): HONOURED: ... serving_as=disk_authority with NO POST. ..."
+#    "kvtier-dev-plugin: BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=ARMED tier=ARMED ... disk_boot=ARMED ..."
 #    and NOTHING else to do. `grep 'BOOT\[' /tmp/vllm-serve.log | tail -1` is the
-#    whole boot verdict.
+#    whole boot verdict; `grep 'disk boot default' /tmp/vllm-serve.log | tail -1` is the
+#    disk tier's half, and it names the way to turn the default off.
 
 # 2. read it back. This no longer PATCHES or ARMS anything (the boot did), it
 #    CONFIRMS it: expect installed: true, armed: true, boot.mode: "auto",
@@ -2722,6 +2841,121 @@ and its reasons), `pr56810.boot_default_armed`, `pr56810.boot_is_inert`,
 engine booted with the tier on, why is it parking nothing?". The `/tier` verb
 repeats `armed`, `boot_default_armed`, `operator_note` and a `next_step` at the top
 level, next to `applied`.
+
+### The SSD tier's boot default (0.2.33) (`KVTIER_DISK_BOOT_ENABLE`)
+
+> **A default boot arms the SSD tier and serves from it, with no POST - and the flag can
+> only ever take a boot back to manual, never forward into serving.**
+
+Until 0.2.32 every boot came up with the SSD tier doing nothing and stayed that way until
+somebody POSTed twice - `{"op":"arm","seconds":7200}` and then
+`{"op":"authority","enabled":true}`. Both are per boot, so every restart, every wake and
+every "let me just restart it" silently reverted to a tier that serves nothing while
+`serving_as` truthfully reported `off`. That is the most common way this feature looks
+broken to a human, and it is what this release removes.
+
+**One flag, ON by default.** `KVTIER_DISK_BOOT_ENABLE` unset (or `1`/`true`/`yes`/`on`)
+means the boot that armed the RAM tier also arms the spill tier for the full cap and
+raises the serve posture, so the engine comes up `serving_as=disk_authority`. Set
+`0`/`false`/`off`/`no` and the boot is byte-for-byte the 0.2.32 boot: disarmed spill tier,
+`serving_as=off`, `restore.gate.reason_kind: "disarmed"`, and the two POSTs are the only
+lever. A value that is not a word in either vocabulary (`flase`) reads as the default -
+**ON** - and says so on the boot line, because a typo that silently means "disabled" is a
+box still serving from disk after somebody decided it should not.
+
+**It is a disable switch, not an arm switch.** Every other facility here starts off and
+is armed by a token-gated POST, and that rule is untouched: guard mode, the RAM tier's
+arm, the byte dump and `spill-one` have no env var. `KVTIER_DISK_BOOT_ENABLE` has the
+same shape as `VLLM_E2_TIER_DEV_BOOT_INERT` - it can only turn a boot effect **off** - and
+`VLLM_E2_TIER_DEV_BOOT_INERT` outranks it, because an inert boot arms nothing at all and
+the disk default obeys that (reported as `INERT`, not as a failure).
+
+**THE PROHIBITION IT EXISTS TO RESPECT.** `llm-api/AGENTS.md` (the 2026-10-03 incident)
+forbids a boot-time re-arm: *"A stale `disk-spill-arm.json` did NOT re-arm workers nine
+hours later; ranks report `armed=False` on their own. Do not add a boot-time re-arm."* A
+proxy-side "restore posture on engine-ready" hook was written for exactly that and was
+deleted rather than left default-off. The line this feature walks, and the only line
+there is: a **previous boot's persisted state decides nothing**. The boot's decision comes
+from this one environment variable and from the boot's own measurements, and
+`disk_boot.py` contains no vocabulary for reading an arm file - no `open`, no `json`, no
+`_arm_path`, no `boot_id` - which `test_the_prohibition_structurally_the_module_never_reads_an_arm_file`
+pins against the module's syntax tree, while
+`test_the_prohibition_no_boot_time_re_arm_from_persisted_arm_state` pins it behaviourally
+by planting an arm file that claims "armed, expires in hours" and naming a **different
+kernel boot id** (what a reboot actually leaves behind): the boot comes up disarmed with
+the flag `0` and armed with the flag unset, and in both cases the planted file is refused
+by `disk_spill`'s own boot fence. A surviving arm file still arms nobody; a restart is
+still a rollback.
+
+**The gates, and the fail-safe direction.** Every outcome except `ARMED` leaves this boot
+uniformly disarmed, and `ARMED` requires **both** halves to have landed:
+
+| gate | outcome | why it is a refusal |
+|---|---|---|
+| the flag says no | `OFF` | today's boot, exactly |
+| `VLLM_E2_TIER_DEV_BOOT_INERT` set | `INERT` | that boot arms nothing, disk included |
+| no `VLLM_E2_TIER_DISK_ROOT` | `NO_STORE` | nothing to arm - **not** a fault |
+| the RAM tier did not arm | `REFUSED` | a disk offer needs scheduled load to ride on |
+| the restore layer is not fitted in this process | `REFUSED` | it would write spilled KV and never read a byte |
+| the host-RAM arena is tiny / has no pool / unreadable | `REFUSED` | the tier moves bytes through that arena both ways |
+| the spill journal cannot be written where it lives | `REFUSED` | every spill would be a file no index can name |
+| `disk_spill.arm()` refused | `REFUSED` | the store's own objection, reported verbatim |
+| the arm could not be published to the ranks | `REFUSED` + rollback | an EngineCore-only arm is a half-armed fleet |
+| the posture could not be raised | `REFUSED` + rollback | an armed tier that serves nothing is the state to avoid |
+
+Nothing here can raise an engine's boot into an exception: the whole path is wrapped, and
+an internal raise is reported as `REFUSED` with the exception type named.
+
+**Renewal, because the cap is hard.** `disk_spill.ARM_MAX_SECONDS` is 7,200 s and is
+enforced inside `disk_spill`, so a boot-default posture nobody renews goes dark two hours
+into the boot - silently, which is the failure this release chases. Renewal therefore runs
+on the scheduler's offer path, at most one look per 30 s, and re-arms when less than 3,600
+s of the cap is left. **It rides the request path because the plugin owns no timer thread**
+- inventing one inside a plugin that patches a serving engine is a worse risk than a
+renewal that needs a request - so a box that serves *nothing* for two hours lets the arm
+lapse and the **next** request re-arms it before the gate reads the arm. The first renewal
+of a boot is logged once, every failure is counted and logged once per distinct reason,
+and the cadence is in the payload (`renewal_check_seconds`, `renew_ahead_seconds`,
+`arm_max_seconds`) rather than left to be inferred.
+
+**A human always wins, and the ordering is not negotiable.** `POST /plugins/kvtier/disk
+{"op":"disarm"}` - or `{"op":"authority","enabled":false}` - latches, and renewal then
+refuses to re-arm for the rest of the boot; reports `disarmed_by_operator: true` with the reason. A manual `{"op":"arm"}` lifts the
+latch (an operator who disarmed and re-armed asked for the tier back, and leaving renewal
+dead would be the two-hour dark tier wearing a latch). A *refused* POST latches nothing, so
+a malformed curl cannot silently kill the feature. Behind the latch sits a second, stronger
+belt: **renewal never arms a box whose serve switches are both down**, latch or no latch.
+
+**One line, at boot, naming how to turn it off.** It is WARNING-level, printed once per
+process, and it is the answer to "what did this boot decide and how do I change it?"
+without opening a source file. Verbatim, on a default boot:
+
+```
+kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset -> default ON): HONOURED: armed the spill path for 7200.0 s and set this boot's serve posture, so it comes up serving_as=disk_authority with NO POST. Renewal keeps it up while the posture stays up (>= 3600 s of the 7200 s cap left, checked at most once every 30 s on the request path). to stop every future boot doing this: set KVTIER_DISK_BOOT_ENABLE=0 in the engine's environment and restart (VLLM_E2_TIER_DEV_BOOT_INERT=1 turns off the whole auto-boot, not just the disk tier); to stop THIS boot right now: POST /plugins/kvtier/disk {"op":"authority","enabled":false} and then POST /plugins/kvtier/disk {"op":"disarm"} - a manual disarm latches, and renewal never re-arms a box the operator just disarmed
+```
+
+```bash
+# What the boot decided, three ways. All three read the same state through the same
+# builder, so they cannot disagree: the boot line's `disk_boot=` token, the snapshot's
+# `disk_restore.boot_default`, and `/disk`'s own `disk_boot_default`.
+grep 'disk boot default' /tmp/vllm-serve.log | tail -1
+curl -s -H "x-kvtier-dev-token: $TOK" $B/snapshot | python3 -c \
+  'import sys,json;b=json.load(sys.stdin)["disk_restore"]["boot_default"];print(b["outcome"],b["honoured"],b["armed_now"],b["renewals"],b["disarmed_by_operator"])'
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"status"}' $B/disk | python3 -c \
+  'import sys,json;print(json.load(sys.stdin)["disk_boot_default"]["reason"])'
+
+# Take it off THIS boot, and permanently, in that order.
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"authority","enabled":false}' $B/disk
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"disarm"}' $B/disk
+# ...and for the next boot: Environment=KVTIER_DISK_BOOT_ENABLE=0, then restart.
+```
+
+The payload is the same dict on every door (`disk_restore.boot_default` in the snapshot,
+`restore.boot_default` on every `/disk` answer, and `disk_boot_default` again at the top
+of a `/disk` `{"op":"status"}`), built by one function, and it carries **the same key set
+on every path** - a boot that never ran the default, one that was refused, one whose flag
+was `0` and one whose arm could not be read all answer with the same fields, so an
+absence never has to be interpreted on the path where something went wrong.
 
 ### The kill switch (runtime, no restart)
 
@@ -3271,8 +3505,11 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2093 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
-count in this README is a snapshot - trust `pytest --collect-only`). The 0.2.30
+2234 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+count in this README is a snapshot - trust `pytest --collect-only`). The per-offer
+bounds after the fixed 32,000-token cap was deleted are in
+`tests/test_disk_offer_bounds.py`, with the affordability ladder that replaces the cap
+as the guard against un-placeable offers. The 0.2.30
 fair-share ceiling is in `tests/test_ceiling_fair_share_multi_rank.py`, the fill block in
 `tests/test_disk_fill_block.py` and its access rules in `tests/test_routes.py`; the 0.2.29
 touch-clock / peer-rank / deadline / evict-pool behaviour is in
@@ -3319,6 +3556,22 @@ capability marker's three states are asserted in `section()`, in `snapshot` and 
 `/status`, including that `/status` says `..._unobserved` rather than inventing
 `armed: false`; and the wire bound on `length` is pinned equal to the engine's own
 `MAX_BYTES_PER_REQUEST` rather than to a second copy of the literal.
+
+The disk tier's **boot default** (`tests/test_disk_boot_default.py`) is written as the
+two properties it must not lose. One half drives the REAL boot (install, guard, tier arm,
+restore fit, arena verdict, then the disk default) and asserts the box comes up
+`disk_authority` with an arm at the cap, an arm file naming this boot, and not one POST -
+then asserts `KVTIER_DISK_BOOT_ENABLE=0` reproduces the 0.2.32 boot field for field, down
+to the gate's `reason_kind`. The other half is the **prohibition**: an arm file from a
+previous boot (a different kernel boot id, which is what a reboot leaves) is planted
+claiming hours of life, and the boot's decision is shown to come from the flag and not
+from the file - behaviourally, and structurally, by walking `disk_boot.py`'s syntax tree
+for any name, attribute, string constant or call that could read persisted arm state.
+Between them: a manual disarm beats the boot default (driven through the verb, with the
+arm then expired so renewal is forced to answer), renewal runs and logs once, renewal
+never arms a box that is not serving, every failed gate leaves the boot uniformly disarmed
+and prints exactly one line naming the gate, and the status payload carries the same key
+set on every path including the one where the arm cannot be read.
 
 The spill wiring (`tests/test_disk_store.py`) is the one that tests naming, because a
 wrong name is the failure that cannot be repaired after the fact. The worker's

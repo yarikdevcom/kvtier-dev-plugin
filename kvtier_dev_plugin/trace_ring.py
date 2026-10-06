@@ -248,7 +248,6 @@ def read(limit=None, after_seq=None) -> dict:
 # --- the verb ---------------------------------------------------------------
 
 TRACE_OPS = ("read", "arm", "disarm", "clear", "status")
-MUTATING_TRACE_OPS = ("arm", "disarm", "clear")
 
 
 def _install_observers(engine) -> dict:

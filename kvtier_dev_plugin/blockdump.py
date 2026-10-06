@@ -202,7 +202,6 @@ WRITER_TAG = "kvtier-dev-plugin/blockdump-1"
 
 # --- the caps, and the unit of every one of them ----------------------------
 MAX_BLOCKS = 8                    # blocks per request (a handful, never the arena)
-DEFAULT_BLOCKS = 4                # reported in `caps`, never a silent wire default
 MAX_BYTES_PER_REQUEST = 1024 * 1024   # BYTES of raw KV bytes per request (pre-base64)
 MAX_BYTES = 256 * 1024 * 1024     # BYTES: the ceiling on ONE block's own size
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # BYTES: the response file's size cap
@@ -244,7 +243,6 @@ FILE_SUFFIX = ".json"
 
 # `op` values of the verb. `dump` is the only one that arms a request.
 BLOCKDUMP_OPS = ("status", "arm", "disarm", "dump")
-MUTATING_BLOCKDUMP_OPS = ("arm", "disarm", "dump")
 
 _state: dict = {
     # install / role

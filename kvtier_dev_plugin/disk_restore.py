@@ -22,9 +22,14 @@ Cross-boot adoption is likewise absent - `disk_index` indexes what THIS boot's
 ranks journalled, so a fresh boot restores nothing until it has spilled.
 
 WHO IS SERVED FROM DISK IS A BOOT POSTURE, NOT A REQUEST FIELD (0.2.31).
-Two per-boot switches, both POST-only and both False at every fresh boot, answer the
-one question the read path has: may this boot serve requests from disk, and if so,
-WHOSE answer decides a request's own prefix.
+Two per-boot switches answer the one question the read path has: may this boot serve
+requests from disk, and if so, WHOSE answer decides a request's own prefix. Both are
+import-time False, and both are written only by `set_disk_authority()` and
+`set_offer_switch()` over the `/disk` POST - and, since 0.2.33, by this package's own
+boot default (`disk_boot.py`), which calls that same setter when
+`KVTIER_DISK_BOOT_ENABLE` is at its default. A restart hands the decision back to the
+boot default either way; a request field, a config file, the spill arm and every
+failure-recovery path still cannot raise either switch.
 
   * `disk_authority_enabled` - THE DISK IS THE AUTHORITY FOR EVERY REQUEST. The fork's
     host-RAM hit is treated as ZERO tokens for the offer arithmetic, so the disk index
@@ -269,26 +274,63 @@ would otherwise be permanent, because the fork has no timeout for
 WAITING_FOR_REMOTE_KVS."""
 
 MAX_RESTORE_BLOCKS_PER_OFFER = 64    # SCHEDULER BLOCKS offered per request
-# THE OFFER'S REAL CEILING, IN TOKENS. 64 blocks of a 3,200-token scheduler block is
-# 204,800 tokens, and the block/slot caps alone let one request ask for the whole
-# prompt: on 2026-10-05 a live boot offered EXACTLY 160,000 tokens (50 blocks) on
-# every one of 123,474 offers, the engine could not place them, and every one of
-# them came back as a load failure that rescheduled the request. A cap that the
-# request's own length can reach is not a cap. 32,000 tokens is 10 scheduler blocks,
-# ~144 MB at the measured 14,416,000 B per 3,200-token span, ~13 ms of streaming
-# against a 45 s deadline: enough to be worth doing, small enough to be placeable.
-MAX_OFFER_TOKENS_PER_OFFER = 32_000  # TOKENS offered per request (10 spans)
+#
+# THE TOKEN CAP THAT USED TO SIT HERE IS DELETED (0.2.32), and the deletion is the
+# whole change. Up to and including 0.2.31 this module fixed the per-offer ceiling at
+# 32,000 tokens (10 spans of a 3,200-token block), and that number was an ARTIFICIAL
+# ceiling on restoring a prefix from disk: below what the process can carry, below what
+# the bounce-buffer pool can afford at the operator's live 256 MiB setting, and below
+# the run depth the store reaches anyway. It existed for a real reason - the 2026-10-05
+# boot offered EXACTLY 160,000 tokens per request 123,474 times, the engine could not
+# place them, and every one came back as a load failure that rescheduled the request -
+# but since 0.2.31 the offer path PRICES that reason DIRECTLY: the reader's own
+# `disk_read.afford_reads()` says how many bounce buffers the pool can hold at once, the
+# offer is cut to it, and `bounded_by` names which bound bit (`pool_budget` /
+# `cpu_slots` / `block_cap`). A crude token constant was only ever the accidental guard,
+# and the pool-aware offer path replaced it on purpose.
+#
+# THE RISK KNOWINGLY ACCEPTED BY THIS DELETION (the operator's decision, recorded here
+# so the code can see it): with the constant gone there is NO reservation arbiter, so
+# two simultaneous offers each compute affordability against the pool's CURRENT free
+# bytes, both can believe they fit, and together they over-commit - the open TODO 14.
+# Accepted because the live offer rate is 4 offers in 332 lookups, so overlap is
+# near-zero, and the crude per-request cap was the only accidental guard against it.
+# What is NOT accepted, and is not bought by this change: raising the offer rate is a
+# different trade, and the arbiter (see `disk_read.pool_state()` / `afford_reads()`:
+# reserve at adoption, release at `finish_batch`) must be scheduled before that.
+#
+# THE BOUND THAT REMAINS IS THE BLOCK WALK, and it is principled rather than a magic
+# token count: `_disk_run` stops its positional walk at `MAX_RESTORE_BLOCKS_PER_OFFER`
+# blocks because that is what one offer can name and stream inside
+# `RESTORE_DEADLINE_SECONDS` (the 45 s arithmetic above is computed FROM 64 spans), so
+# no offer carries more than `MAX_RESTORE_BLOCKS_PER_OFFER x block_size` tokens at any
+# prompt length. Pool affordance binds well before that in practice. Neither bound is
+# what stops a 109k-token prompt (64 x 3,200 = 204,800 tokens is above it): what does is
+# bounce-buffer affordability and the store's own depth - the deepest contiguous run the
+# operator measured on the live store was ~11 spans, because spill follows RAM-tier
+# parking and the CPU arena is ~187 blocks per rank. Deleting a cap removes a ceiling
+# nobody needed; it does not make long prefixes restorable.
+DEFAULT_OFFER_BLOCK_SIZE_TOKENS = 3_200
+"""TOKENS: the scheduler block size used to NAME the block cap in tokens before the
+first lookup reveals the engine's real one. The boot line and the payload publish a
+token figure, and both run in processes that will never make an offer (a worker rank)
+- so they need a number, and the honest one is the live box's block size with its
+source published beside it (`block_size_source=fallback`). The offer path always passes
+the manager's real `block_size`, so no offer has ever been sized by this constant."""
+
 MAX_SLOTS_PER_OFFER = 256            # CPU slots allocated per request
 MAX_TRACKED_LOADS = 64               # REQUESTS with an outstanding disk load
 MAX_TRACKED_SLOTS = 4096             # cpu-slot -> identity entries
 MAX_INVALID_BLOCKS = 4096            # GPU block ids awaiting one report
-MAX_REFUSAL_REASONS = 24             # distinct refusal reasons remembered
 MAX_STRING_CHARS = 160
 MAX_BOOT_LINE_CHARS = 160
 CPU_SLOT_RESERVE = 64                # CPU slots the offer must leave free
 MAX_PATHS_PER_STEP = 512             # load_paths entries one step may carry
 MIN_WITNESS_LOG_SECONDS = 30.0       # SECONDS between witness re-emissions
 MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
+MAX_RACE_REOFFERS_PER_REQUEST = 1    # RE-OFFERS one request may claim after a load it
+                                     # LOST A RACE (0.2.32): a spent allowance, never
+                                     # refilled, so a race costs at most two offers
 MAX_RANK_COUNTER = 1_000_000_000     # ceiling on a counter read from a rank file
 MAX_SPANS_REPORT = 16                # PARTIAL SPANS one shape report may name
 
@@ -330,39 +372,42 @@ MAX_FAILURE_STRING_CHARS = 80        # a string inside one failure record
 REFUSAL_LOG_MIN_SECONDS = 30.0       # SECONDS between load-failure lines of one kind
 POOL_PRICE_MAX_IDENTITIES = 64       # index lookups ONE price walk may make
 
-# --- the settle wait, and the arithmetic that sizes it -----------------------
+# --- the settle wait, and the one number that sizes it -----------------------
 #
-# WHY A CAP AND NOT A BUDGET. The wait has to be proportional to the work in flight,
-# because the two ends of the range are orders of magnitude apart. Measured on the live
-# box: a 9,400-token prompt recomputes in 2.4 s through the proxy, and a 32,000-token
-# offer is 10 spans x 5 groups x 11,468,800 B = ~573 MB per rank. So the recompute a
-# wait is racing is ~2.5 s for a 3-span x 5-group offer (~9,600 tokens, ~172 MB) and
-# ~8.2 s for a 10-span one (~32,000 tokens, ~573 MB), while the read that avoids it is
-# ~15 ms and ~50 ms at the store's measured 11.5 GB/s. A flat budget sized for the big
-# offer is ~3x what the small one needs; the only flat number that is ever obviously
-# safe against recompute (eight seconds) is a net loss on every offer, paid inside the
-# step by requests that never asked for disk. The rule the fields below encode is
-# therefore: WAIT ONLY WHILE THE WAIT IS CHEAPER THAN THE RECOMPUTE, and publish the
-# boundary rather than hide it.
+# THE RULE, IN ONE LINE (0.2.32): `granted = min(SETTLE_MS, the load's own remaining
+# deadline)`. Nothing else. The operator's decision, verbatim: "give it up to 5 s to
+# read; only when something bad happens do we ignore; do not compute how much time it
+# needs."
 #
-# `SETTLE_MS_DEFAULT` is 0.0 for a reason that outlives this experiment: the plugin
-# ships into a box serving real traffic, and a step that blocks on NVMe by accident
-# is worse than a tier that never reads. Every number below is inert until an
-# operator names a cap in the environment.
-SETTLE_MS_DEFAULT = 0.0               # MILLISECONDS; 0 = never wait (today's boot)
+# WHAT USED TO SIT HERE, AND WHY IT IS GONE. Until 0.2.31 the allowance was COMPUTED:
+# bytes still in flight divided by an ASSUMED read throughput, times a safety margin,
+# floored at one scheduler tick and capped by the environment variable. Every one of
+# those inputs was a guess, and the boot measured the guesses to be wrong in the
+# direction that costs a request: on 2026-10-06 a 28,583-token prompt was offered 12
+# jobs / 137.6 MB and the formula granted 23.6 ms for reads whose measured bind-to-apply
+# race gap was 89.7 / 97.1 / 129.7 / 135.8 ms. The request recomputed 28,583 tokens
+# (12.26 s, `cached_tokens: 0`) to save 23.6 ms of a step. A formula that guesses the
+# speed of the device is a formula that loses to the device, and the loss is paid by the
+# request that never asked for a special favour.
+#
+# THE COUNTER THAT COULD NOT SEE THAT IS DELETED WITH IT. `budget_over_recompute`
+# compared the granted wait against the granted budget's own arithmetic, so a load that
+# was dropped at 23.6 ms and then cost a 12-second recompute read as `over_recompute: 0`
+# - a clean bill of health for the bug. What remains is the honest version: how many
+# batches spent the WHOLE allowance and still did not settle (`settle_allowance_spent`).
+#
+# WHAT THE DEFAULT MEANS NOW. `SETTLE_MS_DEFAULT` was 0.0 - never wait - on the argument
+# that a step that blocks on NVMe by accident is worse than a tier that never reads.
+# That argument still holds and the operator accepted its cost deliberately: a flat
+# 5,000 ms is permission to block the worker's load path for up to five seconds, and it
+# is bounded by the load's own deadline (`disk_read.LOAD_DEADLINE_SECONDS`, 30 s) and by
+# `SETTLE_MS_MAX` below, and `VLLM_E2_TIER_DISK_SETTLE_MS=0` still means never wait and
+# is still reachable. The wait is a POLL with three exits (the bytes, the allowance, the
+# read's own expiry), so the five seconds is a ceiling on a wait that usually ends in
+# single-digit milliseconds - `settled_on_arrival` counts the ones that cost nothing.
+SETTLE_MS_DEFAULT = 5_000.0           # MILLISECONDS; the flat allowance one apply point
+                                      # may wait for the bytes it is about to apply
 SETTLE_MS_MAX = 60_000.0              # a cap that is not this is a typo, not a budget
-SETTLE_MIN_MS = 0.5                   # FLOOR: a wait shorter than one scheduler
-                                      # timer tick cannot be observed, so grant the
-                                      # tick and let the poll loop leave early
-SETTLE_SAFETY_MARGIN = 2.0            # the read is the FLOOR of the budget, not the
-                                      # estimate: queue hand-off, thread wakeup and
-                                      # the bounce-buffer copy are all on top of the
-                                      # kernel's read time
-SETTLE_READ_BPS_DEFAULT = 11_500_000_000.0   # BYTES/S assumed while nobody has
-                                             # measured the READ side; see the env
-                                             # var's comment in config.py
-PREFILL_TOKENS_PER_S_DEFAULT = 9400.0 / 2.4  # TOKENS/S: the two measured samples,
-                                             # 9,400 tokens recomputed in 2.4 s
 SETTLE_POLL_SECONDS = 0.0005          # SECONDS between looks while waiting; half a
                                       # millisecond is below every interesting read
                                       # time and above a busy-wait's cost
@@ -371,11 +416,21 @@ MAX_SETTLE_SAMPLES = 512              # WINDOW samples kept for a median; min/ma
 
 # --- the two boot switches ----------------------------------------------------
 # WHO IS SERVED FROM DISK, AND BY WHOSE ANSWER. Both are per-boot in-process booleans,
-# both False at every fresh boot, and both are settable ONLY by the `/disk` dev verb
-# over a POST. No env var, no config file, no arm file, no recovery path and no
-# request field can raise either one: `set_disk_authority()` and `set_offer_switch()`
-# are the two writers, and the test suite asserts by AST that neither reads the
-# environment.
+# both import-time False, and the ONLY writers are `set_disk_authority()` and
+# `set_offer_switch()`. Neither reads the environment, and the test suite asserts that
+# by AST; no config file, no arm file, no recovery path and no request field can raise
+# either one.
+#
+# SINCE 0.2.33 THERE IS A THIRD CALLER OF THE SETTER, AND NOT A THIRD KNOB: the
+# package's own boot default (`disk_boot.py`) calls `set_disk_authority(True)` at
+# connector creation when `KVTIER_DISK_BOOT_ENABLE` is unset. That is the same two
+# writers, the same gate, the same log line - it is the operator's own POST, issued by
+# the boot on his behalf because every restart used to silently revert to a tier that
+# serves nothing. The variable DISABLES that (0/false/off/no); it cannot raise anything
+# the boot default is not already on, which is the property
+# `VLLM_E2_TIER_DEV_BOOT_INERT` has always had. What it must NEVER become is a read of a
+# PREVIOUS boot's arm file or persisted posture: see `disk_boot.py`'s prohibition and
+# the 2026-10-03 entry in the sibling llm-api repo.
 #
 # WHY THERE ARE TWO AND NOT ONE. They answer different questions and a boot can sit in
 # either posture:
@@ -403,12 +458,22 @@ MAX_SETTLE_SAMPLES = 512              # WINDOW samples kept for a median; min/ma
 # left is the axis that always mattered: WHAT the disk may do.
 
 DISK_AUTHORITY_DEFAULT = False
-"""THE boot default, stated as a constant so the import-time value is the assertion.
+"""THE IMPORT-TIME value of the switch, stated as a constant so it is the assertion.
 
-A fresh boot gives disk authority to NOBODY. If the boot is unhealthy it stays off,
-because nothing but the POST route op can move it and the route op cannot run before
-the plugin is fitted. `tests/test_disk_authority_switch.py` pins this value, the
-absence of any other writer, and the fact that a `reset()` puts it back.
+A process that has run no boot gives disk authority to NOBODY, and that stays true in
+0.2.33: what changed is that a boot may now RAISE the switch by calling
+`set_disk_authority(True)` when `KVTIER_DISK_BOOT_ENABLE` is at its default (see
+`disk_boot.py`). The constant stays False for two reasons that are both load-bearing.
+First, an import that turned serving behaviour on would make the plugin's import itself
+a side effect, and this package's import is read by the read side, by tests, and by a
+proxy host that is not serving anything. Second, `disk_boot`'s fail-safe direction is
+"every outcome except ARMED leaves this boot disarmed", and that is only expressible
+against a default-off starting point.
+
+What the constant does NOT mean any more: "this boot will not be serving from disk". For
+that question the payload has `serving_as`, and the log has the one
+`KVTIER disk boot default=` line. `tests/test_disk_authority_switch.py` pins the value,
+the writer set, and that no configuration vocabulary names this switch.
 """
 
 OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
@@ -628,6 +693,177 @@ WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "bad_batch", "bad_job", "bad_size", "incomplete",
                    "deadline_expired", "thread_dead", "not_tracked", "abandoned")
 
+# --- WHAT A FAILURE KIND COSTS (0.2.32) --------------------------------------
+#
+# WHY THIS PARTITION EXISTS. A span that fails to land used to cost the SAME no matter
+# WHY: the GPU block went to `get_block_ids_with_load_errors`, the engine reset the
+# request, and `suppress_load` black-holed the request and the span for the rest of the
+# boot. That is the right cost for BAD BYTES and the wrong cost for a RACE. On
+# 2026-10-06 a 23.6 ms settle grant lost a 135.8 ms race in one group of one span and
+# the bill was a 28,583-token recompute PLUS `suppressed_requests: 3` - a boot-length
+# fuse for a millisecond-scale timing loss. The fuse call site already wrote a reason
+# containing `sorted(_recent_failure_kinds())`, so the code knew which it was and
+# decided without looking.
+#
+# THE RULE: a timing loss may cost the tokens and must not cost the next offer. A data
+# failure keeps the fuse exactly where it was.
+#
+# `LOAD_TIMING_FAILURES`: the bytes are FINE, the read simply had not landed when the
+# engine arrived (`not_settled`, and its deadline-blowing sibling `deadline_expired`).
+# `LOAD_CAPACITY_FAILURES`: the bytes are FINE and the read was never issued, because a
+# bounded pool or queue was full at that instant - a momentary condition that the NEXT
+# offer re-prices, not corruption. `LOAD_DATA_FAILURES`: everything else - a wrong
+# digest, a short read, a size mismatch, a failed copy, a step whose lists disagree, an
+# unattributable loss. These keep the fuse; the partition is published in
+# `failure_kind_classes()` so an operator can check it against a payload, and
+# `test_disk_restore_races.py` pins every one of the 26 names into exactly one class.
+#
+# THE JUDGEMENT CALLS, spelled out so they can be argued with:
+#   * `batch_cap` is DATA-class. It means an offer was made larger than the worker's
+#     batch table - an internal bound violation, and a retry would reproduce it.
+#   * `not_tracked`, `abandoned` and `read_failed` are DATA-class too. They are
+#     UNATTRIBUTABLE, and "nobody saw what happened" is not evidence of a race: fusing
+#     on the unknown case is the fail-closed direction, and it is what keeps the
+#     2026-10-05 loop un-reproducible.
+#   * `no_channel` / `thread_dead` are DATA-class: the read path itself is broken,
+#     which is "something bad" in the operator's own words.
+LOAD_TIMING_FAILURES = ("not_settled", "deadline_expired")
+LOAD_CAPACITY_FAILURES = ("queue_full", "buffer_cap")
+LOAD_DATA_FAILURES = tuple(
+    name for name in WORKER_FAILURES
+    if name not in LOAD_TIMING_FAILURES and name not in LOAD_CAPACITY_FAILURES)
+
+
+def failure_kind_class(kind) -> str:
+    """Which of the three classes one failure name belongs to.
+
+    An unknown name answers `"data"`: `WORKER_FAILURES` is a closed vocabulary and a
+    name outside it means something drifted, which is not a race we should keep
+    offering into.
+    """
+    name = str(kind or "")
+    if name in LOAD_TIMING_FAILURES:
+        return "timing"
+    if name in LOAD_CAPACITY_FAILURES:
+        return "capacity"
+    return "data"
+
+
+def _attributable_failure_kinds(limit: int = 6) -> set:
+    """The failure kinds that name a CAUSE, excluding this process's own report echoes.
+
+    WHY THIS IS NOT `_recent_failure_kinds`. `note_reported` writes a record for the
+    REPORT SHAPE the engine used (`failed_recving`, `invalid_block_ids`) before it
+    decides anything, and those two names are not in the `WORKER_FAILURES` vocabulary,
+    so `_note_load_failure` files them under `read_failed` - a DATA kind. Reading the
+    plain ring here would therefore make every report look like a corruption from the
+    moment the first one arrived, and a race could never be spared: the fix would be
+    inert and would read as if it worked. This reader keeps what the code that TOUCHED
+    THE BYTES wrote (`where` = `apply`, `bind`, `offer`, here or carried by a live rank
+    file) and drops the records that only name the channel the bad news arrived on.
+
+    A kind outside the `WORKER_FAILURES` vocabulary is dropped too, so an empty set
+    means "no cause is on the table" and `classify_failure_kinds` answers `unknown`.
+    """
+    kinds: set = set()
+    try:
+        wanted = max(1, int(limit))
+        rows = ([dict(item) for item in list(_load_failures)[:wanted]]
+                + [dict(item) for item in
+                   list(_state.get("rank_failure_records") or [])[:wanted]])
+        for item in rows:
+            if str(item.get("where") or "") == "report":
+                continue
+            kind = item.get("kind")
+            if kind and str(kind) in WORKER_FAILURES:
+                kinds.add(str(kind))
+    except Exception as exc:  # noqa: BLE001 - a decision is never worth a fault
+        snapshot._error(exc, "disk_restore attributable failure kinds")
+    return kinds
+
+
+def classify_failure_kinds(kinds) -> str:
+    """What a SET of failure kinds says about the loss: `data`, `timing`, `unknown`.
+
+    THREE ANSWERS, ONE RULE. Any data kind present means DATA - one corrupted read in
+    the window outranks any number of races, so the fuse stays. Otherwise, any timing or
+    capacity kind means TIMING. An empty set means UNKNOWN, and UNKNOWN FUSES: the
+    scheduler's knowledge of a worker's kinds arrives through the rank file, so a loss
+    whose worker has not yet been read looks exactly like a loss nobody diagnosed, and
+    guessing "race" there is how the loop that starved the box comes back.
+    """
+    seen = {str(kind) for kind in (kinds or ()) if kind}
+    if not seen:
+        return "unknown"
+    if any(failure_kind_class(name) == "data" for name in seen):
+        return "data"
+    if any(failure_kind_class(name) in ("timing", "capacity") for name in seen):
+        return "timing"
+    return "data"
+
+
+def failure_kind_classes() -> dict:
+    """THE PARTITION, as a payload read, with the decision rule beside it.
+
+    Published because the partition IS the policy for what a failed load costs, and a
+    reader who cannot see it cannot argue with it. `unattributable_are_data` names the
+    fail-closed branch so a quiet `races_not_fused` can be read as "we could not tell"
+    and not as "there were no races".
+    """
+    return {"timing": list(LOAD_TIMING_FAILURES),
+            "capacity": list(LOAD_CAPACITY_FAILURES),
+            "data": list(LOAD_DATA_FAILURES),
+            "rule": ("any data kind visible -> fuse; only timing/capacity kinds -> "
+                     "spare the request and the span and let the one-per-request "
+                     "re-offer decide; nothing visible -> fuse (unknown is not proof "
+                     "of a race)"),
+            "read_from": ("the records the code that touched the bytes wrote "
+                         "(`where` = apply/bind/offer, here or carried by a live rank "
+                         "file). The engine's REPORT SHAPES (`failed_recving`, "
+                         "`invalid_block_ids`) are excluded: they name the CHANNEL the "
+                         "bad news arrived on, and `_note_load_failure` files an "
+                         "unknown name under `read_failed` - a data kind - so reading "
+                         "them would make every report look like a corruption"),
+            "unattributable_are_data": True,
+            "kinds_total": len(WORKER_FAILURES)}
+
+
+def _grant_race_reoffer(request_id) -> None:
+    """THE SMALLEST LOOP RULE (0.2.32): one re-offer per request after a race.
+
+    Not a TTL and not a window: a per-request allowance of exactly
+    `MAX_RACE_REOFFERS_PER_REQUEST` re-offers, SPENT when used and never renewed.
+    Without it, removing the fuse would remove the only bound on the retry loop - a race
+    on a sick device would re-offer forever, five seconds of waiting a step at a time.
+    With it, a request that loses the race twice gets no third offer and the loop is
+    bounded at two, whichever way the loss goes.
+    """
+    try:
+        key = str(request_id or "")[:256]
+        if not key:
+            return
+        if key not in _race_reoffer and len(_race_reoffer) >= MAX_SUPPRESSED_REQUESTS:
+            _race_reoffer.pop(next(iter(_race_reoffer)), None)   # oldest first
+        # `setdefault`, not assignment: a request whose allowance is already SPENT (0)
+        # must not have it refilled by the second race it caused.
+        _race_reoffer.setdefault(key, MAX_RACE_REOFFERS_PER_REQUEST)
+    except Exception as exc:  # noqa: BLE001 - an allowance is never worth a fault
+        _logger.debug("kvtier-dev-plugin: DISK[load-fail] re-offer allowance not "
+                      "granted for %s: %s", request_id, type(exc).__name__)
+
+
+def _spend_race_reoffer(request_id) -> bool:
+    """Claim this request's one re-offer, or say it has none left."""
+    try:
+        key = str(request_id or "")[:256]
+        if not key or int(_race_reoffer.get(key, 0)) < 1:
+            return False
+        _race_reoffer[key] = 0
+        _state["race_reoffers_granted"] += 1
+        return True
+    except Exception:  # noqa: BLE001 - an allowance is never worth a fault
+        return False
+
 _state: dict = {
     # install / posture. `installed` is THIS PROCESS's verdict about the halves it
     # could reach; `sched_fitted` is the one that answers "can this process make an
@@ -639,8 +875,10 @@ _state: dict = {
     "install_refusals": 0, "install_deferrals": 0, "missing_methods": [],
     "install_refusal_line": None, "install_deferral_line": None,
     # WHO IS SERVED FROM DISK, AND WHOSE ANSWER DECIDES A REQUEST'S OWN PREFIX. Two
-    # independent per-boot switches, both False at every fresh boot, both settable only
-    # by the `/disk` dev verb over a POST. Arming the SPILL tier is neither of them:
+    # independent per-boot switches, both import-time False, both written only by the
+    # two setters - by the `/disk` dev verb, and since 0.2.33 by this package's own boot
+    # default calling the same setter (`disk_boot.py`; `KVTIER_DISK_BOOT_ENABLE` turns
+    # that off). Arming the SPILL tier is neither of them:
     # on 2026-10-05 an arm raised for a different experiment offered 19.7 BILLION
     # tokens and starved the harness, which is why offering is its own decision and
     # `disk_authority` (the expensive posture: every request's KV comes off SSD and its
@@ -652,6 +890,21 @@ _state: dict = {
     # marker - it existed as the denominator of `flagged` + `skipped_no_marker`, and
     # `lookups` is incremented at the same statement.
     "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
+    # WHICH FAILURE KIND DECIDED THE FUSE (0.2.32). `suppress_load` used to be called
+    # by every failure report whether the read had LOST A RACE or the bytes were BAD -
+    # and the reason string it was handed already named the kinds (`sorted
+    # (_recent_failure_kinds())`), so the code knew and decided without looking. These
+    # three say which side of `failure_kind_classes()` each decision fell on:
+    # `races_not_fused` is a timing loss that cost the request its tokens and NOT its
+    # next offer; `fuses_on_data_kinds` is the fuse kept for corruption, short reads and
+    # DMA faults; `fuses_on_unknown_kinds` is the fail-closed branch (no kind visible -
+    # usually a worker whose rank file has not been read yet), which fuses exactly as a
+    # data failure does because "nobody saw it" is not proof of a race.
+    "races_not_fused": 0, "fuses_on_data_kinds": 0, "fuses_on_unknown_kinds": 0,
+    "race_reoffers_granted": 0,       # second offers allowed by the one-per-request
+                                      # race allowance (the loop bound that replaced the
+                                      # boot-length fuse for a timing loss)
+    "last_fuse_decision": None,       # the last such decision, as a sentence
     # THE AUTHORITY RULE, IN USE. Under the switch every request hands the DISK the
     # decision about its own prefix: the fork's host-RAM hit is treated as zero tokens
     # for the offer arithmetic. `authority_lookups` counts the lookups that took that
@@ -721,7 +974,9 @@ _state: dict = {
     # or a proven rank can show an applied disk read for it; a completion with no
     # read behind it is `no_read` and is never counted as a restoration.
     "no_read": 0, "disk_reads_applied": 0, "ranks_reads_applied": 0,
-    "offer_clamped": 0,
+    # `offer_clamped` (0.2.31 and earlier) is DELETED with the fixed 32,000-token cap:
+    # with no configured cap there is no clamp to count. See the note at
+    # MAX_RESTORE_BLOCKS_PER_OFFER.
     # worker-side ledger
     "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
     "bytes_applied": 0, "dma_unsettled_entries": 0,
@@ -752,11 +1007,12 @@ _state: dict = {
     "settled_after_wait": 0,          # batches that settled during their wait
     "dropped_after_wait": 0,          # ...still unsettled when the wait expired
     "settle_bytes_waited": 0,         # bytes the waits were waiting for
-    "settle_bound_min": 0,            # which bound decided the budget, per the
-    "settle_bound_proportional": 0,   #   three-way rule in `settle_budget`
-    "settle_bound_cap": 0,
-    "settle_bound_deadline": 0,
-    "settle_budget_over_recompute": 0,  # batches whose budget exceeded the recompute
+    "settle_bound_flat": 0,           # which bound decided the allowance, per the
+    "settle_bound_deadline": 0,       #   three-way rule in `settle_budget`
+    "settle_bound_off": 0,            # (`off` = the allowance is 0: never wait)
+    "settle_allowance_spent": 0,      # batches that spent the WHOLE granted allowance
+                                      # and still had bytes in flight: the honest wait
+                                      # metric, replacing `settle_budget_over_recompute`
     "last_apply_window": None,        # the most recent batch's full window
     "settle_notice": None,            # the once-per-boot line, as data
     # THE SHAPE OF A PARTIAL RESTORE (0.2.24), measured and not decided. A span needs
@@ -776,10 +1032,19 @@ _state: dict = {
     # THE OFFER'S PRICE IN BOUNCE BUFFERS (0.2.31). `offer_pool_capped` counts offers
     # SHORTENED to what the pool can carry and `offer_pool_refused` the lookups given
     # no offer at all because not one job fits. `last_offer_pool` is the arithmetic of
-    # the most recent pricing, so "was this offer bounded by the token cap or by the
-    # pool?" is a payload read and not an inference from a job count.
+    # the most recent pricing, so "did this offer come in short, and against which
+    # bound?" is a payload read and not an inference from a job count.
     "offer_pool_capped": 0, "offer_pool_refused": 0,
     "last_offer_pool": None,
+    # WHICH OFFER BOUND EXISTS IN THIS BOOT (0.2.32). `offer_block_capped` counts the
+    # offers the per-offer BLOCK cap stopped - the positional walk hitting
+    # `MAX_RESTORE_BLOCKS_PER_OFFER` while the request still had tokens left - the
+    # successor to the deleted `offer_clamped`, and the ONLY per-offer cap counter left
+    # now that the fixed 32,000-token clamp is gone. `offer_block_size_seen` is the
+    # engine's real scheduler block size, remembered so the payload and the boot line
+    # can state the block bound in tokens in a process that has made no offer yet.
+    "offer_block_capped": 0,
+    "offer_block_size_seen": None,
     # THE LOAD-FAILURE RING (0.2.31): what the worker said when a read did not happen,
     # in the process that can READ it. `load_failures` counts records written and
     # `load_failures_overwritten` the ones the ring recycled; `ranks_load_failures`
@@ -834,6 +1099,10 @@ _aged_out: dict = {}
 # tokens. A request that returns at or before that point made no progress, which is
 # what a failed load looks like from the scheduler's seat.
 _offered_at: dict = {}
+# Scheduler side: request id -> how many re-offers it may still claim after a load it
+# LOST A RACE rather than corrupted (`_grant_race_reoffer`). 0 means the allowance is
+# spent; a data failure never puts a request in here at all, it fuses it.
+_race_reoffer: dict = {}
 
 # Worker side: request id -> in-flight record (the watchdog's table), and the
 # batches those records share. Both bounded; `_invalid` is drained once per step.
@@ -1270,6 +1539,7 @@ def reset_state_for_tests() -> None:
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
     global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
     global _offered_at, _burned, _aged_out, _load_failures, _failure_log_at
+    global _race_reoffer
     _loads = {}
     _slot_paths = {}
     _wloads = {}
@@ -1280,6 +1550,7 @@ def reset_state_for_tests() -> None:
     _burned = {}
     _aged_out = {}
     _offered_at = {}
+    _race_reoffer = {}
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
@@ -1306,7 +1577,7 @@ def reset_state_for_tests() -> None:
             "slots_allocated": 0, "stale_slots_dropped": 0, "watchdog_fires": 0,
             "index_refreshes": 0, "index_refresh_errors": 0, "loads_released": 0,
             "ranks_proven": 0, "proof_reads": 0, "no_read": 0,
-            "disk_reads_applied": 0, "ranks_reads_applied": 0, "offer_clamped": 0,
+            "disk_reads_applied": 0, "ranks_reads_applied": 0,
             "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
             "bytes_applied": 0, "dma_unsettled_entries": 0, "invalid_reports": 0,
             "finished_released": 0, "worker_watchdog_fires": 0,
@@ -1322,15 +1593,16 @@ def reset_state_for_tests() -> None:
             "settle_ms_max": None, "settle_budget_total_ms": 0.0,
             "settle_budget_max_ms": None, "settled_after_wait": 0,
             "dropped_after_wait": 0, "settle_bytes_waited": 0,
-            "settle_bound_min": 0, "settle_bound_proportional": 0,
-            "settle_bound_cap": 0, "settle_bound_deadline": 0,
-            "settle_budget_over_recompute": 0, "last_apply_window": None,
+            "settle_bound_flat": 0, "settle_bound_deadline": 0,
+            "settle_bound_off": 0, "settle_allowance_spent": 0,
+            "last_apply_window": None,
             "settle_notice": None,
             "spans_observed": 0, "span_entries_observed": 0, "spans_whole": 0,
             "spans_partial": 0, "spans_empty": 0, "spans_hole_in_the_middle": 0,
             "last_span_shape": None,
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
+            "offer_block_capped": 0, "offer_block_size_seen": None,
             "load_failures": 0, "load_failures_overwritten": 0,
             "ranks_load_failures": 0, "failure_log_lines": 0,
             "failure_log_suppressed": 0,
@@ -1344,6 +1616,9 @@ def reset_state_for_tests() -> None:
             "offer_switch_changes": 0, "disk_authority_changes": 0,
             "ranks_seen": 0,
             "suppressed_hits": 0, "suppressed_spans": 0, "suppressions": 0,
+            "races_not_fused": 0, "fuses_on_data_kinds": 0,
+            "fuses_on_unknown_kinds": 0, "race_reoffers_granted": 0,
+            "last_fuse_decision": None,
             "authority_lookups": 0, "local_hit_ignored": 0,
             "local_hit_tokens_ignored": 0, "pin_release_failures": 0,
             "last_local_hit_ignored": None, "last_offer": None,
@@ -1358,95 +1633,87 @@ def reset_state_for_tests() -> None:
     _state["reads_failed"] = {name: 0 for name in WORKER_FAILURES}
 
 
-def settle_budget(bytes_at_stake: int, offered_tokens: int | None = None,
+def settle_budget(bytes_at_stake: int = 0,
                   seconds_left: float | None = None) -> dict:
-    """How long ONE apply point may wait, and what that wait is racing.
+    """How long ONE apply point may wait for the bytes it is about to apply.
 
-    THE FORMULA, as it reads in code:
+    THE RULE, IN ONE LINE (0.2.32):
 
-        proportional_ms = bytes_at_stake / read_bytes_per_s * 1000 * SAFETY_MARGIN
-        budget_ms       = clamp(proportional_ms, SETTLE_MIN_MS, cap_ms)
+        granted_ms = min(SETTLE_MS, the load's own remaining deadline)
 
-    then clamped again by the batch's own deadline (`seconds_left`, which
-    `disk_read.begin_batch` set from `LOAD_DEADLINE_SECONDS`) - a wait that outlives
-    the deadline it is waiting under is not a wait, it is a second bug.
+    `SETTLE_MS` (`SETTLE_MS_DEFAULT`, 5,000 ms, overridable by
+    `VLLM_E2_TIER_DISK_SETTLE_MS`) is the FLAT allowance, and the deadline is the one
+    `disk_read.begin_batch` set from `LOAD_DEADLINE_SECONDS` - the same clock that
+    cancels the read, so a wait can never outlive the bytes it is waiting for. Nothing
+    else decides. `0` still means never wait and is still reachable.
 
-    `bytes_at_stake` is the bytes STILL IN FLIGHT at the apply point, not the size of
-    the offer: a batch that has delivered nine of ten slots is waiting for one slot, and
-    sizing its budget on ten would make the budget a function of the offer instead of a
-    function of the wait.
+    WHY THERE IS NO FORMULA ANY MORE. Through 0.2.31 the allowance was computed from
+    the bytes still in flight over an ASSUMED read throughput, times a safety margin,
+    floored at a scheduler tick and capped by the env var - and every term was a guess.
+    The live box settled the argument on 2026-10-06: 12 jobs / 137.6 MB were offered,
+    the formula granted 23.6 ms, the measured bind-to-apply race gap for the lost
+    batches was 89.7 / 97.1 / 129.7 / 135.8 ms, and the request recomputed 28,583 tokens
+    (12.26 s, `cached_tokens: 0`) to save 23.6 ms. The operator's ruling is the rule
+    above: "give it up to 5 s to read; only when something bad happens do we ignore; do
+    not compute how much time it needs." `SETTLE_SAFETY_MARGIN`,
+    `SETTLE_READ_BPS_DEFAULT`, `PREFILL_TOKENS_PER_S_DEFAULT`, `SETTLE_MIN_MS` and the
+    two env knobs that fed them are deleted with this docstring paragraph - a knob
+    nothing computes on is worse than no knob, because a payload will still report it.
 
-    WHY PROPORTIONAL. The read is the floor of the budget and bytes are the only
-    quantity that scales with it: the measured offer is 11,468,800 B per (span,
-    group) per rank, so a 3-span x 5-group offer is ~172 MB and a 10-span offer is
-    ~573 MB, while the recompute they avoid is ~2.5 s (9,600 tokens) and ~8.2 s
-    (32,000 tokens) at the measured 3,917 tokens/s. A flat budget sized for the 573 MB
-    case is about three times what a 3-span offer needs, and the only FLAT number that
-    is ever obviously safe against recompute - eight seconds - is a net loss on every
-    offer, paid inside the step by requests that never asked for disk. Bytes-per-second
-    is a guess until this release measures it (the 11.5 GB/s figure is the WRITE rate);
-    `SAFETY_MARGIN` covers the parts the estimate omits - queue hand-off, thread wakeup,
-    the bounce-buffer copy - and the env var replaces the guess with a measurement once
-    there is one.
+    `bytes_at_stake` is PUBLISHED AND NOTHING ELSE. It is the bytes still in flight at
+    the apply point (a batch that delivered nine of ten slots is waiting for one), which
+    is the quantity a reader of `last_apply_window` needs beside the wait - but it moves
+    no part of the grant, and the same is true of the offered-token estimate: it is a
+    description of the batch, not an input to the wait.
 
-    WHICH BOUND APPLIED is published, because the three answers mean three
-    different things to the operator: `off` = the cap is 0, this boot never waits (the
-    shipped default); `min` = a batch too small to measure, the floor is what it got;
-    `proportional` = the arithmetic decided, which is the intended regime; `cap` = the
-    operator's ceiling bound it, so a `dropped_after_wait` here is a cap that is too
-    small; `deadline` = the read's own expiry decided, i.e. the wait was told to stop by
-    the same clock that cancels the read.
+    WHICH BOUND APPLIED is published because the three answers mean three different
+    things: `off` = the allowance is 0, this boot never waits; `flat` = the operator's
+    allowance decided it, the ordinary case; `deadline` = the read's own expiry decided
+    it, so the wait was cut short by the clock that is cancelling the read and a drop
+    here is a DEADLINE problem, not an allowance problem.
 
-    The recompute side is published as `recompute_ms` with `budget_over_recompute`
-    set when the granted wait is MORE than the recompute it avoids - a wait there is
-    a regression by construction even when it wins the race, and batches like that are
-    counted (`settle_budget_over_recompute`) instead of being left for a human to
-    notice at 3 a.m.
+    WHAT IS MEASURED INSTEAD OF GUESSED: `settle_allowance_spent` counts the batches
+    that consumed the WHOLE granted allowance and still had bytes in flight - the honest
+    successor to `budget_over_recompute`, which compared a grant against its own
+    arithmetic and therefore read `over_recompute: 0` for exactly the 23.6 ms loss
+    above.
     """
     env = config.settle_env()
     raw_cap = env["cap_ms"] if env["cap_ms"] is not None else SETTLE_MS_DEFAULT
     cap_ms = max(0.0, min(float(raw_cap), SETTLE_MS_MAX))
-    read_bps = (env["read_bytes_per_s"] if env["read_bytes_per_s"]
-                else SETTLE_READ_BPS_DEFAULT)
-    prefill_tps = (env["prefill_tokens_per_s"] if env["prefill_tokens_per_s"]
-                   else PREFILL_TOKENS_PER_S_DEFAULT)
     payload = max(0, int(bytes_at_stake or 0))
-    proportional_ms = (payload / read_bps) * 1000.0 * SETTLE_SAFETY_MARGIN
     if cap_ms <= 0.0:
         granted, bound = 0.0, "off"
-    elif proportional_ms >= cap_ms:
-        granted, bound = cap_ms, "cap"
-    elif proportional_ms <= SETTLE_MIN_MS:
-        granted, bound = SETTLE_MIN_MS, "min"
     else:
-        granted, bound = proportional_ms, "proportional"
+        granted, bound = cap_ms, "flat"
     deadline_ms = None
     if seconds_left is not None:
         try:
             deadline_ms = max(0.0, float(seconds_left)) * 1000.0
         except (TypeError, ValueError):
+            # An unreadable `seconds_left` is NO deadline, not a deadline of zero: the
+            # grant stays the flat allowance. (The pre-0.2.32 body compared None with a
+            # float here and raised TypeError; `test_grant_is_the_flat_cap_or_the_loads_
+            # own_deadline` is the test that found it.)
             deadline_ms = None
-        if deadline_ms < granted:
+        if deadline_ms is not None and deadline_ms < granted:
             granted, bound = deadline_ms, "deadline"
-    recompute_ms = None
-    if offered_tokens:
-        recompute_ms = (int(offered_tokens) / prefill_tps) * 1000.0
     return {"enabled": cap_ms > 0.0, "cap_ms": round(cap_ms, 3),
-            # Named, not swallowed: an absurd cap is clamped and the reader is told a
-            # ceiling did it, so a typo in a systemd drop-in is a visible clamp and not
-            # a mystery wait at 3 a.m.
+            # THE DEFAULT MUST WEAR ITS NAME. Since 0.2.32 an unset
+            # `VLLM_E2_TIER_DISK_SETTLE_MS` means a 5,000 ms allowance instead of never
+            # waiting, so a boot that waits on a command line that never asked to wait
+            # has to be able to say WHY in one line - otherwise "the operator wrote 40
+            # and the box waited 5 s" and "nobody set anything" are the same payload,
+            # and only one of them is a mis-set drop-in.
+            "cap_from_default": env["cap_ms"] is None and not env["problems"],
+            # Named, not swallowed: an absurd allowance is clamped and the reader is
+            # told a ceiling did it, so a typo in a systemd drop-in is a visible clamp
+            # and not a mystery wait at 3 a.m.
             "ceiling_clamped": float(raw_cap) > SETTLE_MS_MAX,
-            "bytes_at_stake": payload, "read_bytes_per_s": read_bps,
-            "safety_margin": SETTLE_SAFETY_MARGIN, "min_ms": SETTLE_MIN_MS,
-            "proportional_ms": round(proportional_ms, 3),
+            "bytes_at_stake": payload,
+            "allowance_ms": round(cap_ms, 3),
             "budget_ms": round(granted, 3), "bound": bound,
             "deadline_ms": None if deadline_ms is None else round(deadline_ms, 3),
-            "offered_tokens_estimate": None if not offered_tokens
-                                      else int(offered_tokens),
-            "prefill_tokens_per_s": round(prefill_tps, 1),
-            "recompute_ms": None if recompute_ms is None else round(recompute_ms, 1),
-            "budget_over_recompute": (None if recompute_ms is None or granted <= 0
-                                      else granted > recompute_ms),
             "env_problems": list(env["problems"])}
 
 
@@ -1571,10 +1838,10 @@ def _note_apply_window(window: dict) -> None:
         # report waiting that never happened.
         _state["settle_bytes_waited"] += int(window.get("bytes_at_stake") or 0)
     bound = window.get("bound")
-    if bound in ("min", "proportional", "cap", "deadline"):
+    if bound in ("flat", "deadline", "off"):
         _state[f"settle_bound_{bound}"] += 1
-    if window.get("budget_over_recompute"):
-        _state["settle_budget_over_recompute"] += 1
+    if window.get("allowance_spent"):
+        _state["settle_allowance_spent"] += 1
     for name, value in (("bind_to_apply_ms", gap), ("apply_elapsed_ms", elapsed),
                         ("settle_ms", window.get("waited_ms")),
                         ("settle_budget_ms", window.get("budget_ms"))):
@@ -1638,12 +1905,13 @@ def apply_window() -> dict:
         # THE POSTURE, before any batch: what the environment says today, so a reader
         # can tell "the wait is off" from "the wait is on and nothing needed it".
         "posture": {key: posture[key] for key in
-                    ("enabled", "cap_ms", "ceiling_clamped", "min_ms",
-                     "safety_margin", "read_bytes_per_s", "prefill_tokens_per_s",
+                    ("enabled", "cap_ms", "allowance_ms", "cap_from_default",
+                     "ceiling_clamped",
                      "env_problems")},
         "waits_granted": granted,
         "settled_after_wait": state["settled_after_wait"],
         "dropped_after_wait": state["dropped_after_wait"],
+        "allowance_spent": state["settle_allowance_spent"],
         "bytes_waited": state["settle_bytes_waited"],
         "waited_ms": {"avg": (None if not granted else
                               round(state["settle_ms_total"] / granted, 3)),
@@ -1655,13 +1923,32 @@ def apply_window() -> dict:
                       "max": (None if state["settle_budget_max_ms"] is None
                               else round(state["settle_budget_max_ms"], 3)),
                       "median": _median(budgets), "median_samples": len(budgets)},
-        "bound": {"min": state["settle_bound_min"],
-                  "proportional": state["settle_bound_proportional"],
-                  "cap": state["settle_bound_cap"],
-                  "deadline": state["settle_bound_deadline"]},
-        "budget_over_recompute": state["settle_budget_over_recompute"],
+        "bound": {"flat": state["settle_bound_flat"],
+                  "deadline": state["settle_bound_deadline"],
+                  "off": state["settle_bound_off"]},
         "last": state["last_apply_window"],
-        "notice": state["settle_notice"]}
+        "notice": state["settle_notice"],
+        # The posture's units. `cap_from_default` is the field that answers "did the
+        # operator set this, or is this the shipped default?" - a question that did not
+        # exist before 0.2.32, when unset meant OFF.
+        "units": {"enabled": "does this boot wait at the apply point at all",
+                  "cap_ms": "milliseconds, the FLAT allowance (`SETTLE_MS`)",
+                  "allowance_ms": "milliseconds, the same cap restated as the policy "
+                                  "word rather than the env-var word",
+                  "cap_from_default": "true when "
+                                      "`VLLM_E2_TIER_DISK_SETTLE_MS` is unset and the "
+                                      "5,000 ms default decided it - the field that "
+                                      "separates 'nobody set it' from 'the value was "
+                                      "ignored'",
+                  "ceiling_clamped": "true when the env value exceeded "
+                                     "`SETTLE_MS_MAX` and was clamped",
+                  "env_problems": "the environment's own complaints, verbatim",
+                  "waits_granted": "batches the code actually sat in front of",
+                  "allowance_spent": "batches that used the WHOLE allowance and still "
+                                     "had bytes in flight",
+                  "bound": "which bound stopped the wait, per boot: `flat` (the "
+                           "allowance), `deadline` (the read's own expiry), `off` "
+                           "(no wait at all)"}}
     out["recompute"] = {"applied_bytes": state["bytes_applied"],
                         "dma_unsettled_entries": state["dma_unsettled_entries"],
                         "read_seconds_avg": read_latency()[0],
@@ -1849,10 +2136,21 @@ def counters_view(out: dict) -> dict:
                       "partial fleet refuses every offer",
         "ranks_armed": "rank files that will SERVICE a disk load: the proof is AND "
                        "over these, so one disarmed rank closes the whole scheduler",
-        "offer_clamped": "offers shortened to MAX_OFFER_TOKENS_PER_OFFER: an offer "
-                         "that would have been bigger than one request may put at "
-                         "once (the 160,000-token offers of 2026-10-05 clamp here)",
         "suppressions": "requests black-holed for disk service in this boot",
+        "races_not_fused": "failure reports classified a RACE (a timing or capacity "
+                           "kind, no data kind visible) and therefore cost the request "
+                           "its tokens but NOT its next offer (0.2.32)",
+        "fuses_on_data_kinds": "fuses raised with a DATA kind visible - corruption, a "
+                               "short read, a bad digest, a failed copy: the fuse the "
+                               "loop-killer was built for, kept",
+        "fuses_on_unknown_kinds": "fuses raised because NO failure kind was visible "
+                                  "(fail closed: the scheduler reads a worker's kinds "
+                                  "from its rank file, so an undiagnosed loss is not "
+                                  "proof of a race)",
+        "race_reoffers_granted": "second offers granted by the one-per-request race "
+                                 "allowance: the loop bound that replaced the "
+                                 "boot-length fuse for a timing loss (a request is "
+                                 "offered at most twice, race or not)",
         "refusals_total": "refusals", "paths_emitted_steps": "steps",
         "path_entries": "load_paths entries naming a file",
         "path_entries_empty": "load_paths entries naming nothing",
@@ -1909,12 +2207,17 @@ def counters_view(out: dict) -> dict:
         "offer_pool_capped": "offers SHORTENED to the job count the bounce-buffer pool "
                              "can hold at once (one read holds its buffer from issue "
                              "to the apply point, so an offer needs the pool to hold "
-                             "ALL of its buffers); the tighter sibling of "
-                             "`offer_clamped`, which counts the TOKEN ceiling",
+                             "ALL of its buffers); the bound that binds in practice "
+                             "now that the fixed token cap is deleted",
         "offer_pool_refused": "lookups given no disk offer at all because the pool "
                               "cannot carry one span's reads: the refusal that "
                               "replaces the 0.2.30 shape, where the offer was made, "
                               "refused at bind as `buffer_cap` and fused the request",
+        "offer_block_capped": "offers the per-offer BLOCK cap bound: the positional "
+                              "walk stopping at MAX_RESTORE_BLOCKS_PER_OFFER while the "
+                              "request still had tokens left. The only per-offer CAP "
+                              "counter left since 0.2.32 deleted the fixed "
+                              "32,000-token clamp (`offer_clamped`)",
         "last_offer_pool": "the most recent offer's bounce-buffer arithmetic: bytes "
                            "per job and where that price came from, the pool budget "
                            "and what was committed, jobs needed versus jobs the pool "
@@ -1937,18 +2240,22 @@ def counters_view(out: dict) -> dict:
         "dropped_after_wait": "batches still unsettled when their wait expired: the "
                               "waits that were spent for nothing",
         "settle_bytes_waited": "bytes a settle wait was waiting for, summed over "
-                               "batches (the quantity the budget is proportional to)",
-        "settle_bound_min": "budgets decided by the floor (`SETTLE_MIN_MS`): batches "
-                            "too small for the arithmetic to say anything",
-        "settle_bound_proportional": "budgets decided by bytes-over-throughput: the "
-                                     "intended regime",
-        "settle_bound_cap": "budgets clamped by the operator's cap: an unsettled batch "
-                            "counted here is a cap that is too small",
-        "settle_bound_deadline": "budgets clamped by the read's own deadline: the wait "
-                                 "was stopped by the clock that cancels the read",
-        "settle_budget_over_recompute": "batches granted a wait LONGER than the "
-                                        "recompute it avoids: a loss by construction "
-                                        "even when the read lands",
+                               "batches (published alongside the flat allowance, which "
+                               "it does not decide)",
+        "settle_bound_flat": "allowances decided by the flat cap (`SETTLE_MS`): the "
+                             "ordinary regime since 0.2.32 deleted the proportional "
+                             "arithmetic",
+        "settle_bound_deadline": "allowances cut short by the read's own deadline: the "
+                                 "wait was stopped by the clock that cancels the read, "
+                                 "so a drop here is a deadline problem and not an "
+                                 "allowance problem",
+        "settle_bound_off": "apply points that saw the allowance at 0 (never wait): "
+                            "the population of a boot that switched the wait off",
+        "settle_allowance_spent": "batches that consumed the WHOLE granted allowance "
+                                  "and still had bytes in flight - the honest wait "
+                                  "metric, "
+                                  "and the successor to `budget_over_recompute`, which "
+                                  "could not see a dropped load at all",
         "invalid_reports": "GPU block ids reported as load errors",
         "finished_released": "requests released without a DMA",
         "witness_emissions": "witness lines logged in this boot",
@@ -2147,18 +2454,22 @@ def disk_posture() -> dict:
     """This boot's disk posture: who may be served, and whose answer decides. Never
     raises, reads no file.
 
-    THREE facts, all per-boot, all set only by the `/disk` dev verb over a POST, and
-    all lost by a restart - which is stated in the payload because an operator deciding
-    "is this boot safe to leave running?" needs to know whether the posture survives a
-    crash. It does not, deliberately: an unhealthy boot comes back giving disk
-    authority to nobody.
+    THREE facts, all per-boot, all written by `set_disk_authority()` and
+    `set_offer_switch()` - the `/disk` dev verb over a POST, and since 0.2.33 this
+    package's own boot default calling the same functions - and all lost by a restart,
+    which hands the decision back to the boot default. That is stated in the payload
+    because an operator deciding "is this boot safe to leave running?" needs to know
+    whether the posture survives a crash. It does not, deliberately: an unhealthy boot
+    comes back the way every boot now comes back, by the flag and the boot's own gates,
+    and a boot whose gates fail comes back giving disk authority to nobody.
 
     `disk_authority` - THE DISK IS THE AUTHORITY FOR EVERY REQUEST. Each request's
       host-RAM hit is treated as zero tokens for the offer arithmetic and released, so
       the disk index decides the span from the local GPU-computed boundary. This is
       "serving everyone from SSD": it opens the offer gate BY ITSELF, so one POST is
-      the whole change, and nothing - no env var, no config file, no arm, no recovery
-      path - can raise it instead of the verb.
+      the whole change, and nothing - no config file, no arm, no recovery path, no
+      request field - can raise it instead of the setter (which the dev verb calls, and
+      since 0.2.33 the boot default calls too).
     `offers_enabled` - the cheaper posture: RAM first, the disk filling the gap.
       Arming the spill tier is not this: on 2026-10-05 an arm raised for a spill
       measurement was enough to put an un-requested 160,000-token disk offer in front
@@ -2176,6 +2487,32 @@ def disk_posture() -> dict:
             "authority_lookups": int(_state["authority_lookups"]),
             "lookups": int(_state["lookups"]),
             "suppressed_requests": len(_suppressed)}
+
+
+def disk_boot_section() -> dict:
+    """THE BOOT DEFAULT BEHIND THIS BOOT'S POSTURE (0.2.33), for the payload. Never
+    raises.
+
+    `disk_restore` owns the two serve switches; `disk_boot` owns the decision about what
+    a FRESH BOOT should do with them, and why renewal is or is not running. This is a
+    pass-through of `disk_boot.view()` and nothing else - no recomputation, no
+    re-decision - because a payload that re-derived a posture claim from somewhere else
+    is how two views start disagreeing in production.
+
+    The except branch returns `disk_boot.static_view()`, the SAME key set built without
+    the live arm reads, so a caller that cannot read the arm still gets every field: the
+    degraded view is never thinner than the healthy one.
+    """
+    try:
+        from . import disk_boot  # noqa: PLC0415 - it imports this module's posture
+        return disk_boot.view()
+    except Exception as exc:  # noqa: BLE001 - a view is never worth a fault
+        snapshot._error(exc, "disk_restore disk_boot view")
+        try:
+            from . import disk_boot  # noqa: PLC0415 - same reason
+            return disk_boot.static_view()
+        except Exception:  # noqa: BLE001 - nothing here is worth a second fault
+            return {}
 
 
 def _switch_verdict(field, enabled, changed, line) -> dict:
@@ -2211,28 +2548,39 @@ def _switch_verdict(field, enabled, changed, line) -> dict:
 def set_disk_authority(enabled) -> dict:
     """THE global disk-authority switch: the disk decides EVERY request's prefix.
 
-    Boot default False, and this function is the ONLY writer - reached from the `/disk`
-    route op over a POST. Not an environment variable, not a config file, not the spill
-    arm and not any failure-recovery path: an unhealthy boot stays off, and so does a
-    boot nobody asked to serve from SSD. Raising it opens the offer gate by itself, so
-    one POST serves every request from disk; dropping it while `offers_enabled` is down
-    puts the gate back to `serving_as=off`.
+    Import-time value False, and this function is the ONLY writer - reached from the
+    `/disk` route op over a POST, and since 0.2.33 from this package's own boot default
+    (`disk_boot.py`, gated on `KVTIER_DISK_BOOT_ENABLE`, a variable whose whole point is
+    that it DISABLES: it never warms anything up). Not a config file, not the spill arm,
+    not any failure-recovery path and not a request field: an unhealthy boot stays off,
+    and the boot default that can turn it on is computed fresh from the environment at
+    connector creation rather than restored from anything a previous boot wrote.
+
+    Raising it opens the offer gate by itself, so one call serves every request from
+    disk; dropping it while `offers_enabled` is down puts the gate back to
+    `serving_as=off`. Lowering it from the VERB is an operator's veto and latches the
+    boot default's renewal (`disk_boot.note_operator_disarm`, called by the route op and
+    NOT by this function) - a manual disarm always beats the boot default.
     """
     return _switch_verdict(
         "disk_authority", enabled, "disk_authority_changes",
         ("DISK[restore] disk_authority=ON for this boot: EVERY request is served from "
-         "disk and its host-RAM hit is given back (serving_as=%s). A fresh boot starts "
-         "with it OFF, only POST /plugins/kvtier/disk {\"op\":\"authority\"} changes "
-         "it, and a restart turns it off")
+         "disk and its host-RAM hit is given back (serving_as=%s). A process starts "
+         "with it OFF; this package's own boot default may raise it "
+         f"({config.ENV_DISK_BOOT_ENABLE} unset = ON since 0.2.33 - read the "
+         "'KVTIER disk boot default=' line), the POST route op changes it either way, "
+         "and a restart hands the decision back to the boot default")
         if enabled else
         # The OFF line has to say what is left serving, because turning this off does
         # not necessarily stop serving: if the gap-fill switch is up, the boot keeps
         # offering with RAM leading. A line that only announced "OFF" would read as
         # "nothing is served from disk" on a boot that still is.
         ("DISK[restore] disk_authority=OFF for this boot: the disk no longer decides "
-         "any request's prefix and no host-RAM hit is given back (serving_as=%s). A "
-         "fresh boot starts with it OFF, only POST /plugins/kvtier/disk "
-         "{\"op\":\"authority\"} changes it, and a restart turns it off"))
+         "any request's prefix and no host-RAM hit is given back (serving_as=%s). The "
+         f"{config.ROUTE_PREFIX}{config.ROUTE_DISK} POST changes it, a restart hands "
+         f"the decision back to the boot default ({config.ENV_DISK_BOOT_ENABLE}), and "
+         "turning it off from that POST latches the boot default's renewal for this "
+         "boot, so nothing re-arms a box you just took out of disk service"))
 
 
 def set_offer_switch(enabled) -> dict:
@@ -2374,7 +2722,9 @@ def gate() -> dict:
         # which is a state a *different* experiment puts up - and on 2026-10-05 that
         # state was enough to put an un-requested 160,000-token disk offer in front of
         # live traffic 123,474 times. Which posture serves, and whether any does, is
-        # decided per boot by the dev verb and by nothing else.
+        # decided per boot - by the dev verb, or by the boot default that calls the same
+        # setter (`disk_boot.py`) when `KVTIER_DISK_BOOT_ENABLE` is at its default - and
+        # by nothing else.
         # Both ops are spelled inside the first 160 characters on purpose: `_fail`
         # clips a reason at MAX_STRING_CHARS, and a sentence whose second half is
         # clipped away stops being the answer to "how do I turn this on?".
@@ -2828,6 +3178,47 @@ def whole_block_tokens(matched, block_size) -> dict:
                tokens=blocks * int(block_size),
                discarded_tokens=matched_tokens - blocks * int(block_size),
                block_size=int(block_size))
+
+
+def offer_block_ceiling(block_size=None) -> dict:
+    """THE bound one offer may carry, as the blocks that define it and the tokens they
+    are worth (0.2.32).
+
+    WHY THIS EXISTS AT ALL: the field it replaces, `offer_cap`, advertised 32,000
+    tokens - the fixed cap deleted in this release - and once the cap is gone a field
+    with that name and that number would be reporting a bound that constrains nothing.
+    So this publishes the bound that DOES constrain: `MAX_RESTORE_BLOCKS_PER_OFFER`
+    scheduler blocks, which `_disk_run`'s positional walk stops at, because one offer
+    can only name that many spans and stream them inside `RESTORE_DEADLINE_SECONDS`.
+    The token figure is derived from the engine's own block size and carries the source
+    of that block size, because a payload read in a process that has made no offer (a
+    worker rank) cannot honestly claim to know the engine's block size yet.
+
+    Read-only, never raises, and derives rather than stores: the block size is the
+    engine's fact and the payload must agree with the next offer, not with the last one.
+    """
+    size = _int(block_size)
+    size_source = "engine"
+    if not size or size <= 0:
+        size = _int(_state.get("offer_block_size_seen"))
+        size_source = "last-lookup"
+    if not size or size <= 0:
+        size = DEFAULT_OFFER_BLOCK_SIZE_TOKENS
+        size_source = "fallback"
+    return {"ok": True,
+            "blocks": MAX_RESTORE_BLOCKS_PER_OFFER,
+            "tokens": MAX_RESTORE_BLOCKS_PER_OFFER * int(size),
+            "block_size": int(size),
+            "block_size_source": size_source,
+            # THE HONEST READING, in the payload rather than only in a comment: this
+            # bound is not what a long prefix hits. Pool affordance
+            # (`offer_pool.jobs_the_pool_can_carry`) is the ceiling that binds in
+            # practice, and on the live store the depth the spill tier reached (~11
+            # spans, because spill follows RAM-tier parking) binds earlier still.
+            "note": ("a per-offer BLOCK bound, not a token cap: the deleted fixed "
+                     "32,000-token cap is gone and nothing replaced it, so the bound "
+                     "that binds in practice is bounce-buffer affordability "
+                     "(`bounded_by` says which bound cut any given offer)")}
 
 
 def _key_helpers() -> dict:
@@ -3416,6 +3807,7 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
         limit = max(0, min(limit, int(max_blocks)))
     # --- 1. the positional run: one file per block, per group ------------------
     pos_keys: list = []
+    walk_capped = False
     while len(pos_keys) < limit:
         index = start_block + len(pos_keys)
         block_keys: list = []
@@ -3432,6 +3824,14 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
         if not complete:
             break
         pos_keys.append(block_keys)
+    else:
+        # WHILE/ELSE, and the distinction IS the point: this branch runs only when the
+        # loop ended on its CONDITION, so the walk stopped because it reached `limit`
+        # and not because a block was missing from the store. That is the per-offer
+        # BLOCK bound binding - the one that survives the deleted token cap - and
+        # `bounded_by` can name it instead of leaving a reader to infer a cap from a
+        # block count that happens to be 64 (0.2.32).
+        walk_capped = True
     # --- 2. the anchors: run ends every boundary group can pay for -------------
     anchors: dict = {}
     for length in range(1, len(pos_keys) + 1):
@@ -3460,7 +3860,7 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
         return _ok(blocks=0, keys=[], view_lengths=lengths,
                    positional_groups=positional, boundary_groups=boundary,
                    positional_run=len(pos_keys), anchors={},
-                   clamped_to_anchor=False,
+                   clamped_to_anchor=False, walk_capped=walk_capped,
                    no_anchor=bool(boundary) and len(pos_keys) > 0)
     # THE TWO VIEWS, and the difference is a bug that was actually shipped once in this
     # change: `keys` is the run AS OFFERED (the last span carrying the boundary-state
@@ -3477,6 +3877,7 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
                positional_groups=positional, boundary_groups=boundary,
                positional_run=len(pos_keys), anchors=anchors,
                clamped_to_anchor=bool(boundary) and blocks != len(pos_keys),
+               walk_capped=walk_capped,
                no_anchor=False)
 
 
@@ -3536,6 +3937,19 @@ def offer(manager, request, num_computed_tokens, ram_result):
     refcounting, pairing and state creation stays the fork's.
     """
     _state["lookups"] += 1
+    # THE SSD TIER'S BOOT-DEFAULT RENEWAL TICK (0.2.33). This is the right place for it
+    # for one reason: the offer path is the only path in this process that consults the
+    # spill arm at all, so an arm lapse costs a disk restore exactly here. Doing it
+    # BEFORE the gate means the request that arrives after a two-hour idle is SERVED
+    # rather than refused - the arm is refreshed and then read, not read and then
+    # regretted. The tick costs one monotonic comparison per lookup until it is due
+    # (`disk_boot.RENEW_CHECK_SECONDS`), obeys the operator's disarm latch, and is
+    # contained twice over: inside itself, and here.
+    try:
+        from . import disk_boot  # noqa: PLC0415 - it reads this module's posture
+        disk_boot.renew_if_due()
+    except Exception as exc:  # noqa: BLE001 - a renewal never costs a schedule
+        snapshot._error(exc, "disk_restore renewal tick")
     try:
         return _offer(manager, request, num_computed_tokens, ram_result)
     except Exception as exc:  # noqa: BLE001 - a restore never breaks a schedule
@@ -3543,11 +3957,6 @@ def offer(manager, request, num_computed_tokens, ram_result):
         snapshot._error(exc, "disk_restore offer")
         _refuse("bad_call", f"the offer path raised {type(exc).__name__}")
         return ram_result
-
-
-def suppression_lookups() -> int:
-    """How many requests are black-holed for disk service right now. For a test."""
-    return len(_suppressed)
 
 
 def suppress_load(request_id: str, reason: str, span=None) -> bool:
@@ -3871,20 +4280,39 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if request_id in _offered_at and computed <= int(_offered_at[request_id]):
         # THE LOOP FUSE, second half, and it needs `computed` to say anything. The
         # engine's recovery from a KV load failure puts the request back at the door
-        # with its computed tokens RESET, so a request we already offered comes back
-        # at the same place or earlier having made no progress - and the index has
-        # not changed, so the honest answer to the second asking is the first answer
-        # plus a failure. Only a request that has moved FORWARD gets a second offer.
-        _state["suppressed_hits"] += 1
-        suppress_load(request_id, f"it came back for a second disk offer at "
-                                  f"{computed} computed tokens having reached "
-                                  f"{_offered_at[request_id]} on the first one")
-        _refuse("suppressed_after_failure",
-                f"{request_id[:48]} was already offered disk tokens at "
-                f"{_offered_at[request_id]} computed tokens and is asking again at "
-                f"{computed}: the engine rescheduled it, so the first load did not "
-                "land, and a second offer is the loop that starved the box")
-        return ram_result
+        # with its computed tokens RESET, so a request we already offered comes back at
+        # the same place or earlier having made no progress - and the index has not
+        # changed, so the honest answer to the second asking is the first answer plus a
+        # failure. Only a request that has moved FORWARD gets a second offer.
+        #
+        # ONE EXCEPTION, BOUNDED TO ONE (0.2.32): a request whose first load lost a
+        # RACE (a timing or capacity kind, and nothing bad in the window) holds exactly
+        # `MAX_RACE_REOFFERS_PER_REQUEST` re-offers, spent here and never refilled - see
+        # `_grant_race_reoffer`. Without it, deleting the permanent fuse for a race
+        # would delete the loop's only bound; with it, the loop stays bounded at TWO
+        # offers per request whether the losses are races or faults. A data failure
+        # never reaches this branch with an allowance, because `_fuse_or_spare` fused
+        # it at the report.
+        if _spend_race_reoffer(request_id):
+            _state["last_fuse_decision"] = (
+                f"req={request_id[:48]} where=second_asking verdict=timing "
+                f"reoffer=granted (one per request, spent)")[:400]
+            _note(f"re-offering {request_id[:48]} at {computed} computed tokens: its "
+                  f"first load lost a race and its one re-offer is unspent (the "
+                  f"allowance is now spent)")
+        else:
+            _state["suppressed_hits"] += 1
+            suppress_load(request_id, f"it came back for a second disk offer at "
+                                      f"{computed} computed tokens having reached "
+                                      f"{_offered_at[request_id]} on the first one")
+            _refuse("suppressed_after_failure",
+                    f"{request_id[:48]} was already offered disk tokens at "
+                    f"{_offered_at[request_id]} computed tokens and is asking again at "
+                    f"{computed}: the engine rescheduled it, so the first load did not "
+                    f"land, and its one race re-offer is spent ({request_id[:48]} "
+                    "would be offered a third time - that is the loop that starved "
+                    "the box)")
+            return ram_result
     if ram_tokens % block_size != 0:
         # A fine-grained (hash-aligned) RAM hit would interleave with our blocks
         # inside a group block, so the merged list's ORDER would no longer mean
@@ -3988,20 +4416,34 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         _refuse("bad_call", floored["reason"])
         return ram_result
     disk_tokens = int(floored["tokens"])
-    # WHICH BOUND SHORTENED THIS OFFER, recorded as it happens. The token ceiling and
-    # the bounce-buffer pool are different constraints with different fixes (raise
-    # `MAX_OFFER_TOKENS_PER_OFFER` vs raise the pool and pay host RAM), so an offer
-    # that came in short has to say WHICH one bit - otherwise a job count is the only
-    # evidence and a job count cannot be read.
+    # WHICH BOUND SHORTENED THIS OFFER, recorded as it happens. THREE bounds are left
+    # on this path and they have three different fixes - the per-offer BLOCK walk
+    # (`MAX_RESTORE_BLOCKS_PER_OFFER`), the CPU-slot pool, and the bounce-buffer pool -
+    # so an offer that came in short has to say WHICH one bit, or a job count is the
+    # only evidence and a job count cannot be read.
+    #
+    # THE FIXED 32,000-TOKEN CAP AND ITS CLAMP WERE DELETED HERE (0.2.32), along with
+    # `offer_clamped`: with no configured token cap there is nothing to clamp and
+    # nothing to count, and `bounded_by` can no longer contain `offer_cap`. THE RISK
+    # THAT DELETION ACCEPTS (the operator's decision, not an oversight): that cap was
+    # the only accidental guard against the still-open TODO 14 - with no reservation
+    # arbiter, two simultaneous offers each price affordability against the pool's
+    # CURRENT free bytes, both believe they fit, and together they over-commit. Accepted
+    # because the live offer rate is 4 offers in 332 lookups, so overlap is near-zero;
+    # raising that rate is a different trade and needs the arbiter (reserve at adoption,
+    # release at `finish_batch`) scheduled first. See MAX_RESTORE_BLOCKS_PER_OFFER.
     bounds: list = []
-    if disk_tokens > MAX_OFFER_TOKENS_PER_OFFER:
-        # Clamped, not truncated mid-span: whole spans only, so the fork's own
-        # "one whole block per entry" rule still holds after the clamp. This is the
-        # ceiling that 160,000-token offers blew straight through.
-        _state["offer_clamped"] += 1
-        bounds.append("offer_cap")
-        disk_tokens = whole_block_tokens(MAX_OFFER_TOKENS_PER_OFFER,
-                                         block_size)["tokens"]
+    # Remembered for `offer_block_ceiling()`, which publishes the block bound in tokens
+    # to processes that have no manager of their own to ask (a worker rank's payload).
+    _state["offer_block_size_seen"] = int(block_size)
+    if run.get("walk_capped") and max_hit_len > run["blocks"] * block_size:
+        # The walk stopped at the block cap with tokens still left to restore, so the
+        # block cap - not the pool and not the CPU slots - is what ended this run. The
+        # `max_hit_len` test is what keeps the label honest: a run that happened to be
+        # exactly 64 blocks long because that is all the store HOLDS says nothing here
+        # (the store bounded it, and `no_disk_run`/`run_blocks` already say that).
+        bounds.append("block_cap")
+        _state["offer_block_capped"] += 1
     if disk_tokens <= 0:
         _refuse("disk_run_below_one_block", f"{matched} matched tokens is below one "
                                             f"{block_size}-token scheduler block "
@@ -4071,6 +4513,13 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                     "jobs_the_pool_can_carry": jobs_ceiling,
                     "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
                     "bytes_the_offer_needs": jobs_wanted * int(price_bytes),
+                    # THE PER-OFFER BOUND THAT STOOD WHEN THIS OFFER WAS PRICED, beside
+                    # the pool arithmetic `bounded_by` names it next to (0.2.32): a
+                    # reader asking "was this offer short because of a cap or because of
+                    # the pool" gets both numbers from the one field. BLOCKS, because
+                    # the deleted fixed token cap is not coming back under a new name.
+                    "block_cap_blocks": MAX_RESTORE_BLOCKS_PER_OFFER,
+                    "block_cap_tokens": int(offer_block_ceiling(block_size)["tokens"]),
                     "bounded_by": bounds}
     _state["last_offer_pool"] = dict(pool_pricing)
     # ONE SPAN IS THE MINIMUM OFFER, and a span costs `per_span` positional reads plus
@@ -4945,6 +5394,51 @@ def _mark_adopted() -> None:
 
 # --- the scheduler's door 3: completions, and the ledger's expiry -------------
 
+def _fuse_or_spare(request_id, span, *, where: str, why: str) -> dict:
+    """WHAT A FAILED LOAD COSTS, decided from the failure kinds the code can see.
+
+    THE BUG THIS CLOSES (2026-10-06). Every failure report used to call `suppress_load`
+    - black-holing the REQUEST and fusing the SPAN for the rest of the boot - whatever
+    the failure was, while the reason string it handed that call already contained
+    `sorted(_recent_failure_kinds())`. The code had the answer in its hand and decided
+    without looking, so a span that lost a 135.8 ms race in one group of one span cost a
+    28,583-token recompute AND the permanent fuse (`suppressed_requests: 3`).
+
+    THE RULE, in the operator's words: "give it up to 5 s to read; only when something
+    bad happens do we ignore". A timing loss costs the tokens (the engine still
+    recomputes them - see `LOAD_TIMING_FAILURES` for what the engine does with the
+    reported blocks) and does NOT cost the next offer. A data failure keeps the fuse
+    exactly where it was, and so does the UNKNOWN case: a loss nobody diagnosed is not
+    proof of a race, because the scheduler learns a worker's kinds from the rank file
+    and that transport lags (`PROOF_CACHE_SECONDS`). The first loss of an episode
+    therefore usually fuses and the losses after it do not - which is the honest shape
+    of what this process can know, and it is published in `last_fuse_decision`.
+
+    A spared request is not unsentinelled: it gets exactly one re-offer through
+    `_grant_race_reoffer`, spent when used, so the loop that starved the box stays
+    bounded at two offers per request however the losses fall.
+    """
+    kinds = sorted(_attributable_failure_kinds())
+    verdict = classify_failure_kinds(kinds)
+    fused = verdict != "timing"
+    if fused:
+        _state["fuses_on_data_kinds" if verdict == "data"
+               else "fuses_on_unknown_kinds"] += 1
+        suppress_load(request_id, f"{why} (failure kinds visible: "
+                                  f"{kinds or ['none seen']}; classified {verdict})",
+                      span=span)
+    else:
+        _state["races_not_fused"] += 1
+        _grant_race_reoffer(request_id)
+    _state["last_fuse_decision"] = (
+        f"req={str(request_id)[:48]} where={where} verdict={verdict} "
+        f"kinds={kinds or ['none seen']} "
+        + ("fused (no further offer)" if fused
+           else "spared: one re-offer granted, span not fused"))[:400]
+    return {"verdict": verdict, "fused": fused, "kinds": kinds,
+            "span": span, "request_id": request_id}
+
+
 def note_reported(manager, connector_output) -> dict:
     """A load was reported finished: those disk bytes are now live on the GPU.
 
@@ -4967,7 +5461,8 @@ def note_reported(manager, connector_output) -> dict:
       like success: the live box counted 123,161 "restorations" with
       `reads_applied=0` in the same line.
     """
-    out = {"released": 0, "restorations": 0, "failures": 0, "no_read": 0}
+    out = {"released": 0, "restorations": 0, "failures": 0, "no_read": 0,
+           "races_not_fused": 0}
     try:
         reported = {str(item) for item in
                     (getattr(connector_output, "finished_recving", None) or ())}
@@ -4984,19 +5479,30 @@ def note_reported(manager, connector_output) -> dict:
                        f"{sorted(_recent_failure_kinds()) or ['none seen']})",
                 request_id=request_id, span=_span_key_of(record),
                 provenance=False)
-            suppress_load(request_id, "the engine reported this request's KV load "
-                                      "failed",
-                          span=_span_key_of(record))
-            # THE LEDGER MUST CLOSE. Until 0.2.23 this line was `_loads.pop(...)`, a
-            # hand-rolled duplicate of `_drop_load` that skipped its two side
-            # effects: the `loads_released` counter and the release of this load's
-            # `_slot_paths` entries. On a box where EVERY failure arrives in this
-            # shape, `loads_released` sat at 0 forever while the fork's `_reqs_to_load`
-            # drained - which is exactly the on-call reading "the load was never
-            # registered at all" instead of "it was registered and burned", and it
-            # left slot->path mappings naming a request that no longer had a load.
-            _burn_load(request_id, "the engine reported this request's KV load "
-                                   "failed")
+            # A RACE AND A FAULT NO LONGER COST THE SAME (0.2.32): see
+            # `_fuse_or_spare`. A spared request closes its ledger with `_drop_load`
+            # rather than `_burn_load`, so it is offered again exactly once.
+            decision = _fuse_or_spare(request_id, _span_key_of(record),
+                                      where="failed_recving",
+                                      why="the engine reported this request's KV "
+                                          "load failed")
+            if decision["fused"]:
+                # THE LEDGER MUST CLOSE. Until 0.2.23 this line was `_loads.pop(...)`,
+                # a hand-rolled duplicate of `_drop_load` that skipped its two side
+                # effects: the `loads_released` counter and the release of this load's
+                # `_slot_paths` entries. On a box where EVERY failure arrives in this
+                # shape, `loads_released` sat at 0 forever while the fork's
+                # `_reqs_to_load` drained - which is exactly the on-call reading "the
+                # load was never registered at all" instead of "it was registered and
+                # burned", and it left slot->path mappings naming a request that no
+                # longer had a load.
+                _burn_load(request_id, "the engine reported this request's KV load "
+                                       "failed")
+            else:
+                _drop_load(request_id, "the engine reported this request's KV load "
+                                       "failed and the loss was a race: the request "
+                                       "keeps its next offer")
+                out["races_not_fused"] += 1
             out["failures"] += 1
         if invalid and not failed:
             # The block-id-only shape: we own the load-error report, so on a step
@@ -5015,18 +5521,29 @@ def note_reported(manager, connector_output) -> dict:
                 provenance=False)
             for request_id in list(_loads):
                 if _loads[request_id].get("adopted"):
-                    suppress_load(request_id, f"{invalid} GPU block id(s) came "
-                                              "back as load errors on a step that "
-                                              "carried this request's disk slots",
-                                  span=_span_key_of(_loads.get(request_id)))
-                    # The live box's whole failure signature: 66 requests with
-                    # `invalid_block_ids=1..3` and an empty `failed_recving`, so this
-                    # is the path that decided the run - and the path whose
-                    # `_loads.pop` meant `loads_released` never moved by one. The
-                    # suppression decision is unchanged; only the bookkeeping is.
-                    _burn_load(request_id, f"{invalid} GPU block id(s) reported as "
-                                           "load errors on a step carrying this "
-                                           "request's disk slots")
+                    # A RACE AND A FAULT NO LONGER COST THE SAME (0.2.32). This is the
+                    # shape the live box actually produced (66 requests with
+                    # `invalid_block_ids=1..3` and an empty `failed_recving`), so this
+                    # is where tonight's 12 ms race became a boot-length fuse.
+                    decision = _fuse_or_spare(
+                        request_id, _span_key_of(_loads.get(request_id)),
+                        where="invalid_block_ids",
+                        why=f"{invalid} GPU block id(s) came back as load errors on a "
+                            f"step that carried this request's disk slots")
+                    if decision["fused"]:
+                        # The suppression decision for a FAULT is unchanged; only the
+                        # bookkeeping was ever wrong (`_loads.pop` meant
+                        # `loads_released` never moved by one).
+                        _burn_load(request_id,
+                                   f"{invalid} GPU block id(s) reported as load errors "
+                                   "on a step carrying this request's disk slots")
+                    else:
+                        _drop_load(request_id,
+                                   f"{invalid} GPU block id(s) reported as load errors "
+                                   "on a step carrying this request's disk slots, and "
+                                   "the loss was a race: the request keeps its next "
+                                   "offer")
+                        out["races_not_fused"] += 1
                     out["failures"] += 1
         for request_id in sorted(reported):
             if request_id in _burned:
@@ -5076,6 +5593,11 @@ def note_reported(manager, connector_output) -> dict:
                 continue
             _state["restorations"] += 1
             out["restorations"] += 1
+            # A SUCCESS CLEARS THE ALLOWANCE (0.2.32): the race allowance exists to give
+            # a request ONE more chance at the bytes it lost, and a request whose load
+            # landed has no use for it. Freeing the row is also what keeps the table
+            # bounded in a long boot that offers a great many requests.
+            _race_reoffer.pop(request_id, None)
             # THE BLOCKS, NOT JUST THE REQUEST (0.2.25). This is the one place the
             # plugin's own claim ("these GPU blocks are the ones our disk span
             # feeds") and the fork's own verdict ("this request's load is DMA'd")
@@ -5615,16 +6137,17 @@ def _observe_apply_point(batch_id, batch: dict, status: dict,
     tokens, tokens_basis = _offered_tokens_estimate(batch)
     jobs = batch.get("jobs") or {}
     bytes_asked = sum(int(job.get("bytes") or 0) for job in jobs.values())
-    # WHAT THE WAIT IS WAITING FOR. The budget is sized on the bytes STILL IN FLIGHT,
-    # not the whole batch: a batch that has delivered nine of ten slots does not get a
-    # ten-slot budget, and a batch that has delivered all of them gets nothing at all.
-    # Every entry in one batch is the same width (the store's slot width for this
-    # fingerprint), so the outstanding bytes are exact rather than estimated - and
-    # `bytes_asked` is published next to it so a reader can see both numbers.
+    # WHAT THE WAIT IS WAITING FOR. Since 0.2.32 the allowance is FLAT, so the bytes
+    # still in flight decide nothing about the grant: they are PUBLISHED beside it, and
+    # they are the bytes STILL IN FLIGHT rather than the size of the offer - a batch
+    # that has delivered nine of ten slots is waiting for one slot. Every entry in one
+    # batch is the same width (the store's slot width for this fingerprint), so the
+    # outstanding bytes are exact rather than estimated, and `bytes_asked` is published
+    # next to it so a reader can see both numbers.
     pending = int(status.get("pending") or 0)
     per_entry = (bytes_asked / len(jobs)) if jobs else 0.0
     bytes_at_stake = int(round(per_entry * min(pending, len(jobs))))
-    budget = settle_budget(bytes_at_stake, tokens, status.get("seconds_left"))
+    budget = settle_budget(bytes_at_stake, status.get("seconds_left"))
     settled_on_arrival = bool(status.get("settled"))
     window = {"settled_on_arrival": settled_on_arrival,
               "bind_to_apply_ms": gap_ms,
@@ -5647,14 +6170,16 @@ def _observe_apply_point(batch_id, batch: dict, status: dict,
             _state["settle_notice"] = ("ignored: "
                                        + "; ".join(budget["env_problems"]))[:300]
     elif budget["enabled"]:
-        key = (f"settle-on-{budget['cap_ms']}-{budget['read_bytes_per_s']}"
-               f"-{budget['safety_margin']}")
-        line = (f"DISK[settle] wait=ON cap_ms={budget['cap_ms']} "
-                f"min_ms={budget['min_ms']} margin=x{budget['safety_margin']} "
-                f"read_bps={budget['read_bytes_per_s']:.0f} "
-                f"prefill_tokens_per_s={budget['prefill_tokens_per_s']} "
-                f"(one line per distinct setting; the apply point waits inside the "
-                f"engine step)")
+        key = f"settle-on-{budget['cap_ms']}-{budget['cap_from_default']}"
+        origin = (f"{config.ENV_DISK_SETTLE_MS} is UNSET, so this is the 0.2.32 "
+                  f"default: set it to 0 for the pre-0.2.32 never-wait boot"
+                  if budget["cap_from_default"] else
+                  f"{config.ENV_DISK_SETTLE_MS} is set by the environment")
+        line = (f"DISK[settle] wait=ON cap_ms={budget['cap_ms']} ({origin}; FLAT "
+                f"allowance since 0.2.32: granted = min(cap, the load's own "
+                f"remaining deadline); no throughput or prefill-rate arithmetic "
+                f"anymore. One line per distinct setting; the apply point waits "
+                f"inside the engine step)")
         if notice_once(key, line):
             _state["settle_notice"] = line
     waited_ms = 0.0
@@ -5677,6 +6202,14 @@ def _observe_apply_point(batch_id, batch: dict, status: dict,
     window["settled_after_wait"] = settled_after_wait
     window["dropped_after_wait"] = bool(budget["enabled"] and waited_ms > 0
                                         and not status.get("settled"))
+    # THE HONEST WAIT METRIC (0.2.32). `budget_over_recompute` compared a grant with
+    # the arithmetic that produced it, so the 23.6 ms grant that lost a 135.8 ms race
+    # and then cost a 12-second recompute read as `over_recompute: 0`. This one asks
+    # the only question a flat allowance can answer: did the batch consume the WHOLE
+    # allowance and still not have its bytes? The 1 ms tolerance is because the poll
+    # loop leaves when the remaining time drops below a tick, not at zero.
+    window["allowance_spent"] = bool(granted and not settled_after_wait
+                                     and waited_ms + 1.0 >= float(budget["budget_ms"]))
     window["settled_now"] = bool(status.get("settled"))
     states = ({} if not status.get("known", True) or not status.get("pending")
               else disk_read.job_states(batch_id))
@@ -6492,10 +7025,22 @@ def partial_load_verdict() -> dict:
          tokens and RESCHEDULES it. A KV prefix is a prefix: everything from the first
          invalid block onward is recomputed, so an applied read that sits after a hole
          is work done for bytes the request will overwrite.
-      4. `note_reported` reads that same invalid set back and FUSES the request
-         (`suppress_load`) and burns its load. So a partial load is not a partial
-         credit for that request: the offer is wasted for it even when the prefix
-         landed, and the next request asking for the same span meets the SPAN fuse.
+      4. `note_reported` reads that same invalid set back and decides what it COSTS
+         (0.2.32, `failure_kind_classes`): a DATA kind fuses the request and the span,
+         a RACE kind (`not_settled`, `deadline_expired`, `buffer_cap`, `queue_full`)
+         spares both and grants the request exactly one re-offer. Either way the offer
+         is wasted for THAT request while its prefix was in flight: reads after the
+         first hole are bytes the request will recompute over.
+      5. THE SHRINK THE ENGINE WILL NOT LET US DO. A hole in ONE group of ONE span
+         should be truncatable to the contiguous landed prefix, and the fork CAN do
+         that - but only for a request with exactly one KV cache group
+         (`vllm/v1/core/sched/scheduler.py:3217-3252`). This box runs a hybrid model,
+         so `req_block_ids_per_group` has more than one entry and the branch above it
+         (`scheduler.py:3193-3215`) sets `num_computed_tokens = 0`: the WHOLE prefix,
+         not the tail, is recomputed. That is why a 23.6 ms grant became a 12.26 s
+         recompute, and no plugin-side change can shorten it: the invalid-block channel
+         is the only channel the worker has for "these bytes are not here", and on this
+         layout that channel means "recompute everything".
 
     The span counters say how much of that was a hole in the middle rather than a
     missing suffix, which is the shape N reader threads introduced.
@@ -6530,8 +7075,12 @@ def partial_load_verdict() -> dict:
             "reads are real work and the restoration is not. A PARTIAL load is the "
             "likely shape - the survivors were DMA'd and the refused ones were "
             "reported as load errors, so the engine reset the request's computed "
-            "tokens at the first invalid block and rescheduled it, and "
-            "`suppress_load` then fused the request so it is never offered again. "
+            "tokens and rescheduled it (on a multi-group layout that reset is to "
+            "ZERO, not to the first hole: see `partial_load_verdict`'s item 5), and "
+            f"the fuse decision now reads the failure kinds - races not fused: "
+            f"{int(_state['races_not_fused'])}, fuses on data kinds: "
+            f"{int(_state['fuses_on_data_kinds'])}, on unknown kinds: "
+            f"{int(_state['fuses_on_unknown_kinds'])}. "
             "That means an offer whose jobs did not all fit is WASTED for the "
             "request even when its prefix landed: reads after the first hole are "
             "bytes the request will recompute over.")
@@ -6707,13 +7256,22 @@ def boot_line() -> str:
         # "this boot serves EVERY request from SSD and gives its host-RAM hit back" -
         # a posture an operator must be able to confirm at a glance, and one no request
         # can influence. `serving_as` is the same two switches read as one verdict, and
-        # `offer_cap`/`ranks_armed` are the bounds that still apply under it.
+        # `offer_block_cap`/`ranks_armed` are the bounds that still apply under it.
         parts.append("disk_authority={}".format(
             "ON" if _state["disk_authority"] else "OFF"))
         parts.append(f"serving_as={serving_as()}")
         parts.append("offers_switch={}".format(
             "ON" if _state["offers_enabled"] else "OFF"))
-        parts.append(f"offer_cap={int(MAX_OFFER_TOKENS_PER_OFFER)}")
+        # THE PER-OFFER BOUND, on the line, in BLOCKS and in the tokens they are worth.
+        # `offer_cap=32000` used to sit here, and after 0.2.32 deletes that cap the
+        # field would be reporting a bound that constrains nothing - so it is gone, and
+        # what replaces it is the bound that DOES constrain: the block walk. Blocks
+        # first because the block count is the real quantity; the token figure is only
+        # that many blocks times the engine's block size, whose source a payload reader
+        # can check at `limits.offer_block_ceiling.block_size_source`.
+        ceiling = offer_block_ceiling()
+        parts.append("offer_block_cap={}".format(int(ceiling["blocks"])))
+        parts.append("offer_block_cap_tokens={}".format(int(ceiling["tokens"])))
         parts.append("authority_lookups={}".format(
             int(_state["authority_lookups"])))
         parts.append("suppressed={}".format(int(_state["suppressions"])))
@@ -6892,11 +7450,12 @@ def worker_report() -> dict:
                               round(_state["settle_ms_total"] / waited, 3)),
             "waited_ms_max": _state["settle_ms_max"],
             "budget_ms_max": _state["settle_budget_max_ms"],
-            "over_recompute": int(_state["settle_budget_over_recompute"]),
+            "allowance_spent": int(_state["settle_allowance_spent"]),
             "last": ({key: value for key, value in
                       (_state["last_apply_window"] or {}).items()
-                      if key in ("bytes_asked", "budget_ms", "waited_ms", "bound",
-                                 "settled", "settled_after_wait", "recompute_ms")}
+                      if key in ("bytes_asked", "bytes_at_stake", "budget_ms",
+                                 "waited_ms", "bound", "settled",
+                                 "settled_after_wait", "allowance_spent")}
                      or None)}
         # THE CONCURRENCY AND THE SHAPE, in the rank file because a WORKER is the only
         # process that reads, and both are worker-side facts. A handful of ints on
@@ -7595,6 +8154,12 @@ def section() -> dict:
         "max_paths_per_step": MAX_PATHS_PER_STEP,
         "cpu_slot_reserve": CPU_SLOT_RESERVE,
         "identity_digest_placeholder": IDENTITY_DIGEST_PLACEHOLDER,
+        # THE BOUND ONE OFFER MAY CARRY (0.2.32), as the blocks that define it plus the
+        # tokens they are worth and where that block size came from. The fixed
+        # 32,000-token cap it replaces is DELETED, not renamed: a number without its
+        # derivation is what made the old cap impossible to argue about from a payload,
+        # so the whole `offer_block_ceiling()` dict travels here.
+        "offer_block_ceiling": offer_block_ceiling(),
     }
     average, maximum = read_latency()
     view["read_latency_seconds"] = {"avg": average, "max": maximum}
@@ -7678,6 +8243,11 @@ def scheduler_section() -> dict:
     # recomputes nothing, so a payload and a verb can never disagree about a posture.
     posture = disk_posture()
     tally = counters()
+    # THE PER-OFFER BOUND, computed ONCE for the whole payload (0.2.32). Like
+    # `_offer_pool_view()`, this is a re-derivation rather than a stored value: the
+    # engine's block size is the authority and a payload that published a cached figure
+    # could disagree with the next offer. ONE call per payload read, not one per field.
+    offer_ceiling = offer_block_ceiling()
     # THE INDEX'S OWN BLINDNESS, computed once for every branch below (0.2.28).
     blindness = _index_blindness()
     # THE VERDICT AS OF THIS INSTANT, for `witness_*_now`. Computed here, not stored "
@@ -7838,11 +8408,37 @@ def scheduler_section() -> dict:
         "disk_authority": bool(posture["disk_authority"]),
         "offers_enabled": bool(posture["enabled"]),
         "serving_as": posture["serving_as"],
+        # THE BOOT DEFAULT BEHIND THE POSTURE (0.2.33): whether
+        # `KVTIER_DISK_BOOT_ENABLE` asked for this boot to come up armed and serving,
+        # whether it was honoured, whether renewal has run, and whether an operator
+        # disarm has latched. `disk_boot.view()` answers with every key on every path,
+        # so a degraded boot cannot hand back a thinner payload than a healthy one - and
+        # nothing here recomputes any of it: the view is the same dict the `/disk` verb
+        # answers with, from the module that owns the decision.
+        "boot_default": disk_boot_section(),
         "per_boot": True,
         "survives_restart": False,
         "disk_authority_changes": int(posture["disk_authority_changes"]),
         "offer_switch_changes": int(posture["offer_switch_changes"]),
-        "offer_cap": int(MAX_OFFER_TOKENS_PER_OFFER),
+        # THE BOUND THAT REPLACES `offer_cap`, and `offer_cap` IS GONE (0.2.32): it
+        # advertised the fixed 32,000-token cap this release deletes, and a field with
+        # that name reporting a number that constrains nothing is worse than no field.
+        # What is published instead is the bound that does constrain - the per-offer
+        # BLOCK walk - in blocks (the real quantity) and in the tokens those blocks are
+        # worth, with the block size and its source so a reader can see the token figure
+        # is derived, not measured. `offer_block_capped` is the counter of offers that
+        # bound here, and for every offer that came in short for a DIFFERENT reason,
+        # `bounded_by` names the one that bit (`pool_budget` / `cpu_slots` /
+        # `block_cap`).
+        # THE HONEST READING, and the payload says it because the number invites the
+        # opposite one: this bound is not what makes a long prefix restorable. Pool
+        # affordance binds far below it in practice, and on the live store the depth the
+        # spill tier reached (~11 spans) binds earlier still.
+        "offer_block_cap_blocks": int(offer_ceiling["blocks"]),
+        "offer_block_cap_tokens": int(offer_ceiling["tokens"]),
+        "offer_block_cap_block_size": int(offer_ceiling["block_size"]),
+        "offer_block_cap_block_size_source": str(offer_ceiling["block_size_source"]),
+        "offer_block_capped": int(state["offer_block_capped"]),
         "ranks_armed": int(proof.get("ranks_armed") or 0),
         "ranks_seen": int(proof.get("ranks_seen") or 0),
         "suppressed_hits": int(tally["suppressed_hits"]),
@@ -7889,12 +8485,14 @@ def scheduler_section() -> dict:
         "pin_release_failures": int(tally["pin_release_failures"]),
         "last_local_hit_ignored": tally["last_local_hit_ignored"],
         "last_offer": tally["last_offer"],
-        # WHAT THE OFFER COSTS THE BOUNCE-BUFFER POOL (0.2.31). The cap that keeps an
+        # WHAT THE OFFER COSTS THE BOUNCE-BUFFER POOL (0.2.31). The bound that keeps an
         # offer inside what THIS process can carry, the arithmetic behind it, and the
-        # two counters that say how often it bound. `offer_cap` above is the TOKEN
-        # ceiling and stays exactly what it always meant; this is the tighter,
-        # byte-denominated constraint beside it, and `last_offer_pool.bounded_by` says
-        # which of the two shortened any given offer.
+        # two counters that say how often it bound. Since 0.2.32 deletes the fixed
+        # 32,000-token cap this is the binding bound in practice: with the block walk
+        # the only cap left above it, `last_offer_pool.bounded_by` naming `pool_budget`
+        # is the normal answer for a long prefix - and the ONLY guard against the
+        # 2026-10-05 shape of un-placeable offers, since nothing arbitrates two
+        # simultaneous offers against the pool's current free bytes (TODO 14).
         "offer_pool": _offer_pool_view(),
         "offers_pool_capped": int(tally["offer_pool_capped"]),
         "offers_pool_refused": int(tally["offer_pool_refused"]),
@@ -7904,6 +8502,16 @@ def scheduler_section() -> dict:
         # with this process's own, newest first, each carrying its block provenance.
         "recent_load_failures": load_failure_report()["records"],
         "load_failure_kinds": sorted(_recent_failure_kinds()),
+        # WHAT EACH KIND IS ALLOWED TO COST (0.2.32). The partition is the policy for
+        # what a failed load costs, so it travels in the payload rather than only in a
+        # comment: a reader can check `not_settled` against `races_not_fused` and see
+        # whether a box is losing reads to a race it survives or to bytes it does not.
+        "failure_kind_classes": failure_kind_classes(),
+        "races_not_fused": int(tally["races_not_fused"]),
+        "fuses_on_data_kinds": int(tally["fuses_on_data_kinds"]),
+        "fuses_on_unknown_kinds": int(tally["fuses_on_unknown_kinds"]),
+        "race_reoffers_granted": int(tally["race_reoffers_granted"]),
+        "last_fuse_decision": tally["last_fuse_decision"],
         "load_failures_here": int(tally["load_failures"]),
         "load_failures_from_ranks": int(tally["ranks_load_failures"]),
         # THE BLOCK IDS THE FORK BLAMED, kept instead of discarded, so a scheduler-side
@@ -8092,8 +8700,10 @@ def scheduler_section() -> dict:
             "offer_pool": "what an offer costs the BOUNCE-BUFFER POOL: the bytes one "
                           "read needs, the pool's budget, how many jobs it can carry, "
                           "and the last offer's pricing with `bounded_by` naming which "
-                          "constraint shortened it (`offer_cap` = tokens, `cpu_slots` "
-                          "= CPU blocks, `pool_budget` = bounce buffers)",
+                          "constraint shortened it (`pool_budget` = bounce buffers, "
+                          "`cpu_slots` = CPU blocks, `block_cap` = the per-offer block "
+                          "walk). `offer_cap` is RETIRED with the fixed 32,000-token "
+                          "cap: no configured token cap exists to bound an offer",
             "offers_pool_capped": "offers SHORTENED to the job count the bounce-buffer "
                                   "pool can carry, from counters()",
             "offers_pool_refused": "lookups given NO disk offer because the pool "
@@ -8109,6 +8719,27 @@ def scheduler_section() -> dict:
             "load_failure_kinds": "the failure kinds seen most recently (this "
                                   "process's ring plus the live rank files), from "
                                   "`_recent_failure_kinds`",
+            "failure_kind_classes": "THE PARTITION of `WORKER_FAILURES` into timing "
+                                    "/ capacity / data, with the decision rule beside "
+                                    "it: "
+                                    "a RACE may cost a request its tokens and must not "
+                                    "cost its next offer, a DATA failure keeps the "
+                                    "fuse, and an UNKNOWN report fuses (fail closed)",
+            "races_not_fused": "failure reports classified a race, so no request fuse "
+                               "and no span fuse was written, from counters()",
+            "fuses_on_data_kinds": "fuses raised with a data kind visible (corruption, "
+                                   "short read, bad digest, failed copy), from "
+                                   "counters()",
+            "fuses_on_unknown_kinds": "fuses raised with NO failure kind visible - the "
+                                      "fail-closed branch, and the reason a quiet "
+                                      "`races_not_fused` can mean 'could not tell' and "
+                                      "not 'there were no races', from counters()",
+            "race_reoffers_granted": "second offers granted by the one-per-request "
+                                     "race allowance: a request is offered at most "
+                                     "TWICE per boot, race or fault, from counters()",
+            "last_fuse_decision": "the last failure report's decision as a sentence: "
+                                  "the request, where the report arrived, the kinds "
+                                  "visible, and whether it fused or spared the offer",
             "load_failures_here": "load-failure records written by THIS process, from "
                                   "counters()",
             "load_failures_from_ranks": "load-failure records read from live rank "
@@ -8297,9 +8928,41 @@ def scheduler_section() -> dict:
                                       "per experiment (unit: changes)",
             "offer_switch_changes": "times the gap-fill switch moved this boot, from "
                                     "counters() (unit: changes)",
-            "offer_cap": "tokens: the most one offer may carry, clamped at "
-                         "MAX_OFFER_TOKENS_PER_OFFER (the 160,000-token offers of "
-                         "2026-10-05 clamp here)",
+            # `offer_cap` IS RETIRED, with the fixed 32,000-token cap it advertised:
+            # leaving a field of that name in the payload reporting a number that no
+            # longer constrains anything would be the worst kind of stale field, so the
+            # name is gone and the four fields below carry the bound that DOES bind.
+            "offer_block_cap_blocks": "SCHEDULER BLOCKS: the per-offer bound that "
+                                      "replaces the deleted fixed 32,000-token cap - "
+                                      "MAX_RESTORE_BLOCKS_PER_OFFER, where the "
+                                      "`_disk_run` positional walk stops, because that "
+                                      "is how many spans one offer can name and stream "
+                                      "inside RESTORE_DEADLINE_SECONDS",
+            "offer_block_cap_tokens": "tokens those blocks are worth "
+                                      "(offer_block_cap_blocks x the scheduler block "
+                                      "size): a DERIVED figure, not a cap anyone "
+                                      "configured, and far above what a real offer "
+                                      "reaches - bounce-buffer affordability is the "
+                                      "bound that binds, and on the live store the "
+                                      "spill tier's depth (~11 spans) binds earlier",
+            "offer_block_cap_block_size": "tokens in one scheduler block, the "
+                                          "multiplier behind `offer_block_cap_tokens`, "
+                                          "from the manager's own `block_size` once a "
+                                          "lookup has run",
+            "offer_block_cap_block_size_source": "`engine` (a lookup in this process "
+                                                 "supplied it), `last-lookup` "
+                                                 "(remembered from one), or `fallback` "
+                                                 "(DEFAULT_OFFER_BLOCK_SIZE_TOKENS, in "
+                                                 "a process that has made no offer yet "
+                                                 "- a worker rank, typically)",
+            "offer_block_capped": "offers the per-offer BLOCK cap bound, from "
+                                  "counters(): the positional walk hit "
+                                  "MAX_RESTORE_BLOCKS_PER_OFFER with tokens still left "
+                                  "to restore. The only per-offer cap counter left now "
+                                  "that `offer_clamped` is retired with the token cap; "
+                                  "read it beside `offers_pool_capped` (the "
+                                  "bounce-buffer pool), which is the bound that binds "
+                                  "in practice",
             "ranks_armed": "live rank files that WILL SERVICE a disk load, from the "
                            "same worker_proof() read as `ranks_proven`: the proof is "
                            "AND over these, so one disarmed rank closes the whole "

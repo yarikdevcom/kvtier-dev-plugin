@@ -438,17 +438,10 @@ PATCHED_SHA256 = {
         'd39d9df7f72e0dbff2508eed458843b99c6028b3a1c4b2cc09eebb1ab20c68f3',
 }
 
-# Whole-file fingerprints of the tracked patch, for the operator-facing line
-# (the tool in the llm-api repo is what applies them; these are for reporting).
-MANAGER_FILE_SHA256_PRE = (
-    '3cc841ff97e4ec237800d4f81dcb5dfb5191c639f275a32892915e8b1af43eb7')
-MANAGER_FILE_SHA256_POST = (
-    'e4b00291991cfd6fdcabb8a22379b119073fca63341d2f488954b280b4a996eb')
-
-# Where the ORIGINAL bodies above came from, so a fingerprint can be traced to a
-# commit rather than to a claim.
-FORK_PIN_HEAD = '10b8e073321f22113da977856b5d5593ab6fa5d5'
-UPSTREAM_ISSUE = 'vllm-project/vllm#56396'   # the crash on the first store request
+# The PR that fixed it, named on the install-time refusal line (`backport.py`). The
+# commit the ORIGINAL bodies above came from is `10b8e07` (recorded in this file's
+# header, where the per-method fingerprints were taken), and the crash it fixed is
+# upstream issue #56396 - both are documented in README.md's PR #56810 section.
 UPSTREAM_PR = 'vllm-project/vllm#56810'      # the fix, +9/-1 in manager.py
 
 SOURCES = {

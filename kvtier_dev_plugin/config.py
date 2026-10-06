@@ -134,6 +134,45 @@ the file contract the proxy host's reader expects):
                                       `evict_threads_requested` beside
                                       `evict_threads_configured` when they differ).
 
+  THE DISK TIER'S BOOT DEFAULT (`disk_boot.py`, 0.2.33) -----------------------
+
+  KVTIER_DISK_BOOT_ENABLE    the SSD tier's BOOT posture, and the ONE flag that
+                             turns it off. UNSET (the default) = the boot comes up
+                             ARMED AND SERVING: at connector creation the plugin
+                             arms the spill path for the maximum legal TTL and
+                             raises this boot's serve posture, so the disk - not
+                             whatever host RAM happened to hold - decides every
+                             request's prefix, with no POST at all.
+                             Set it to `0`/`false`/`off`/`no` and the boot behaves
+                             exactly as every release up to 0.2.32: disarmed,
+                             `serving_as=off`, and the two dev-verb POSTs are the
+                             only lever.
+
+                             WHY THE DEFAULT IS ON AND WHY THAT IS NOT AN ARM BY
+                             ENV VAR. Every other facility in this package starts
+                             off and is armed by a POST, because a launcher script
+                             must not be able to turn a KV-reading diagnostic on.
+                             The disk tier's POSTure is different in kind: it is
+                             the feature the operator deployed the tier FOR, and
+                             for six evenings it reverted to doing nothing on
+                             every restart while `serving_as` reported the truth
+                             nobody had asked for. So this is a DISABLE switch on
+                             a working default - the same shape as
+                             `VLLM_E2_TIER_DEV_BOOT_INERT` above, which also only
+                             ever turns a boot effect OFF. Nothing reads this
+                             variable to warm anything that a boot would not
+                             otherwise do, and it never touches guard mode, the
+                             RAM tier's arm or the byte dump.
+
+                             This flag is not a re-arm from persisted state and
+                             must never become one: it decides what THIS boot
+                             does from the environment, fresh, and reads no arm
+                             file from a previous boot (see `disk_boot.py` and the
+                             prohibition quoted there). The boot log prints one
+                             `KVTIER disk boot default=` line naming the value it
+                             read, whether it came from the environment or the
+                             default, and how to turn it off.
+
   THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
   is installed in every worker whenever the plugin is on, and its per-step cost
   while unarmed is two `os.environ.get` calls; the two switches that make it do
@@ -227,44 +266,26 @@ ENV_DISK_BYTES = "VLLM_E2_TIER_DISK_BYTES"
 ENV_DISK_JOURNAL_DIR = "VLLM_E2_TIER_DISK_JOURNAL_DIR"
 
 # THE RESTORE SETTLE WAIT (`disk_restore.py`) ---------------------------------
-# THE CAP on how long one apply point (`start_load_kv`) may wait for its disk
-# reads, in MILLISECONDS. **Default 0 = never wait**, which is the behaviour every
-# release before 0.2.23 had on every boot, and the reason the read path loses its
-# race: reads are queued at `bind_connector_metadata` and applied one step later, so
-# an unsettled read was dropped and recomputed.
+# THE ALLOWANCE on how long one apply point (`start_load_kv`) may wait for its disk
+# reads, in MILLISECONDS. **Default 5,000 = give the read up to five seconds**
+# (0.2.32). `0` means never wait, which is every boot up to and including 0.2.31 and
+# the reason the read path loses its race: reads are queued at `bind_connector_metadata`
+# and applied one step later, so an unsettled read was dropped and recomputed.
 #
-# It is a CAP and not a budget, deliberately: the budget a batch is actually granted
-# is proportional to the bytes it is waiting for (`disk_restore.settle_budget`), and
-# this is the ceiling on that. The arithmetic that makes a flat budget wrong is the
-# operator's, and it is worth spelling out because it is the whole reason this is
-# capped rather than set generously: a 32,000-token offer is ~573 MB per rank and
-# ~8.2 s of recompute at the measured prefill rate, while a 9,400-token prompt measured
-# 2.4 s of recompute for ~172 MB of spilled KV. The budgets those reads deserve at the
-# store's measured write rate are ~100 ms and ~30 ms - milliseconds, both - so a cap
-# sized in seconds is not "generous", it is permission to lose the trade: a wait that
-# costs more than the recompute it avoids is a net loss paid inside the step by every
-# other request sharing it.
+# It is a FLAT allowance and not a computed budget, deliberately: until 0.2.31 the
+# grant was proportional to the bytes in flight over an assumed read throughput times a
+# safety margin, and the box measured what that guessing was worth - a 23.6 ms grant
+# against a 135.8 ms race gap, and a 28,583-token recompute to save the 23.6 ms. See
+# `disk_restore.settle_budget` for the deleted arithmetic and the operator's ruling that
+# replaced it. The only other bound is the read's own deadline, so this number can never
+# outrun the clock that cancels the read.
 #
-# This is NOT an arm and it arms nothing: the restore path still needs the disk
-# root, the spill tier's arm file, the tier's arm, this boot's offer switch and a
-# proven worker rank before it reads one byte. With those up and this at 0 the
-# engine thread waits exactly as long as it did in 0.2.22: not at all. A value that
-# cannot be parsed means OFF, never a default wait, because the safe failure of a
-# typo in a systemd drop-in is the behaviour that has been running all along.
+# This is NOT an arm and it arms nothing: the restore path still needs the disk root,
+# the spill tier's arm file, the tier's arm, this boot's offer switch and a proven
+# worker rank before it reads one byte. A value that cannot be parsed means OFF, never a
+# default wait, because the safe failure of a typo in a systemd drop-in is the behaviour
+# that does not block a step at all.
 ENV_DISK_SETTLE_MS = "VLLM_E2_TIER_DISK_SETTLE_MS"
-# The assumed SEQUENTIAL READ throughput of the spill store in BYTES PER SECOND,
-# which is what turns "bytes still in flight" into "milliseconds worth waiting
-# for". The default is the WRITE-side figure this repo already measured (11.5 GB/s,
-# see `disk_restore`'s recompute arithmetic) because that is the only number on this
-# box measured on the same RAID array - the READ side has never been measured, which
-# is exactly what the settle-wait fields exist to measure. Set this from the first
-# run's `settle.read_seconds_max` and the budget tracks the hardware.
-ENV_DISK_SETTLE_READ_BPS = "VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S"
-# The engine's PREFILL rate in TOKENS PER SECOND, used for one published number and
-# nothing else: the recompute cost a wait is racing (`recompute_ms`). Default
-# derives from the two measured samples the operator supplied: 9,400 tokens
-# recomputed in 2.4 s through the proxy.
-ENV_DISK_PREFILL_TOKENS_PER_S = "VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S"
 
 # THE PARALLEL READER (`disk_read.py`, 0.2.24) --------------------------------
 # How many threads issue spill reads at once. ONE is today: a single
@@ -288,7 +309,10 @@ ENV_DISK_READ_THREADS = "VLLM_E2_TIER_DISK_READ_THREADS"
 # at once. Two numbers decide whether it does:
 #   * units per offer per rank = spans x eligible groups, and the live boot's
 #     `per_block` (disk_restore.py:2260) is 1 - only g5 is eligible, so a 10-span
-#     offer (the MAX_OFFER_TOKENS_PER_OFFER cap) is 10 units, not 50;
+#     offer is 10 units, not 50 (and ~11 spans is the DEEPEST contiguous run the live
+#     store held on the boot the operator measured - spill follows RAM-tier parking and
+#     the CPU arena measured 187 blocks per rank, so run depth, not the offer ceiling,
+#     was what bound it);
 #   * bytes per unit = one rank's CPU slot: 11,468,800 B on the live narrow width,
 #     12,902,400 B on the wide one.
 # At the default 96 MiB the pool holds 8 of the narrow unit and 7 of the wide one, so
@@ -334,6 +358,24 @@ ENV_DISK_EVICT_THREADS = "VLLM_E2_TIER_DISK_EVICT_THREADS"
 # env-only on purpose: an HTTP argument naming a path the engine appends to would
 # be a write surface this plugin does not have anywhere else. See
 # miss_attribution.py (bounded by MAX_MIRROR_BYTES, which it stops at, counted).
+# THE DISK TIER'S BOOT DEFAULT (`disk_boot.py`, 0.2.33). The name deliberately does
+# NOT follow the `VLLM_E2_TIER_*` family: the operator asked for one flag he can find
+# by name when a boot misbehaves, and this is it. UNSET = the boot brings the SSD tier
+# up ARMED AND SERVING; `0`/`false`/`off`/`no` = the pre-0.2.33 posture (disarmed, the
+# dev-verb POSTs are the only lever). Like `ENV_BOOT_INERT`, this variable only ever
+# DISABLES a boot effect - it arms nothing that the boot default is not already on -
+# and it has no influence on guard mode, the RAM tier's arm or the raw-byte dump.
+ENV_DISK_BOOT_ENABLE = "KVTIER_DISK_BOOT_ENABLE"
+
+# The words that turn the disk tier's boot default OFF. Everything else - including a
+# value that is not a word at all - reads as ENABLED, because the default is on and a
+# typo must not silently produce the off posture (a boot the operator believes is
+# serving, serving nothing, is the failure this whole flag exists to end). A value
+# outside both vocabularies is still reported verbatim in `raw_value` and named on the
+# boot line, so `KVTIER_DISK_BOOT_ENABLE=flase` cannot pass unnoticed.
+_DISK_BOOT_OFF_WORDS = frozenset({"0", "false", "off", "no"})
+_DISK_BOOT_ON_WORDS = frozenset({"1", "true", "yes", "on"})
+
 ENV_MISS_LOG = "VLLM_E2_TIER_MISS_LOG"
 
 logger = logging.getLogger("kvtier_dev_plugin.config")
@@ -447,6 +489,46 @@ def boot_inert() -> bool:
     return os.environ.get(ENV_BOOT_INERT, "").strip().lower() not in _FALSY
 
 
+def disk_boot_enable() -> dict:
+    """The SSD tier's boot posture, resolved ONCE per boot by `disk_boot.py`.
+
+    Returns `{enabled, source, raw, recognised, env_var}` and never raises:
+
+      * UNSET or empty -> `{"enabled": True, "source": "default", "raw": None}`.
+        The default is ON: the boot arms the spill path and raises this boot's serve
+        posture, so a restart no longer silently reverts to a tier that serves nothing.
+      * `0`/`false`/`off`/`no` -> `{"enabled": False, "source": "env"}` - exactly the
+        behaviour of every release through 0.2.32, with the two dev-verb POSTs as the
+        only lever.
+      * anything else -> enabled, and `recognised: False` when the word is not one the
+        grammar defines. It is reported rather than guessed at, because an operator who
+        meant to disable a boot and typed `flase` needs the boot line to tell him the
+        value he wrote is not a disable word - not a payload that reads as intent.
+
+    THE ONE THING THIS FUNCTION MUST NEVER DO: read a persisted arm or posture from an
+    earlier boot and honour it. It reads `os.environ` and nothing else, and its result
+    is a decision about THIS boot computed at connector creation. `tests/
+    test_disk_boot_default.py` pins that, and `llm-api/AGENTS.md`'s 2026-10-03 entry
+    ("do not add a boot-time re-arm") is the reason it is a rule rather than a taste.
+
+    Note what is NOT here: no name, key or wording of the disk-serve switch itself.
+    That switch's own name belongs to `disk_restore`, and keeping this module free of it
+    is what pins that no configuration vocabulary can raise it directly - the suite
+    named for that switch asserts exactly this about this file.
+    """
+    raw = os.environ.get(ENV_DISK_BOOT_ENABLE, "").strip()
+    if not raw:
+        return {"enabled": True, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_BOOT_ENABLE}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_OFF_WORDS:
+        return {"enabled": False, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_BOOT_ENABLE}
+    return {"enabled": True, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_ON_WORDS,
+            "env_var": ENV_DISK_BOOT_ENABLE}
+
+
 def token_configured() -> bool:
     return bool(os.environ.get(ENV_TOKEN, "").strip())
 
@@ -507,11 +589,6 @@ def timeout_seconds() -> float:
     if not (MIN_TIMEOUT_SECONDS <= value <= MAX_TIMEOUT_SECONDS):
         return DEFAULT_TIMEOUT_SECONDS
     return value
-
-
-def package_dir() -> Path:
-    """The directory this plugin was imported from (resolved, symlinks gone)."""
-    return _PKG_DIR
 
 
 def diagnostics_dir() -> Path | None:
@@ -617,19 +694,26 @@ def diagnostics_rank() -> str | None:
 
 
 def settle_env() -> dict:
-    """The three settle-wait env vars, parsed and NOT interpreted.
+    """The settle-wait environment variable, parsed and NOT interpreted.
+
+    ONE variable, because 0.2.32 deleted the arithmetic that spent the other two: the
+    allowance is `min(VLLM_E2_TIER_DISK_SETTLE_MS, the load's own deadline)` and there
+    is no throughput figure and no prefill rate left to feed (`VLLM_E2_TIER_DISK_SETTLE_
+    READ_BYTES_PER_S` and `VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S` are gone, and reading
+    them would report a number nothing computes on).
 
     The split is deliberate: the env grammar ("what did the operator write") lives
-    here with every other env var, and the arithmetic that spends those numbers
+    here with every other env var, and the policy that spends the number
     (`disk_restore.settle_budget`) lives with the policy it belongs to. A number read
     here has already been rejected if it cannot be a number, so a typo cannot reach
     the arithmetic at all.
 
     A value that will not parse is reported in `problems` and left as None, which the
-    consumer reads as "the operator said nothing" - the conservative reading. The
-    alternative, a default wait, would make a typo in a systemd drop-in a behaviour
-    change nobody asked for, and this plugin has a standing rule that the safe
-    failure of a bad setting is the setting being OFF.
+    consumer reads as "the operator said nothing". That is the CONSERVATIVE reading for
+    every other knob and the DELIBERATELY EXPLICIT one here: since 0.2.32 the unset
+    value is a 5,000 ms allowance, so the only way a typo leaves the boot waiting
+    nothing at all is the line `problems` produces - which `settle_budget` publishes and
+    the apply point logs once as `DISK[settle] IGNORED`.
     """
     problems: list = []
 
@@ -648,14 +732,12 @@ def settle_env() -> dict:
             return None
         return value
 
-    # SYNTAX, not policy: each value is checked for "is this the number the operator
-    # meant" and nothing else. The ceilings on them are policy and live with the
-    # policy (`disk_restore.SETTLE_MS_MAX`), which reports when it clamps one - so an
-    # absurd value is visibly clamped in a published field instead of being silently
-    # discarded here and reading as "the operator never set it".
+    # SYNTAX, not policy: the value is checked for "is this the number the operator
+    # meant" and nothing else. The ceiling on it is policy and lives with the policy
+    # (`disk_restore.SETTLE_MS_MAX`), which reports when it clamps one - so an absurd
+    # value is visibly clamped in a published field instead of being silently discarded
+    # here and reading as "the operator never set it".
     return {"cap_ms": number(ENV_DISK_SETTLE_MS, 0.0),
-            "read_bytes_per_s": number(ENV_DISK_SETTLE_READ_BPS, 1.0),
-            "prefill_tokens_per_s": number(ENV_DISK_PREFILL_TOKENS_PER_S, 1.0),
             "problems": problems}
 
 

@@ -1947,6 +1947,14 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             # that has a manager and does not fit the restore layer is a boot whose
             # spilled KV can never be read back. See `_boot_restore`.
             "restore": None,
+            # THE SSD TIER'S BOOT DEFAULT (0.2.33): whether
+            # `KVTIER_DISK_BOOT_ENABLE` asked for a boot that comes up armed and
+            # serving, whether this boot honoured it, and what an operator can do about
+            # it. `None` means this boot never reached the step; the verdict itself is
+            # `disk_boot`'s own stable-key view. See `disk_boot.py` - including the
+            # prohibition it must never cross, which is that this is computed FRESH and
+            # never restored from a previous boot's arm file.
+            "disk_boot": None,
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -2037,6 +2045,25 @@ def boot_from_connector(cls, install_report, manager) -> dict:
                 (arena.get("reason") or "the host-RAM arena is unusable")[
                     :MAX_BOOT_ITEM_CHARS]))
 
+        # THE SSD TIER'S BOOT DEFAULT, last, because it is the only boot step that acts
+        # rather than reports: with `KVTIER_DISK_BOOT_ENABLE` at its default it arms the
+        # spill path and raises this boot's serve posture so the box comes up
+        # `serving_as=disk_authority` with no POST. Every input it needs is a verdict
+        # this boot already reached above, and every failure leaves the boot exactly as
+        # disarmed as an inert one - see `disk_boot.py` for the gates, the rollback and
+        # the prohibition on resurrecting a posture from an earlier boot's arm file.
+        disk_verdict = _boot_disk_default(boot)
+        boot["disk_boot"] = disk_verdict
+        if disk_verdict.get("outcome") == "REFUSED":
+            # COUNTED AS A REFUSAL only when the disk tier exists and the default could
+            # not be honoured: `NO_STORE` (no root) and `OFF` (the operator's own flag)
+            # are normal postures, not failures, and putting them in `refusals` would
+            # make every engine without an SSD tier look broken to the reader of this
+            # list. The one log line is printed either way.
+            boot["refusals"].append("disk_boot: {}".format(
+                (disk_verdict.get("reason") or "the boot default was not honoured")[
+                    :MAX_BOOT_ITEM_CHARS]))
+
         _state["boots"] += 1
         _state["boot"] = boot
         boot["line"] = boot_line(boot)
@@ -2114,6 +2141,74 @@ def _boot_arena(manager) -> dict:
                 f"reading the arena verdict raised {type(exc).__name__}",
                 "cpu_slot_reserve": None, "free_blocks": None,
                 "pool_total_blocks": None, "blocks_usable_for_an_offer": None}
+
+
+def _boot_disk_default(boot: dict) -> dict:
+    """THE SSD TIER'S BOOT DEFAULT (0.2.33), asked at the one moment all its inputs
+    exist. Never raises.
+
+    WHY HERE AND NOT EARLIER: the decision needs the RAM tier's arm verdict, the
+    restore layer's fit verdict and the arena's verdict - and all three are only known
+    after the install, the guard and the restore fit have run. It re-measures nothing:
+    the dict handed to `disk_boot.boot_enable` is this boot's own report, plus the
+    journal directory's writability, which is the one fact the arena verdict does not
+    cover and the one that decides whether a spilled byte can ever be named again.
+
+    WHY IT MAY NEVER RAISE: this runs on the engine's connector-construction path.
+    A disk-tier default that cannot be computed is a disarmed boot with a log line, and
+    never a boot that failed - which is the same fail-safe direction the flag itself
+    takes. THE PROHIBITION this path must never cross (see `disk_boot`'s docstring and
+    `llm-api/AGENTS.md`, 2026-10-03): it may not read a PREVIOUS boot's arm file or any
+    persisted posture and honour it. It computes this boot's posture from the
+    environment and the boot's own measurements, and nothing else.
+    """
+    from . import disk_boot  # noqa: PLC0415 - sibling layer, lazy by idiom
+    out = {"outcome": disk_boot.OUTCOME_UNDECIDED,
+           "reason": "the disk boot default never ran in this process"}
+    try:
+        restore = boot.get("restore") if isinstance(boot.get("restore"), dict) else {}
+        arena = boot.get("arena") if isinstance(boot.get("arena"), dict) else {}
+        journal: dict = {}
+        try:
+            from . import disk_index  # noqa: PLC0415 - sibling layer, lazy by idiom
+            journal = disk_index.journal_fs_state() or {}
+        except Exception as exc:  # noqa: BLE001 - an unreadable journal is no verdict
+            snapshot._error(exc, "backport boot disk default: journal")
+            journal = {}
+        pre = {"inert": bool(config.boot_inert()),
+               "tier_armed": bool(boot.get("tier")),
+               "restore_fitted": bool(restore.get("fitted")),
+               "arena_state": str(arena.get("state") or "unseen"),
+               "arena_reason": arena.get("reason"),
+               # None means "nobody could tell", and that is NOT a refusal; only an
+               # observed `False` (EACCES on the directory, or a non-directory on the
+               # way to it) withholds the boot default.
+               "journal_writable": journal.get("writable"),
+               "journal_error": journal.get("directory_error")}
+        return disk_boot.boot_enable(pre)
+    except Exception as exc:  # noqa: BLE001 - a boot default never costs a boot
+        snapshot._error(exc, "backport boot disk default")
+        out["reason"] = (f"the disk boot default raised {type(exc).__name__}: "
+                         f"{exc}"[:MAX_BOOT_ITEM_CHARS])
+        return out
+
+
+def _disk_boot_field(boot: dict) -> str:
+    """The boot line's `disk_boot=` token. Never raises; unknown reads as REFUSED.
+
+    Sits AFTER the bare `tier=` in the field order for the same reason `arena=` does:
+    the restart verifier in the llm-api repo takes the last `tier=`-shaped grep match,
+    and this field's name does not contain `tier=`, so it is invisible to that grep
+    while still reading next to `disk_tier=` for a human scanning the line.
+    """
+    try:
+        from . import disk_boot  # noqa: PLC0415 - sibling layer, lazy by idiom
+        verdict = boot.get("disk_boot")
+        if not isinstance(verdict, dict):
+            return disk_boot.OUTCOME_UNDECIDED
+        return disk_boot.field_token(verdict.get("outcome"))
+    except Exception:  # noqa: BLE001 - a boot line never fails over a field
+        return "REFUSED"
 
 
 def _arena_field(boot: dict) -> str:
@@ -2217,6 +2312,13 @@ def boot_line(boot: dict) -> str:
     # healthy and serves nothing, and the reason is in `boot.arena.reason` and in the
     # refusal tail below.
     parts.append("arena={}".format(_arena_field(boot)))
+    # THE SSD TIER'S BOOT DEFAULT (0.2.33): ARMED / OFF / NO_STORE / INERT / REFUSED /
+    # UNDECIDED. `ARMED` here and `disk_tier=DISARMED` on the same line is a real and
+    # readable contradiction, so this field's job is to say WHICH of the two the reader
+    # is looking at: `disk_tier=` is the spill arm's live fact at boot, `disk_boot=` is
+    # what the boot default decided about it. A REFUSED/INERT/OFF token next to a
+    # `disk_tier=DISARMED` is the boot doing exactly what its flag said.
+    parts.append("disk_boot={}".format(_disk_boot_field(boot)))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2270,7 +2372,7 @@ def boot_section() -> dict:
                 "tier": False, "faults_at_boot": 0, "refusals": [],
                 "not_covered": [], "nested": [], "live_check": None,
                 "install_reason": None, "manager": None, "restore": None,
-                "arena": None,
+                "arena": None, "disk_boot": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "
@@ -2323,6 +2425,7 @@ def boot_note(reason: str) -> dict:
             "guard_armed": False, "tier": False, "faults_at_boot": 0,
             "refusals": [reason], "not_covered": [], "nested": [],
             "live_check": None, "manager": None, "install_reason": None,
+            "restore": None, "arena": None, "disk_boot": None,
             "line": None}
     boot["line"] = boot_line(boot)
     _state["boot_line"] = boot["line"]

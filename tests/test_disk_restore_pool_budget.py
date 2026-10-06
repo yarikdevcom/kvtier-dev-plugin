@@ -22,9 +22,12 @@ So the tests here are in the order the money moves:
    run whose minimum (one span plus the boundary states it cannot be claimed without)
    does not fit makes NO OFFER AT ALL - the same shape as `no_disk_run`, because a
    shorter offer is what got refused at bind last time.
-3. WHICH CEILING BOUND IT. `offer_cap` (tokens) keeps its semantics; the pool budget
-   is an additional, tighter constraint, and `bounded_by` says which one (or both)
-   actually decided the offer's length.
+3. WHICH BOUND CUT IT. `bounded_by` names the bound, and since 0.2.32 deletes the
+   fixed 32,000-token cap there are exactly three: `pool_budget` (bounce buffers),
+   `cpu_slots` (CPU blocks) and `block_cap` (the positional walk's
+   `MAX_RESTORE_BLOCKS_PER_OFFER` limit). `offer_cap` is RETIRED with the cap it named -
+   the pool is the guard against un-placeable offers now, and the tests below assert
+   affordability rather than a token constant.
 4. THE RECORD AND THE LINE. A refusal that cannot be read is a refusal that cannot be
    fixed, so a `buffer_cap` record carries the five byte/job figures that decided it
    and the provenance of the block it was reading, and the log line for an episode is
@@ -311,50 +314,80 @@ def test_a_pool_carrying_too_little_for_one_span_makes_no_offer_at_all(armed,
     assert last_pool()["price_source"].startswith("exact:"), last_pool()
 
 
-# --- 3. which ceiling bound it --------------------------------------------------
+# --- 3. which bound cut it ----------------------------------------------------
+#
+# SINCE 0.2.32 THE FIXED 32,000-TOKEN CAP IS DELETED, so the vocabulary here is
+# `pool_budget` / `cpu_slots` / `block_cap` and `offer_cap` is retired with it. Two of
+# the three tests below used to derive an `offer_cap` entry from that constant; they are
+# rewritten as assertions about AFFORDANCE and about which bound actually bit, which is
+# the property the incident needed. The pool is the guard now - see
+# `test_disk_offer_bounds.py` for the exhaustive version of that claim.
 
-def test_bounded_by_names_the_token_ceiling_when_only_tokens_bound_it(armed,
-                                                                      monkeypatch):
-    """A run that is merely too LONG says `offer_cap`, and the pool stays silent.
+def test_a_run_every_bound_can_carry_is_offered_whole_past_the_deleted_cap(armed,
+                                                                          monkeypatch):
+    """12 spans (38,400 tokens) passes whole because nothing can afford-refuse it.
 
-    The pre-existing token ceiling is untouched by this change and keeps its own
-    counter; the pool view must not claim credit for a shortening it did not do, or
-    an operator reading "pool" turns a knob that changes nothing.
+    REPLACES the test that pinned the fixed 32,000-token constant: it filled 12 blocks,
+    a generous pool, and asserted the offer came back at 10 spans with `offer_cap`.
+    What that test was FOR - a run that is too long for ONE bound and not for the
+    others, attributed to the right bound - survives here as its negative: with a pool
+    that affords 200 jobs against the 36 this run needs, and 12 spans well under the
+    64-block walk, NOTHING bounds it, so `bounded_by` is empty and the offer crosses
+    the 32,000-token line the deleted cap used to cut at. An empty `bounded_by` is a
+    claim, not an absence: it says every bound was checked and none of them bit.
     """
-    fill(armed, blocks=12)                       # 12 wanted, `offer_cap` allows 10
+    fill(armed, blocks=12)                       # 12 spans = 38,400 tokens
     monkeypatch.setenv(config.ENV_DISK_READ_BUFFER_BYTES, str(200 * WIDTH))
     disk_read.reset_state_for_tests()
-    assert offer(Manager(), Req(blocks=12), 0, (0, False)) == (10 * BLOCK, True)
-    assert last_pool()["bounded_by"] == ["offer_cap"], last_pool()
-    assert disk_restore.counters()["offer_clamped"] == 1
-    assert disk_restore.counters()["offer_pool_capped"] == 0
+    assert offer(Manager(), Req(blocks=12), 0, (0, False)) == (12 * BLOCK, True)
+    pricing = last_pool()
+    assert pricing["bounded_by"] == [], pricing
+    assert pricing["jobs_the_offer_needed"] == 36
+    assert pricing["jobs_the_pool_can_carry"] >= 200, pricing
+    assert pricing["block_cap_blocks"] == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER
+    counters = disk_restore.counters()
+    assert counters["offer_pool_capped"] == 0
+    assert counters["offer_block_capped"] == 0
+    # THE RETIRED COUNTER, pinned as absent rather than as zero: a counter named
+    # `offer_clamped` would promise a token clamp that no longer exists.
+    assert "offer_clamped" not in counters
 
 
 def test_bounded_by_names_the_pool_when_only_the_pool_bounds_it(armed, monkeypatch):
-    """A run the pool cannot carry says `pool_budget`, and nothing else."""
+    """A run the pool cannot carry says `pool_budget`, and nothing else.
+
+    THE GUARD THE DELETED CAP USED TO PROVIDE, and the reason its deletion is safe at
+    today's offer rate: the offer is cut to the job count the pool can hold at once,
+    so the engine can place every job the scheduler names.
+    """
     fill(armed, blocks=8)                        # 8 blocks = 24 jobs at 4,096 B
     pool_at_most_jobs(monkeypatch, 11, WIDTH)
     assert offer(Manager(), Req(blocks=8), 0, (0, False)) == (3 * BLOCK, True)
     assert last_pool()["bounded_by"] == ["pool_budget"], last_pool()
     counters = disk_restore.counters()
-    assert counters["offer_clamped"] == 0
     assert counters["offer_pool_capped"] == 1
+    assert counters["offer_block_capped"] == 0, "8 spans is nowhere near the block cap"
+    assert "offer_clamped" not in counters
 
 
-def test_bounded_by_lists_both_ceilings_in_the_order_they_were_applied(armed,
-                                                                      monkeypatch):
-    """Guilty of both: clamped to 10 blocks by tokens, then to 3 by the pool.
+def test_bounded_by_lists_both_bounds_in_the_order_they_were_applied(armed,
+                                                                    monkeypatch):
+    """Guilty of both: the 64-span walk first, then the pool - in that order.
 
     Without this an operator reading "offer shortened" has to guess which knob to
-    turn, and turning the wrong one is how a pool fix becomes a token-ceiling fix that
-    changes nothing.
+    turn, and turning the wrong one is how a pool fix becomes a block-cap fix that
+    changes nothing. The walk is FIRST because it is applied first: the run is built to
+    the block ceiling, then the CPU slots, then the bounce buffers.
     """
-    fill(armed, blocks=12)
+    fill_sized(armed, blocks=72)                 # deeper than the 64-block walk
     pool_at_most_jobs(monkeypatch, 11, WIDTH)
-    assert offer(Manager(), Req(blocks=12), 0, (0, False)) == (3 * BLOCK, True)
-    assert last_pool()["bounded_by"] == ["offer_cap", "pool_budget"], last_pool()
+    assert offer(Manager(), Req(blocks=72), 0, (0, False)) == (3 * BLOCK, True)
+    pricing = last_pool()
+    assert pricing["bounded_by"] == ["block_cap", "pool_budget"], pricing
+    assert pricing["block_cap_tokens"] == (disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER
+                                           * BLOCK)
     counters = disk_restore.counters()
-    assert counters["offer_clamped"] == 1 and counters["offer_pool_capped"] == 1
+    assert counters["offer_block_capped"] == 1 and counters["offer_pool_capped"] == 1
 
 
 # --- 4. the record and the line -------------------------------------------------

@@ -1760,9 +1760,18 @@ def test_boot_line_names_the_verdict_and_the_counters():
     assert line.startswith("DISK[restore] ")
     for field in ("installed=", "class=", "armed=", "root=", "index=", "digest=",
                   "offers=", "reads_applied=", "ranks_armed=", "deadline=",
-                  "disk_authority=", "serving_as=", "offers_switch=", "offer_cap=",
+                  "disk_authority=", "serving_as=", "offers_switch=",
+                  "offer_block_cap=", "offer_block_cap_tokens=",
                   "refused="):
         assert field in line, field
+    # THE PER-OFFER BOUND, named in the unit that is actually a bound. `offer_cap=` is
+    # GONE with the fixed 32,000-token cap it advertised (0.2.32): leaving a field whose
+    # name means "the most one offer may carry in tokens" reporting a number that
+    # constrains nothing is worse than printing nothing, so the line carries the block
+    # walk instead - blocks, and the tokens those blocks are worth.
+    for retired in ("offer_cap=", "offer_cap_src="):
+        assert retired not in line, retired
+    assert f"offer_block_cap={disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER}" in line
     # A fresh boot says so, in the field an operator reads to answer "is this boot
     # serving everyone from SSD?"
     assert "disk_authority=OFF" in line
@@ -3066,7 +3075,8 @@ def test_every_counter_has_a_unit():
 
     It walks BOTH views: `counters()` (the module's own numbers) and
     `scheduler_section()` (the one-call payload), because the section publishes keys of
-    its own - `offer_cap`, `ranks_armed`, `ranks_seen`, the three `suppressed_*` - and a
+    its own - `offer_block_cap_blocks`, `offer_block_cap_tokens`, `ranks_armed`,
+    `ranks_seen`, the three `suppressed_*` - and a
     number that reached the payload through a pass-through is exactly as bare as one
     that came from `_state`.
 
@@ -3342,12 +3352,21 @@ def test_the_snapshot_payload_carries_the_scheduler_restore_section():
                 # `scope` and `marker_key` are GONE with the marker they described.
                 "disk_authority", "serving_as", "per_boot", "survives_restart",
                 "disk_authority_changes", "offer_switch_changes",
-                "offers_enabled", "offer_cap", "ranks_armed",
+                "offers_enabled", "offer_block_cap_blocks", "offer_block_cap_tokens",
+                "offer_block_cap_block_size",
+                "offer_block_cap_block_size_source", "offer_block_capped",
+                "ranks_armed",
                 "ranks_seen", "suppressed_hits", "suppressed_spans",
                 "suppressed_requests", "suppressions"):
         assert key in view, key
     for retired in ("scope", "marker_key", "flagged", "skipped_no_marker",
-                    "requests_seen"):
+                    "requests_seen",
+                    # THE RETIRED TOKEN CAP (0.2.32). `offer_cap` advertised the fixed
+                    # 32,000-token per-offer ceiling this release deletes; a payload
+                    # field with that name and no bound behind it is a number a
+                    # dashboard will keep plotting after it stops meaning anything.
+                    "offer_cap", "offer_cap_source", "offer_cap_default",
+                    "offer_cap_configured"):
         assert retired not in view, retired
     # EVERY OFFER REFUSAL, counted AND spelled out: the closed vocabulary is the
     # whole answer, and a name without a sentence is a name nobody can act on.

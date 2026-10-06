@@ -18,11 +18,14 @@ decision:
    helps if the budget beats the read). One `not_settled` counter covered both and
    explained neither. A state table that cannot be read is counted as UNKNOWN, never
    folded into one of the two.
-3. THE WAIT IS PROPORTIONAL, CAPPED, AND FOUR-WAYS BOUNDED. Bytes over an assumed read
-   throughput times a safety margin, floored at one scheduler tick, capped by the
-   operator's environment variable, and clamped again by the read's own deadline - and
-   every batch says WHICH of those decided, next to the recompute cost it was racing.
-   The default cap is 0, and these tests pin that a default boot waits not at all.
+3. THE WAIT IS FLAT AND BOUNDED TWICE. Since 0.2.32 the allowance is
+   `min(VLLM_E2_TIER_DISK_SETTLE_MS, the load's own remaining deadline)` - the
+   proportional formula that used to decide it guessed the store's read throughput and
+   the engine's prefill rate, and on the live box that guessing granted 23.6 ms against
+   a 135.8 ms race gap and cost a 28,583-token recompute. Every batch still says WHICH
+   bound decided (`flat` / `deadline` / `off`), because the two answers mean "the cap
+   was too small" and "the read's own expiry got there first". The default cap is 0, and
+   these tests pin that a default boot waits not at all.
 
 Also pinned here, because it was found by reading the counters this release publishes:
 a load retired through a FAILURE report used to bypass `_drop_load`, so `loads_released`
@@ -63,10 +66,11 @@ Worker = base.Worker
 
 WINDOW_KEYS = ("settled_on_arrival", "bind_to_apply_ms", "elapsed_ms", "known",
                "accepted", "expected", "running", "queued", "settled",
-               "bytes_asked", "bytes_at_stake", "budget_ms", "bound",
-               "waited_ms", "settled_after_wait", "dropped_after_wait", "wait_granted",
-               "recompute_ms", "offered_tokens_estimate", "read_bytes_per_s",
-               "safety_margin", "proportional_ms", "prefill_tokens_per_s")
+               "bytes_asked", "bytes_at_stake", "cap_ms", "allowance_ms",
+               "budget_ms", "bound", "deadline_ms", "ceiling_clamped",
+               "waited_ms", "settled_after_wait", "dropped_after_wait",
+               "allowance_spent", "wait_granted", "offered_tokens_estimate",
+               "tokens_basis", "env_problems")
 
 
 def unsettled_status(monkeypatch, *, queued=0, running=0, seconds_left=29.0,
@@ -221,7 +225,9 @@ def test_an_untracked_batch_observations_no_window_and_no_crash(armed):
 
 def test_a_queued_drop_is_counted_as_never_started(armed, monkeypatch):
     """A read still QUEUED when the engine arrived: a scheduling loss, and the kind a
-    wait can fix."""
+    wait can fix. Named cap 0: this test pins the CLASSIFICATION, so it says out loud
+    that it is not waiting (the shipped default would wait the full 5 s allowance)."""
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "0")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1)
@@ -241,8 +247,10 @@ def test_a_running_drop_is_counted_as_mid_flight(armed, monkeypatch):
 
     Same drop, different diagnosis - and the only way the operator running the
     experiment can tell "raise the cap" from "the disk is the floor" is that these two
-    numbers are separate.
+    numbers are separate. Named cap 0 so the drop happens now and not after a full
+    five-second allowance.
     """
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "0")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1, event=12)
@@ -261,6 +269,7 @@ def test_an_unreadable_state_table_is_unknown_and_never_guessed(armed, monkeypat
     story, and the story this one would tell - "it was always scheduling" - is exactly
     the conclusion the run is trying to be allowed to reach.
     """
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "0")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1)
@@ -275,19 +284,20 @@ def test_an_unreadable_state_table_is_unknown_and_never_guessed(armed, monkeypat
     assert counters["dropped_queued"] == 0 and counters["dropped_running"] == 0
 
 
-# --- 3: the default boot waits not at all ------------------------------------
+# --- 3: the bytes in flight are published, and the grant ignores them --------
 
-def test_the_budget_is_sized_on_the_bytes_still_in_flight(armed, monkeypatch):
-    """A batch three-quarters delivered is waiting for a quarter, and pays for that.
+def test_the_window_publishes_the_bytes_still_in_flight_and_the_grant_ignores_them(
+        armed, monkeypatch):
+    """A batch three-quarters delivered is WAITING for a quarter, and says so.
 
-    Sizing the budget on the OFFER rather than on what is outstanding would make the
-    wait a function of how much the request asked for - so a batch that had already
-    read nine of ten slots would be granted a ten-slot budget and sit in front of
-    bytes that are not coming. Both numbers are published (`bytes_asked`,
-    `bytes_at_stake`) so the rule is checkable from a payload alone.
+    The bytes still in flight are PUBLISHED and no longer GRANT anything: since 0.2.32
+    the allowance is flat, so a batch that had read nine of ten slots gets exactly the
+    same wait as one that had read none - and `bytes_at_stake` (beside `bytes_asked`) is
+    the number that tells a reader what the wait was actually waiting for. Before this
+    release the same field decided the grant, which is what made the grant a guess about
+    the device rather than a decision by the operator.
     """
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "20000")
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_READ_BPS, "1000")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1, event=13)
@@ -297,18 +307,22 @@ def test_the_budget_is_sized_on_the_bytes_still_in_flight(armed, monkeypatch):
     window = disk_restore.counters()["last_apply_window"]
     assert window["bytes_asked"] == WIDTH * len(CACHEABLE)
     assert window["bytes_at_stake"] == WIDTH, window
-    expected = WIDTH / 1000.0 * 1000.0 * disk_restore.SETTLE_SAFETY_MARGIN
-    assert window["bound"] == "proportional", window
-    assert window["budget_ms"] == pytest.approx(expected, abs=0.01), window
+    assert window["bound"] == "flat", window
+    assert window["budget_ms"] == 20000.0, window
+    # Ten times the bytes, the SAME grant. That is the flat rule stated as a test.
+    assert disk_restore.settle_budget(WIDTH * 10)["budget_ms"] == 20000.0
 
 
-def test_a_batch_that_came_in_free_is_not_counted_as_a_wait(armed):
-    """A settled batch counts no wait, whatever the budget arithmetic says.
+def test_a_batch_that_came_in_free_is_not_counted_as_a_wait(armed, monkeypatch):
+    """A settled batch counts no wait, whatever the allowance says.
 
     The counter and the behaviour are decided by the same boolean for this reason:
     `settle_waits_granted` is the denominator of the wait's hit rate, and a boot that
     counted batches it never sat in front of would make every later ratio meaningless.
+    The cap is named at 20,000 ms here so this measures the SETTLED path and not an
+    allowance that happens to be zero.
     """
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "20000")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=0)
@@ -319,27 +333,68 @@ def test_a_batch_that_came_in_free_is_not_counted_as_a_wait(armed):
     assert counters["apply_observations"] == 1
     assert counters["settle_waits_granted"] == 0
     assert counters["settle_bytes_waited"] == 0
+    assert counters["settle_allowance_spent"] == 0
     assert counters["last_apply_window"]["wait_granted"] is False
 
-def test_a_default_boot_observates_the_window_and_waits_zero(armed, monkeypatch):
-    """THE byte-identical default, pinned on the fields and not on a hope.
 
-    With `VLLM_E2_TIER_DISK_SETTLE_MS` unset the apply point must drop exactly the
-    entries it used to drop, in the same call, having slept not once. `bound == "off"`
-    and a wall-clock budget are both asserted because "it is off" has to be falsifiable
-    from the outside: the release ships into a box serving traffic.
+# --- 4: the default, the off switch, and the two bounds ----------------------
+
+def test_the_shipped_default_waits_and_says_so(armed, monkeypatch):
+    """THE DEFAULT CHANGED IN 0.2.32, AND THIS IS THE TEST THAT PINS IT.
+
+    `VLLM_E2_TIER_DISK_SETTLE_MS` unset used to mean "never wait"; it now means a flat
+    5,000 ms allowance, because the operator ruled "give it up to 5 s to read" after the
+    live box lost a 28,583-token prompt to a 23.6 ms budget that a formula had guessed.
+    A default boot therefore WAITS - bounded by the load's own deadline, and leaving the
+    moment the bytes land.
+
+    The wait observed here is the 40 ms it takes the batch to stop lying, not five
+    seconds: the allowance is a CEILING on a wait, not a duration.
     """
+    assert disk_restore.settle_budget()["budget_ms"] == 5000.0
+    assert disk_restore.settle_budget()["bound"] == "flat"
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1)
     bind(worker, metadata)
-    # 60 ms of "not settled" that the default boot must NOT sit through.
+    unsettled_status(monkeypatch, queued=len(CACHEABLE), until_settled=0.04)
+    started = time.monotonic()
+    report = disk_restore.worker_before_load(worker)
+    took = time.monotonic() - started
+    assert took >= 0.03, f"the default boot did not wait: {took * 1000:.1f} ms"
+    assert report["dropped"] == 0, "and the wait is why the bytes were applied"
+    counters = disk_restore.counters()
+    window = counters["last_apply_window"]
+    assert window["bound"] == "flat"
+    assert window["cap_ms"] == 5000.0 and window["budget_ms"] == 5000.0
+    assert window["settled_after_wait"] is True
+    assert window["dropped_after_wait"] is False
+    assert window["allowance_spent"] is False, "it left early: the bytes landed"
+    assert counters["settle_waits_granted"] == 1
+    assert counters["settle_allowance_spent"] == 0
+    assert counters["settle_bound_flat"] == 1
+    assert counters["dropped_queued"] == 0
+
+
+def test_a_zero_cap_still_means_never_wait(armed, monkeypatch):
+    """`0` is still OFF and still reachable: the whole 0.2.23-0.2.31 behaviour.
+
+    Pinned on the wall clock because "the wait is off" has to be falsifiable from the
+    outside: this release ships into a box serving real traffic, and `0` is the value an
+    operator sets to get the old boot back.
+    """
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "0")
+    fill(armed, blocks=1)
+    worker = Worker()
+    metadata = disk_meta(armed, seeds=(1,), ram=1)
+    bind(worker, metadata)
+    # 60 ms of "not settled" that a cap-0 boot must NOT sit through.
     unsettled_status(monkeypatch, queued=len(CACHEABLE), until_settled=0.06)
     started = time.monotonic()
     report = disk_restore.worker_before_load(worker)
     took = time.monotonic() - started
     assert report["dropped"] == len(CACHEABLE), "the drop rule is unchanged"
-    assert took < 0.05, f"a default boot waited {took * 1000:.1f} ms"
+    assert took < 0.05, f"a cap-0 boot waited {took * 1000:.1f} ms"
     counters = disk_restore.counters()
     window = counters["last_apply_window"]
     assert window["bound"] == "off"
@@ -347,82 +402,74 @@ def test_a_default_boot_observates_the_window_and_waits_zero(armed, monkeypatch)
     assert window["waited_ms"] == 0.0
     assert window["settled_after_wait"] is False
     assert window["dropped_after_wait"] is False
+    assert window["allowance_spent"] is False
     assert counters["settle_waits_granted"] == 0
     assert counters["settle_ms_max"] is None
     assert counters["settle_bytes_waited"] == 0
+    assert counters["settle_bound_off"] == 1
     assert counters["dropped_queued"] == len(CACHEABLE)
     assert disk_restore.apply_window()["wait"]["waits_granted"] == 0
 
 
-# --- 4: the budget, and which bound decided it -------------------------------
+def test_the_grant_is_the_flat_cap_or_the_loads_own_deadline(monkeypatch):
+    """`granted = min(cap, remaining deadline)`, at every corner of that expression.
 
-def test_the_budget_is_proportional_to_bytes_and_named_by_the_floor_or_the_cap(
-        monkeypatch):
-    """The formula, at both ends and in the middle.
-
-    Numbers are the live box's: 11,468,800 B per (span, group) per rank, and the two
-    measured offers - a 9,400-token prompt at ~172 MB and a 32,000-token prompt at
-    ~573 MB. The point of publishing `proportional_ms` next to `budget_ms` is that a
-    reader can verify this arithmetic on the box without reading the source.
+    The deleted formula had four regimes and three constants; this has one line, so the
+    corners are exhaustive: the cap decides, the deadline decides, the deadline has
+    already run out, the deadline is unreadable, and the cap is 0.
     """
-    span_group = 11_468_800
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "10000")
-    small = disk_restore.settle_budget(span_group * 15, 9400)
-    big = disk_restore.settle_budget(span_group * 50, 32000)
-    assert small["enabled"] is True
-    # 9,400 tokens recompute in 2.4 s measured, and 32,000 in ~8.2 s at that rate.
-    assert abs(small["recompute_ms"] - 2400.0) < 60.0, small["recompute_ms"]
-    assert abs(big["recompute_ms"] - 8170.0) < 200.0, big["recompute_ms"]
-    for verdict in (small, big):
-        assert verdict["safety_margin"] == disk_restore.SETTLE_SAFETY_MARGIN
-        assert verdict["bound"] == "proportional", verdict
-        expected = (verdict["bytes_at_stake"] / verdict["read_bytes_per_s"]
-                    * 1000.0 * verdict["safety_margin"])
-        assert abs(verdict["budget_ms"] - expected) < 0.5, verdict
-        assert verdict["budget_over_recompute"] is False, verdict
-
-    # The floor: one slot of one group is not worth measuring, so it gets the tick.
-    tiny = disk_restore.settle_budget(WIDTH, 100)
-    assert tiny["bound"] == "min"
-    assert tiny["budget_ms"] == disk_restore.SETTLE_MIN_MS
-
-    # The cap: 573 MB at a 40 ms ceiling is a cap decision, and a batch counted there
-    # is an operator whose cap is too small - which is the only way to say that.
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "40")
-    capped = disk_restore.settle_budget(span_group * 50, 32000)
-    assert capped["bound"] == "cap" and capped["budget_ms"] == 40.0
-
-    # The deadline: a read with 5 ms left cannot be promised 40 ms of waiting.
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "5000")
-    expiring = disk_restore.settle_budget(span_group * 50, 32000,
-                                          seconds_left=0.005)
+    flat = disk_restore.settle_budget(11_468_800 * 50, seconds_left=29.0)
+    assert flat["bound"] == "flat" and flat["budget_ms"] == 10000.0, flat
+    assert flat["deadline_ms"] == 29000.0, flat
+    # A read with 5 ms left cannot be promised 10 s of waiting.
+    expiring = disk_restore.settle_budget(11_468_800 * 50, seconds_left=0.005)
     assert expiring["bound"] == "deadline"
-    assert expiring["budget_ms"] == pytest.approx(5.0, abs=0.01)
+    assert expiring["budget_ms"] == pytest.approx(5.0, abs=0.01), expiring
+    # An expired read gets nothing, and the bound still names who decided.
+    expired = disk_restore.settle_budget(11_468_800, seconds_left=0.0)
+    assert expired["bound"] == "deadline" and expired["budget_ms"] == 0.0, expired
+    # Bytes never change the answer - that is the whole point of the deletion.
+    for payload in (0, 11_468_800, 11_468_800 * 400):
+        assert disk_restore.settle_budget(payload)["budget_ms"] == 10000.0
+    # An unreadable `seconds_left` is no deadline at all, not a zero one.
+    junk = disk_restore.settle_budget(1000, seconds_left="soon")
+    assert junk["bound"] == "flat" and junk["deadline_ms"] is None, junk
+    # Cap 0 is OFF, not "a budget of zero that still polls".
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "0")
+    off = disk_restore.settle_budget(11_468_800 * 50, seconds_left=29.0)
+    assert off["enabled"] is False
+    assert off["budget_ms"] == 0.0 and off["bound"] == "off", off
 
 
-def test_a_zero_cap_grants_no_budget_at_all(monkeypatch):
-    """Cap 0 is OFF, not "a budget of zero that still polls"."""
+def test_the_default_allowance_is_five_seconds_and_the_max_still_clamps(monkeypatch):
+    """The two numbers the operator set by hand, pinned as constants AND as behaviour.
+
+    5,000 ms is the decision; 60,000 ms is the typo guard. 1e9 ms is a typo, not a
+    budget, and the clamp is visible in `ceiling_clamped` rather than silent.
+    """
+    assert disk_restore.SETTLE_MS_DEFAULT == 5_000.0
+    assert disk_restore.SETTLE_MS_MAX == 60_000.0
     monkeypatch.delenv(config.ENV_DISK_SETTLE_MS, raising=False)
-    verdict = disk_restore.settle_budget(11_468_800 * 50, 32000, seconds_left=29.0)
-    assert verdict["enabled"] is False
-    assert verdict["budget_ms"] == 0.0 and verdict["bound"] == "off"
-
-
-def test_an_absurd_cap_is_clamped_and_says_which_ceiling_clamped_it(monkeypatch):
-    """1e9 ms is a typo, not a budget: the clamp is visible, never silent."""
+    default = disk_restore.settle_budget(11_468_800)
+    assert default["cap_ms"] == 5000.0 and default["budget_ms"] == 5000.0
+    assert default["ceiling_clamped"] is False, default
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "1000000000")
     verdict = disk_restore.settle_budget(1000)
     assert verdict["cap_ms"] == disk_restore.SETTLE_MS_MAX
     assert verdict["ceiling_clamped"] is True
 
 
-def test_a_typo_in_the_cap_is_said_out_loud_and_leaves_the_boot_off(
+def test_a_typo_in_the_cap_is_said_out_loud_and_falls_back_to_the_default(
         armed, monkeypatch, caplog):
-    """`VLLM_E2_TIER_DISK_SETTLE_MS=10s` means OFF, and says so once.
+    """`VLLM_E2_TIER_DISK_SETTLE_MS=10s` is not a number: it says so, and it is NOT off.
 
     The dangerous failure of a wait knob is a typo that silently means something else.
-    Here it means the behaviour that has been running all along, and the line names the
-    variable that was wrong.
+    Through 0.2.31 an unparseable value meant OFF because OFF was the default; since
+    0.2.32 the default is a 5,000 ms allowance, so "the operator said nothing usable"
+    now means the SHIPPED default - which is exactly why the line naming the wrong
+    variable is mandatory rather than nice. A boot that waits 5 s when the operator
+    meant 40 ms must be a boot that SAYS the variable was ignored.
     """
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "10s")
     fill(armed, blocks=1)
@@ -430,15 +477,16 @@ def test_a_typo_in_the_cap_is_said_out_loud_and_leaves_the_boot_off(
     metadata = disk_meta(armed, seeds=(1,), ram=1)
     bind(worker, metadata)
     unsettled_status(monkeypatch, queued=len(CACHEABLE), until_settled=0.05)
-    started = time.monotonic()
-    assert disk_restore.worker_before_load(worker)["dropped"] == len(CACHEABLE)
-    assert time.monotonic() - started < 0.05
+    assert disk_restore.worker_before_load(worker)["dropped"] == 0
     lines = [record.getMessage() for record in caplog.records
              if "DISK[settle] IGNORED" in record.getMessage()]
     assert len(lines) == 1, lines
     assert config.ENV_DISK_SETTLE_MS in lines[0]
-    assert disk_restore.counters()["settle_waits_granted"] == 0
-    assert "ignored" in disk_restore.counters()["settle_notice"]
+    counters = disk_restore.counters()
+    assert counters["settle_waits_granted"] == 1, "the default allowance still waits"
+    assert "ignored" in counters["settle_notice"]
+    # And the problem is a payload field, not only a log line.
+    assert disk_restore.apply_window()["wait"]["posture"]["env_problems"]
 
 
 # --- 5: the wait, when it is on ----------------------------------------------
@@ -453,11 +501,6 @@ def test_a_batch_that_settles_during_the_wait_is_applied_and_counted(
     status - rather than a fixture where nothing could be applied either way.
     """
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "5000")
-    # A slow device, so the proportional term is what sets the budget: at the real
-    # 11.5 GB/s a 12 KB test offer would be granted the 0.5 ms floor and no wait could
-    # ever be observed at this scale. The throughput is an env var precisely so the
-    # arithmetic can be exercised at a scale a unit test can reach.
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_READ_BPS, "1000")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=0)
@@ -475,7 +518,8 @@ def test_a_batch_that_settles_during_the_wait_is_applied_and_counted(
     window = counters["last_apply_window"]
     assert window["settled_after_wait"] is True
     assert window["waited_ms"] >= 20.0
-    assert window["bound"] in ("min", "proportional", "cap", "deadline"), window
+    assert window["bound"] == "flat", window
+    assert window["allowance_spent"] is False
     assert counters["settled_after_wait"] == 1
     assert counters["dropped_after_wait"] == 0
     assert counters["settle_waits_granted"] == 1
@@ -494,11 +538,12 @@ def test_the_wait_never_outruns_its_budget(armed, monkeypatch):
     """A batch that never settles must cost the step its budget AND NOTHING MORE.
 
     This is the hang-shaped hazard: an unbounded wait on the engine's step thread is a
-    box that stops serving. The budget is the only thing standing between the feature
-    and that, so the bound is asserted on the wall clock, not on a field.
+    box that stops serving. The allowance is the only thing standing between the feature
+    and that, so the bound is asserted on the wall clock, not on a field - and the
+    honest wait metric (`allowance_spent`) is asserted to HAVE fired, because this is
+    precisely the case it exists to count.
     """
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "30")
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_READ_BPS, "1000")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1)
@@ -514,20 +559,21 @@ def test_the_wait_never_outruns_its_budget(armed, monkeypatch):
     window = counters["last_apply_window"]
     assert window["waited_ms"] >= 25.0, "it did wait, it just stopped"
     assert window["dropped_after_wait"] is True
+    assert window["allowance_spent"] is True, "the whole allowance went, for nothing"
     assert counters["dropped_after_wait"] == 1
+    assert counters["settle_allowance_spent"] == 1
     assert counters["settled_after_wait"] == 0
     assert counters["dropped_running"] == len(CACHEABLE)
 
 
 def test_the_wait_stops_at_the_reads_own_deadline(armed, monkeypatch):
-    """The fourth bound: a read with 5 ms left is not promised 5 seconds.
+    """The second bound: a read with 5 ms left is not promised five seconds.
 
     `disk_read` cancels the job at its deadline; a wait that kept going past that
     would be waiting for bytes that have already been given up, which is a second bug
     stacked on the first.
     """
     monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "5000")
-    monkeypatch.setenv(config.ENV_DISK_SETTLE_READ_BPS, "1000")
     fill(armed, blocks=1)
     worker = Worker()
     metadata = disk_meta(armed, seeds=(1,), ram=1, event=12)
@@ -559,6 +605,7 @@ def test_the_settle_line_is_logged_once_per_boot_not_per_step(armed, monkeypatch
              if "DISK[settle] wait=ON" in record.getMessage()]
     assert len(lines) == 1, lines
     assert "cap_ms=5000.0" in lines[0]
+    assert "FLAT allowance" in lines[0]
     assert disk_restore.counters()["apply_observations"] == 3
 
 
@@ -574,8 +621,10 @@ def test_a_burned_load_releases_its_ledger_entry(armed):
     was wrong in a way that sent the investigation to the scheduler instead of to the
     worker, and the slot->path mappings outlived the load they named.
 
-    The SUPPRESSION decision is unchanged and re-pinned here: the request is fused and
-    a re-offer is still refused. Only the bookkeeping was lying.
+    The SUPPRESSION decision is unchanged and re-pinned here for a report with NO
+    failure kind visible: unknown is not proof of a race, so it fuses (see
+    `test_disk_restore_races.py` for the case that does not). Only the bookkeeping in
+    this test was ever lying.
     """
     fill(armed, blocks=1)
     manager = Manager(reqs_to_load={"req-1": object()})
@@ -595,8 +644,9 @@ def test_a_burned_load_releases_its_ledger_entry(armed):
     counters = disk_restore.counters()
     assert counters["loads_released"] == 1, "the ledger entry was retired, so say so"
     assert counters["tracked_slots"] == 0, \
-        "and its slot->path mappings went with it"
+        ("no slot->path mapping may outlive the load that named it")
     assert counters["suppressions"] == 1, "the fuse is the same decision it was"
+    assert counters["fuses_on_unknown_kinds"] == 1
     assert counters["no_read"] == 0, \
         ("no_read stays a claim about finished reports; this load was already "
          "counted as a failure, and moving both would double-book one release")
@@ -708,9 +758,11 @@ def test_the_snapshot_section_carries_the_window_and_the_wait(armed):
     for key in ("observations", "settled_on_arrival", "windows", "wait",
                 "recompute"):
         assert key in window, key
-    for key in ("settled_after_wait", "dropped_after_wait", "waited_ms",
-                "budget_ms", "bound", "budget_over_recompute", "last", "notice"):
+    for key in ("settled_after_wait", "dropped_after_wait", "allowance_spent",
+                "waited_ms", "budget_ms", "bound", "posture", "last", "notice"):
         assert key in window["wait"], key
+    for key in ("flat", "deadline", "off"):
+        assert key in window["wait"]["bound"], key
 
 
 def test_every_settle_counter_has_a_unit():
@@ -726,9 +778,8 @@ def test_every_settle_counter_has_a_unit():
                  "dropped_running", "dropped_unattributed",
                  "settle_waits_granted", "settled_after_wait",
                  "dropped_after_wait", "settle_bytes_waited",
-                 "settle_bound_min", "settle_bound_proportional",
-                 "settle_bound_cap", "settle_bound_deadline",
-                 "settle_budget_over_recompute"):
+                 "settle_bound_flat", "settle_bound_deadline",
+                 "settle_bound_off", "settle_allowance_spent"):
         assert name in units, name
         assert units[name], name
 
@@ -746,6 +797,70 @@ def test_the_wait_reads_its_environment_through_config_only():
 
     source = inspect.getsource(disk_restore)
     assert "os.environ" not in source and "getenv" not in source
-    for name in (config.ENV_DISK_SETTLE_MS, config.ENV_DISK_SETTLE_READ_BPS,
-                 config.ENV_DISK_PREFILL_TOKENS_PER_S):
-        assert name.startswith("VLLM_E2_TIER_DISK_"), name
+    assert config.ENV_DISK_SETTLE_MS.startswith("VLLM_E2_TIER_DISK_")
+
+
+def test_the_boot_line_says_whose_number_the_allowance_is(armed, monkeypatch, caplog):
+    """An unset knob and an ignored knob must not read the same, because 0.2.32 moved
+    the meaning of unset from "never wait" to "wait up to 5 s".
+
+    A boot that waits on a command line that never asked to wait is the expected
+    behaviour now, but it has to be distinguishable from a drop-in whose value was
+    ignored, and both from a boot the operator set deliberately. `cap_from_default` is
+    the payload's answer and the boot line is the human's; this pins that the line names
+    the variable on BOTH sides, because the useful question at 3 a.m. is "did the
+    operator's number arrive?" and only the variable's name answers it.
+    """
+    def settle_line():
+        return [record.getMessage() for record in caplog.records
+                if "DISK[settle] wait=ON" in record.getMessage()]
+
+    def run_one():
+        disk_restore._state["settle_notice"] = ""
+        caplog.clear()
+        fill(armed, blocks=1)
+        worker = Worker()
+        bind(worker, disk_meta(armed, seeds=(1,), ram=1))
+        unsettled_status(monkeypatch, queued=len(CACHEABLE), until_settled=0.02)
+        assert disk_restore.worker_before_load(worker)["dropped"] == 0
+        lines = settle_line()
+        assert len(lines) == 1, lines
+        return lines[0], disk_restore.apply_window()["wait"]["posture"]
+
+    monkeypatch.delenv(config.ENV_DISK_SETTLE_MS, raising=False)
+    line, posture = run_one()
+    assert posture["cap_from_default"] is True and posture["cap_ms"] == 5000.0
+    assert config.ENV_DISK_SETTLE_MS in line and "UNSET" in line, line
+    assert "never-wait" in line, "the line must also say how to get the old boot back"
+
+    monkeypatch.setenv(config.ENV_DISK_SETTLE_MS, "40")
+    line, posture = run_one()
+    assert posture["cap_from_default"] is False and posture["cap_ms"] == 40.0
+    assert config.ENV_DISK_SETTLE_MS in line and "UNSET" not in line, line
+
+    # A posture field with no unit is a bare boolean in the payload, so the map is
+    # checked against the keys rather than against a list that can drift.
+    wait = disk_restore.apply_window()["wait"]
+    for key in wait["posture"]:
+        assert wait["units"][key], key
+
+
+def test_the_notice_is_one_line_per_distinct_setting_and_not_per_wait(armed,
+                                                                     monkeypatch):
+    """A per-step log line inside a 3 s poller is how a diagnostic becomes an outage.
+
+    The key carries the cap AND the origin, so flipping an unset boot to a set boot
+    announces the change once, while a thousand batches under the same setting produce
+    one line.
+    """
+    monkeypatch.delenv(config.ENV_DISK_SETTLE_MS, raising=False)
+    fill(armed, blocks=1)
+    for _ in range(3):
+        worker = Worker()
+        bind(worker, disk_meta(armed, seeds=(1,), ram=1))
+        unsettled_status(monkeypatch, queued=len(CACHEABLE), until_settled=0.01)
+        disk_restore.worker_before_load(worker)
+    notices = disk_restore.counters()["settle_notice"]
+    assert "cap_ms=5000.0" in notices
+    assert disk_restore.counters()["settle_waits_granted"] == 3, \
+        "three waits ran under one announcement"

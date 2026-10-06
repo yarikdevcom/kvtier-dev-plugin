@@ -593,11 +593,6 @@ def _give_buffer(buffer, size: int) -> None:
         _give_buffer_locked(buffer, size)
 
 
-def buffers_held_bytes() -> int:
-    with _state_lock:
-        return int(_state["buffers_held_bytes"])
-
-
 def pool_state() -> dict:
     """The pool's budget in bytes: the ceiling, what is committed, and the headroom.
 
@@ -1601,15 +1596,6 @@ def batch_buffer(batch_id, job_id):
         return entry.get("job", {}).get("buffer")
 
 
-def batch_bytes(batch_id, job_id) -> int:
-    with _state_lock:
-        batch = _batches.get(batch_id)
-        if batch is None:
-            return 0
-        entry = batch["jobs"].get(job_id)
-        return 0 if entry is None else int(entry["bytes"])
-
-
 def finish_batch(batch_id) -> dict:
     """Close a batch and return the buffers nobody is writing into any more.
 
@@ -1671,12 +1657,6 @@ def cancel_batch(batch_id, reason: str) -> dict:
         _note(f"batch {batch_id!r} cancelled: {reason}")
         return _ok(cancelled=True, running=running,
                    reason=str(reason)[:MAX_STRING_CHARS])
-
-
-def open_batches() -> list:
-    """The batch ids currently tracked, for a watchdog sweep. Bounded."""
-    with _state_lock:
-        return sorted(_batches, key=str)[:MAX_BATCHES]
 
 
 def drain(timeout_seconds: float = 5.0) -> dict:

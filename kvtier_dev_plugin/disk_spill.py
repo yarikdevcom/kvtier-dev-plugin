@@ -440,7 +440,6 @@ MAX_PEER_DIGESTS = 32                # DIGESTS remembered (a 4-rank fleet needs 
 SHARE_SOURCE_PEERS = "peers_learned"       # n_effective = 1 + live peers
 SHARE_SOURCE_NO_PEERS = "no_live_peer_seen"  # n_effective = 1: today's behaviour
 SHARE_SOURCE_NO_DIGEST = "no_geometry_digest"  # cannot attribute: whole ceiling
-SHARE_SOURCE_UNATTRIBUTED = "not_measured_yet"  # no walk has run in this boot
 
 # The group-collision witness: which group ids this process has seen spill each
 # `key16`. Three caps, because this is a witness and not a database. The map is

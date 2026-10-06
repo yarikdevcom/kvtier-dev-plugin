@@ -21,6 +21,7 @@ import fakes_debug  # noqa: E402 - the shared fake engine structures
 from kvtier_dev_plugin import (  # noqa: E402
     blockdump,
     config,
+    disk_boot,
     disk_index,
     disk_spill,
     disk_store,
@@ -38,11 +39,14 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             config.ENV_DIAG_INTERVAL, config.ENV_DIAG_MIN_INTERVAL,
             config.ENV_DIAG_RANK, config.ENV_BOOT_INERT,
             config.ENV_MISS_LOG, config.ENV_DISK_ROOT, config.ENV_DISK_BYTES,
-            # The settle wait's three knobs. Listed so no test can inherit a cap from
+            # The settle wait's one knob. Listed so no test can inherit a cap from
             # the environment it runs in: a suite that silently waits inside the apply
-            # point is a suite whose timings mean nothing.
-            config.ENV_DISK_SETTLE_MS, config.ENV_DISK_SETTLE_READ_BPS,
-            config.ENV_DISK_PREFILL_TOKENS_PER_S,
+            # point is a suite whose timings mean nothing. Since 0.2.32 the UNSET value
+            # is a 5,000 ms FLAT allowance, so this deletion is what makes an unset
+            # environment mean the shipped default rather than whatever a developer's
+            # shell happens to export - and a test that wants to observe a WAIT must
+            # name the cap it waits under, out loud.
+            config.ENV_DISK_SETTLE_MS,
             # The reader-thread count and the bounce-buffer pool. Listed for the same
             # reason, and more sharply: the DEFAULT of both is the claim that this
             # release changes nothing, so a test that inherited `=4` from the shell it
@@ -54,7 +58,14 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # inherited EVICT_THREADS=4 would be testing a pool the release does not
             # ship by default.
             config.ENV_DISK_CEILING_BUDGET_SECONDS,
-            config.ENV_DISK_EVICT_THREADS)
+            config.ENV_DISK_EVICT_THREADS,
+            # THE DISK TIER'S BOOT DEFAULT (0.2.33). Listed for the sharpest reason of
+            # any variable here: its DEFAULT IS ON, so a suite that inherited
+            # `KVTIER_DISK_BOOT_ENABLE=0` from a developer's shell would be testing the
+            # off posture while claiming to test the shipped one - and a suite that
+            # inherited nothing would be right. Deleting it makes "unset = ON" the fact
+            # every test measures, and the tests that want the other value name it.
+            config.ENV_DISK_BOOT_ENABLE)
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +119,11 @@ def reset_dev_state():
              "disk_spill": dict(disk_spill._state),
              "disk_index": dict(disk_index._state),
              "disk_store": dict(disk_store._state),
+             # THE DISK TIER'S BOOT DEFAULT (0.2.33): an honoured boot default holds an
+             # arm, a serve posture and the operator's disarm latch, all process-wide.
+             # Without this a test that ran the real boot with a disk root would hand
+             # the next file a latch it never set - or an arm it never armed.
+             "disk_boot": dict(disk_boot._state),
              "lookups": dict(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -133,6 +149,11 @@ def reset_dev_state():
     # inherit. Its unwrap handle lives on the wrapper, so `unwrap_everything` is what
     # puts the fork's methods back - the reset only zeroes counters and `_retained`.
     disk_store.reset_state_for_tests()
+    # THE DISK TIER'S BOOT DEFAULT (0.2.33). Its state decides whether the renewal tick
+    # is allowed to arm the spill tier on the NEXT test's first offer, and whether an
+    # operator's disarm latch is standing - both are boot-scoped facts a test must never
+    # inherit from another test. Reset before the yield, like every sibling here.
+    disk_boot.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
@@ -141,6 +162,7 @@ def reset_dev_state():
            "disk_spill": disk_spill._state,
            "disk_index": disk_index._state,
            "disk_store": disk_store._state,
+           "disk_boot": disk_boot._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -157,6 +179,7 @@ def reset_dev_state():
                        ("disk_spill", disk_spill._state),
                        ("disk_index", disk_index._state),
                        ("disk_store", disk_store._state),
+                       ("disk_boot", disk_boot._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])

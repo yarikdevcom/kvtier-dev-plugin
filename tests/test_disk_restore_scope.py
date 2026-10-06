@@ -319,10 +319,12 @@ def test_the_posture_is_reported_wherever_it_can_be_read(armed):
     """
     line = disk_restore.boot_line()
     for field in ("disk_authority=ON", "serving_as=disk_authority",
-                  "offers_switch=OFF", "offer_cap=", "ranks_armed=", "suppressed=",
-                  "authority_lookups="):
+                  "offers_switch=OFF", "offer_block_cap=", "offer_block_cap_tokens=",
+                  "ranks_armed=", "suppressed=", "authority_lookups="):
         assert field in line, field
-    for retired in ("scope=", "marker="):
+    # `offer_cap=` is retired with the fixed 32,000-token cap (0.2.32): a boot line that
+    # still printed it would advertise a bound that constrains nothing.
+    for retired in ("scope=", "marker=", "offer_cap="):
         assert retired not in line, retired
     posture = disk_restore.disk_posture()
     assert posture["disk_authority"] is True, "the `armed` fixture raises authority"
@@ -334,7 +336,7 @@ def test_the_posture_is_reported_wherever_it_can_be_read(armed):
                 "authority_lookups", "disk_authority_changes",
                 "offer_switch_changes",
                 "suppressed_hits", "suppressed_spans", "suppressed_requests",
-                "ranks_seen", "no_read", "offer_clamped", "witness_kind"):
+                "ranks_seen", "no_read", "offer_block_capped", "witness_kind"):
         assert key in counters, key
         assert key in counters["units"], key
     # The witness line, which is what a rank prints when it disagrees.
@@ -362,7 +364,10 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     new_keys = ("disk_authority", "offers_enabled", "serving_as", "per_boot",
                 "survives_restart", "disk_authority_changes", "offer_switch_changes",
                 "authority_lookups",
-                "offer_cap", "ranks_armed",
+                "offer_block_cap_blocks", "offer_block_cap_tokens",
+                "offer_block_cap_block_size",
+                "offer_block_cap_block_size_source", "offer_block_capped",
+                "ranks_armed",
                 "ranks_seen", "suppressed_hits", "suppressed_spans",
                 "suppressed_requests", "suppressions",
                 # THE APPLIED-READ EVIDENCE. `restorations` is the counter that read
@@ -384,7 +389,25 @@ def test_the_snapshot_payload_carries_the_posture_as_fields(armed):
     # here when the POST happened.
     assert section["per_boot"] is True
     assert section["survives_restart"] is False
-    assert section["offer_cap"] == disk_restore.MAX_OFFER_TOKENS_PER_OFFER
+    # THE PER-OFFER BOUND, AS ITS OWN OWNER DERIVES IT (0.2.32). The fixed 32,000-token
+    # cap is DELETED, so `offer_cap` is gone from the payload rather than renumbered:
+    # what is published is the bound that still constrains - the block walk - in blocks
+    # and in the tokens those blocks are worth, asserted HERE against
+    # `offer_block_ceiling()` so the payload and the derivation cannot disagree. The
+    # block size in this fixture comes from the fallback constant (no lookup has run in
+    # this process), and the payload says so instead of pretending to know the engine.
+    ceiling = disk_restore.offer_block_ceiling()
+    assert section["offer_block_cap_blocks"] == ceiling["blocks"] == 64
+    assert section["offer_block_cap_tokens"] == ceiling["tokens"]
+    assert section["offer_block_cap_tokens"] == 64 * ceiling["block_size"]
+    assert section["offer_block_cap_block_size"] == ceiling["block_size"]
+    assert (section["offer_block_cap_block_size_source"]
+            == ceiling["block_size_source"] == "fallback")
+    assert section["offer_block_capped"] == counters["offer_block_capped"] == 0
+    for retired in ("offer_cap", "offer_cap_source", "offer_cap_default",
+                    "offer_cap_configured", "offer_cap_notice"):
+        assert retired not in section, retired
+    assert "offer_clamped" not in counters, "no token clamp, so no clamp counter"
     assert section["ranks_armed"] == 1 and section["ranks_seen"] == 1
     for key in ("suppressed_hits", "suppressed_spans", "suppressed_requests",
                 "suppressions"):
@@ -480,22 +503,68 @@ def test_the_fuse_is_reported_as_data_in_the_payload(armed):
     assert section["suppressions"] == 1, "the lifetime total, not only the live table"
 
 
-def test_the_offer_is_capped_below_the_incident_size(armed):
-    """160,000 tokens per offer is unreachable at any prompt length.
+def test_an_offer_past_the_deleted_cap_passes_unbounded_by_default(armed):
+    """18 spans (57,600 tokens) is the DELETED cap's business, not any bound's.
 
-    Every one of the incident's 123,474 offers was EXACTLY 160,000 tokens (50 spans):
-    a cap expressed only in blocks and slots is a cap the request's own length can
-    reach. The ceiling is in tokens now, and the clamp keeps whole spans so the fork's
-    "one whole block per entry" rule still holds afterwards.
+    REPLACES `test_the_offer_is_capped_below_the_incident_size`, which pinned the fixed
+    32,000-token constant rather than a behaviour: it filled 18 spans and asserted the
+    offer came back at 10. The cap is DELETED (0.2.32), so what this fixture's store
+    HOLDS is what the offer gets, and the assertion worth having is the affordability
+    one: the pool affords thousands of jobs here against the 54 this run needs, so no
+    bound bites and `bounded_by` is empty. `offer_clamped` is pinned ABSENT, because a
+    counter named for a clamp that no longer exists promises a guard nobody has.
+
+    What this does NOT claim: that a long prefix is now restorable. At 18 spans this
+    fixture has a deeper contiguous run than the live store measured (~11 spans, because
+    spill follows RAM-tier parking), so the run depth is the fixture's, not the box's.
     """
-    blocks = (disk_restore.MAX_OFFER_TOKENS_PER_OFFER // BLOCK) + 8
+    blocks = 18                       # 57,600 tokens: above the DELETED 32,000 cap
     fill(armed, blocks=blocks)
     tokens, flag = offer(Manager(), Req(request_id="big", blocks=blocks))
     assert flag is True
-    assert 0 < tokens <= disk_restore.MAX_OFFER_TOKENS_PER_OFFER
-    assert tokens % BLOCK == 0, "a clamp must not cut a span in half"
-    assert disk_restore.counters()["offer_clamped"] == 1
-    assert disk_restore.MAX_OFFER_TOKENS_PER_OFFER < 160_000
+    assert tokens == blocks * BLOCK, "nothing bounds this run, so all of it is offered"
+    assert tokens > 32_000, "the line the deleted cap used to cut at"
+    assert tokens % BLOCK == 0, "an offer is whole spans only"
+    pricing = disk_restore._state["last_offer_pool"]
+    assert pricing["bounded_by"] == [], pricing
+    assert pricing["jobs_the_offer_needed"] == blocks * 3
+    assert pricing["jobs_the_pool_can_carry"] > pricing["jobs_the_offer_needed"], (
+        "the offer fits the pool with room to spare, which is WHY nothing bound it")
+    counters = disk_restore.counters()
+    assert "offer_clamped" not in counters
+    assert counters["offer_block_capped"] == 0
+    assert counters["offer_pool_capped"] == 0
+
+
+def test_the_bound_that_survives_is_the_block_walk_and_says_block_cap(armed):
+    """72 spans of store is offered as 64, and the bound that cut it is named.
+
+    The request's own length used to be able to reach any cap expressed only in blocks
+    and slots (the incident offered EXACTLY 160,000 tokens 123,474 times), which is part
+    of why the token cap existed. What is left is the one bound a prompt length cannot
+    reach for a structural reason: `_disk_run` stops its positional walk at
+    `MAX_RESTORE_BLOCKS_PER_OFFER` blocks, because that is how many spans one offer can
+    name and stream inside `RESTORE_DEADLINE_SECONDS`. `bounded_by` says `block_cap`,
+    `offer_block_capped` counts it, and the retired `offer_clamped`/`offer_cap` names
+    stay absent - the block bound is not a configured token cap and must never read as
+    one.
+
+    SYNTHETIC DEPTH, said plainly: 72 contiguous spilled spans are deeper than anything
+    the live store held (~11 spans on the boot the operator measured). This fixture
+    exists to make the block bound reachable at all.
+    """
+    blocks = disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER + 8
+    fill(armed, blocks=blocks)
+    tokens, flag = offer(Manager(), Req(request_id="walk", blocks=blocks))
+    assert flag is True
+    assert tokens == disk_restore.MAX_RESTORE_BLOCKS_PER_OFFER * BLOCK
+    assert tokens % BLOCK == 0
+    counters = disk_restore.counters()
+    assert counters["offer_block_capped"] == 1
+    assert "offer_clamped" not in counters
+    bounds = disk_restore._state["last_offer_pool"]["bounded_by"]
+    assert bounds == ["block_cap"], (
+        f"the block bound must never read as the retired `offer_cap`: {bounds!r}")
 
 
 # --- the incident's fuel: armed scheduler, disarmed workers -------------------

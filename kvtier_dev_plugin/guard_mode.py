@@ -177,7 +177,6 @@ def _decline_reset_refused(original):  # noqa: ARG001
 # change anything, and the HTTP layer requires the token for every request to
 # this verb - a route that can change dev state is token-gated in all its shapes.
 GUARD_OPS = ("status", "arm", "disarm", "captures")
-MUTATING_GUARD_OPS = ("arm", "disarm")
 
 
 _NO_DECLINE = object()
