@@ -2825,7 +2825,7 @@ retention removed is counted as ours going away and never as the store's absence
 shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
 published key set does not change shape.
 
-## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39-0.2.41)
+## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39-0.2.42)
 
 The two modules above answer a WRITE question: after the arena spilled a block, does the
 GPU still hold those bytes, and can those bytes be written straight to NVMe? This module
@@ -2946,7 +2946,7 @@ worker process on this fork, so `oracle_checked` stays 0 in production while
 against the same key helpers the offer path is tested against) waiting for a provider, not a
 stub.
 
-## THE OTHER HALF OF THE SAME MODULE: did we offer the RIGHT file? (0.2.40, moved to the alloc hook in 0.2.41)
+## THE OTHER HALF OF THE SAME MODULE: did we offer the RIGHT file? (0.2.40; alloc hook since 0.2.41; the hash view accepted since 0.2.42)
 
 Assertion 4 above - the binding oracle - is unreachable **in a worker**, and for 0.2.39
 that was the honest end of the story. It is not the end of the check. The pairing that a
@@ -3013,6 +3013,51 @@ offered file. **Nothing in this module re-hashes or re-packs**: both calls go th
 `disk_restore._key_helpers()`, the same resolver the OFFER path uses, so the code that
 wrote the name and the code that re-derives it cannot disagree about which bytes are the
 group.
+
+**THE SHAPE OF THAT VIEW, AND WHY 0.2.41 RAN WITH `scheduler_checked = 0` (0.2.42).**
+`resolve_block_hashes` does not answer a list. Its declared answer is the union
+`BlockHashList = list[BlockHash] | BlockHashListWithBlockSize`
+(`vllm/v1/core/kv_cache_utils.py:2850`), and the second member is a **lazy view that is
+not a `Sequence`** - it neither inherits from nor registers
+`collections.abc.Sequence` (`kv_cache_utils.py:2783-2848`). 0.2.40/0.2.41 checked
+`isinstance(view, (list, tuple))`, refused the view, and the live boot reported exactly
+what a decorative witness reports: `scheduler_expectations_consumed = 2`,
+`scheduler_oracle_refused = 2` with reason
+`resolve_shape: ... BlockHashListWithBlockSize, not a sequence`, and `scheduler_checked =
+0`. Refusing a shape this module cannot index was the right behaviour; the list of
+understood shapes was too short. **0.2.42 accepts the union by capability** - `len(view)`
+must answer and integer `view[i]` must exist, both looked up on the `type`, the only place
+Python looks them up - and still REFUSES, counted and reasoned, anything without that
+protocol, because comparing a shape you cannot index is how a file gets read under the
+wrong name.
+
+**AND THE VIEW IS INDEXED, NEVER THE LIST UNDER IT - on this box they differ by a factor
+of 80.** The live numbers are `hash_block_size = 40` against
+`group_block_sizes = [3200, 3200, 3200, 3200, 8, 3200]`, so a serving group's view has
+`scale_factor = 3200 / 40 = 80`: `view[i]` is `raw[(i + 1) * 80 - 1]` and `len(view)` is
+`len(raw) // 80`. Indexing the raw list at `i` does not give a near miss - it gives the
+digest of tokens `[0, 40)` compared against a file named for tokens `[0, 3200)`, a
+DIFFERENT TOKEN RANGE, which would read as a storm of false mismatches or as an accidental
+agreement that looks like a passed safety check. So `view[index]` is the only read in this
+module and `view.block_hashes` is never touched, and the tests pin it from both sides: the
+correct pairing must verify (a raw-indexing oracle calls it a mismatch), and a name built
+from `raw[index]` must be REFUSED as a mismatch whose `expected_key16` is the view's; a
+second test pins the collapsed length, because block 9 exists in a 640-entry list and does
+not exist in the 8-entry view, and comparing past the view is comparing a digest for a
+token range nobody named.
+
+**A GROUP THE ENGINE CANNOT VIEW IS COUNTED, NEVER COMPARED.** Group 4's blocks are 8
+tokens against a 40-token hash, and the fork's view-builder requires the target to be a
+multiple of the hash granularity - it asserts it twice (`kv_cache_utils.py:2826`, `:2887`) -
+so asking for group 4 raises `AssertionError`. Group 4 is the parked QSA ring: not
+prefix-cacheable, never spilled, so the oracle has no business being asked about it; but
+the classification walk enumerates EVERY other group of a mismatching record, so it walks
+into that assert on this box on every finding. `_scheduler_view` contains it, names it
+(`scheduler_hash_view_unbuildable`, with a reason that says which group and which
+arithmetic), and never lets it reach the caller as an exception. A skipped group with no
+counter is precisely how a witness goes decorative again, so the counter lives at the one
+place that BUILDS a view - every call site, including the walk, is covered by
+construction.
 
 **Both negative controls fail loudly, driven through the real hook signature.** A
 **one-slot shift** - the failure every list-vs-list check in this plugin is blind to,
@@ -3098,6 +3143,7 @@ the scheduler half of it, plus the keys that interpret it):
   "scheduler_mismatch_neighbour_index": 1, "scheduler_mismatch_other_group": 0,
   "scheduler_mismatch_unknown": 0,
   "scheduler_oracle_unavailable": 0, "scheduler_oracle_refused": 0,
+  "scheduler_hash_view_unbuildable": 0,
   "scheduler_index_out_of_range": 0, "scheduler_errors": 0,
   "scheduler_oracle_hook": "update_state_after_alloc: fitted",
   "scheduler_mismatch_samples": [
@@ -3134,7 +3180,10 @@ sounds.
 `scheduler_mismatch_stable`, `scheduler_mismatch_unstable`,
 `scheduler_mismatch_neighbour_index`, `scheduler_mismatch_other_group`,
 `scheduler_mismatch_unknown`, `scheduler_oracle_unavailable`, `scheduler_oracle_refused`,
-`scheduler_index_out_of_range`, `scheduler_errors`, `scheduler_allocs_observed`,
+`scheduler_hash_view_unbuildable` (a group the engine cannot view at its own block size -
+group 4's 8 tokens against this box's 40-token hash - which the classification walk would
+otherwise skip in silence), `scheduler_index_out_of_range`, `scheduler_errors`,
+`scheduler_allocs_observed`,
 `scheduler_expectations_captured`, `scheduler_expectations_consumed`,
 `scheduler_expectations_dropped`, `scheduler_expectations_capped`.
 `scheduler_mismatch_gpu_block_not_in_table` is GONE with the observation point it came
@@ -3147,7 +3196,9 @@ unsound is a named `scheduler_oracle_refused`, not a re-derived finding.
 section is handed to the seam (which refuses over-cap sections). The mandatory scheduler
 content grew again in 0.2.41 - five expectation counters, the hook line and the gauge over
 the retired classification - to ~3.5 KiB fresh, so `MAX_SECTION_BYTES` moved from 3800 to
-3920 and that is the whole seam story: the cap is 4096, the section ships its mandatory
+3920 (0.2.42 added one more mandatory counter, `scheduler_hash_view_unbuildable`, and the
+fresh section measures 3531 B against that cap, so no further move was needed), and that is
+the whole seam story: the cap is 4096, the section ships its mandatory
 keys FIRST, and `_fit()` sheds in a stated order (reason text, then the boundary
 illustration lists, then the scheduler's mismatch samples oldest first, then the
 explanatory prose, then the reasons). `roles`/`oracle_rule` are shed LAST because a reader
@@ -3165,7 +3216,7 @@ fail to write. The EngineCore's numbers are readable through `POST /disk
 {"op":"restore-verify"}` and `/snapshot` (`dev_state_sections()` publishes the section);
 no new op was added, and the scheduler role needs none.
 
-`tests/test_disk_restore_verify_scheduler.py` (37 tests) is that spec: the correctly-paired
+`tests/test_disk_restore_verify_scheduler.py` (49 tests) is that spec: the correctly-paired
 alloc is CONFIRMED at the emitter (without the positive case every negative case below is
 hollow); a shift and its mirror are classified with the right SIGN; a digest from another
 group's view and a name with a contradicting suffix are both `other_group`; EVERY negative
@@ -3183,7 +3234,14 @@ after an emit / after a mismatch / fat, and it fits the seam's cap under the fiv
 arithmetic; and two tests drive the REAL `disk_restore.install` wrapper over
 `update_state_after_alloc` feeding the fork's own pairing loop and then the real
 `build_load_paths` - the hook site pinned by the product, not assumed, including the
-install-then-uninstall round trip that must report NOT WIRED again.
+install-then-uninstall round trip that must report NOT WIRED again. Since 0.2.42 the same
+file holds the LAZY-VIEW section: a replicated `BlockHashListWithBlockSize` (never the
+fork's class, never a `Sequence`) driven at this box's real 80-to-1 ratio, which pins that
+the digest COMPARED is `view[index]` and never `raw[index]` (from both directions, plus the
+collapsed `len(view)` as the bound), that the shift/signed-shift/group-swap controls still
+fail through the view, that group 4's unviewable 8-token ring is contained and counted
+rather than raised, that a shape with no index protocol is still refused, and that the
+plain scale-one list answer is unregressed.
 
 `tests/test_disk_restore_verify.py` (44 tests) is the executable spec: that the default reads
 no file and no device and moves no counter (proved with the readers instrumented to RAISE,
@@ -4385,7 +4443,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2401 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2450 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU

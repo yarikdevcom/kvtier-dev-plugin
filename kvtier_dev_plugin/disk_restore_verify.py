@@ -157,7 +157,15 @@ IS `group_gpu_ids[gpu_ext_start + i]`, `manager.py:460-475`), and compared at NA
 time (`observe_offer`, hung on `build_connector_meta` via `disk_restore
 .build_load_paths`). `view_g` is the engine's own `resolve_block_hashes(request
 .block_hashes, hash_block_size, group_block_sizes[g])` - re-derived on this module's
-thread, never on the step thread. That is the whole point: a one-slot shift moves
+thread, never on the step thread. THE VIEW IS THE ONLY THING INDEXED, AND IT IS NOT A
+LIST ON THIS BOX (0.2.42): that call answers `list[BlockHash] |
+BlockHashListWithBlockSize` (`kv_cache_utils.py:2850`) and the lazy arm is NOT a
+`Sequence`, so a shape check for a sequence refused it and the witness ran with
+`scheduler_checked = 0`; and its index arithmetic is scaled (`view[i]` is
+`raw[i * (group_size // hash_block_size) + stride]`, 80-to-1 with this box's 40-token
+hashes against 3200-token groups), so indexing the raw list instead of the view compares
+digests for a DIFFERENT TOKEN RANGE, not a near miss. See `_scheduler_view`. That is the
+whole point: a one-slot shift moves
 `load_cpu_blocks` and `load_gpu_blocks` together, so every comparison BETWEEN them is
 blind, and the answer has to come from outside them - and the ONE moment "which GPU
 block for which span" is actually decided is the alloc loop, not the metadata walk.
@@ -349,7 +357,7 @@ NEIGHBOUR_WINDOW = 2
 # separate `scheduler_last_mismatch` key - the ring's last element IS the newest
 # verdict, and publishing it twice cost 440 B of a 4096 B section budget to say the same
 # thing. TWO is the cap, and the arithmetic behind it is this section's own: the
-# mandatory content (sixty-three counters, two roles' oracle states, and the sentences
+# mandatory content (sixty-four counters, two roles' oracle states, and the sentences
 # that tell the roles apart) measures most of 3.8 KiB, so the illustration a reader
 # gets is what is
 # left under `MAX_SECTION_BYTES` - and a section the seam REFUSES for being 100 B fat
@@ -482,6 +490,11 @@ _COUNTER_KEYS = (
     "scheduler_mismatch_unknown",
     "scheduler_oracle_unavailable",
     "scheduler_oracle_refused",
+    # A group the engine cannot view at its OWN block size (group 4 here: 8 tokens
+    # against a 40-token hash). Counted at the one place that builds a view, so a group
+    # the classification walk skips is never a SILENT skip - the distinction the whole
+    # 0.2.40 lesson is about.
+    "scheduler_hash_view_unbuildable",
     "scheduler_index_out_of_range",
     "scheduler_errors",
     "section_trimmed",
@@ -1998,19 +2011,104 @@ def _scheduler_helpers() -> dict:
     return {"ok": True, "pack": helpers["pack"], "resolve": helpers["resolve"]}
 
 
-def _scheduler_view(helpers: dict, record: dict, group_bytes=None) -> dict:
-    """One call to the engine's `resolve_block_hashes`, or a named refusal."""
+# THE HASH VIEW IS A UNION, AND IT IS NOT A SEQUENCE (0.2.42, the reason the witness
+# was decorative in production). `resolve_block_hashes` is declared to answer
+# `BlockHashList`, and `BlockHashList` is `list[BlockHash] | BlockHashListWithBlockSize`
+# (`kv_cache_utils.py:2850`). The second arm is a LAZY VIEW THAT IS NOT A SEQUENCE: it
+# neither inherits from nor registers `collections.abc.Sequence`
+# (`kv_cache_utils.py:2783-2848`), so 0.2.40/0.2.41's `isinstance(view, (list, tuple))`
+# refused it on a box whose groups are NOT the hash granularity - which is THIS box, and
+# the live result was `scheduler_checked = 0` beside `scheduler_oracle_refused = 2`,
+# reason `resolve_shape: ... BlockHashListWithBlockSize, not a sequence`. Refusing a
+# shape this module does not understand was the RIGHT move; the understood shape list
+# was simply too small. What the comparison needs is two operations, so those two
+# operations are now the test: `len(view)` and integer `view[i]`.
+#
+# AND THE VIEW IS INDEXED, NEVER THE LIST UNDERNEATH IT. The lazy view's own arithmetic
+# is `_get_value_at(i) = raw[(i + 1) * scale_factor - 1]` and `__len__ = len(raw) //
+# scale_factor` (`kv_cache_utils.py:2845-2848`, `:2824-2825`), with `scale_factor =
+# target_block_size // hash_block_size`. On the live box `hash_block_size` is 40 and the
+# serving groups are 3200-token blocks, so the factor is 80: `view[i]` is `raw[i*80+79]`
+# and the view is 80 times SHORTER than the list it reads. Indexing the raw list at `i`
+# therefore does not produce a near miss, it produces a digest for tokens `[0, 40)`
+# against a file named for tokens `[0, 3200)` - a DIFFERENT TOKEN RANGE, which would
+# read as a storm of false mismatches or as accidental agreement. Everything here goes
+# through `view[index]`; `view.block_hashes` is never read.
+def _hash_view_is_indexable(view) -> bool:
+    """May this `resolve_block_hashes` answer be compared? Capability, not lineage.
+
+    Checked on `type(view)`, because that is where Python looks up `__len__` and
+    `__getitem__` for `len(view)` / `view[i]`; and `len()` is CALLED, not just looked
+    for, because a view whose length cannot be computed has no usable protocol (a view
+    built with `scale_factor == 0` under `python -O`, where the fork's assert is
+    stripped, divides by zero exactly here).
+    """
+    kind = type(view)
+    if not callable(getattr(kind, "__getitem__", None)) \
+            or not callable(getattr(kind, "__len__", None)):
+        return False
     try:
-        view = helpers["resolve"](record["hashes"], record["hash_block_size"],
-                                  int(record["group_bytes"] if group_bytes is None
-                                      else group_bytes))
+        length = len(view)
+    except Exception:  # noqa: BLE001 - an unusable length is not a view to compare
+        return False
+    return isinstance(length, int) and not isinstance(length, bool) and length >= 0
+
+
+def _scheduler_view(helpers: dict, record: dict, group_bytes=None,
+                    viewed_group=None) -> dict:
+    """One call to the engine's `resolve_block_hashes`, or a named refusal.
+
+    `viewed_group` names the group whose block size is being resolved WHEN IT IS NOT
+    the record's own: the classification walk asks every OTHER group for its view, and a
+    refusal that blamed the record's group would send an operator to the wrong one.
+
+    THE GROUP-4 SHAPE IS CONTAINED HERE, AND NAMED. `group_block_sizes` on this box is
+    `[3200, 3200, 3200, 3200, 8, 3200]` against a `hash_block_size` of 40, and the
+    fork's view-builder requires the target to be a MULTIPLE of the hash granularity,
+    asserting it twice (`kv_cache_utils.py:2826`, in
+    `BlockHashListWithBlockSize.__init__`, and `:2887`, in `resolve_block_hashes`).
+    Group 4 is the 13,824 B QSA ring: parked, never prefix-cacheable, never spilled, so
+    the oracle should never be pointed at it - but the classification walk enumerates
+    EVERY group of the record, so a 40-into-8
+    group is asked for on every mismatch this box produces, and the fork's answer is an
+    `AssertionError`. This module does not re-derive that arithmetic (a group block size
+    is not required to be a multiple of the hash granularity by anything except this
+    one assert, and a plugin that guessed the rule would refuse views the fork is happy
+    to build); it ASKS, and contains what comes back. `AssertionError` is named on its
+    own - `scheduler_hash_view_unbuildable`, with a reason - because on this box it has
+    exactly one cause and an operator needs to see that cause, not a generic
+    `resolve_raised`. Nothing here reaches the caller as an exception.
+    """
+    target = int(record["group_bytes"] if group_bytes is None else group_bytes)
+    named = record.get("group") if viewed_group is None else viewed_group
+    hash_block = record.get("hash_block_size")
+    try:
+        view = helpers["resolve"](record["hashes"], record["hash_block_size"], target)
+    except AssertionError as exc:  # noqa: BLE001 - the fork's own refusal, contained
+        # The fork's `target % hash == 0` assert, fired by a group this box cannot view
+        # at its own block size. It is not an engine fault and must not read as one:
+        # group 4 on this box walks into it on EVERY mismatch classification, so the
+        # generic `resolve_raised` name would bury a standing fact under what is
+        # supposed to mean "the engine's helper broke".
+        with _lock:
+            _count("scheduler_hash_view_unbuildable")
+        detail = (f"resolve_block_hashes refused group {named}'s "
+                  f"{target}-token blocks on a {hash_block}-token hash "
+                  f"(AssertionError{f': {exc}'[:60]}): the fork's own refusal that "
+                  "this group has no view at its own block size")
+        _reason("hash_view_unbuildable", detail)
+        return {"ok": False, "kind": "resolve_asserted", "reason": detail}
     except Exception as exc:  # noqa: BLE001 - the engine's helper is not ours to trust
         return {"ok": False, "kind": "resolve_raised",
                 "reason": f"resolve_block_hashes raised {type(exc).__name__}"}
-    if not isinstance(view, (list, tuple)):
+    if not _hash_view_is_indexable(view):
         return {"ok": False, "kind": "resolve_shape",
-                "reason": f"resolve_block_hashes answered "
-                          f"{type(view).__name__}, not a sequence"}
+                "reason": f"resolve_block_hashes answered {type(view).__name__}, "
+                          f"which answers neither `len()` nor integer `__getitem__`, "
+                          "so it is a shape this module refuses to compare (the fork's "
+                          "declared answer is `list[BlockHash] | "
+                          "BlockHashListWithBlockSize`, and a lazy non-`Sequence` view "
+                          "IS one of the two legitimate shapes)"}
     return {"ok": True, "view": view}
 
 
@@ -2073,9 +2171,14 @@ def _scheduler_classify(record: dict, helpers: dict, view) -> tuple:
         for other, size in enumerate(record.get("group_block_sizes") or ()):
             if other == group or not size:
                 continue
-            other_view = _scheduler_view(helpers, record, group_bytes=size)
+            other_view = _scheduler_view(helpers, record, group_bytes=size,
+                                         viewed_group=other)
             if not other_view["ok"]:
-                continue      # another group's view may legitimately not exist here
+                # NOT a silent skip: the one place a view is BUILT counts its own
+                # failures (`scheduler_hash_view_unbuildable` moves for group 4's
+                # 40-into-8 shape on every classification walk that reaches it), so a
+                # group this walk cannot consult is a counted group.
+                continue
             found = _scheduler_key16(helpers, other_view["view"], index, other)
             if found["ok"] and found["key16"] == record["key16"]:
                 return (SCHED_CLASS_GROUP, None,

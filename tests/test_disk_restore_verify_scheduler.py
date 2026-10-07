@@ -1196,3 +1196,544 @@ def test_the_installed_wrapper_with_the_verifier_off_observes_nothing(offer_stag
     finally:
         disk_restore.uninstall()
         disk_restore.reset_state_for_tests()
+
+
+# --- 10: THE FORK'S LAZY HASH VIEW (0.2.42): THE SHAPE THAT WAS REFUSED -------
+# Production, after the 0.2.41 alloc hook fixed the observation point:
+# `scheduler_oracle_unavailable = 0`, `scheduler_expectations_consumed = 2`, and
+# `scheduler_checked = 0` - because the last thing the oracle did was REFUSE the
+# engine's answer: `resolve_shape: resolve_block_hashes answered
+# BlockHashListWithBlockSize, not a sequence`. It is not a sequence. `BlockHashList` is
+# the UNION `list[BlockHash] | BlockHashListWithBlockSize`
+# (`vllm/v1/core/kv_cache_utils.py:2850`) and the second member is a lazy view that
+# inherits from nothing (`:2783-2848`). Refusing an unrecognised shape was right; the
+# recognised list was too short.
+#
+# THE ARITHMETIC THIS SECTION EXISTS TO PIN. `hash_block_size` on the live box is 40
+# against `group_block_sizes = [3200, 3200, 3200, 3200, 8, 3200]`, so a serving group's
+# view has `scale_factor = 3200 / 40 = 80`: `view[i]` is `raw[i*80 + 79]` and
+# `len(view)` is `len(raw) // 80`. Indexing the raw list at `i` instead compares the
+# digest of tokens `[0, 40)` against a file named for tokens `[0, 3200)` - a DIFFERENT
+# TOKEN RANGE, which reads either as a storm of false mismatches or as an accidental
+# agreement that looks like a passed safety check. `test_the_digest_compared_is_the
+# views_and_never_the_raw_list` is the test that makes that swap fail loudly, and
+# `test_the_views_collapsed_length_is_the_bound_not_the_raw_lists` is its twin.
+LIVE_HASH_BLOCK = 40                                  # `tier.hash_block_size`, the box
+LIVE_SIZES = [3200, 3200, 3200, 3200, 8, 3200]   # `tier.group_block_sizes`, the box
+LIVE_CACHEABLE = (0, 1, 2, 3, 5)                      # group 4 is parked, never spilled
+LIVE_SCALE = 3200 // LIVE_HASH_BLOCK                  # 80: this box's real ratio
+LIVE_TOKENS = 6400                                    # -> 2 blocks per 3200-token group
+LIVE_RID = "req-live-1"
+LIVE_RAW = [raw_digest(seed) for seed in range(LIVE_SCALE * 8)]     # 8 view entries
+LIVE_GPU = {group: [7000 + 100 * group + i for i in range(12)] for group in range(6)}
+LIVE_CPU = {group: [5000 + 100 * group + i for i in range(12)] for group in range(6)}
+
+# Every read of the underlying list the fake views have made, newest last. The ONLY way
+# to tell "indexed the view" from "indexed the list the view reads" without trusting the
+# module's own words.
+LIVE_READS: list = []
+
+
+class LiveHashView:
+    """`BlockHashListWithBlockSize`, REPLICATED - never imported.
+
+    Fork: `vllm/v1/core/kv_cache_utils.py:2783-2848`, whose whole protocol is
+    `__len__ = len(block_hashes) // scale_factor`, `__getitem__(int) =
+    _get_value_at(idx)` and `_get_value_at(idx) =
+    block_hashes[(idx + 1) * scale_factor - 1]`, with `__init__` asserting
+    `target_block_size % hash_block_size == 0`. It is deliberately NOT a `Sequence`,
+    NOT registered as one, and NOT a list or tuple: those three facts are the shape the
+    oracle had to learn to accept, and a fake that inherited `Sequence` would test
+    something the fork is not. `_get_value_at` logs the index it read so a test can see
+    the arithmetic rather than infer it.
+    """
+
+    def __init__(self, block_hashes, hash_block_size, target_block_size) -> None:
+        self.block_hashes = block_hashes
+        assert target_block_size % hash_block_size == 0
+        self.scale_factor = target_block_size // hash_block_size
+
+    def __len__(self) -> int:
+        return len(self.block_hashes) // self.scale_factor
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int):
+            return self._get_value_at(idx)
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self._get_value_at(i) for i in range(start, stop, step)]
+        raise TypeError(f"Invalid index type: {type(idx)!r}")
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self._get_value_at(i)
+
+    def _get_value_at(self, idx: int) -> bytes:
+        raw_index = (idx + 1) * self.scale_factor - 1
+        LIVE_READS.append(raw_index)
+        return self.block_hashes[raw_index]
+
+
+def live_resolve(block_hashes, hash_block_size, block_size):
+    """`resolve_block_hashes` (`kv_cache_utils.py:2859-2891`), replicated.
+
+    Same three answers as the fork: the raw list when the sizes are equal, the SAME view
+    when handed a view, and a new view otherwise - behind the fork's
+    `assert block_size % hash_block_size == 0`, which is what raises `AssertionError`
+    for group 4's 8-token ring against a 40-token hash.
+    """
+    if block_size == hash_block_size:
+        return block_hashes
+    if isinstance(block_hashes, LiveHashView):
+        assert block_hashes.scale_factor == block_size // hash_block_size
+        return block_hashes
+    assert block_size % hash_block_size == 0
+    return LiveHashView(block_hashes, hash_block_size, block_size)
+
+
+def live_view(index: int, group: int, sizes=None) -> LiveHashView:
+    """The live view for `group`, at the fork's own construction."""
+    return LiveHashView(LIVE_RAW, LIVE_HASH_BLOCK,
+                        (LIVE_SIZES if sizes is None else sizes)[group])
+
+
+LIVE_PAIRS = {(group, index): (LIVE_GPU[group][index], LIVE_CPU[group][index])
+              for group in range(6) for index in range(2)}
+
+
+def live_offered(index: int, group: int, *, sizes=None, suffix=None,
+                 from_group=None) -> str:
+    """The name for block `index` of `group`, read out of the VIEW, not the list."""
+    use = LIVE_SIZES if sizes is None else sizes
+    source = group if from_group is None else from_group
+    return bytes(pack(LiveHashView(LIVE_RAW, LIVE_HASH_BLOCK, use[source])[index],
+                      group if suffix is None else suffix)).hex()
+
+
+def raw_indexed(index: int, group: int) -> str:
+    """The name a raw-LIST-indexing oracle would offer: `raw[index]`, nothing else.
+
+    At scale 80 this is the digest for tokens `[0, 40)` while the file name claims
+    tokens `[0, 3200)`. It is the trap, written down as a fixture.
+    """
+    return bytes(pack(LIVE_RAW[index], group)).hex()
+
+
+def live_entry(*, group=0, index=1, key=None, sizes=None, gpu=None,
+               cpu=None) -> dict:
+    """One offered entry for the live geometry, correct unless `key` says otherwise.
+
+    `gpu`/`cpu` override the DEFAULT pairing, which a test that shifts
+    `num_computed_tokens` needs: the pairing the fork makes is then not the one
+    `LIVE_PAIRS` holds, and the oracle's whole authority comes from looking up the
+    pairing the fork actually made.
+    """
+    gpu_id, cpu_id = LIVE_PAIRS[(group, index)]
+    return {"request_id": LIVE_RID,
+            "cpu_block": (cpu_id if cpu is None else cpu),
+            "gpu_block": (gpu_id if gpu is None else gpu),
+            "group": group, "span": 0,
+            "key": (live_offered(index, group, sizes=sizes) if key is None else key)}
+
+
+@pytest.fixture
+def live_stage(armed, wired, monkeypatch):
+    """The box's geometry, a `resolve_block_hashes` that answers with the LAZY VIEW."""
+    module = types.ModuleType(disk_restore.KV_UTILS_MODULE)
+    module.make_block_hash_with_group_id = pack
+    module.resolve_block_hashes = live_resolve
+    monkeypatch.setitem(sys.modules, disk_restore.KV_UTILS_MODULE, module)
+    manager = Manager(hash_block=LIVE_HASH_BLOCK, sizes=LIVE_SIZES,
+                      cacheable=LIVE_CACHEABLE,
+                      hits={LIVE_RID: pending(cpu={group: LIVE_CPU[group]
+                                                   for group in range(6)})})
+    LIVE_READS.clear()
+    return {"manager": manager,
+            "request": Request(request_id=LIVE_RID, hashes=LIVE_RAW),
+            "blocks": Blocks({group: LIVE_GPU[group] for group in range(6)})}
+
+
+def live_step(stage, entries, tokens=LIVE_TOKENS, computed=0) -> dict:
+    """Capture at the alloc hook, emit the offer, run the pass. One box-shaped step.
+
+    THE READ LOG IS CLEARED HERE, AFTER the caller built its entry names: what
+    `LIVE_READS` must show is the reads THE ORACLE made, and a fixture that built its
+    own digest out of a view is not the oracle reading one.
+    """
+    stage["manager"]._pending_cpu_hits[LIVE_RID] = pending(
+        cpu={group: LIVE_CPU[group] for group in range(6)}, computed=computed)
+    LIVE_READS.clear()
+    alloc(stage, tokens=tokens)
+    see(entries, stage["manager"])
+    return one_pass()
+
+
+def key16_of(key_hex: str) -> str:
+    return disk_layout.split_block_key(key_hex)["key16"]
+
+
+def test_the_fakers_lazy_view_is_not_a_list_a_tuple_or_a_sequence():
+    """THE PREMISE, tested before anything is concluded from it.
+
+    Every test in this section rests on the fake having the shape the fork's has. If
+    someone "simplifies" it into a list, or gives it a `Sequence` base, this fails and
+    the section below stops meaning anything - which is the point.
+    """
+    import collections.abc
+
+    view = live_view(1, 0)
+    assert view.scale_factor == LIVE_SCALE == 80
+    assert not isinstance(view, (list, tuple)), \
+        "a list-shaped fake tests the 0.2.40 code path, not the one that broke"
+    assert not isinstance(view, collections.abc.Sequence), \
+        "the fork's view is NOT a Sequence; a fake that is one hides the bug"
+    assert len(view) == len(LIVE_RAW) // LIVE_SCALE
+    assert list(view)[1] == view[1]
+
+
+def test_the_lazy_hash_view_is_compared_not_refused(live_stage):
+    """THE PRODUCTION REGRESSION. A lazy non-`Sequence` view must produce a verdict.
+
+    0.2.41 in production: `scheduler_expectations_consumed = 2`,
+    `scheduler_oracle_refused = 2` with reason `resolve_shape`, `scheduler_checked = 0`.
+    The view arrived, this module did not recognise it, and the witness ran decorative.
+    """
+    assert key16_of(live_offered(1, 0)) != key16_of(raw_indexed(1, 0)), \
+        "the fixture has stopped distinguishing view-indexing from raw-indexing"
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    passed = counts()
+    assert passed["scheduler_checked"] == 1, \
+        "a view this module cannot index is the 0.2.41 failure, back again"
+    assert passed["scheduler_equal"] == 1
+    assert passed["scheduler_oracle_refused"] == 0
+    assert passed["scheduler_oracle_unavailable"] == 0
+    assert passed["scheduler_mismatch"] == 0
+    assert passed["scheduler_errors"] == 0
+
+
+def test_the_digest_compared_is_the_views_and_never_the_raw_list(live_stage):
+    """THE SWAP THAT WOULD LOOK LIKE A SAFETY CHECK, pinned from both directions.
+
+    A "just accept the view and index it" fix that indexes the list underneath it does
+    not crash and does not log anything odd: at scale 80 it compares the digest of
+    tokens `[0, 40)` against a name covering tokens `[0, 3200)`. So this test pins the
+    DIGEST THE ORACLE COMPARED, twice over - the correct pairing must verify (which a
+    raw-indexing oracle would report as a mismatch), and the raw-indexed name must be
+    REFUSED AS A MISMATCH whose expected digest is the VIEW's (which a raw-indexing
+    oracle would report as an agreement). Either swap breaks one half, loudly.
+    """
+    # Half one: the view's digest is the one that verifies.
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    assert counts()["scheduler_equal"] == 1
+    assert LIVE_READS == [1 * LIVE_SCALE + LIVE_SCALE - 1], \
+        "the oracle must read the underlying list THROUGH the view's arithmetic: " \
+        f"view[1] is raw[159] at scale {LIVE_SCALE}, and the reads were {LIVE_READS}"
+    AT_VIEW_BOUNDARIES = {(i + 1) * LIVE_SCALE - 1 for i in range(8)}
+
+    # Half two: the name built from `raw[1]` is a mismatch, and the oracle says WHAT it
+    # expected - the view's digest, by name.
+    LIVE_READS.clear()
+    live_step(live_stage, [live_entry(group=0, index=1, key=raw_indexed(1, 0))])
+    passed = counts()
+    assert passed["scheduler_mismatch"] == 1
+    assert passed["scheduler_equal"] == 1, "the raw-indexed name must NOT agree"
+    sample = newest()
+    assert sample["key16"] == key16_of(raw_indexed(1, 0))
+    assert sample["expected_key16"] == key16_of(live_offered(1, 0))
+    assert sample["expected_key16"] != sample["key16"]
+    assert 1 not in LIVE_READS, \
+        f"raw[1] was read: the oracle indexed the list, not the view ({LIVE_READS})"
+    # EVERY read, including the neighbour and other-group probes, landed on a view
+    # boundary. A raw-indexing oracle reads raw[0], raw[1], raw[2], raw[3] here.
+    outside = set(LIVE_READS) - AT_VIEW_BOUNDARIES
+    assert not outside, \
+        f"reads outside the view's arithmetic, i.e. raw-indexing: {sorted(outside)}"
+    assert 159 in LIVE_READS
+
+
+def test_the_views_collapsed_length_is_the_bound_not_the_raw_lists(live_stage):
+    """`len(view)` is 80 times shorter, and THAT is the length the comparison honours.
+
+    Block index 9 of group 0 exists in the raw list (640 entries) and does NOT exist in
+    the view (8 entries), because a request whose hashes stop before block 9 has no
+    digest for it. A raw-indexing oracle compares something; this one must refuse with
+    `index_out_of_range` and compare nothing - the same arithmetic the fork's own
+    `len(view)` bounds use when it publishes a block's hash.
+    """
+    assert len(live_view(9, 0)) == 8, "the fixture's view no longer collapses by 80"
+    # `computed` 9*3200 makes the fork's own `start = num_computed // g_block_size`
+    # pair this request's first external block with position 9 of group 0's table.
+    live_step(live_stage, [live_entry(group=0, index=1, key=raw_indexed(9, 0),
+                                      gpu=LIVE_GPU[0][9], cpu=LIVE_CPU[0][0])],
+              computed=9 * 3200)
+    passed = counts()
+    assert passed["scheduler_index_out_of_range"] == 1
+    assert passed["scheduler_oracle_refused"] == 1
+    assert passed["scheduler_checked"] == 0, \
+        "comparing past the view is comparing a digest for a token range no one named"
+    assert passed["scheduler_mismatch"] == 0
+    assert LIVE_READS == []
+
+
+def test_the_negative_controls_still_fail_through_the_lazy_view(live_stage):
+    """Shift, signed shift, and the suffix swap: caught through the view, not around it.
+
+    Accepting a new answer shape must not have cost this oracle the three findings it
+    was built for. Each is asserted at the live scale, where a wrong index is 80 tokens
+    wide rather than one hash, so a near-miss in the arithmetic is a DIFFERENT RANGE.
+    """
+    LIVE_READS.clear()
+    live_step(live_stage, [live_entry(group=0, index=1,
+                                      key=live_offered(2, 0))])
+    assert counts()["scheduler_mismatch_neighbour_index"] == 1
+    assert newest()["offset"] == 1
+    assert newest()["expected_key16"] == key16_of(live_offered(1, 0))
+
+    LIVE_READS.clear()
+    live_step(live_stage, [live_entry(group=0, index=1,
+                                      key=live_offered(0, 0))])
+    assert newest()["offset"] == -1, "the sign is the diagnosis, and it must survive"
+    assert set(LIVE_READS) <= {(i + 1) * LIVE_SCALE - 1 for i in range(8)}, \
+        "the classification walk must not read outside the view's arithmetic"
+
+    live_step(live_stage, [live_entry(group=0, index=1,
+                                      key=live_offered(1, 0, suffix=1))])
+    assert counts()["scheduler_mismatch_other_group"] == 1
+    assert newest()["name_group"] == 1 and newest()["group"] == 0
+
+
+def test_a_name_from_another_groups_view_is_caught_through_the_lazy_view(live_stage):
+    """THE SHAPE A SUFFIX CHECK CANNOT SEE, at two genuinely different view scales.
+
+    The box's five serving groups all resolve at 3200, so their views are the same
+    object's arithmetic and one group's digest IS another's - here the second group is
+    1600 tokens (scale 40) so the two views differ, which is the only way this
+    classification can ever fire. Group 4's 8 stays out of the comparison, contained by
+    the next two tests.
+    """
+    # Group 1 at 2000 tokens (scale 50) rather than a neighbour of group 0's index 1:
+    # its digest for block 1 is raw[99], which is NOT group 0's view at index 0, 2 or 3,
+    # so the finding can only come from the other-group walk and not from the window.
+    sizes = [3200, 2000, 3200, 3200, 8, 3200]
+    assert live_view(1, 0, sizes).scale_factor == 80
+    assert live_view(1, 1, sizes).scale_factor == 50
+    assert live_offered(1, 0, sizes=sizes) != live_offered(1, 1, sizes=sizes)
+    assert live_offered(1, 1, sizes=sizes) not in (live_offered(0, 0, sizes=sizes),
+                                                   live_offered(2, 0, sizes=sizes),
+                                                   live_offered(3, 0, sizes=sizes))
+    stage = live_stage
+    stage["manager"].group_block_sizes = list(sizes)
+    live_step(stage, [live_entry(group=0, index=1, sizes=sizes,
+                                 key=live_offered(1, 0, sizes=sizes, from_group=1))])
+    passed = counts()
+    assert passed["scheduler_mismatch_other_group"] == 1
+    assert passed["scheduler_mismatch_neighbour_index"] == 0
+    assert newest()["classification"] == "other_group"
+    assert any("a group swap: the name carries group 1's digest" in line
+               for line in reasons())
+
+
+def test_group_4s_unviewable_ring_is_contained_and_never_raises(live_stage):
+    """GROUP 4: 8-token blocks against a 40-token hash. No view can exist for it.
+
+    `BlockHashListWithBlockSize.__init__` asserts `target % hash == 0`
+    (`kv_cache_utils.py:2826`) and `resolve_block_hashes` asserts it again before
+    building (`:2887`), so asking for group 4 raises `AssertionError` - and 8 % 40 is
+    not 0. Group 4 is the parked QSA ring: not prefix-cacheable, never spilled, so the
+    oracle has no business being pointed at it. Two facts must both hold: it is
+    CONTAINED (nothing reaches the scheduler's step thread or kills the pass) and it is
+    NAMED (a
+    counter and a reason, because a skipped group with no counter is how a witness goes
+    decorative again).
+    """
+    with pytest.raises(AssertionError):
+        live_resolve(LIVE_RAW, LIVE_HASH_BLOCK, 8)     # the fork's own answer
+
+    # A fork whose gate names group 4 pairs it, so the oracle is asked for it directly.
+    stage = live_stage
+    stage["manager"].prefix_cacheable_group_ids = [0, 4]
+    live_step(stage, [live_entry(group=4, index=0, key=raw_indexed(0, 4))],
+              tokens=16)
+    passed = counts()
+    # ORDERED: the escape first, so an observer that RAISES is reported as an escape
+    # rather than as a missing counter, and the two failure modes stay distinguishable
+    # in the one line a reader sees.
+    assert passed["scheduler_errors"] == 0, \
+        "an AssertionError escaping the observer reaches the step thread's caller"
+    assert passed["scheduler_hash_view_unbuildable"] >= 1, \
+        "a group the engine cannot view must be counted, never silently skipped"
+    assert passed["scheduler_oracle_refused"] >= 1
+    assert passed["scheduler_checked"] == 0
+    assert passed["scheduler_mismatch"] == 0
+    assert any(line.startswith("hash_view_unbuildable:") and "group 4" in line
+               and "8-token" in line and "40-token" in line
+               for line in reasons()), reasons()
+    # Asking a SECOND time: the containment is not a one-shot, and nothing about it
+    # may escalate into `scheduler_errors` as the pass keeps meeting the same group.
+    live_step(stage, [live_entry(group=4, index=0, key=raw_indexed(0, 4))],
+              tokens=16)
+    again = counts()
+    assert again["scheduler_errors"] == 0
+    assert again["scheduler_hash_view_unbuildable"] >= 2
+
+
+def test_group_4_in_the_classification_walk_does_not_lose_the_mismatch(live_stage):
+    """The realistic path: a mismatch on group 0 walks EVERY other group, group 4 too.
+
+    `_scheduler_classify` enumerates `group_block_sizes` to see whether a name carries
+    another group's digest, so on this box group 4's unviewable 8 is reached on the way
+    to a finding about group 0. The finding must survive - the walk is not allowed to
+    turn into an exception or to swallow the verdict - and the group it could not
+    consult must still be counted.
+    """
+    foreign = bytes(pack(raw_digest(9999), 0)).hex()
+    live_step(live_stage, [live_entry(group=0, index=1, key=foreign)])
+    passed = counts()
+    assert passed["scheduler_errors"] == 0
+    assert passed["scheduler_mismatch"] == 1
+    assert passed["scheduler_mismatch_unknown"] == 1
+    assert passed["scheduler_hash_view_unbuildable"] >= 1, \
+        "group 4 was skipped by the walk without saying so"
+    assert newest()["classification"] == "unknown"
+    assert key16_of(foreign) == newest()["key16"]
+
+
+def test_a_fork_that_asserts_on_a_viewable_size_is_contained_too(live_stage,
+                                                                 monkeypatch):
+    """THE BACKSTOP. An `AssertionError` from elsewhere is the same counted fact.
+
+    The pre-check reads `target % hash` off the record, so on this box group 4 never
+    reaches the fork. This test removes that shield's premise: a fork that notices the
+    shape differently, or one run under `-O` where the assert is stripped and something
+    downstream complains instead, must be met by the same containment and the same
+    counter - not by `scheduler_errors`.
+    """
+    def asserting(block_hashes, hash_block_size, block_size):
+        # 3200 % 40 IS 0, so the pre-check lets this through and the fork is the one
+        # that says no - which is the branch that must still be contained.
+        raise AssertionError("a fork that notices it HERE")
+
+    monkeypatch.setattr(sys.modules[disk_restore.KV_UTILS_MODULE],
+                        "resolve_block_hashes", asserting)
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    passed = counts()
+    assert passed["scheduler_hash_view_unbuildable"] == 1
+    assert passed["scheduler_oracle_refused"] == 1
+    assert passed["scheduler_checked"] == 0
+    assert passed["scheduler_errors"] == 0
+    assert passed["scheduler_mismatch"] == 0
+
+
+def test_an_answer_that_is_indexable_by_nothing_is_still_refused(live_stage,
+                                                                 monkeypatch):
+    """THE OTHER HALF OF THE CAPABILITY CHECK: an unrecognised shape is REFUSED.
+
+    Accepting the lazy view must not have meant accepting anything. An object with
+    neither `len()` nor integer `__getitem__` is not a hash view, and comparing one is
+    how a file gets read under the wrong name - so it keeps its named refusal and its
+    counter, and nothing is compared.
+    """
+    class NotAView:
+        """No `__len__`, no `__getitem__`: the shape `resolve_shape` was written for."""
+
+    monkeypatch.setattr(sys.modules[disk_restore.KV_UTILS_MODULE],
+                        "resolve_block_hashes", lambda *a: NotAView())
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    passed = counts()
+    assert passed["scheduler_oracle_refused"] == 1
+    assert passed["scheduler_checked"] == 0
+    assert passed["scheduler_hash_view_unbuildable"] == 0, \
+        "an unrecognised shape is not the same fact as an unviewable group"
+    assert passed["scheduler_mismatch"] == 0
+    assert passed["scheduler_errors"] == 0
+
+
+def test_the_plain_list_answer_still_works_at_scale_one(armed, wired, monkeypatch):
+    """THE 0.2.40 CASE, UNREGRESSED: `hash_block_size == group block_size`.
+
+    When the group is the hash granularity `resolve_block_hashes` returns the REQUEST'S
+    OWN LIST (`kv_cache_utils.py:2866-2867`), so `view[i] is raw[i]`, the scale is 1,
+    and the oracle must behave exactly as it did before it learned about the union. It
+    also the case every test in sections 1-9 above runs at.
+    """
+    module = types.ModuleType(disk_restore.KV_UTILS_MODULE)
+    module.make_block_hash_with_group_id = pack
+    module.resolve_block_hashes = live_resolve
+    monkeypatch.setitem(sys.modules, disk_restore.KV_UTILS_MODULE, module)
+    hashes = [raw_digest(seed) for seed in range(8)]
+    manager = Manager(hash_block=3200, sizes=[3200, 3200, 3200, 3200, 8, 3200],
+                      cacheable=(0, 1), hits={LIVE_RID: pending(
+                          cpu={group: LIVE_CPU[group] for group in range(2)})})
+    stage = {"manager": manager, "request": Request(request_id=LIVE_RID,
+                                                    hashes=hashes),
+             "blocks": Blocks({group: LIVE_GPU[group] for group in range(2)})}
+    answer = live_resolve(hashes, 3200, 3200)
+    assert isinstance(answer, list) and answer is hashes, \
+        "at scale one the fork hands the list itself, and the oracle must accept that"
+    live_step(stage, [{"request_id": LIVE_RID,
+                       "cpu_block": LIVE_CPU[0][1], "gpu_block": LIVE_GPU[0][1],
+                       "group": 0, "span": 0,
+                       "key": bytes(pack(hashes[1], 0)).hex()}])
+    passed = counts()
+    assert passed["scheduler_checked"] == 1
+    assert passed["scheduler_equal"] == 1
+    assert passed["scheduler_oracle_refused"] == 0
+    assert passed["scheduler_hash_view_unbuildable"] == 0
+
+
+def test_the_section_keeps_its_key_set_across_the_view_shapes(live_stage, monkeypatch):
+    """SIX STATES, ONE KEY SET - including the two this release adds.
+
+    Nothing seen, an expectation captured and not consumed, a verdict from the lazy
+    view, a REFUSED shape, the contained group-4 assertion, and the fat payload. A
+    reader
+    diffing two rank files must be able to tell "this never happened" from "this build
+    does not report it", and the fat payload must still carry the same keys inside the
+    cap the seam REFUSES at - which is what makes a new counter key safe to add at all.
+    """
+    fresh = disk_restore_verify.section()
+
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    captured = disk_restore_verify.section()
+    assert captured["scheduler_expectations_captured"] > 0
+
+    foreign = bytes(pack(raw_digest(9999), 0)).hex()
+    live_step(live_stage, [live_entry(group=0, index=1, key=foreign)])
+    verdict = disk_restore_verify.section()
+    assert verdict["scheduler_mismatch"] >= 1
+
+    # THE REFUSED SHAPE: an answer with no index protocol at all. A refusal must not
+    # be a state where keys go missing - it is the state a reader most needs to diff.
+    class NotAView:
+        pass
+
+    monkeypatch.setattr(sys.modules[disk_restore.KV_UTILS_MODULE],
+                        "resolve_block_hashes", lambda *a: NotAView())
+    live_step(live_stage, [live_entry(group=0, index=1)])
+    refused = disk_restore_verify.section()
+    assert refused["scheduler_oracle_refused"] >= 1
+
+    stage = live_stage
+    stage["manager"].prefix_cacheable_group_ids = [0, 4]
+    live_step(stage, [live_entry(group=4, index=0, key=raw_indexed(0, 4))], tokens=16)
+    unviewable = disk_restore_verify.section()
+    assert unviewable["scheduler_hash_view_unbuildable"] >= 1
+
+    disk_restore_verify._state["reasons"] = [
+        f"tag{index}: " + "a persistent condition described at some length " * 4
+        for index in range(disk_restore_verify.MAX_REASON_SAMPLES)]
+    disk_restore_verify._state["boundary_missing_groups"].update(
+        {index: 1 for index in range(40)})
+    fat = disk_restore_verify.section()
+
+    for payload in (captured, verdict, refused, unviewable, fat):
+        assert set(payload) == set(fat), \
+            "the key set changed between two live states: a rank-file reader cannot " \
+            "tell a zero from an absent counter"
+    assert set(fresh) == set(fat)
+    for payload in (fresh, captured, verdict, refused, unviewable, fat):
+        encoded = json.dumps(payload, separators=(",", ":"), default=str)
+        assert len(encoded.encode()) <= disk_restore_verify.MAX_SECTION_BYTES
+        assert len(encoded.encode()) <= worker_diag.MAX_CONTRIBUTION_BYTES
+    assert fat["roles"]["worker"] == disk_restore_verify.WORKER_ROLE, \
+        "the trim ladder must shed illustration before the role sentences"
