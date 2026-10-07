@@ -182,6 +182,7 @@ CONNECTOR_CLASS = "SimpleCPUOffloadConnector"
 KV_UTILS_MODULE = "vllm.v1.core.kv_cache_utils"
 
 METHOD_MATCHED = "get_num_new_matched_tokens"
+METHOD_ALLOC = "update_state_after_alloc"
 METHOD_BUILD_META = "build_connector_meta"
 METHOD_UPDATE_OUTPUT = "update_connector_output"
 METHOD_BIND = "bind_connector_metadata"
@@ -5754,14 +5755,18 @@ def build_load_paths(manager, metadata, scheduler_output=None) -> dict:
     Mutates the metadata in place and returns a report; the WRAPPER returns the fork's
     object untouched either way, so a refusal here is invisible to the fork.
 
-    `scheduler_output` (0.2.40) is passed THROUGH, untouched and unread except by the
-    offer-point witness, for one reason: `kv_connector_block_state` is the fork's own
-    connector-only channel to a request's GPU block table, and the fork clears the field
-    after this call returns (`sched/scheduler.py:1479` then `:1497`), so this is the ONE
-    moment a connector can ask which token block the GPU block it just paired our file
-    with actually is. A caller that has no SchedulerOutput to hand (a test, a later
-    replay) simply gets the witness without the table: it counts
-    `scheduler_oracle_unavailable` rather than guessing.
+    `scheduler_output` (0.2.40) is passed THROUGH, untouched and unread. In 0.2.40 it
+    reached the offer-point witness because `kv_connector_block_state` was the only
+    channel to a request's GPU block table at THIS moment - but that table is the
+    CURRENT step's (`sched/scheduler.py:1412-1425`, cleared at `:1497`) and a load
+    state is emitted in steps LATER than the one that allocated it, so the witness
+    went blind in production (`block_state_does_not_cover_request`, zero
+    comparisons). Since 0.2.41 the witness reads NOTHING from it: the expectation is
+    captured at `update_state_after_alloc` by the alloc observer (`make_wrapper`),
+    which sees the request, its `block_hashes` and `blocks.get_block_ids()` as
+    ARGUMENTS. The parameter stays so the wrapper and the witness call signature are
+    unchanged; a caller with no SchedulerOutput to hand (a test, a later replay) gets
+    the identical verdict.
     """
     _sweep_loads(manager)
     try:
@@ -8125,6 +8130,18 @@ def make_wrapper(name: str, original):
         def wrapper(self, request, num_computed_tokens):
             result = original(self, request, num_computed_tokens)
             return offer(self, request, num_computed_tokens, result)
+    elif name == METHOD_ALLOC:
+        def wrapper(self, request, blocks, num_external_tokens):
+            # THE ALLOC-TIME OBSERVER (0.2.41), BEFORE the fork's body: the fork
+            # POPS `manager._pending_cpu_hits[req_id]` inside that body, so a peek
+            # at the pairing's own inputs is only possible while they are still
+            # there. `observe_alloc` is contained (never raises) and returns
+            # nothing: the fork's None passes through exactly as it would without
+            # the layer. It is a DIAGNOSTIC hook, not a restore hook - which is
+            # why the install below fits it best-effort and never fatally.
+            disk_restore_verify.observe_alloc(self, request, blocks,
+                                              num_external_tokens)
+            return original(self, request, blocks, num_external_tokens)
     elif name == METHOD_BUILD_META:
         def wrapper(self, scheduler_output):
             metadata = original(self, scheduler_output)
@@ -8358,6 +8375,62 @@ def emit_install_deferral(reason: str) -> dict:
     return _emit_install_line(reason, deferred=True)
 
 
+def _install_alloc_observer(cls) -> dict:
+    """Best-effort: fit the ALLOC-TIME OBSERVER (0.2.41) on `update_state_after_alloc`.
+
+    NOT part of `SCHED_METHODS`, and deliberately so. That tuple feeds
+    `methods_expected`, `sched_fitted_here()` and the install-success sentence - it
+    describes the layer a RESTORE needs. A diagnostic witness must never be able to
+    cost the restore layer its install: if a future fork renames
+    `update_state_after_alloc`, the right outcome is a restore layer that still
+    fits and a verify section that says `update_state_after_alloc: NOT WIRED here`,
+    not a refused boot.
+
+    COMPOSES ON TOP; it does NOT rebuild underneath. `_install_sched_method` inserts
+    the RESTORE layer at the bottom, directly over the fork body - correct for the
+    layer whose faults the guard must catch, WRONG here for two reasons: an observer
+    that never raises needs no guard above it, and the bottom-insert path rebuilds
+    the chain through `backport._rewrap`, which REPLACES the backport layer it finds
+    ("the freshly compiled copy IS that layer") - so fitting the observer that way
+    would silently delete the backport patch of `update_state_after_alloc` while
+    `backport` still believed it was fitted. The layer walk keeps this single-
+    stacked: a chain that already carries a restore layer of ours on this name is
+    REUSED, never doubled.
+    """
+    from . import backport  # noqa: PLC0415 - the layer vocabulary lives there
+    current = cls.__dict__.get(METHOD_ALLOC)
+    if current is None:
+        current = getattr(cls, METHOD_ALLOC, None)
+    refusal = None
+    if current is None:
+        refusal = f"{cls.__name__}.{METHOD_ALLOC} does not exist: the fork renamed it"
+    elif not callable(current):
+        refusal = f"{cls.__name__}.{METHOD_ALLOC} is not callable"
+    elif _layer_is_foreign(current):
+        refusal = (f"{cls.__name__}.{METHOD_ALLOC} carries a wrapper from another "
+                   "owner: refusing to stack on an unknown layer")
+    elif _layer_is_ours(current):
+        disk_restore_verify.note_alloc_hook(True, None)
+        return {"fitted": True, "reason": "reused"}
+    else:
+        layers, _bottom = backport._layers_of(current)
+        if any(kind == LAYER_KIND for kind, _ in layers):
+            disk_restore_verify.note_alloc_hook(True, None)
+            return {"fitted": True, "reason": "reused"}
+        wrapper = make_wrapper(METHOD_ALLOC, current)
+        if wrapper is None:
+            refusal = f"{cls.__name__}.{METHOD_ALLOC} has no alloc observer"
+        else:
+            setattr(cls, METHOD_ALLOC, wrapper)
+            disk_restore_verify.note_alloc_hook(True, None)
+            return {"fitted": True, "reason": None}
+    disk_restore_verify.note_alloc_hook(False, refusal)
+    _logger.info("kvtier-dev-plugin: DISK[restore-verify] alloc observer NOT fitted "
+                 "on %s: %s (the scheduler-side oracle will report NOT WIRED)",
+                 getattr(cls, "__name__", "?"), refusal)
+    return {"fitted": False, "reason": refusal}
+
+
 def install(refit: bool = False, sched_cls=None) -> dict:
     """Fit the restore layer onto whichever halves of the tier this process has.
 
@@ -8428,6 +8501,9 @@ def install(refit: bool = False, sched_cls=None) -> dict:
             if not _install_pass(sched_cls, SCHED_METHODS, _install_sched_method,
                                  report):
                 return report
+            # THE DIAGNOSTIC HOOK, fitted AFTER the restore layer and NEVER fatally
+            # (see `_install_alloc_observer` for why it is not a SCHED_METHOD).
+            _install_alloc_observer(sched_cls)
             halves.append(sched_cls.__name__)
         if worker_cls is not None:
             if not _install_pass(worker_cls, WORKER_METHODS, _install_worker_method,
@@ -8618,7 +8694,7 @@ def uninstall() -> dict:
     report = {"uninstalled": False, "restored": [], "reason": None}
     try:
         for module_name, class_name, names in (
-                (SCHED_MODULE, SCHED_CLASS, SCHED_METHODS),
+                (SCHED_MODULE, SCHED_CLASS, SCHED_METHODS + (METHOD_ALLOC,)),
                 (WORKER_MODULE, WORKER_CLASS, WORKER_METHODS)):
             module = sys.modules.get(module_name)
             cls = getattr(module, class_name, None) if module else None
@@ -8652,6 +8728,7 @@ def uninstall() -> dict:
                 report["restored"].append(f"connector.{METHOD_LOAD_ERRORS}")
         _state["uninstalls"] += 1
         _state["installed"] = False
+        disk_restore_verify.note_alloc_hook(False, "the restore layer was uninstalled")
         _state["sched_fitted"] = sched_fitted_here()
         _state["worker_fitted"] = False
         _state["methods_fitted"] = fitted_methods_here()

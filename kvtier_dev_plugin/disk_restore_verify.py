@@ -134,7 +134,8 @@ for writing anywhere - its whole safety story). It never changes a restore decis
 reads the batch the apply point already decided on, and cannot prune, reorder or re-file
 anything.
 
-THE SCHEDULER-SIDE ROLE (0.2.40): THE CHECK THAT CAN SEE A ONE-SLOT SHIFT
+THE SCHEDULER-SIDE ROLE (0.2.40, MOVED at 0.2.41): THE CHECK THAT CAN SEE A ONE-SLOT
+SHIFT
 ------------------------------------------------------------------------------- The
 worker-side oracle above is unreachable where it lives, and the reason is structural
 (`metadata.py`: a worker has no requests). The SCHEDULER side of the same plugin does
@@ -145,65 +146,96 @@ name says which role produced it: every scheduler-side counter begins `scheduler
 
 THE COMPARISON, per sampled offered entry:
 
-key16 in the file name we offered for (group g, span p) ==  key16 of `view_g[j]` packed
-with g,
+key16 in the file name we offered for the pairing (GPU block G, CPU slot C) ==  key16
+of `view_g[j]` packed with g,
 
-where `view_g` is the engine's own `resolve_block_hashes(request.block_hashes,
-hash_block_size, group_block_sizes[g])` and `j` is the position, IN THE REQUEST'S OWN
-BLOCK TABLE FOR GROUP g, of the GPU block the fork put beside our CPU slot - not an
-index taken from our lists. That is the whole point: a one-slot shift moves
+where (g, j) is the EXPECTATION the fork itself created when it paired G with C:
+group `g`, and position `j` in the request's own GPU block table for that group. The
+expectation is captured at ALLOC time (`observe_alloc`, hung on
+`update_state_after_alloc`, the one method where the fork decides the pairing: its loop
+IS `group_gpu_ids[gpu_ext_start + i]`, `manager.py:460-475`), and compared at NAME-EMIT
+time (`observe_offer`, hung on `build_connector_meta` via `disk_restore
+.build_load_paths`). `view_g` is the engine's own `resolve_block_hashes(request
+.block_hashes, hash_block_size, group_block_sizes[g])` - re-derived on this module's
+thread, never on the step thread. That is the whole point: a one-slot shift moves
 `load_cpu_blocks` and `load_gpu_blocks` together, so every comparison BETWEEN them is
-blind, and the answer has to come from outside them. The fork's own pairing is
-`group_gpu_ids[gpu_ext_start + i]` (`manager.py:461-468`); the digest of the block it
-landed on is what this role asks for.
+blind, and the answer has to come from outside them - and the ONE moment "which GPU
+block for which span" is actually decided is the alloc loop, not the metadata walk.
 
-WHAT IS REACHABLE THERE, PROVEN RATHER THAN HOPED (fork HEAD 10b8e07): *
-`request.block_hashes` - `LoadRequestState` carries `request`
-(`vllm/v1/simple_kv_offload/manager.py:85-89`) and the fork writes it at `:483-484` when
-it builds the transfer meta whose two lists are in the metadata; the load lists this
-module reads are built FROM that dict at `:523-531`, so the request is present at the
-moment we look. Read via `manager._reqs_to_load` (and `_abandoned_reqs_to_load`, the
-preemption copy at `:1275`). * the request's per-group GPU block table - the field
-`scheduler_output.kv_connector_block_state` (`vllm/v1/core/sched/output.py:208-221`),
-built by the scheduler with `resolve_block_ids=self.kv_cache_manager.get_block_ids`
-(`sched/scheduler.py:1412-1425`), attached to the SchedulerOutput at `:1475` and cleared
-at `:1497` AFTER the connector's metadata is built (`:1479`) precisely so it never
-reaches a worker. It is therefore the fork's own connector-only channel for exactly this
-question, and the fork reads it the same way inside the same `build_connector_meta` call
-(`manager.py:657`). * what is NOT reachable, and was rejected on purpose: the GPU block
-pool's `blocks[gpu_id].block_hash` (the store side's witness, `manager.py:846-847`). A
-load DESTINATION is taken from the free queue, and `BlockPool.get_new_blocks` calls
-`_maybe_evict_cached_block`, which RESETS the hash metadata (`core/block_pool.py:686`,
-`:726-747`) - so at load time that field is None or belongs to the previous tenant.
-Comparing against it would invent mismatches.
+WHY `kv_connector_block_state` WAS THE WRONG OBSERVATION POINT (the 0.2.40 finding,
+live in production, not theoretical). 0.2.40 read the request's GPU block table from
+`scheduler_output.kv_connector_block_state` at the EMIT point. That table is THIS
+STEP'S (`sched/scheduler.py:1412-1425`, cleared at `:1497`), but a load state in
+`_reqs_to_load` can be emitted in a LATER step than the one that allocated it - so the
+request id legitimately is not in the current step's `req_ids`, and every sampled entry
+hit `block_state_does_not_cover_request`: the oracle shipped decorative, checked
+nothing, and only stayed trustworthy because it counted its own blindness instead of
+reporting a green zero. The alloc hook fixes this structurally: the expectation is
+captured when the pairing is MADE, so it does not matter when - or over how many steps
+- the load is emitted. The block-state channel is NOT kept as a second source: it reads
+the same fork facts at the later, wrong moment, and its one independent signal (the
+request's current-step table) adds a comparison the alloc-time expectation already
+answers at the authoritative moment. Its counters are gone with it, and
+`scheduler_oracle_hook` in the published section names the hook that runs.
 
-WHAT A FAILURE MEANS, and it is four different things with four different fixes, so the
-classification is a name and not a number: `neighbour_index` (the name carries the
+WHAT THE ALLOC HOOK READS (all of it arguments or manager fields, nothing invented): in
+`update_state_after_alloc(self, request, blocks, num_external_tokens)` -
+`request.block_hashes` (the engine's own hash list, referenced, never copied, never
+hashed on the step thread), `blocks.get_block_ids()` (the per-group GPU block-id tables
+for THIS request, the very lists whose fork indexes), and the manager's
+`_pending_cpu_hits[req_id]` PEEKED (a `.get`, never the fork's `.pop`) for the CPU hit
+blocks and `num_computed_tokens` - plus `hash_block_size`, `group_block_sizes` and
+`prefix_cacheable_group_ids`, the same fields the fork's own loop reads at
+`manager.py:433-475`. The observer REPLICATES the fork's pairing loop (cdiv truncation,
+the prefix-cacheable gate, the `is_null` skip that keeps the index) so the captured
+(g, j) is the fork's decision, not a guess at it. It mutates NOTHING and its whole
+loop is bounded by `MAX_EXPECTATIONS_PER_ALLOC` per call and `MAX_SCHED_EXPECTATIONS`
+in the map (LRU, oldest evicted).
+
+THE EXPECTATION LIFECYCLE IS COUNTED, BECAUSE AN ORACLE THAT SILENTLY HAS NOTHING TO
+COMPARE IS THE FAILURE MODE THIS RELEASE EXISTS TO KILL. `scheduler_allocs_observed`
+counts allocs that carried a real external load; `scheduler_expectations_captured` the
+pairings written into the map; `scheduler_expectations_consumed` the sampled emitted
+entries that matched one; `scheduler_expectations_dropped` the ones EVICTED UNCONSUMED
+(a load abandoned, a request finished, or plain churn - the vast majority of pairings
+have no disk file and are never expected to be consumed); `scheduler_expectations_
+capped` the per-alloc bound hit. An emitted entry whose (GPU block, CPU slot) pairing
+has NO captured expectation is a NAMED `scheduler_oracle_unavailable`
+(`no_captured_expectation`), never a silent skip: a check that cannot run says so in a
+counter an operator can see.
+
+WHAT A FAILURE MEANS, and it is three different things with three different fixes, so
+the classification is a name and not a number: `neighbour_index` (the name carries the
 digest of the block at index j +/- 1..N: a one-slot shift, the finding this role exists
 for), `other_group` (the digest is real but belongs to another group's view of the same
-index, or the group suffix INSIDE the name contradicts the group the entry is paired
-with), `gpu_block_not_in_table` (the GPU block the fork paired with our slot is not in
-this request's table for that group at all), and `unknown`. A name's OWN group suffix
-outranks the digest comparison, so a suffix that contradicts the entry is a mismatch
-even when the digest part matches exactly: the file is named by BOTH halves
-(`disk_layout.build_slot_path` writes the group into the name), so a `key16`-only
-equality would call a wrong group a match. Like the worker side's `mismatch_stable`, a
-scheduler mismatch is re-derived before it is called stable: `scheduler_mismatch_stable`
-means the same captured inputs re-derived the same expected key, so the disagreement is
-not a half-mutated `block_hashes` view; `_unstable` means the engine's own inputs moved
-under us and the sample is not evidence.
+index, or the group suffix INSIDE the name contradicts the group THE FORK PAIRED at
+alloc time), and `unknown`. A name's OWN group suffix outranks the digest comparison,
+so a suffix that contradicts the pairing is a mismatch even when the digest part
+matches exactly: the file is named by BOTH halves (`disk_layout.build_slot_path` writes
+the group into the name), so a `key16`-only equality would call a wrong group a match.
+Like the worker side's `mismatch_stable`, a scheduler mismatch is re-derived before it
+is called stable: `scheduler_mismatch_stable` means the same captured inputs re-derived
+the same expected key, so the disagreement is not a half-mutated `block_hashes` view;
+`_unstable` means the engine's own inputs moved under us and the sample is not
+evidence.
 
-WHAT THE SCHEDULER THREAD PAYS, AND WHAT IT DOES NOT. `observe_offer` is the only call
-on an engine thread and it does: enablement, counters, a sample decision, one
-`kv_cache_manager.get_block_ids(rid)` resolve PER REQUEST ID per step (a list of ints
-the fork builds fresh, cached for the step, capped by `MAX_SCHED_RIDS_PER_STEP`), a
-`list.index` of one int, and at most `MAX_RETAINED_PER_STEP` small dicts. It does no
-hashing: `resolve_block_hashes` + `make_block_hash_with_group_id` + the key split run on
-the module's ONE existing daemon thread, off the scheduler's way, bounded by
-`MAX_CHECKS_PER_PASS` and the same `MIN_INTERVAL_SECONDS` floor. The references it
-carries to that thread are a `block_hashes` list and one group's freshly-built id list,
-both plain ints and bytes - no tensor, no file handle, and the ring holds at most
-`MAX_RETAINED_JOBS` of them for at most `JOB_MAX_AGE_SECONDS`.
+WHAT THE ENGINE THREADS PAY, AND WHAT THEY DO NOT. `observe_alloc` and `observe_offer`
+are the only calls on engine threads. `observe_alloc` (once per SCHEDULED request - the
+scheduler calls `update_state_after_alloc` unconditionally, `scheduler.py:1228` - and
+it returns at once for the overwhelming majority that carry no external load) pays,
+for a real external load: enablement, a peek at the manager's own pending map, and a
+bounded int-only loop replicating the fork's pairing - the fork runs the same loop one
+layer below, so this doubles a walk the step was already taking, bounded by
+`MAX_EXPECTATIONS_PER_ALLOC`. NO hashing, no file I/O, no GPU work, no list copy
+beyond the small per-group id ranges it indexes. `observe_offer` pays enablement,
+counters, a sample decision, one dict lookup per sampled entry and at most
+`MAX_RETAINED_PER_STEP` small dicts. `resolve_block_hashes` +
+`make_block_hash_with_group_id` + the key split + the neighbour walk all run on the
+module's ONE existing daemon thread, off the scheduler's way, bounded by
+`MAX_CHECKS_PER_PASS` and the same `MIN_INTERVAL_SECONDS` floor. The references the
+step thread hands that thread are `block_hashes` list references and ints - no tensor,
+no file handle; the expectation map holds at most `MAX_SCHED_EXPECTATIONS` entries and
+the pending ring at most `MAX_RETAINED_JOBS` records for at most `JOB_MAX_AGE_SECONDS`.
 
 WHY IT LIVES IN THIS MODULE AND NOT A NEW ONE: `worker_diag.MAX_CONTRIBUTIONS` is 5 and
 the contribution allow-list is EXACTLY those five names, so a sixth section is refused
@@ -226,9 +258,12 @@ The samples carry numbers and no sentence for the same reason - the sentence is 
 WHAT IT NEVER DOES
 ------------------------------------------------------------------------------- * writes
 any file, anywhere, ever (the only file operation is a read of a path the restore path
-itself already chose to read); * mutates the engine: it reads a request, a block table
-and a metadata it was handed and returns nothing to the offer path. It cannot prune,
-reorder or re-file an entry, and the call site is after the paths have been written; *
+itself already chose to read); * mutates the engine: it reads a request, a pending-hit
+tuple it PEEKS (a `.get`, never the fork's `.pop`), a `KVCacheBlocks` it only calls
+`get_block_ids()` on, and a metadata it was handed, and returns nothing to any of them.
+It cannot prune, reorder or re-file an entry; the offer-point call site is after the
+paths have been written, and the alloc-point call site runs before the fork's body and
+cannot change what that body decides; *
 changes a restore outcome - `observe_apply` cannot raise, cannot prune and is called
 after every decision the apply point makes; * blocks the step thread (no I/O, no CUDA,
 no torch symbol, no unbounded loop); * imports `torch`/`vllm`/`cuda`/`numpy` (the same
@@ -314,14 +349,27 @@ NEIGHBOUR_WINDOW = 2
 # separate `scheduler_last_mismatch` key - the ring's last element IS the newest
 # verdict, and publishing it twice cost 440 B of a 4096 B section budget to say the same
 # thing. TWO is the cap, and the arithmetic behind it is this section's own: the
-# mandatory content (71 counters, two roles' oracle states, and the sentences that tell
-# the roles apart) measures about 3.4 KiB, so the illustration a reader gets is what is
+# mandatory content (sixty-three counters, two roles' oracle states, and the sentences
+# that tell the roles apart) measures most of 3.8 KiB, so the illustration a reader
+# gets is what is
 # left under `MAX_SECTION_BYTES` - and a section the seam REFUSES for being 100 B fat
 # carries NO samples at all, which is the failure mode the cap exists to prevent. The
 # counters, which are the load-bearing numbers, see every single mismatch.
 MAX_SCHED_MISMATCH_SAMPLES = 2
-MAX_SCHED_RIDS_PER_STEP = 8        # block-table resolves per step, whatever the batch
 MAX_SCHED_ID_CHARS = 32            # a request id, clipped the way `disk_restore` clips
+
+# THE EXPECTATION MAP (0.2.41). `MAX_EXPECTATIONS_PER_ALLOC` bounds what ONE
+# `update_state_after_alloc` may write (a 128k-token restore over a 1600-token group
+# would otherwise put eighty dicts on one alloc, and the map is LRU-thrashed by exactly
+# such steps); hitting it is a bound, counted once per alloc as
+# `scheduler_expectations_capped`, never a finding. `MAX_SCHED_EXPECTATIONS` is the
+# global LRU cap: the oldest entry goes first, and if it goes UNCONSUMED that is the
+# `scheduler_expectations_dropped` counter - the named fact that the pairing this map
+# remembered was abandoned, finished, or outrun. At a few hundred bytes a record (ints,
+# one shared `group_block_sizes` copy, one `block_hashes` LIST REFERENCE) the cap is a
+# fraction of a megabyte, held for at most a few seconds of step churn.
+MAX_EXPECTATIONS_PER_ALLOC = 256
+MAX_SCHED_EXPECTATIONS = 2048
 
 # The first-difference scan, and why it is chunked: `memcmp` per 4 KiB block, so the
 # only Python-level byte loop runs inside the ONE chunk that differs. A full-window
@@ -332,14 +380,18 @@ MAX_DIFF_SCAN_BYTES = 262_144
 MAX_BOUNDARY_GROUPS_PUBLISHED = 8
 TRIM_BOUNDARY_GROUPS = 4
 TRIM_REASON_CHARS = 42
-# 3072 was the budget while this section described ONE role. The scheduler role adds
-# nineteen counters, an oracle state and a bounded mismatch sample to the same section
-# (it must be the same section: `worker_diag.MAX_CONTRIBUTIONS` is 5 and its allow-list
-# is exactly five names, so a sixth is refused at register time and the verdict would be
-# SILENTLY ABSENT from the rank file). The new number keeps the section below the seam's
-# own `MAX_CONTRIBUTION_BYTES` = 4096 with a margin, which is the only ceiling that can
-# make this key disappear.
-MAX_SECTION_BYTES = 3800
+# 3072 was the budget while this section described ONE role; 3800 was the 0.2.40
+# number (the scheduler role lives in THIS section because
+# `worker_diag.MAX_CONTRIBUTIONS` is 5 and its allow-list is exactly five names, so a
+# sixth is refused at register time and the verdict would be SILENTLY ABSENT from the
+# rank file). The 0.2.41 expectation lifecycle and the hook-name line pushed the
+# mandatory content to ~3660 B, which under 3800 left no room for even one mismatch
+# sample - the trim ladder then shed the section's own findings as a structural
+# certainty, which is a different way of shipping a decorative witness. The new number
+# keeps 176 B of margin under the seam's own `MAX_CONTRIBUTION_BYTES` = 4096, the only
+# ceiling that can make this key disappear; the trim ladder protects that margin when
+# a worker's live geometry and six fat reasons arrive.
+MAX_SECTION_BYTES = 3920
 
 # The fork's own reason for calling a group's blocks positionally unstable, read from
 # the group's spec on the worker (`kv_cache_interface.py:992-998`: only `MambaSpec`
@@ -396,11 +448,24 @@ _COUNTER_KEYS = (
     "oracle_mismatch",
     "oracle_unavailable",
     "oracle_refused",
-    # --- THE SCHEDULER-SIDE ORACLE (0.2.40). Every one of these begins `scheduler_`
-    # because a number that can be confused with the worker's own is worse than a
-    # missing one: the worker's `oracle_unavailable` is EXPECTED in production, while
-    # `scheduler_oracle_unavailable` means the oracle did not get built far enough to
-    # be useful. Never add the two together.
+    # --- THE SCHEDULER-SIDE ORACLE (0.2.40, moved to the alloc hook at 0.2.41). Every
+    # one of these begins `scheduler_` because a number that can be confused with the
+    # worker's own is worse than a missing one: the worker's `oracle_unavailable` is
+    # EXPECTED in production, while `scheduler_oracle_unavailable` means the oracle did
+    # not get built far enough to be useful. Never add the two together.
+    #
+    # THE EXPECTATION LIFECYCLE (0.2.41) is counted, because "the oracle ran" and "the
+    # oracle found nothing to look at" must never read the same. `allocs_observed` is
+    # the alloc hook seeing a real external load; `expectations_captured` the pairings
+    # it wrote; `expectations_consumed` the sampled emitted entries that matched one;
+    # `expectations_dropped` the ones evicted UNCONSUMED (an abandoned load, a finished
+    # request, or plain churn - most pairings have no disk file and are legitimately
+    # never consumed); `expectations_capped` the per-alloc bound hit.
+    "scheduler_allocs_observed",
+    "scheduler_expectations_captured",
+    "scheduler_expectations_consumed",
+    "scheduler_expectations_dropped",
+    "scheduler_expectations_capped",
     "scheduler_steps_seen",
     "scheduler_entries_seen",
     "scheduler_sampled_out",
@@ -414,7 +479,6 @@ _COUNTER_KEYS = (
     "scheduler_mismatch_unstable",
     "scheduler_mismatch_neighbour_index",
     "scheduler_mismatch_other_group",
-    "scheduler_mismatch_gpu_block_not_in_table",
     "scheduler_mismatch_unknown",
     "scheduler_oracle_unavailable",
     "scheduler_oracle_refused",
@@ -424,15 +488,18 @@ _COUNTER_KEYS = (
     "errors",
 )
 
-# The four scheduler-side mismatch classifications, and the counter each one moves.
+# The three scheduler-side mismatch classifications, and the counter each one moves.
+# (0.2.41 removed `gpu_block_not_in_table` with its observation point: at the alloc
+# hook the index comes FROM the fork's pairing, so "a destination outside the request's
+# table" has no observable moment left - the failure that replaced it, an emitted entry
+# whose pairing was never captured, is a NAMED `scheduler_oracle_unavailable`, not a
+# mismatch.)
 SCHED_CLASS_SHIFT = "neighbour_index"
 SCHED_CLASS_GROUP = "other_group"
-SCHED_CLASS_NOT_IN_TABLE = "gpu_block_not_in_table"
 SCHED_CLASS_UNKNOWN = "unknown"
 _SCHED_CLASS_COUNTERS = {
     SCHED_CLASS_SHIFT: "scheduler_mismatch_neighbour_index",
     SCHED_CLASS_GROUP: "scheduler_mismatch_other_group",
-    SCHED_CLASS_NOT_IN_TABLE: "scheduler_mismatch_gpu_block_not_in_table",
     SCHED_CLASS_UNKNOWN: "scheduler_mismatch_unknown",
 }
 
@@ -443,14 +510,22 @@ _SCHED_CLASS_COUNTERS = {
 # characters of prose is a hundred characters no counter could use.
 WORKER_ROLE = "worker: the apply point"
 SCHEDULER_ROLE = "scheduler: the offer point"
-ROLE_MEANING = ("unprefixed counters = a WORKER's apply point; scheduler_* = the "
-                "EngineCore's offer point; never add the two")
+ROLE_MEANING = ("unprefixed=worker apply point; scheduler_*=EngineCore offer point; "
+                "never add the two")
 # The one sentence that keeps the two oracles from being read as one facility. A
 # worker's `oracle_unavailable` is a fact of the fork; a `scheduler_oracle_unavailable`
 # means the check is not running where it could - the distinction an operator acts on.
 ORACLE_RULE = ("worker oracle_unavailable is EXPECTED (a worker has no requests); "
                "scheduler_oracle_unavailable means the check is NOT running")
 SCHED_NOTHING_UNAVAILABLE = "nothing unavailable yet"
+
+# WHICH HOOK PRODUCES THE `scheduler_*` NUMBERS, published so "the oracle ran" and
+# "the oracle found nothing to look at" are one glance apart. 0.2.40 published numbers
+# from an observation point that could not see its own inputs (see the module
+# docstring); the least a rewrite of that failure can promise is to name, IN THE
+# PAYLOAD, the hook that captured the expectations it is comparing.
+SCHED_HOOK_FITTED = "update_state_after_alloc: fitted"
+SCHED_HOOK_UNWIRED = "update_state_after_alloc: NOT WIRED here"
 
 
 def _fresh_state() -> dict:
@@ -478,13 +553,20 @@ def _fresh_state() -> dict:
         "oracle": None,          # (provider, note), see `set_oracle`
         # THE SCHEDULER-SIDE ROLE: its own ring, its own cursor, its own samples. The
         # thread is SHARED (one daemon thread for both roles, so this module can never
-        # grow a second one by accident).
+        # grow a second one by accident). THE EXPECTATION MAP (0.2.41) is insertion-
+        # ordered on purpose: the LRU eviction is `popitem(last=False)`-by-first-key
+        # over that order, and `consumed` is a mark, not a deletion - a pairing that
+        # was compared may be compared again when the same load state is emitted in a
+        # later step, and an entry that was consumed must never be counted as dropped.
         "scheduler_seq": 0,
         "scheduler_pending": {},
         "scheduler_sample_cursor": 0,
         "scheduler_mismatch_samples": [],
         "scheduler_last_oracle": None,
         "scheduler_unreachable_reason": None,
+        "scheduler_expectations": {},
+        "scheduler_alloc_hook_fitted": False,
+        "scheduler_alloc_hook_reason": None,
         "notes": {}, "reasons": [], "reason_seen": set(), "last_trim": None,
         "counters": {key: 0 for key in _COUNTER_KEYS},
     }
@@ -1389,11 +1471,13 @@ def _oracle_check(record: dict) -> dict:
             "expected_key16": expected["key16"]}
 
 
-# --- THE SCHEDULER-SIDE ROLE (0.2.40): THE OFFER-POINT ORACLE ----------------
-# Everything below runs in the EngineCore. The engine-thread entry point is
-# `observe_offer`, called by `disk_restore._build_load_paths` at the one moment the
-# scheduler sees a CPU slot WE allocated paired with the GPU block the fork will DMA it
-# into; everything above it in this file is a worker's apply point.
+# --- THE SCHEDULER-SIDE ROLE (0.2.40, moved at 0.2.41): THE BINDING ORACLE ----
+# Everything below runs in the EngineCore. TWO engine-thread doors: `observe_alloc`
+# (hung on `update_state_after_alloc` by `disk_restore`'s wrapper, BEFORE the fork's
+# body) captures what the fork is about to pair; `observe_offer` (called by
+# `disk_restore._build_load_paths` after the paths are written) compares the names we
+# emitted against those captured expectations. Everything above in this file is a
+# worker's apply point.
 def _sched_unavailable(tag: str, detail: str) -> dict:
     """The oracle could not be BUILT for this entry: counted, reasoned, published.
 
@@ -1442,114 +1526,308 @@ def _scheduler_sizes(manager) -> dict:
             "group_block_sizes": cleaned}
 
 
-def _load_request(manager, request_id):
-    """The `Request` the fork holds for a load, or None.
+# --- THE ALLOC-TIME HOOK (0.2.41): THE EXPECTATION CAPTURE ---------------------
+# The 0.2.40 offer point read the request's GPU block table from
+# `scheduler_output.kv_connector_block_state`, and that table is THIS STEP'S
+# (`sched/scheduler.py:1412-1425`, cleared at `:1497`) while a load state is
+# emitted in steps LATER than the one that allocated it. In production every
+# sampled entry landed on exactly those later steps, every lookup answered
+# `block_state_does_not_cover_request`, and the oracle checked nothing while
+# counting its own blindness. The hook below moves the observation to where the
+# PAIRING IS DECIDED - `update_state_after_alloc` (`manager.py:381-489`) - which
+# is where every input the oracle needs is an ARGUMENT.
 
-    `LoadRequestState` carries `request` (`manager.py:85-89`) and the fork writes it
-    when it creates the transfer meta whose two lists this metadata carries
-    (`:483-484`). The abandoned map (`:1275`, the preemption copy) is asked SECOND and
-    only if the live one has nothing, because a preempted load's table is the one place
-    a block id may already have moved.
+def note_alloc_hook(fitted: bool, reason=None) -> dict:
+    """Record the ALLOC HOOK's state, called by `disk_restore.install`/`uninstall`.
+
+    This is what makes `scheduler_oracle_hook` in the published section a FACT
+    rather than a claim: the module does not infer whether the hook is wired, it
+    is told by the only installer. Until an install says otherwise the answer is
+    "not wired" - the honest state of a worker process (which runs no allocs at
+    all) and of any process whose tier class was never fitted.
     """
-    for attribute in ("_reqs_to_load", "_abandoned_reqs_to_load"):
-        table = getattr(manager, attribute, None)
-        if not isinstance(table, dict):
-            continue
-        try:
-            state = table.get(request_id)
-        except Exception:  # noqa: BLE001,S112 - a ledger that cannot be read holds no
-            # request for us: that IS the answer, not a fault to log loudly
-            continue
-        request = getattr(state, "request", None)
-        if request is not None:
-            return request
-    return None
+    with _lock:
+        _state["scheduler_alloc_hook_fitted"] = bool(fitted)
+        _state["scheduler_alloc_hook_reason"] = (
+            None if fitted or reason is None
+            else str(reason)[:MAX_REASON_CHARS])
+        return {"fitted": bool(fitted)}
 
 
-def _block_table_verdict(state, request_id: str) -> dict:
-    """Ask the fork's connector channel for one request's block table."""
-    if state is None:
-        return {"ok": False, "kind": "no_kv_connector_block_state",
-                "reason": "scheduler_output.kv_connector_block_state is None on this "
-                          "step, so the request's own GPU block table is unreadable "
-                          "here (`sched/scheduler.py:1412-1425` builds it only for a "
-                          "step that has a connector)"}
-    getter = getattr(state, "get_block_ids", None)
-    if not callable(getter):
-        return {"ok": False, "kind": "block_state_without_get_block_ids",
-                "reason": "kv_connector_block_state carries no callable "
-                          "get_block_ids: the fork renamed the channel"}
+def _cdiv(a: int, b: int) -> int:
+    """The fork's own ceiling division (`manager.py:445`), local on purpose.
+
+    Not imported: the fork does not export it, and this observer must stay
+    answerable on a fork that moved it.
+    """
+    return -(-int(a) // int(b))
+
+
+def _alloc_gate(manager):
+    """The manager's prefix-cacheable set as a frozenset, or None for no gate.
+
+    The fork's pairing loop SKIPS groups outside this set (`manager.py:441-443`),
+    and the observer must apply the same gate or it captures pairings the fork
+    will never emit - which would turn `scheduler_expectations_dropped` into
+    churn noise and dilute the one counter that is supposed to mean "a pairing
+    this map remembered was abandoned". A fork without the field has no gate;
+    that is answered here, not guessed at.
+    """
+    gate = getattr(manager, "prefix_cacheable_group_ids", None)
+    if gate is None:
+        return None
     try:
-        table = getter(request_id)
-    except Exception as exc:  # noqa: BLE001 - the fork's channel is not ours to trust
-        return {"ok": False, "kind": "get_block_ids_raised",
-                "reason": f"get_block_ids raised {type(exc).__name__}"}
-    if table is None:
-        return {"ok": False, "kind": "block_state_does_not_cover_request",
-                "reason": "the request id is not in this step's "
-                          "kv_connector_block_state.req_ids, so the table is not "
-                          "offered for it (`output.py:218-221` says so by returning "
-                          "None rather than by guessing a table)"}
-    if not isinstance(table, (list, tuple)) or not table:
-        return {"ok": False, "kind": "empty_block_table",
-                "reason": f"get_block_ids answered {type(table).__name__} with no "
-                          "groups, which is not a block table"}
-    return {"ok": True, "table": table}
+        return frozenset(int(g) for g in gate)
+    except Exception:  # noqa: BLE001 - an unreadable gate is no gate; the fork's
+        # own loop will fail on it there, where the guard can see it
+        return None
 
 
-def _block_table(scheduler_output, request_id: str, cache: dict) -> dict:
-    """The request's own per-group GPU block-id table, through the fork's channel.
+def _peek_pending(manager, request_id):
+    """`manager._pending_cpu_hits[request_id]`, PEEKED - never popped.
 
-    `KVConnectorBlockState.get_block_ids(req_id)` (`output.py:208-221`) answers from
-    `kv_cache_manager.get_block_ids` and returns a FRESH tuple of lists per call, which
-    is why holding one for a millisecond on this module's thread is safe: it is a
-    snapshot, not a live view. The fork clears the field after the connector's metadata
-    is built (`sched/scheduler.py:1497`), so a worker can never see it - the reason this
-    is a SCHEDULER-side check and could never be a worker-side one.
-
-    Resolved at most once per request id per step (`cache`), capped by
-    `MAX_SCHED_RIDS_PER_STEP`: the resolve copies a table, and a step with more disk
-    loads than that cap is a step this role stops looking at rather than a step it slows
-    down.
+    The fork POPS the entry when its body runs (`manager.py:404`), which is why
+    the wrapper calls `observe_alloc` BEFORE the fork's body and why this is a
+    `.get`: a peek is the only read that survives the call it observes. The
+    returned tuple is the engine's live object; this module reads it
+    (`[0]` per-group hit lists, `[2]` num_computed_tokens) and mutates nothing.
     """
-    if request_id in cache:
-        return cache[request_id]
-    if len(cache) >= MAX_SCHED_RIDS_PER_STEP:
-        return {"ok": False, "kind": "too_many_request_ids_this_step",
-                "reason": f"this step carries more than {MAX_SCHED_RIDS_PER_STEP} "
-                          "request ids with disk entries, so no block table was "
-                          "resolved for it (a bound, not a fault)"}
-    verdict = _block_table_verdict(
-        getattr(scheduler_output, "kv_connector_block_state", None), request_id)
-    cache[request_id] = verdict
-    return verdict
+    table = getattr(manager, "_pending_cpu_hits", None)
+    if not isinstance(table, dict):
+        return None
+    try:
+        pending = table.get(request_id)
+    except Exception:  # noqa: BLE001,S112 - an unreadable ledger holds nothing
+        return None
+    if not isinstance(pending, (tuple, list)) or len(pending) < 3:
+        return None
+    return pending
 
 
-def _scheduler_record(manager, scheduler_output, sizes: dict, tables: dict,
-                      entry) -> dict | None:
-    """One offered entry, in the shape the thread can hash. NOTHING IS HASHED HERE.
+def observe_alloc(manager, request, blocks, num_external_tokens) -> dict:
+    """THE ALLOC-TIME DOOR (0.2.41): capture what the fork is about to pair.
 
-    The four things it captures are the four the comparison needs: the name we offered
-    (and the group the run says it belongs to), the GPU block the fork paired it with,
-    the engine's raw `block_hashes`, and the request's own block-table position of that
-    GPU block. The LAST of those is the one that comes from outside our lists, and it is
-    the reason this oracle can see a shift that every list-vs-list comparison cannot.
+    Called by the `update_state_after_alloc` wrapper BEFORE the fork's body. The
+    scheduler calls that method for EVERY scheduled request
+    (`sched/scheduler.py:1228`), so this runs per scheduled request and returns
+    at once for the overwhelming majority that carry no external load. For a
+    real external load it runs a bounded, int-only loop replicating the fork's
+    own pairing walk (`manager.py:433-475`: prefix-cacheable gate, cdiv
+    truncation of the per-group hit, start at `num_computed_tokens //
+    g_block_size`, `is_null` skipped WITHOUT advancing the pairing), and writes
+    `(gpu_block, cpu_block) -> (group, index in that group's table, the engine's
+    block_hashes)` into the bounded LRU expectation map. It hashes nothing,
+    reads no file, touches no GPU and mutates NOTHING: the pending hit is
+    peeked, not popped, `blocks` is only asked for `get_block_ids()`, and it
+    returns nothing to the caller. Never raises; the wrapper hands it to the
+    scheduler's step path.
+    """
+    try:
+        if not effective_enabled():
+            return {"captured": 0, "reason": "disabled"}
+        request_id = getattr(request, "request_id", None)
+        if not isinstance(request_id, str) or not request_id:
+            _sched_refused("alloc_no_request_id",
+                           "update_state_after_alloc was handed a request with no "
+                           "request id, so no expectation can be attached to any "
+                           "pairing it makes")
+            return {"captured": 0, "reason": "no_request_id"}
+        if not isinstance(num_external_tokens, int) \
+                or isinstance(num_external_tokens, bool) \
+                or num_external_tokens <= 0:
+            # THE COMMON CASE: the scheduler calls this for every request, and
+            # the fork itself returns at once (`manager.py:406-416`). No counter
+            # moves at all for it - this is the step thread's cost for a request
+            # that loads nothing.
+            return {"captured": 0, "reason": "no_external_tokens"}
+        pending = _peek_pending(manager, request_id)
+        if pending is None:
+            # The fork warns and skips the load for this too
+            # (`manager.py:417-426`): no pairing happens, so there is nothing to
+            # expect and nothing to say.
+            return {"captured": 0, "reason": "no_pending_cpu_hit"}
+        cpu_hits = pending[0]
+        num_computed = _int_or_none(pending[2])
+        if not isinstance(cpu_hits, (list, tuple)) or num_computed is None \
+                or num_computed < 0:
+            _sched_refused("alloc_pending_shape",
+                           "the manager's pending-CPU-hit entry for this request "
+                           "is not the fork's (blocks, hit_length, "
+                           "num_computed_tokens) triple, so the pairing cannot be "
+                           "replicated from it")
+            return {"captured": 0, "reason": "pending_shape"}
+        sizes = _scheduler_sizes(manager)
+        if not sizes["ok"]:
+            _sched_unavailable(sizes["kind"], sizes["reason"])
+            return {"captured": 0, "reason": sizes["kind"]}
+        hashes = getattr(request, "block_hashes", None)
+        if not isinstance(hashes, (list, tuple)) or not hashes:
+            _sched_unavailable("alloc_no_block_hashes",
+                               "the request the fork handed to "
+                               "update_state_after_alloc carries no "
+                               "block_hashes, so there is no engine key to "
+                               "re-derive for the GPU blocks it pairs")
+            return {"captured": 0, "reason": "no_block_hashes"}
+        getter = getattr(blocks, "get_block_ids", None)
+        if not callable(getter):
+            _sched_refused("alloc_blocks_shape",
+                           "the KVCacheBlocks the scheduler handed over carries no "
+                           "callable get_block_ids: the fork moved the per-group "
+                           "GPU tables out of the argument the pairing loop "
+                           "indexes")
+            return {"captured": 0, "reason": "blocks_shape"}
+        try:
+            gpu_tables = getter()
+        except Exception as exc:  # noqa: BLE001 - the fork's objects are not ours
+            _sched_refused("alloc_get_block_ids_raised",
+                           f"blocks.get_block_ids() raised {type(exc).__name__}")
+            return {"captured": 0, "reason": "get_block_ids_raised"}
+        if not isinstance(gpu_tables, (list, tuple)) or not gpu_tables:
+            _sched_refused("alloc_blocks_table",
+                           f"blocks.get_block_ids() answered "
+                           f"{type(gpu_tables).__name__}, not per-group block-id "
+                           f"tables")
+            return {"captured": 0, "reason": "blocks_table"}
+        gate = _alloc_gate(manager)
+        group_sizes = sizes["group_block_sizes"]
+        pairs: list = []
+        capped = False
+        num_groups = min(len(gpu_tables), len(cpu_hits), len(group_sizes))
+        for group in range(num_groups):
+            if gate is not None and group not in gate:
+                continue
+            group_size = _int_or_none(group_sizes[group])
+            if not group_size or group_size <= 0:
+                continue
+            group_gpu = gpu_tables[group]
+            group_cpu = cpu_hits[group]
+            if not isinstance(group_gpu, (list, tuple)) \
+                    or not isinstance(group_cpu, (list, tuple)):
+                continue
+            start = num_computed // group_size
+            for index in range(_cdiv(num_external_tokens, group_size)):
+                if len(pairs) >= MAX_EXPECTATIONS_PER_ALLOC:
+                    capped = True
+                    break
+                if index >= len(group_cpu):
+                    break
+                cpu_block = group_cpu[index]
+                if getattr(cpu_block, "is_null", False):
+                    continue        # the fork skips a null WITHOUT advancing the
+                    # pairing, and so do we: the index is `start + index`, not the
+                    # position in the compacted list (`manager.py:464-468`).
+                position = start + index
+                cpu_id = _int_or_none(getattr(cpu_block, "block_id", None))
+                if cpu_id is None:
+                    continue
+                if position >= len(group_gpu):
+                    # The fork's own line would IndexError on this index one
+                    # layer down: the accepted load reaches past the table the
+                    # scheduler allocated. Same name the thread side uses.
+                    with _lock:
+                        _count("scheduler_index_out_of_range")
+                    break
+                gpu_id = _int_or_none(group_gpu[position])
+                if gpu_id is None:
+                    break
+                pairs.append((gpu_id, cpu_id, group, position))
+            if capped:
+                break
+        if capped:
+            with _lock:
+                _count("scheduler_expectations_capped")
+        captured = _capture_expectations(request_id, pairs, hashes, sizes)
+        return {"captured": captured, "reason": "capped" if capped else None}
+    except Exception as exc:  # noqa: BLE001 - never into the scheduler's step path
+        with _lock:
+            _count("scheduler_errors")
+        _reason("observe_alloc",
+                f"the alloc-time witness raised {type(exc).__name__}")
+        return {"captured": 0, "reason": f"error_{type(exc).__name__}"}
+
+
+def _capture_expectations(request_id, pairs, hashes, sizes: dict) -> int:
+    """Write the captured pairings into the bounded LRU expectation map.
+
+    Keyed by `(gpu_block, cpu_block)` - the exact pair the fork will emit in its
+    metadata's two index-aligned lists, and the only key that can tell two
+    pairings of one GPU block (in two groups, or two runs) apart. A re-capture of
+    the same pair REPLACES it at the map's newest end: a resumed request
+    re-allocing gets its NEW expectation, not the one the first attempt left.
+    The `block_hashes` list is held by REFERENCE - the same list the stability
+    witness re-derives from, and the reason the map is capped rather than aged:
+    a pinned reference to a dead request's hashes is a bounded memory fact, and
+    the cap is the bound.
+    """
+    if not pairs:
+        return 0
+    now = time.monotonic()
+    group_sizes = list(sizes["group_block_sizes"])
+    captured = 0
+    with _lock:
+        _count("scheduler_allocs_observed")
+        expectations = _state["scheduler_expectations"]
+        for gpu_id, cpu_id, group, position in pairs:
+            while len(expectations) >= MAX_SCHED_EXPECTATIONS:
+                oldest = next(iter(expectations))
+                evicted = expectations.pop(oldest)
+                if not evicted.get("consumed"):
+                    _count("scheduler_expectations_dropped")
+            key = (gpu_id, cpu_id)
+            expectations.pop(key, None)      # re-insert at the newest end
+            expectations[key] = {
+                "rid": request_id[:MAX_SCHED_ID_CHARS], "group": int(group),
+                "index": int(position), "hashes": hashes,
+                "hash_block_size": int(sizes["hash_block_size"]),
+                "group_block_sizes": group_sizes, "mono": now,
+                "consumed": False}
+            _count("scheduler_expectations_captured")
+            captured += 1
+    return captured
+
+
+def _take_expectation(gpu_block: int, cpu_block: int) -> dict | None:
+    """The captured expectation for one emitted pairing, marked consumed. NOT removed.
+
+    Consumption is a MARK, not a pop, for the very failure mode that made 0.2.40
+    decorative: a load state is emitted in EVERY step until the worker confirms
+    the load, so the same pairing can be sampled twice - and the second sampling
+    deserves the same verdict, not a "no_captured_expectation". The map is bounded
+    by eviction, not by consumption.
+    """
+    with _lock:
+        record = _state["scheduler_expectations"].get((int(gpu_block),
+                                                       int(cpu_block)))
+        if record is None:
+            return None
+        if not record.get("consumed"):
+            record["consumed"] = True
+            _count("scheduler_expectations_consumed")
+        return dict(record)
+
+
+def _scheduler_record(entry) -> dict | None:
+    """One offered entry PLUS the expectation captured for its pairing.
+
+    The name we offered and the group our ledger believed (from the entry
+    `disk_restore._build_load_paths` wrote) on one side; the fork's own
+    alloc-time decision - group, and the position in that group's GPU block
+    table, plus the `block_hashes` to re-derive from - on the other. What makes
+    this oracle able to see a shift is that the (group, index) side comes from
+    the alloc hook and NOT from either list in the metadata: a shift moves both
+    lists together, and neither of them can contradict the other. NOTHING IS
+    HASHED HERE; `hashes` travels by reference to the module's one thread.
     """
     if not isinstance(entry, dict):
         return None
     request_id = entry.get("request_id")
-    group = _int_or_none(entry.get("group"))
     gpu_block = _int_or_none(entry.get("gpu_block"))
+    cpu_block = _int_or_none(entry.get("cpu_block"))
     key_hex = entry.get("key")
     if not isinstance(request_id, str) or not request_id:
         _sched_refused("no_request_id", "the offer witness handed an entry with no "
-                                        "request id, so no request and no block table "
-                                        "can be found for it")
-        return None
-    if group is None or group < 0:
-        _sched_refused("no_group", "the entry names no group, and a key16 without a "
-                                   "group is exactly the pre-fix identity that put two "
-                                   "groups in one file")
+                                        "request id, so it can be neither "
+                                        "attributed nor reported")
         return None
     if not isinstance(key_hex, str) or not key_hex:
         _sched_refused("no_key", "the ledger's identity for this entry carries no "
@@ -1560,80 +1838,59 @@ def _scheduler_record(manager, scheduler_output, sizes: dict, tables: dict,
         _sched_refused("offered_key_shape", f"the key we offered this entry under is "
                                             f"not a block hash: {split.get('reason')}")
         return None
-    if not sizes["ok"]:
-        _sched_unavailable(sizes["kind"], sizes["reason"])
-        return None
-    request = _load_request(manager, request_id)
-    if request is None:
-        _sched_unavailable(
-            "no_request_in_load_state",
-            "this request id is in neither manager._reqs_to_load nor "
-            "_abandoned_reqs_to_load, so its request (and therefore its "
-            "block_hashes) is unreachable here")
-        return None
-    hashes = getattr(request, "block_hashes", None)
-    if not isinstance(hashes, (list, tuple)) or not hashes:
-        _sched_unavailable(
-            "no_block_hashes",
-            "the request the fork holds for this load carries no block_hashes, so the "
-            "engine's own key cannot be re-derived for it")
-        return None
-    table = _block_table(scheduler_output, request_id, tables)
-    if not table["ok"]:
-        _sched_unavailable(table["kind"], table["reason"])
-        return None
-    groups = table["table"]
-    if group >= len(groups):
-        _sched_unavailable("group_outside_block_table",
-                           f"group {group} is outside a block table of "
-                           f"{len(groups)} group(s): the run named a group the "
-                           "allocator has no table for")
-        return None
-    group_table = groups[group]
-    if not isinstance(group_table, (list, tuple)):
-        _sched_unavailable("block_table_group_shape",
-                           f"group {group}'s block table is "
-                           f"{type(group_table).__name__}, not a list of block ids")
-        return None
-    ids = list(group_table)
-    index = None
     if gpu_block is None:
         _sched_refused("no_gpu_block", "this step's metadata carries no GPU block id "
                                        "beside this CPU slot (the two lists are not "
                                        "aligned), so there is no destination to ask "
                                        "about")
         return None
-    try:
-        index = ids.index(int(gpu_block))
-    except ValueError:
-        # Not a refusal: a MISMATCH with its own name, raised by the thread-side verdict
-        # so the sample carries the table it searched and the id it could not find.
-        index = None
-    except Exception:  # noqa: BLE001 - an unreadable table is a refusal, not a raise
-        _sched_unavailable("block_table_unreadable",
-                           f"group {group}'s block table could not be searched "
-                           "for a block id")
+    if cpu_block is None:
+        _sched_refused("no_cpu_block", "this step's metadata carries no CPU slot id "
+                                       "beside this GPU block, so there is no "
+                                       "pairing to look an expectation up for")
         return None
-    group_size = (sizes["group_block_sizes"][group]
-                  if group < len(sizes["group_block_sizes"]) else None)
+    expectation = _take_expectation(gpu_block, cpu_block)
+    if expectation is None:
+        _sched_unavailable(
+            "no_captured_expectation",
+            "no captured expectation covers this (GPU block, CPU slot) pairing: "
+            "the alloc hook is not wired in this process (`scheduler_oracle_hook` "
+            "says so), the expectation was evicted under the map cap "
+            "(`scheduler_expectations_dropped` counts that), the per-alloc cap "
+            "stopped it (`scheduler_expectations_capped`), or this load was never "
+            "paired by update_state_after_alloc at all")
+        return None
+    group = _int_or_none(expectation.get("group"))
+    index = _int_or_none(expectation.get("index"))
+    hashes = expectation.get("hashes")
+    group_sizes = expectation.get("group_block_sizes") or ()
+    if group is None or group < 0 or index is None or index < 0 \
+            or not isinstance(hashes, (list, tuple)) or not hashes:
+        _sched_unavailable("captured_expectation_incomplete",
+                           "the expectation captured at alloc time lacks a group, "
+                           "an index, or the engine's block_hashes, so there is "
+                           "nothing for the thread to re-derive from it")
+        return None
+    group_size = (group_sizes[group] if group < len(group_sizes) else None)
     if not group_size:
         _sched_unavailable("no_group_block_size",
-                           f"the manager gives no `group_block_sizes` entry for group "
-                           f"{group}, so the engine's view for it cannot be built")
+                           f"the manager gave no usable `group_block_sizes` entry "
+                           f"for group {group} at alloc time, so the engine's view "
+                           f"of it cannot be built at emit time")
         return None
     with _lock:
         _state["scheduler_seq"] = int(_state["scheduler_seq"]) + 1
         record_id = int(_state["scheduler_seq"])
-    return {"id": record_id, "rid": request_id[:MAX_SCHED_ID_CHARS],
+    return {"id": record_id,
+            "rid": str(expectation.get("rid") or "")[:MAX_SCHED_ID_CHARS],
             "group": int(group), "span": _int_or_none(entry.get("span")),
             "key": key_hex[:72], "key16": split["key16"],
             "name_group": int(split["group_id"]),
-            "cpu_block": _int_or_none(entry.get("cpu_block")),
-            "gpu_block": int(gpu_block), "index": index,
-            "hashes": hashes, "hash_block_size": int(sizes["hash_block_size"]),
+            "cpu_block": int(cpu_block), "gpu_block": int(gpu_block),
+            "index": int(index), "hashes": hashes,
+            "hash_block_size": int(expectation.get("hash_block_size") or 0),
             "group_bytes": int(group_size),
-            "group_block_sizes": list(sizes["group_block_sizes"]),
-            "table": list(group_table)[:4096],
+            "group_block_sizes": list(group_sizes),
             "mono": time.monotonic()}
 
 
@@ -1654,17 +1911,31 @@ def _retain_scheduler(record: dict) -> bool:
     return True
 
 
-def observe_offer(manager, scheduler_output, entries) -> dict:
-    """THE SCHEDULER DOOR: what did the fork pair the file we offered with?
+# --- THE OFFER POINT (0.2.40): THE NAME COMPARISON -----------------------------
+# The second half of the check: `disk_restore._build_load_paths` hands us the
+# entries whose file this plugin's ledger NAMED, and each one is compared against
+# the expectation the alloc hook captured for its pairing. The hashing happens on
+# this module's thread (`_verify_scheduler_inner`), never here.
+def observe_offer(manager, scheduler_output, entries) -> dict:  # noqa: ARG001
+    """THE SCHEDULER DOOR: does the name we offered match the captured expectation?
 
-    Called by `disk_restore._build_load_paths` after the length rule has been satisfied
-    and the paths have been written, with the entries of this step that are OURS (the
-    ones whose CPU slot this module's ledger named a file for). Bookkeeping only: it
-    cannot change the step, cannot prune an entry and cannot reorder a list, and every
-    path inside is a counter.
+    Called by `disk_restore._build_load_paths` after the length rule has been
+    satisfied and the paths have been written, with the entries of this step that
+    are OURS (the ones whose CPU slot this module's ledger named a file for).
+    Bookkeeping only: it cannot change the step, cannot prune an entry and cannot
+    reorder a list, and every path inside is a counter.
 
-    The sampling decision is taken BEFORE any block table is resolved, so an unarmed or
-    unsampled step costs this role nothing at all.
+    `manager` and `scheduler_output` are ACCEPTED AND NOT READ (0.2.41). 0.2.40
+    resolved the request's GPU block table from
+    `scheduler_output.kv_connector_block_state` HERE, and that table is the
+    CURRENT step's - so a load state emitted in a later step than its alloc
+    (the normal life of a multi-step load) had no table, and the oracle went
+    blind exactly when it mattered. The expectation now arrives EARLY, from
+    `observe_alloc`, and leaves the emission timing irrelevant. The parameters
+    stay so the call site does not have to know the oracle stopped reading them.
+
+    The sampling decision is taken BEFORE any expectation is touched, so an
+    unarmed or unsampled step costs this role nothing at all.
     """
     try:
         if not effective_enabled():
@@ -1674,8 +1945,6 @@ def observe_offer(manager, scheduler_output, entries) -> dict:
         with _lock:
             _count("scheduler_steps_seen")
         scanned = list(entries)[:MAX_ENTRIES_SCANNED]
-        sizes = _scheduler_sizes(manager)
-        tables: dict = {}
         seen = 0
         retained = 0
         for entry in scanned:
@@ -1687,12 +1956,12 @@ def observe_offer(manager, scheduler_output, entries) -> dict:
                 selected = (cursor % max(1, SAMPLE_EVERY_N_RESTORES)) == 0
                 room = retained < MAX_RETAINED_PER_STEP
             if not selected or not room:
-                # The per-step bound is a BOUND: hitting it is normal on a wide step and
-                # one reason per step would be a reason per step.
+                # The per-step bound is a BOUND: hitting it is normal on a wide
+                # step and one reason per step would be a reason per step.
                 with _lock:
                     _count("scheduler_sampled_out")
                 continue
-            record = _scheduler_record(manager, scheduler_output, sizes, tables, entry)
+            record = _scheduler_record(entry)
             if record is None:
                 continue      # the refusal was counted and named where it happened
             if not _retain_scheduler(record):
@@ -1901,24 +2170,26 @@ def _verify_scheduler_record(record: dict) -> dict:
 
 
 def _verify_scheduler_inner(record: dict) -> dict:
-    """The comparison, in the order that makes each refusal nameable on its own."""
+    """The comparison, in the order that makes each refusal nameable on its own.
+
+    There is no "the destination is not in the request's table" branch any more,
+    and there cannot be: at the alloc hook the index comes FROM the fork's own
+    pairing decision, so the old `gpu_block_not_in_table` shape has no observable
+    moment left at this site. Its replacement - an emitted entry whose pairing was
+    never captured - is a NAMED `scheduler_oracle_unavailable` at the door
+    (`_scheduler_record`), never a silent skip and never a guessed mismatch.
+    """
     if (time.monotonic() - float(record.get("mono") or 0.0)) > JOB_MAX_AGE_SECONDS:
         with _lock:
             _count("scheduler_retained_dropped")
         return {"checked": False, "reason": "stale"}
     if record.get("index") is None:
-        # Not a comparison - no expected key exists - and the most alarming thing this
-        # role can report: the destination the fork chose is not in the request's own
-        # table for this group, so "which token block is this GPU block" has no answer.
-        return _scheduler_mismatch(
-            record, SCHED_CLASS_NOT_IN_TABLE,
-            # THE CONCLUSION FIRST: `reason` is clipped at `MAX_REASON_CHARS`, and the
-            # sentence a reader acts on is "this block is not one this request owns",
-            # with the ids that prove it inside the same clip.
-            f"not one this request owns for group {record['group']}: GPU block "
-            f"{record['gpu_block']} is not in request {record['rid']}'s table of "
-            f"{len(record.get('table') or ())} ids, so the destination of this "
-            "restore is a block this request does not have")
+        # Unreachable by construction (the expectation's index is an int or the
+        # record was refused at the door); counted as a refusal, never a mismatch.
+        return _sched_refused("no_captured_index",
+                              "a retained scheduler record reached the thread with "
+                              "no captured index, which the door guarantees it "
+                              "cannot have")
     helpers = _scheduler_helpers()
     if not helpers["ok"]:
         _sched_unavailable(helpers["kind"], helpers["reason"])
@@ -2291,6 +2562,21 @@ def section() -> dict:
     # five and its allow-list is five), and for the reachability proof of the two inputs
     # this half reads that the worker half cannot.
     out["scheduler_oracle"] = scheduler_state()
+    # WHICH HOOK PRODUCES THESE NUMBERS. The 0.2.40 lesson, published: numbers from
+    # an unwired or blind observation point are worse than no numbers, so the
+    # section names the hook (`update_state_after_alloc`, the allocation-time
+    # capture) whenever it is actually fitted, and says NOT WIRED when it is not -
+    # "the oracle ran" and "the oracle found nothing to look at" are one glance
+    # apart. The expectation map's live size is published beside it as
+    # `scheduler_expectations_now`: the state between "ran" and "nothing to see".
+    with _lock:
+        fitted = bool(_state["scheduler_alloc_hook_fitted"])
+        hook_reason = _state["scheduler_alloc_hook_reason"]
+        out["scheduler_expectations_now"] = len(_state["scheduler_expectations"])
+    out["scheduler_oracle_hook"] = (
+        SCHED_HOOK_FITTED if fitted else
+        (SCHED_HOOK_UNWIRED if not hook_reason else
+         f"{SCHED_HOOK_UNWIRED}; install said: {hook_reason}"[:160]))
     out["roles"] = {"worker_apply_point": bool(out["batches_seen"]),
                     "scheduler_offer_point": bool(out["scheduler_steps_seen"]),
                     "worker": WORKER_ROLE, "scheduler": SCHEDULER_ROLE,
@@ -2302,8 +2588,7 @@ def section() -> dict:
     out["section"] = MODULE
     out["writer"] = OWNER_TAG
     out["note"] = ("a mismatch is a QUESTION: only mismatch_stable is a layout "
-                   "candidate, and only the leading W_g bytes of the window are "
-                   "compared; the tail is other groups' by construction")
+                   "candidate; the tail is other groups' by construction")
     return _fit(out)
 
 
@@ -2412,6 +2697,10 @@ def view() -> dict:
                               "oracle_note": (_state["oracle"][1]
                                               if _state["oracle"] else None),
                               "scheduler_pending": _state["scheduler_pending"],
+                              "scheduler_expectations_now":
+                                  len(_state["scheduler_expectations"]),
+                              "scheduler_alloc_hook_fitted":
+                                  bool(_state["scheduler_alloc_hook_fitted"]),
                               "scheduler_mismatch_samples":
                                   _state["scheduler_mismatch_samples"],
                               "scheduler_unreachable_reason":

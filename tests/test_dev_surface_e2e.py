@@ -305,21 +305,24 @@ def test_a_real_fault_becomes_a_capture_and_a_ring_record(dev, monkeypatch):
     # declining to guard the most fault-prone method while reporting "guard mode
     # ON" would be the worse failure.
     #
-    # THREE methods now, not two: the SSD restore layer is fitted on all three
-    # scheduler entry points in the EngineCore (`disk_restore.adopt_if_missed`, from
-    # the connector-creation boot and the snapshot verb), so the guard composes over
-    # a sibling layer on `update_connector_output` too. That is the ordering the
+    # FOUR methods now, not three: since 0.2.41 the restore family also fits the
+    # ALLOC OBSERVER (a sibling restore layer) on `update_state_after_alloc`, so the
+    # SSD restore layer is fitted on all three scheduler entry points in the
+    # EngineCore (`disk_restore.adopt_if_missed`, from the connector-creation boot
+    # and the snapshot verb) AND on the alloc hook, and the guard composes over a
+    # sibling layer on `update_connector_output` too. That is the ordering the
     # layer walk guarantees - guard outermost, restore at the bottom, the fork's body
     # underneath - and it means a fault raised inside the restore path is a captured
     # DECLINE rather than a step that silently did nothing.
     assert armed["install"]["nested"] == ["get_num_new_matched_tokens",
+                                          "update_state_after_alloc",
                                           "build_connector_meta",
                                           "update_connector_output"]
     assert armed["install"]["skip_detail"] == []
     # The composition is still readable afterwards, not only at arm time.
     assert client.get(GUARD, headers=headers()).json()["guard"]["nested"] == [
-        "get_num_new_matched_tokens", "build_connector_meta",
-        "update_connector_output"]
+        "get_num_new_matched_tokens", "update_state_after_alloc",
+        "build_connector_meta", "update_connector_output"]
     dev["tier_module"].FAILING.add("get_num_new_matched_tokens")
 
     # The tier raises where the fork would have asserted; the step survives.

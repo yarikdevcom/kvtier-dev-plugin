@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvtier-dev-plugin"
-version = "0.2.40"
+version = "0.2.41"
 description = "Development plugin for a live vLLM host-RAM KV-cache tier: loopback-or-allowlist scheduler-side diagnostics (token-gated off-box) and hot reload of a local policy module."
 readme = "README.md"
 requires-python = ">=3.10"
