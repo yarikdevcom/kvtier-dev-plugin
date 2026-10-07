@@ -100,7 +100,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT` | **where those shadow files go.** Unset = `<the live store root>/../gpu-shadow`, a sibling of the store (so one `cmp -r` compares the two trees and the store's own sweep never walks the evidence). Read once per process; validated like any other root, and subject to the same refusal. |
 | `VLLM_E2_TIER_DISK_RESTORE_VERIFY` | **the RESTORE-side byte verifier (0.2.39), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no spill file is opened and no GPU block is read by this module. `1`/`true`/`yes`/`on` = a sampled restored entry is compared byte-for-byte: the leading `W_g` bytes of the spill file against the leading `W_g` bytes of the GPU block the restore loaded it into, with the file width and the group width checked first and the tail (the other groups' stale bytes) never compared at all. A disagreement is re-read before it is reported, so `mismatch_stable` (a layout candidate) is separable from `mismatch_gpu_changed_on_recheck` (the engine moved). Since **0.2.40** the same variable arms BOTH roles of the module: the worker's byte comparison above, and the scheduler-side **binding oracle** - which since **0.2.41** witnesses `update_state_after_alloc`, the hook where the fork DECIDES which GPU block each offered CPU block pairs with: the observer captures that pairing's expected file name at the alloc and the emitter compares it against the name it is about to ship (`scheduler_*` counters; a one-slot shift and a group swap are both named findings there; `scheduler_oracle_hook` says whether the witness is actually wired). One variable, because arming half a verifier would be the worst of both: it would publish numbers about a check that is not running. `POST /disk {"op":"restore-verify"}` latches only the answering process and its answer says so. It never changes a restore decision, and the engine's step thread pays a counter and a dict of ints - the file read and the device copy happen on its own bounded thread. See *Do the RESTORED bytes match the file?*. |
-| `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` | **the GPU-DIRECT WRITE (0.2.43), OFF by default, same grammar, and the one dev feature in this package that WRITES into live KV memory.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no copy is issued, no memory is page-locked, no thread starts and no counter moves. `1`/`true`/`yes`/`on` = at the restore apply point, for a sampled entry whose bytes were just memmoved into a CPU slot, the plugin copies that slot into the GPU window the entry names (`gpu_block_id`) on the tier's own `load_stream`, BEFORE the fork's body runs - and reads the window back once before its own copy and once after, so the copy is witnessed rather than assumed. The fork's own arena-to-GPU copy still runs afterwards on that same stream and keeps the last word on every byte, so a wrong addressing guess here is a wrong WITNESS and not a wrong answer. The readback is compared against the SPILL FILE (the leading `W_g` only, the tail never), never against the CPU slot it copied from - `readback_mismatch_stable` is the single counter that names THIS module's addressing as the candidate, and `readback_mismatch_gpu_changed_on_recheck` is the expected race from which nothing follows. Pinned readback rows are allocated only on this module's own thread and released only when the tier's load watermark passes the entry's event; a row whose DMA state is unknowable is leaked (`buffers_leaked`) and never handed out again. Sampled at one entry in `sample_every_n_applied`, at most one write per step, and never an allocation on the step thread. The value is read once at first use; `POST /disk {"op":"gpu-write"}` latches only the answering process, and for this feature that process has no apply point at all - its answer says so in `scope` instead of letting a zero read as an all-clear. See *Writing the window ourselves, and watching it land*. |
+| `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` | **the GPU-DIRECT WRITE (0.2.43, cold start fixed in 0.2.44), OFF by default, same grammar, and the one dev feature in this package that WRITES into live KV memory.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no copy is issued, no memory is page-locked, no thread starts and no counter moves. `1`/`true`/`yes`/`on` = at the restore apply point, for a sampled entry whose bytes were just memmoved into a CPU slot, the plugin copies that slot into the GPU window the entry names (`gpu_block_id`) on the tier's own `load_stream`, BEFORE the fork's body runs - and reads the window back once before its own copy and once after, so the copy is witnessed rather than assumed. The fork's own arena-to-GPU copy still runs afterwards on that same stream and keeps the last word on every byte, so a wrong addressing guess here is a wrong WITNESS and not a wrong answer. The readback is compared against the SPILL FILE (the leading `W_g` only, the tail never), never against the CPU slot it copied from - `readback_mismatch_stable` is the single counter that names THIS module's addressing as the candidate, and `readback_mismatch_gpu_changed_on_recheck` is the expected race from which nothing follows. Pinned readback rows are allocated only on this module's own thread and released only when the tier's load watermark passes the entry's event; a row whose DMA state is unknowable is leaked (`buffers_leaked`) and never handed out again. Sampled at one entry in `sample_every_n_applied`, at most one write per step, and never an allocation on the step thread. The value is read once at first use; `POST /disk {"op":"gpu-write"}` latches only the answering process, and for this feature that process has no apply point at all - its answer says so in `scope` instead of letting a zero read as an all-clear. Since **0.2.44** an armed process starts the writer's own thread when the module registers (with the write attempt asking for it again as a safety net), because pinned rows can ONLY be allocated by that thread and 0.2.43 started it on the line after a row had already been taken - so it never started, and the module wrote nothing with `errors=0`. Read `liveness.state` to ask whether the witness is alive (`off` / `armed, no apply point seen in this process` / `armed but never wrote` / `writing`); `passes`, `pool_refills` and `buffers_allocated` all zero with `applies_seen` climbing is a writer that never ran. See *Writing the window ourselves, and watching it land*. |
 | `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` | **how many CPU slots of the host-RAM arena's block pool an offer must NOT take (0.2.38). Unset = `disk_restore.CPU_SLOT_RESERVE` = 64, the value every release before 0.2.38 used.** An offer allocates its *destination* slots out of the same pool the RAM tier parks its own blocks in, and is clamped to `(free - reserve - boundary slots) // slots-per-span` spans - so on a shrunk arena the reserve is an offer-size lever, not a footnote: at the operator's 166 free slots per rank on the wide PP1 pair, reserve 64 leaves **98 spans (313,600 tokens)** and reserve 16 leaves **146**. `0` is **honoured** ("an offer may take the arena's last slot" - it leaves the RAM tier nothing to park, see the section). A non-integer or a negative falls back to 64 and logs once (`DISK[reserve] IGNORED`); there is deliberately **no ceiling**, because a reserve larger than the arena correctly declines every offer as `no_cpu_slots` instead of oversubscribing. The value in force, its origin (`env` / `default` / `ignored`) and the spans it leaves are published in `restore.limits`, `restore.offer_pool`, `last_offer_pool` and the boot line's `cpu_slot_reserve=64(default)`. See *Sizing the CPU-slot reserve an offer leaves alone*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
@@ -3262,7 +3262,7 @@ when no provider is installed; that the apply point touches no file and no devic
 counts; and that two tests drive the REAL `worker_bind` -> `worker_before_load` path so the
 hook site and the field names it reads are pinned by the product rather than by a fake.
 
-## Writing the window ourselves, and watching it land (`disk_gpu_write.py`, 0.2.43)
+## Writing the window ourselves, and watching it land (`disk_gpu_write.py`, 0.2.43-0.2.44)
 
 Entry 28's route has a write side and a read side, and the two verifiers above each read the
 GPU. This module is the write side of that route taken for real - and it is the **one dev
@@ -3324,13 +3324,36 @@ no ledger to read is `no_event_ledger`.
 readback destination has to be page-locked or the read is synchronous on the step thread, and
 `pin_memory=True` means a `cudaHostAlloc` - so rows are allocated ONLY on this module's own
 thread, never at the apply point. The price is that the first apply after a boot finds an
-empty pool and refuses with `no_pinned_buffer`, which is counted and published and correct.
-A row handed to a `copy_(non_blocking=True)` is still being written until the load event
-completes, so rows are held until the tier's own load watermark passes the entry's event and
-are released by nothing else. An entry whose event never passes has an unknowable DMA state:
-its rows go to `buffers_leaked` and are never handed out again. That is the direction this
-module fails in - a witness that cannot afford a buffer refuses, and a row of unknowable
-provenance is never a witness twice.
+empty pool and refuses; that is counted, published and correct, but since **0.2.44** it is
+named as the COLD case (`pool_never_filled`, counted alongside `no_pinned_buffer`) instead of
+sharing one name with the opposite diagnosis. A row handed to a `copy_(non_blocking=True)` is
+still being written until the load event completes, so rows are held until the tier's own load
+watermark passes the entry's event and are released by nothing else. An entry whose event never
+passes has an unknowable DMA state: its rows go to `buffers_leaked` and are never handed out
+again. That is the direction this module fails in - a witness that cannot afford a buffer
+refuses, and a row of unknowable provenance is never a witness twice.
+
+**THE COLD START, AND HOW TO RECOGNISE IT (0.2.44).** Rows exist only because this module's
+thread allocates them, and in 0.2.43 that thread was started on the line AFTER a successful
+`_take_rows` - so a cold pool refused the write, the refusal returned, and nothing ever started
+the thread that could have filled the pool. The first write was unreachable, therefore every
+write was: the live rank file said `applies_seen=64 writes=0 checked=0 passes=0 pool_refills=0
+buffers_allocated=0 no_pinned_buffer=1 errors=0` and wrote nothing, ever, with `errors=0` the
+reason nobody read it as a fault. The fix is both ends of that loop: an ARMED process starts
+its writer thread when the module registers its contribution (so before the first restore, and
+a thread born that way allocates nothing because no worker is registered yet), and the write
+attempt asks for the thread at its TOP, before it touches the pool, so even an unregistered
+module starts it on its first refusal. **An operator recognises the dead state in one field:
+`liveness.state` is `armed but never wrote`, and `liveness.verdict` spells it out with the
+numbers - `passes`, `pool_refills` and `buffers_allocated` all zero with `applies_seen`
+climbing is a writer that never ran, and `thread_started=0` is the proof.** `liveness.state`
+is one of `off` / `armed, no apply point seen in this process` (an EngineCore: no apply point,
+so it can never write) / `armed but never wrote` / `writing`. The one refusal name that used to
+carry two facts is now counted apart: `no_pinned_buffer` with `pool_never_filled` beside it
+means "the witness thread has not warmed up, the next apply will be written", and `no_pinned_buffer`
+alone means the pool filled and drained - rows held by records whose load event has not passed,
+or leaked, which never recovers by waiting. The third member of that family, the in-flight cap,
+was already separable through `in_flight_dropped`.
 
 **What it costs when it is on**, all of it published in the section: one entry per
 `sample_every_n_applied` (64) applies, at most `max_writes_per_step` (1) write per step and
@@ -3357,7 +3380,7 @@ about live KV writes to be missing, because absence reads as "nothing to report"
 can ask for 24 KiB of the 32 KiB ceiling, which is why contributions are what the byte triage
 sheds first.
 
-`tests/test_disk_gpu_write.py` (33 tests) is the executable spec. The default posture is
+`tests/test_disk_gpu_write.py` (37 tests) is the executable spec. The default posture is
 proved against seams that RAISE if touched, not against a counter agreeing with itself. One
 flipped environment variable separates that from a write that puts the file's bytes in a GPU
 block and a verdict that says so. The journal of submissions reads `pre-readback, our copy,
@@ -4564,7 +4587,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2485 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2489 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -4596,7 +4619,13 @@ post-readback, then the fork's copy, that shifting only the copy's destination r
 `..._gpu_changed_on_recheck`, that moving the spill FILE moves the verdict with the copy
 untouched (so the comparison cannot be a mirror of its own source), that a pinned row is
 released by the fork's load event and by nothing else and ages out by leaking rather than
-being reused, that the step thread never calls the allocator at all, and that the region
+being reused, that the step thread never calls the allocator at all, that a COLD armed boot
+reaches a real write through the production entry point alone - no patched `_ensure_thread`,
+no pre-filled pool, the product's own sample rate - because the cold refusal must start the
+thread and the allocations must all land on the module's own thread and never on the step
+thread's (the 0.2.44 regression), that `liveness` names which of the four states the writer is
+in with the same key set in all four, and that a cold pool and a drained pool are two different
+readings rather than one name, and that the region
 pairing is by name in `sorted(name)` order - pinned by two fake caches deliberately built
 in different insertion orders. The per-offer
 bounds after the fixed 32,000-token cap was deleted are in

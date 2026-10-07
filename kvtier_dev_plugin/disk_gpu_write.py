@@ -129,6 +129,36 @@ into a restore, the thread's passes are wrapped so that nothing kills the thread
 every refusal is a NAME. A refusal means the fork's copy runs alone, exactly as it does
 when `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` is unset - which is the default, and the
 posture this whole module is built under.
+
+THE COLD START: THE THREAD MUST EXIST BEFORE THE MODULE ASKS FOR A ROW (0.2.44)
+-------------------------------------------------------------------------------
+A write needs pinned readback rows. Rows are allocated only by `_refill_pools`, which
+runs only on this module's thread. In 0.2.43 that thread was started from ONE place -
+inside `_write_one`, on the line AFTER `_take_rows` had already returned rows - so on a
+cold boot the empty pool refused the write, the refusal returned, and the start-up call
+was never reached. No thread, so no rows; no rows, so no thread: THE FIRST WRITE WAS
+UNREACHABLE, AND SO WAS EVERY LATER ONE. Four hundred armed applies in-process reproduce
+the live rank file exactly (`writes=0 passes=0 pool_refills=0 buffers_allocated=0
+no_pinned_buffer=7 errors=0`) with `thread_started=0`, which is the field that
+proves the thread never ran rather than merely found nothing.
+
+THE FIX IS BOTH ENDS OF THAT LOOP. `register_contribution()` starts the thread when the
+module is armed, so it exists before the first restore, and `_write_one` asks for it at
+the TOP of the attempt, before it takes a row, so even a module that was never
+registered starts it on its first refusal. Neither start allocates: the refill walks
+`_resolve_worker()`, and the worker weakref is only ever set by the apply point, so a
+thread born at install finds no worker, allocates nothing and counts nothing until the
+first restore registers one. The thread still never runs on the step thread's behalf -
+the cold pool is REFUSED, and the first write waits for the thread's next pass.
+
+WHAT AN OPERATOR READS. `liveness.state` in the rank section says which state this is
+(`off` / `armed, no apply point seen in this process` / `armed but never wrote` /
+`writing`) and `liveness.verdict` spells the dead one out with the numbers in it. The
+refusal name also stopped being one word for two facts: `no_pinned_buffer` now has a
+companion counter for its cause, so `pool_never_filled` (the refill has never produced a
+row - warm up and try the next apply) is no longer spelled the same way as a pool that
+filled and then drained (rows held by records whose load event has not passed, or
+leaked), and the in-flight cap was already separable through `in_flight_dropped`.
 """
 
 from __future__ import annotations
@@ -265,6 +295,13 @@ _COUNTER_KEYS = (
     "region_pair_missing",
     "too_many_regions",
     "no_pinned_buffer",
+    # THE CAUSE OF A `no_pinned_buffer`, counted alongside it and never instead of it.
+    # Three refusals used to share the one name (see the module docstring). This one
+    # separates "no pinned row has EVER been allocated on this module's thread" - the
+    # cold start, which resolves itself on the thread's next pass - from a pool that
+    # filled and then drained, which does not. The third, the in-flight cap, already has
+    # its own companion in `in_flight_dropped`.
+    "pool_never_filled",
     "stream_unavailable",
     "refused_thread_unavailable",
     "write_failed",
@@ -527,7 +564,10 @@ def _allocate_row(region, elems: int):
     torch symbol and no `cudaHostAlloc` through ctypes. It is also the only allocation
     this module makes, and it runs on the DAEMON THREAD ONLY: page-locking memory is
     slow and serialises the device, and the step thread must never pay for it (which is
-    what `no_pinned_buffer` means: the pool has not been filled yet, or is empty).
+    what `no_pinned_buffer` means: the pool has not been filled yet, or is empty). The
+    cold half of that sentence is its own counter, `pool_never_filled`, so "the witness
+    thread has not warmed up" and "the device has run out of rows" are not the same
+    reading of one number.
     """
     return region.new_empty((1, int(elems)), device="cpu", pin_memory=True)
 
@@ -722,8 +762,15 @@ def _refill_pools(worker) -> int:
     The step thread never allocates: `pin_memory=True` means a `cudaHostAlloc`, which is
     slow and serialises the device, and the whole cost model of this module is that the
     step thread pays a dict lookup for a buffer. The price of that choice is that the
-    first apply point after a boot finds an empty pool and refuses with
-    `no_pinned_buffer`, which is counted, published and correct.
+    first apply point after a boot finds an empty pool and refuses - counted, published
+    and correct, and since 0.2.44 named as the COLD case by `pool_never_filled` rather
+    than left to read like a shortage. What must never happen is the reverse trade: this
+    function runs ONLY on this module's thread, and the thread must therefore exist
+    before any write is attempted, which is why `_ensure_thread` is called at the top of
+    `_write_one` and at registration (`register_contribution`) rather than after a
+    successful `_take_rows` - the 0.2.43 ordering that made the first write unreachable.
+    A worker that is not registered yet (`_resolve_worker()` answering None, which is
+    every thread born at install) allocates NOTHING and returns 0.
     """
     allocated = 0
     if worker is None:
@@ -842,7 +889,20 @@ def _release_rows(taken: dict, kind: str | None = None) -> None:
 
 # --- THE THREAD ----------------------------------------------------------------
 def _ensure_thread() -> bool:
-    """Start the module's single thread, once, lazily. Never at import."""
+    """Start the module's single thread, once, lazily. Never at import.
+
+    TWO CALLERS, AND THE ORDER IS THE WHOLE POINT (0.2.44): `register_contribution()`
+    asks at install, so an armed process has a writer thread before its first restore,
+    and `_write_one` asks at the TOP of a write attempt, before it touches the pool, as
+    the safety net for a module that was never registered. It must NOT be asked after a
+    successful `_take_rows`, which is where 0.2.43 put it and what made the first write
+    unreachable: the rows only exist once this thread has run a refill, and the refusal
+    that the missing rows cause returned before this line could be reached.
+
+    One thread, bounded, respawned only if the previous one died. Starting it allocates
+    nothing: the thread waits `PASS_TICK_SECONDS` first, and its refill walks
+    `_resolve_worker()`, which answers None until the apply point registers a worker.
+    """
     global _thread, _stop
     with _thread_lock:
         if _thread is not None and _thread.is_alive():
@@ -1222,6 +1282,7 @@ def observe_apply(worker, batch, failed) -> dict:
         written = 0
         seen = 0
         refusal = None
+        refusal_cause = None
         for _job_id, job in survivors:
             if not isinstance(job, dict):
                 continue
@@ -1260,10 +1321,15 @@ def observe_apply(worker, batch, failed) -> dict:
                 # happened to THIS restore step?" should not have to diff counters to
                 # find out - and a throttle is deliberately not a refusal, so the sample
                 # and the step cap leave this None rather than naming something nothing
-                # rejected.
+                # rejected. `cause` travels with it for the one name that carries more
+                # than one fact (`no_pinned_buffer`, whose cold and drained readings are
+                # different operational stories); every other refusal's name IS its
+                # cause and leaves this None.
                 refusal = outcome.get("reason")
+                refusal_cause = outcome.get("cause")
         return {"seen": seen, "written": written,
-                "reason": (None if written else refusal)}
+                "reason": (None if written else refusal),
+                "cause": refusal_cause}
     except Exception as exc:  # noqa: BLE001 - never into the engine's step path
         with _lock:
             _count("errors")
@@ -1271,11 +1337,57 @@ def observe_apply(worker, batch, failed) -> dict:
         return {"seen": 0, "written": 0, "reason": f"error_{type(exc).__name__}"}
 
 
-def _refuse(kind: str, detail: str, seen: int = 1) -> dict:
+def _refuse(kind: str, detail: str, seen: int = 1, cause: str | None = None) -> dict:
     with _lock:
         _count(kind, seen)
     _reason(kind, detail)
-    return {"written": False, "reason": kind}
+    out = {"written": False, "reason": kind}
+    if cause:
+        out["cause"] = cause
+    return out
+
+
+# THE TWO SENTENCES FOR THE ONE NAME THAT USED TO CARRY TWO FACTS. `no_pinned_buffer`
+# was both "the witness thread has not filled its pool yet" and "the pool is out of
+# rows", and an operator reading a rank file cannot act on those the same way: the
+# first fixes itself on the thread's next pass, the second means rows are held by
+# records whose load event has not passed (or leaked, which is permanent). They are now
+# counted apart (`pool_never_filled` rides along with the cold case) and said apart.
+COLD_POOL_REASON = (
+    "no pinned readback row exists because NONE HAS EVER BEEN ALLOCATED: this module's "
+    "thread was started by this call (or at install) and fills the pool on its own "
+    "first pass, so a later apply will be written; if `pool_refills` stays 0 while "
+    "`thread_alive` is true, pinned allocation itself is failing - see "
+    "`pinned_allocation_failed` in reasons")
+DRAINED_POOL_REASON = (
+    "no pinned readback row is FREE for this region: rows were allocated and are all "
+    "held by records whose load event has not passed, or leaked, so this write is "
+    "refused rather than performed unwitnessed")
+
+
+def _pool_cold() -> bool:
+    """True when no pinned row has EVER been allocated in this process since boot.
+
+    That is the cold start, and it is a fact about the WRITER rather than about the
+    device: once a single refill has run, `buffers_allocated` stops being zero for the
+    rest of the boot (rows leak and are replaced by fresh ones, they are never
+    un-counted), so from then on a refusal means the pool is genuinely drained.
+    """
+    with _lock:
+        return int(_state["counters"]["buffers_allocated"]) == 0
+
+
+def _refuse_pinned() -> dict:
+    """The pool refusal: one NAME, the cause counted beside it and said in its place."""
+    cold = _pool_cold()
+    with _lock:
+        _count("no_pinned_buffer")
+        if cold:
+            _count("pool_never_filled")
+    _reason("no_pinned_buffer_cold_pool" if cold else "no_pinned_buffer",
+            COLD_POOL_REASON if cold else DRAINED_POOL_REASON)
+    return {"written": False, "reason": "no_pinned_buffer",
+            "cause": ("pool_never_filled" if cold else "pool_drained")}
 
 
 def _write_one(worker, job: dict, event) -> dict:
@@ -1314,6 +1426,18 @@ def _write_one(worker, job: dict, event) -> dict:
                        "has not imported torch), so there is no stream to order our "
                        "copy before the fork's on - and writing on the wrong stream "
                        "would break the ordering argument, not just weaken it")
+    # THE THREAD, BEFORE THE POOL. The rows this write needs are allocated only BY this
+    # thread, so asking for it AFTER `_take_rows` (where 0.2.43 asked) made the first
+    # refusal the thing that prevented the only thing that could have answered it: cold
+    # pool -> refusal -> return -> no thread -> cold pool. The first write was
+    # unreachable and so was every later one. Asking here means the very first armed
+    # apply at least STARTS the writer; the refusal is still a refusal, because an
+    # allocation on this thread is a `cudaHostAlloc` inside `start_load_kv`.
+    if not _ensure_thread():
+        return _refuse("refused_thread_unavailable",
+                       "this module's thread could not be started, so no write is "
+                       "attempted: an unwitnessed write is worse than no write, and "
+                       "the pinned rows this write needs are allocated on that thread")
     with _lock:
         if len(_state["in_flight"]) >= MAX_IN_FLIGHT:
             _count("in_flight_dropped")
@@ -1323,21 +1447,11 @@ def _write_one(worker, job: dict, event) -> dict:
     if full:
         return _refuse("no_pinned_buffer",
                        f"{MAX_IN_FLIGHT} records are already in flight waiting for "
-                       "their load events; the write is skipped rather than queued")
+                       "their load events; the write is skipped rather than queued",
+                       cause="in_flight_cap")
     taken = _take_rows(plan)
     if taken is None:
-        return _refuse("no_pinned_buffer",
-                       "no pinned readback row is free for this region, so the write "
-                       "is refused rather than performed unwitnessed (rows are filled "
-                       "on this module's thread and released only when the load "
-                       "event's watermark passes)")
-    if not _ensure_thread():
-        # Nothing has been enqueued yet, so releasing is safe and the refusal is the
-        # whole story: an unwitnessed write into live KV is not a diagnostic.
-        _release_rows(taken)
-        return _refuse("refused_thread_unavailable",
-                       "this module's thread could not be started, so no write is "
-                       "attempted: an unwitnessed write is worse than no write")
+        return _refuse_pinned()
     names = [region["name"] for region in plan["regions"]]
     try:
         with context:
@@ -1479,6 +1593,76 @@ def pool_view() -> dict:
                 "in_flight": len(_state["in_flight"])}
 
 
+# --- IS THIS WITNESS ACTUALLY ALIVE? -------------------------------------------
+# The four states a rank file can be in, named so that "is the writer running?" is a
+# lookup and not a reading of five counters. 0.2.43 shipped a writer that could not
+# write and a section that said nothing about it: `writes=0` against `applies_seen=64`
+# was true, legible only to someone who already knew that `passes`, `pool_refills` and
+# `buffers_allocated` all being zero means the thread never ran - and that
+# `thread_started=0` was the proof. These are those counters, in one sentence, computed
+# rather than remembered, so they cannot disagree with the numbers beside them.
+LIVENESS_OFF = "off"
+LIVENESS_NO_APPLY = "armed, no apply point seen in this process"
+LIVENESS_NEVER_WROTE = "armed but never wrote"
+LIVENESS_WRITING = "writing"
+
+
+def liveness_view() -> dict:
+    """`is this witness alive?`, answered from the counters that are already published.
+
+    A derived view, never a stored one: it reads the same counters the section
+    publishes, so there is no second state to keep honest and nothing for a reset to
+    forget. The key set is fixed in every state (a reader must be able to diff two rank
+    files), and `cause` is non-null only in the dead state it explains.
+    """
+    with _lock:
+        counts = dict(_state["counters"])
+        free_rows = sum(len(rows) for rows in _state["pool"].values())
+        in_flight = len(_state["in_flight"])
+    running = bool(_thread is not None and _thread.is_alive())
+    writes = int(counts["writes"])
+    applies = int(counts["applies_seen"])
+    cause = None
+    if not effective_enabled():
+        state = LIVENESS_OFF
+        verdict = ("not enabled: no thread starts, nothing is page-locked, no copy is "
+                   "issued and the fork's copy runs alone")
+    elif writes:
+        state = LIVENESS_WRITING
+        verdict = (f"writing: {writes} write(s) over {applies} applied entr(ies), "
+                   f"{counts['checked']} read back and compared, {free_rows} pinned "
+                   f"row(s) free")
+    elif not applies:
+        state = LIVENESS_NO_APPLY
+        verdict = ("armed, but this process has run no restore apply point, so it can "
+                   "never write: only a WORKER applies a restore (thread started "
+                   f"{counts['thread_started']}x, running: "
+                   f"{'yes' if running else 'NO'})")
+    else:
+        state = LIVENESS_NEVER_WROTE
+        if counts["pool_never_filled"]:
+            cause = "pool_never_filled"
+        elif counts["in_flight_dropped"]:
+            cause = "in_flight_cap"
+        elif counts["no_pinned_buffer"]:
+            cause = "pool_drained"
+        elif counts["sampled_out"] >= applies:
+            cause = "never_sampled_in"
+        else:
+            cause = "see_reasons"
+        verdict = (f"armed but NEVER WROTE: {applies} applied entr(ies) seen, "
+                   f"{counts['sampled_out']} sampled out, "
+                   f"{counts['no_pinned_buffer']} refused for want of a pinned row "
+                   f"({counts['pool_never_filled']} of them with a pool that had never "
+                   f"been filled), thread started {counts['thread_started']}x and "
+                   f"running: {'yes' if running else 'NO'}, rows allocated "
+                   f"{counts['buffers_allocated']}, pool refills "
+                   f"{counts['pool_refills']}, passes {counts['passes']}, free rows "
+                   f"{free_rows}, in flight {in_flight}; cause: {cause}")
+    return {"state": state, "verdict": verdict, "thread_running": running,
+            "free_rows": free_rows, "cause": cause}
+
+
 def geometry_view() -> dict:
     with _lock:
         return {"group_bytes": copy.deepcopy(_state["group_bytes"]),
@@ -1518,6 +1702,8 @@ def section() -> dict:
     out["geometry"] = geometry_view()
     out["pool"] = pool_view()
     out["thread_alive"] = bool(_thread is not None and _thread.is_alive())
+    # THE ONE-LINE ANSWER TO "IS THE WRITER RUNNING?", beside the counters it sums.
+    out["liveness"] = liveness_view()
     out["order_rule"] = ORDER_RULE
     out["meaning_rule"] = MEANING_RULE
     out["section"] = MODULE
@@ -1532,6 +1718,24 @@ def worker_report() -> dict:
     return section()
 
 
+def _contribution_signal() -> tuple:
+    """The rank writer's "did anything change?" value for this section. Cheap: ONE
+    counter snapshot plus the two live facts the counters do not carry.
+
+    `thread_started` and `pool_refills` are in here because they are exactly the facts
+    that move with NOTHING else moving, which is what a signal is for: an armed boot
+    that has written nothing yet goes from "there is no writer thread" to "there is
+    one, and its pool is warm" without any other counter stirring, and a reader should
+    not have to wait for restore traffic to see the witness arrive.
+    """
+    counts = counters()
+    return (int(bool(enable_state()["enabled"])),
+            int(bool(pool_view()["pinned_bytes"])),
+            int(bool(counts["writes"])),
+            int(bool(counts["thread_started"])),
+            int(bool(counts["pool_refills"])))
+
+
 def register_contribution() -> dict:
     """Offer this module's verdict to the rank-file writer. Idempotent.
 
@@ -1544,17 +1748,30 @@ def register_contribution() -> dict:
     `test_disk_restore_verify.py` exist to catch. The arithmetic of six sections
     (24 KiB of a 32 KiB file, contributions shed first) is in `MAX_SECTION_BYTES`'
     comment above.
+
+    IT ALSO STARTS THE WRITER, WHEN THIS PROCESS IS ARMED - that is the cold-start fix,
+    and it belongs HERE because this is the only call this module has before its first
+    restore. It is safe at engine start precisely because a thread on its own does
+    nothing: `_ensure_thread` creates one daemon thread, the loop waits
+    `PASS_TICK_SECONDS` before it acts, its refill asks `_resolve_worker()` - a weakref
+    only the APPLY POINT ever sets, so it answers None here and the refill reads no
+    geometry, allocates nothing, touches no CUDA and counts nothing - and its pass
+    returns on the enablement test or on an empty in-flight map. A process that can
+    never write (an EngineCore, which also registers) therefore runs a no-op tick and
+    says so in `liveness` as `armed, no apply point seen in this process`. With the
+    module OFF, which is the default, no thread starts and no counter moves.
     """
-    return worker_diag.register_contribution(
+    answer = worker_diag.register_contribution(
         MODULE, worker_report,
         # OWNER_TAG's claim, kept true: this reports a STATE, never an age. What moves
-        # with no counter moving is the ENABLEMENT and the POOL - either can change
-        # between two writes of the file with nothing written in between, and a reader
-        # must be able to see that without diffing the file by hand.
+        # with no counter moving is the ENABLEMENT, the POOL and the WRITER THREAD - any
+        # of the three can change between two writes of the file with nothing written in
+        # between, and a reader must be able to see that without diffing the file.
         owner=f"{OWNER_TAG} state, never a window",
-        signal=lambda: (int(bool(enable_state()["enabled"])),
-                        int(bool(pool_view()["pinned_bytes"])),
-                        int(bool(counters()["writes"]))))
+        signal=_contribution_signal)
+    if effective_enabled():
+        _ensure_thread()
+    return answer
 
 
 def status() -> dict:

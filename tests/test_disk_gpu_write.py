@@ -44,6 +44,19 @@ which part of the ordering argument it is holding up:
    test writes a rank file carrying all SIX and checks the required fields survive under
    the file cap. The verb's two halves and its POST-only rule are pinned, and
    `/snapshot` publishes the same `section()`.
+9. THE WRITER STARTS ITSELF, AND SAYS WHETHER IT IS ALIVE (0.2.44). 0.2.43 could not
+   write a single byte in the field: rows are allocated only on the module's thread, the
+   thread was started only AFTER `_take_rows` had returned rows, and a cold pool refused
+   the write BEFORE that line - so no thread, no rows, no thread. Every test here missed
+   it because the `armed` fixture supplies both missing pieces (a `_ensure_thread` that
+   says yes without starting anything, and a pool filled by hand), which is the lesson
+   this section of the file exists to teach: a test that provides what production does
+   not is worse than no test. So ONE test drives the production entry point cold - real
+   thread, real sample rate, nothing pre-armed - and asserts a write actually happens
+   with every pinned allocation on the module's thread and none on the step thread's.
+   Beside it: an armed registration starts the thread and allocates nothing, the cold
+   refusal and a drained pool are counted and named apart (`pool_never_filled`), and
+   `liveness` answers "is this witness alive?" with the same key set in all four states.
 
 WHAT IS FAKE, STATED WHERE IT CANNOT BE MISSED. There is no CUDA device here. The three
 expressions that touch one are the module's own seams (`_copy_host_to_device`,
@@ -67,6 +80,8 @@ import ctypes
 import json
 import os
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -452,6 +467,15 @@ def armed(monkeypatch):
     the process that applies a restore and the only process that can write a window. The
     thread is replaced so the tests drive `run_pass` themselves instead of racing a
     daemon.
+
+    READ THIS BEFORE USING IT AS A TEMPLATE. This fixture hands the module the two
+    things production never provides - a `_ensure_thread` that says yes WITHOUT starting
+    a thread, and (with `fill_pool`) rows nobody had to allocate - and that is exactly
+    how 0.2.43 shipped a writer that could not write: 33 green tests, every one of them
+    reaching a write through help the field does not give. Determinism is the reason it
+    stays, but the cold path is pinned ONLY by `armed_cold` and
+    `test_a_cold_writer_starts_its_own_thread_and_then_actually_writes`; a new test that
+    needs to know whether the module can start itself may not borrow this shortcut.
     """
     monkeypatch.setenv(config.ENV_DISK_GPU_DIRECT_WRITE, "1")
     disk_gpu_write._state["env_resolved"] = False
@@ -1144,12 +1168,17 @@ def test_the_section_key_set_never_changes_and_fits_the_contribution_cap():
     something rather than overflow.
     """
     fresh = disk_gpu_write.section()
+    # `liveness` is 0.2.44's, and it is IN THIS LIST ON PURPOSE: the 0.2.43 writer could
+    # not write at all and its section had no field that said so. The list is the gate
+    # that makes adding a published key a decision rather than an accident - it is not a
+    # claim that the key set of 0.2.43 was the right one.
     assert set(fresh) == set(disk_gpu_write._COUNTER_KEYS) | {
         "reasons", "last_verdict", "mismatch_samples", "enabled", "enable_source",
         "env_var", "env_raw", "env_recognised", "latch", "sample_every_n_applied",
         "max_writes_per_step", "min_interval_seconds", "max_checks_per_pass",
         "job_max_age_seconds", "max_in_flight", "geometry", "pool", "thread_alive",
-        "order_rule", "meaning_rule", "section", "writer", "note", "trimmed"}
+        "liveness", "order_rule", "meaning_rule", "section", "writer", "note",
+        "trimmed"}
     disk_gpu_write._state["group_bytes"] = list(GROUP_WIDTHS)
     disk_gpu_write._state["window_bytes"] = WIDTH
     disk_gpu_write._state["last_verdict"] = {
@@ -1398,3 +1427,219 @@ def test_the_real_apply_point_with_the_writer_off_writes_nothing(restore_stage,
     assert worker.journal.entries == []
     assert disk_gpu_write.view()["in_flight"] == {}
     assert disk_gpu_write._state["pool"] == {}
+
+
+# --- 10: THE COLD START, i.e. the writer starting ITSELF ----------------------
+@pytest.fixture
+def armed_cold(monkeypatch):
+    """Armed by the ENVIRONMENT and by nothing else: no patched `_ensure_thread`.
+
+    THE COLD-BOOT FIXTURE, and it exists because of the bug it regression-tests. Every
+    other test here reaches a write through the `armed` fixture, which replaces
+    `_ensure_thread` with `lambda: True` and then calls `fill_pool` by hand - it hands
+    over BOTH pieces production never provides. A suite built that way is green about a
+    module that cannot write a single byte in the field, which is worse than no suite:
+    it turns a total failure into a passing build. This fixture arms the module and
+    touches nothing else: the thread, if one is ever started, is the module's own real
+    thread, and the pinned rows, if any are ever allocated, are allocated by the
+    module's own refill.
+    """
+    monkeypatch.setenv(config.ENV_DISK_GPU_DIRECT_WRITE, "1")
+    disk_gpu_write._state["env_resolved"] = False
+    return True
+
+
+def test_a_cold_writer_starts_its_own_thread_and_then_actually_writes(
+        armed_cold, worker, tmp_path, monkeypatch):
+    """THE FIRST WRITE MUST BE REACHABLE FROM THE PRODUCTION ENTRY POINT ALONE.
+
+    THE BUG THIS IS THE REGRESSION TEST FOR (0.2.44): rows are allocated only inside a
+    refill, the refill runs only on this module's thread, and the thread was started
+    only AFTER `_take_rows` had already succeeded - so a cold pool refused the write,
+    the refusal returned before the thread start, and nothing could ever start the
+    thread.
+    No rows, no thread, no rows: the first write was unreachable, therefore EVERY write
+    was. In production that read `applies_seen=64 batches_seen=1 writes=0 checked=0
+    passes=0 pool_refills=0 buffers_allocated=0 no_pinned_buffer=1 errors=0`, with
+    `thread_started=0` the field that actually proves the thread never ran.
+
+    Nothing is pre-armed here: the sample rate and the interval floor are the PRODUCT
+    values (64 and 0.5 s), so this test drives 65+ applies exactly as a worker does and
+    asserts the four counters that mean the writer is alive, plus the one that means the
+    allocation stayed OFF the step thread.
+    """
+    alloc_threads: list = []
+    real_alloc = disk_gpu_write._allocate_row
+
+    def observe_alloc(region, elems):
+        """THE REAL ALLOCATION, with the thread it ran on recorded.
+
+        Wrapping the seam rather than replacing it keeps the production call chain
+        (`_refill_pools` -> `_allocate_row` -> the fake region's `new_empty`) and makes
+        "no allocation on the step thread" an assertion about a list of thread names
+        instead of about a comment.
+        """
+        alloc_threads.append(threading.current_thread().name)
+        return real_alloc(region, elems)
+
+    monkeypatch.setattr(disk_gpu_write, "_allocate_row", observe_alloc)
+    path = write_window(str(tmp_path / "kvslot-window"), b"\x5a" * 64)
+    seed_window(worker, path)
+
+    # THE FIRST ARMED APPLY, cold: the pool has never been filled, so this refuses - and
+    # the refusal must at least START the thread (the fix's safety net) rather than read
+    # like a hardware shortage.
+    first = disk_gpu_write.observe_apply(worker, armed_batch(path=path), {})
+    assert first["written"] == 0
+    assert first["reason"] == "no_pinned_buffer"
+    assert worker.gpu.allocated == 0, \
+        "the apply point allocated pinned memory to work around an empty pool"
+    assert counters()["thread_started"] == 1, \
+        "the cold refusal did not start the module's own thread: the first write is " \
+        "unreachable, which is the 0.2.43 bug"
+
+    deadline = time.monotonic() + 6.0
+    seen = {}
+    while time.monotonic() < deadline:
+        disk_gpu_write.observe_apply(worker, armed_batch(path=path), {})
+        seen = counters()
+        if (seen["writes"] and seen["pool_refills"] and seen["passes"]
+                and seen["readback_enqueued_before_original"]):
+            break
+        time.sleep(0.005)
+
+    assert seen["writes"] >= 1, \
+        f"the writer never wrote from the production entry point alone: {seen}"
+    assert seen["pool_refills"] >= 1, "the module's thread never refilled its pool"
+    assert seen["passes"] >= 1, "the module's thread never ran a pass over its records"
+    assert seen["readback_enqueued_before_original"] >= 1, \
+        "a write happened without its ordering witness"
+    assert seen["buffers_allocated"] >= 2
+    # THE STEP THREAD STILL NEVER ALLOCATES: the fix must not "solve" the cold pool by
+    # page-locking memory inside `start_load_kv`, which is a `cudaHostAlloc` on the step
+    # thread and exactly the stall this module exists not to cause.
+    assert alloc_threads, "the pool filled without a single allocation"
+    assert "MainThread" not in alloc_threads, \
+        f"a pinned row was allocated on the step thread: {set(alloc_threads)}"
+    assert set(alloc_threads) == {"kvtier-disk-gpu-write"}, set(alloc_threads)
+
+
+def test_registering_the_contribution_while_armed_starts_the_writer_and_nothing_else(
+        worker, monkeypatch):
+    """FIX (b): the thread exists BEFORE the module ever asks for a row.
+
+    The cold start had two ends and this one is not the apply point: an armed worker
+    should have its writer thread - and therefore its first chance at a warm pool - from
+    the moment the plugin is installed, not from the moment a restore is refused. What
+    this test ALSO pins is the half that makes starting at install legal at all: a
+    thread born before any worker exists allocates NOTHING, reads no geometry, refills
+    nothing
+    and counts nothing, because the refill walks `_resolve_worker()` and only the apply
+    point ever registers a worker.
+    """
+    # OFF FIRST, because "arming starts a thread" only means something against "off
+    # starts nothing": a thread in a process that was told to do nothing is a thread the
+    # operator never asked for.
+    assert disk_gpu_write.register_contribution()["registered"] is True
+    assert counters()["thread_started"] == 0
+    assert disk_gpu_write.section()["thread_alive"] is False
+    assert worker.gpu.allocated == 0
+
+    monkeypatch.setenv(config.ENV_DISK_GPU_DIRECT_WRITE, "1")
+    disk_gpu_write._state["env_resolved"] = False
+    assert disk_gpu_write.register_contribution()["registered"] is True
+    assert counters()["thread_started"] == 1, \
+        "an armed registration started no writer: that is the 0.2.43 cold start"
+    assert disk_gpu_write.section()["thread_alive"] is True
+    # ... and the thread that just started has done NOTHING heavy: no worker yet, so no
+    # row, no refill, no CUDA, no counter beyond `thread_started` itself.
+    assert counters()["buffers_allocated"] == 0
+    assert counters()["pool_refills"] == 0
+    assert worker.gpu.allocated == 0
+    assert disk_gpu_write.pool_view()["pinned_bytes"] == 0
+    assert disk_gpu_write.section()["liveness"]["state"] == (
+        disk_gpu_write.LIVENESS_NO_APPLY)
+
+
+def test_a_cold_pool_and_a_drained_pool_are_two_different_readings(armed, worker,
+                                                                  tmp_path):
+    """THE TWO FACTS THAT USED TO SHARE THE NAME `no_pinned_buffer`.
+
+    "The witness thread has not filled its pool yet" and "the pool has rows and none is
+    free" look identical in a rank file and mean opposite things to a reader: the first
+    resolves itself on the thread's next pass, the second means rows are held by records
+    whose load event has not passed, or have leaked, which never resolves. They are now
+    counted apart (`pool_never_filled` rides along with the cold case and NEVER with the
+    drained one), named apart in the refusal sentence, and said apart in the returned
+    `cause`. The third member of the family - the in-flight cap - was already separable
+    through `in_flight_dropped`.
+    """
+    path = write_window(str(tmp_path / "kvslot-window"), b"\x5a" * 8)
+    seed_window(worker, path)
+    worker._load_hwm = -1            # rows never come back: the drained case below
+
+    # THE COLD ONE: no row has ever been allocated in this process.
+    disk_gpu_write._state["last_write_mono"] = None
+    cold = disk_gpu_write.observe_apply(worker, armed_batch(path=path), {})
+    assert cold["reason"] == "no_pinned_buffer"
+    assert cold["cause"] == "pool_never_filled"
+    assert counters()["no_pinned_buffer"] == 1
+    assert counters()["pool_never_filled"] == 1
+    assert any(row.startswith("no_pinned_buffer_cold_pool:")
+               for row in disk_gpu_write.section()["reasons"]), \
+        disk_gpu_write.section()["reasons"]
+
+    # THE DRAINED ONE: the pool filled, and a record holds every row it has.
+    assert fill_pool(worker) == 2
+    assert one_write(worker, path=path)["written"] == 1
+    drained = one_write(worker, path=path)
+    assert drained["reason"] == "no_pinned_buffer"
+    assert drained["cause"] == "pool_drained"
+    assert counters()["no_pinned_buffer"] == 2
+    assert counters()["pool_never_filled"] == 1, \
+        "a drained pool counted as a cold one: they are different operational facts"
+    assert not any(row.startswith("no_pinned_buffer_cold_pool:")
+                   and "all held by records" in row
+                   for row in disk_gpu_write.section()["reasons"])
+
+
+def test_the_section_says_out_loud_which_state_the_writer_is_in(worker, tmp_path,
+                                                                monkeypatch):
+    """`liveness`: the section must answer "is this witness actually alive?".
+
+    0.2.43's rank file said `writes=0` next to `applies_seen=64` and left the reading to
+    whoever found it. Four states, one field, and THE SAME KEY SET IN ALL FOUR - a
+    reader who diffs two rank files must be able to tell "the writer died" from "this
+    boot has
+    no GPU" by reading a value, not by noticing that a key is missing.
+    """
+    rows = [disk_gpu_write.section()["liveness"]]
+    assert rows[0]["state"] == disk_gpu_write.LIVENESS_OFF, rows[0]
+
+    monkeypatch.setenv(config.ENV_DISK_GPU_DIRECT_WRITE, "1")
+    disk_gpu_write._state["env_resolved"] = False
+    rows.append(disk_gpu_write.section()["liveness"])
+    assert rows[1]["state"] == disk_gpu_write.LIVENESS_NO_APPLY, rows[1]
+
+    # ARMED, AN APPLY POINT, AND NOT ONE WRITE: the state production was in.
+    disk_gpu_write.observe_apply(worker, armed_batch(path="/tmp/kvslot-never"), {})
+    dead = disk_gpu_write.section()["liveness"]
+    rows.append(dead)
+    assert dead["state"] == disk_gpu_write.LIVENESS_NEVER_WROTE, dead
+    assert dead["cause"] == "pool_never_filled", dead
+    for fragment in ("NEVER WROTE", "1 applied entr", "thread started",
+                     "pool refills", "free rows", "cause: pool_never_filled"):
+        assert fragment in dead["verdict"], dead["verdict"]
+
+    # AND THE ALIVE ONE, for the same key set.
+    path = write_window(str(tmp_path / "kvslot-window"), b"\x5a" * 8)
+    seed_window(worker, path)
+    monkeypatch.setattr(disk_gpu_write, "_ensure_thread", lambda: True)
+    monkeypatch.setattr(disk_gpu_write, "SAMPLE_EVERY_N_APPLIED", 1)
+    assert fill_pool(worker) == 2
+    assert one_write(worker, path=path)["written"] == 1
+    rows.append(disk_gpu_write.section()["liveness"])
+    assert rows[-1]["state"] == disk_gpu_write.LIVENESS_WRITING, rows[-1]
+    for row in rows:
+        assert set(row) == {"state", "verdict", "thread_running", "free_rows",
+                            "cause"}, row
