@@ -3424,7 +3424,7 @@ def _walk_store(root, *, max_files=None, max_shard_dirs=None,
 
 
 def request_spill(caches=None, slot=None, key=None, *, worker=None,
-                  fingerprint=None, resolver=None) -> dict:
+                  fingerprint=None, resolver=None, shadow=None) -> dict:
     """THE entry point the store-completion hook calls. Cheap, bounded, never blocks.
 
     `key` is the 16-hex-char, group-qualified block hash for this slot, or None;
@@ -3439,6 +3439,13 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
     the engine thread pays a dict lookup, an arm check and one `put_nowait`. A full
     queue is a DROP with a counter - the queue never grows, because an unbounded
     queue on a box that is already slow is a memory leak with a nicer name.
+
+    `shadow` is the optional hand-off to `disk_shadow`, the read-only witness that
+    compares a completed store's GPU bytes against these same bytes. It is a dict, it
+    is filled with `blob` by reference below, and NOTHING else in this function reads
+    or writes it: no import of that module, no call into it, no behavior of this
+    function depends on it. A caller that passes nothing (every caller today except the
+    store-completion hook) changes nothing about this call.
     """
     _state["requests"] += 1
     try:
@@ -3522,6 +3529,17 @@ def request_spill(caches=None, slot=None, key=None, *, worker=None,
         job = {"blob": read["bytes"], "slot": int(slot), "key": resolved,
                "fingerprint": adopted, "bytes": width,
                "queued_ts": round(time.time(), 6)}
+        # THE SHADOW WITNESS GETS THE SAME BYTES, BY REFERENCE. `shadow` is a plan
+        # `disk_shadow.snapshot()` decided and `disk_store` handed down: filling this
+        # one key is the ENTIRE interface between the two modules - no import, no
+        # call, no second copy of 11 MB. It happens after the read and before the
+        # queue put, so the comparison runs against what this call decided to write,
+        # at the earliest moment those bytes exist; a job that is refused above leaves
+        # the plan's `blob` None, which `disk_shadow.settle` counts as "nothing to
+        # compare" rather than as a mismatch. Ignored entirely when no shadow is
+        # watching.
+        if isinstance(shadow, dict):
+            shadow["blob"] = read["bytes"]
         pending = _get_queue()
         if not _ensure_thread():
             _state["refused"]["write_failed"] += 1

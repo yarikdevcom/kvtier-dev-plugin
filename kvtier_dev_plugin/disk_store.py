@@ -184,7 +184,7 @@ import os
 import sys
 import time
 
-from . import config, disk_index, disk_layout, disk_spill, snapshot
+from . import config, disk_index, disk_layout, disk_shadow, disk_spill, snapshot
 
 # The engine's logging posture is why this module logs at WARNING, not INFO: a
 # plugin logger is not one of the `vllm.*` loggers the engine configures, so an
@@ -292,8 +292,8 @@ MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
-             "authority", "failures")
-MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority")
+             "authority", "failures", "shadow")
+MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -1172,6 +1172,12 @@ def observe_bind(handler, metadata) -> dict:
         # wrong-bytes-under-the-right-name failure this module exists to prevent.
         pairs = tuple(zip(resolved["slots"], resolved["keys"], strict=True))
         named = tuple(pair for pair in pairs if pair[1] is not None)
+        # THE SHADOW WITNESS SEES THE SAME BIND. Contained and default-off: it keeps
+        # the GPU block ids v0.2.35 names next to these CPU slots so it can read the
+        # GPU's own bytes at completion and ask whether the arena captured the right
+        # ones (`disk_shadow`). It cannot change what is remembered here: the store's
+        # own pairing is computed above and returned below, untouched.
+        disk_shadow.observe_bind(handler, metadata)
         return _remember_event(event, named, digest, resolved["count"])
     except Exception as exc:  # noqa: BLE001 - a diagnostic never breaks a bind
         _state["fallbacks"] = int(_state["fallbacks"]) + 1
@@ -1253,7 +1259,18 @@ def on_store_completed(handler, before) -> dict:
                 _state["slots_offered"] = int(_state["slots_offered"]) + 1
                 handed += 1
                 spilled_here += 1
-                answer = disk_spill.request_spill(worker=handler, slot=slot, key=key)
+                # THE SHADOW'S COMPARISON WINDOW. `snapshot` decides (default OFF, then
+                # sampled and bounded) whether THIS store is compared, and returns a
+                # plan `request_spill` fills with the bytes it captured - so the
+                # comparison runs against the blob the spill decided to write, on this
+                # thread, at the earliest moment it exists. `settle` never raises and
+                # never changes `answer`: a spill's fate is decided entirely by the
+                # spill path below.
+                shadow = disk_shadow.snapshot(handler=handler, event=event, slot=slot,
+                                              key=key)
+                answer = disk_spill.request_spill(worker=handler, slot=slot, key=key,
+                                                  shadow=shadow)
+                disk_shadow.settle(shadow, answer)
                 if answer.get("ok"):
                     _state["spill_queued"] = int(_state["spill_queued"]) + 1
                     report["queued"] = int(report["queued"]) + 1
@@ -3113,10 +3130,47 @@ def _op_failures(body: dict) -> dict:
     return disk_restore.load_failure_report(limit=body.get("limit"))
 
 
+def _op_shadow(body: dict) -> dict:
+    """The SHADOW VERIFIER: read its counters, or arm it in this process.
+
+    `{"op":"shadow"}` alone READS (the counters, the enablement, the region list and
+    widths, the limits in force). `{"op":"shadow","enabled":true|false}` latches the
+    switch - the same shape as the two boot switches above: a key that is PRESENT is an
+    instruction and a key that is absent is a question, and a value that is not a real
+    boolean is refused rather than guessed at.
+
+    IT IS LISTED AS MUTATING even though it writes nothing, because it CHANGES WHAT THE
+    PROCESS DOES (a worker that was comparing nothing starts reading GPU blocks off the
+    device). A browser that can issue a GET must not be able to do that, exactly as
+    with `offers` and `authority`.
+
+    THE SCOPE IS SAID IN THE ANSWER. This module writes no control file - it opens no
+    file handle for writing anywhere, which is its whole safety story - so a POST that
+    arrives at the EngineCore latches the EngineCore. The process that spills, and so
+    the process that can compare a GPU block with a blob, is a WORKER, and a worker is
+    armed with `VLLM_E2_TIER_DISK_SHADOW=1` in the engine's environment. `scope` says
+    that, instead of letting an operator believe he armed the worker.
+    """
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        value = body["enabled"]
+        if not isinstance(value, bool):
+            return {"ok": False,
+                    "reason": f"enabled must be a JSON boolean, got {value!r}: "
+                              "nothing changed",
+                    "shadow": disk_shadow.status()}
+        applied = disk_shadow.set_enabled(value)
+        applied["changed"] = True
+        return {"ok": True, "reason": None, "shadow": applied,
+                "note": ("the latch is this process only; the worker that spills is "
+                         f"armed with {config.ENV_DISK_SHADOW}=1")}
+    return {"ok": True, "reason": None, "shadow": disk_shadow.status()}
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
              "offers": _op_offers, "authority": _op_authority,
-             "failures": _op_failures}
+             "failures": _op_failures, "shadow": _op_shadow}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring
@@ -3619,6 +3673,10 @@ def install() -> dict:
         # `worker_diag` is the only writer of the rank file, so the verdict goes to it
         # rather than becoming a fourth file or a second writer.
         register_contribution()
+        # THE SHADOW'S VERDICT TRAVELS WITH THE SPILL'S. Both are the worker's own
+        # answer about the same spill path, both are relevant only in a process that
+        # has this hook, and `worker_diag` remains the only writer of the rank file.
+        disk_shadow.register_contribution()
         report.update({"installed": True, "class": cls.__name__,
                        "reason": (f"{cls.__name__}.{METHOD_BIND_METADATA} and "
                                   f"{cls.__name__}.{METHOD_GET_FINISHED} now spill "

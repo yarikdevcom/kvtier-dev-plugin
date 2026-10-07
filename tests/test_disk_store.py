@@ -1898,7 +1898,14 @@ def test_install_offers_the_section_only_where_a_worker_class_exists(tier,
                                                                     worker_class):
     """An EngineCore or an API server has no spill hook and nothing to report, so it
     registers NOTHING and the rank file carries no `disk` key at all - rather than an
-    empty object claiming a facility this process does not have."""
+    empty object claiming a facility this process does not have.
+
+    A worker registers TWO sections since 0.2.36: the spill tier's own verdict and the
+    shadow verifier's. The claim this test holds - nothing is registered where there is
+    no worker class - is unchanged by that; what changed is the list a worker answers
+    with. Both are registered from `install()` and nowhere else, which is the property
+    being pinned.
+    """
     saved = sys.modules.pop(disk_store.TARGET_MODULE, None)
     try:
         assert disk_store.install()["installed"] is False
@@ -1907,9 +1914,10 @@ def test_install_offers_the_section_only_where_a_worker_class_exists(tier,
         if saved is not None:
             sys.modules[disk_store.TARGET_MODULE] = saved
     assert disk_store.install()["installed"] is True
-    assert worker_diag.contributions()["registered"] == ["disk"]
+    assert worker_diag.contributions()["registered"] == ["disk", "disk_shadow"]
     assert worker_diag.contributions()["owners"] == {
-        "disk": "kvtier-dev-plugin/disk-store"}
+        "disk": "kvtier-dev-plugin/disk-store",
+        "disk_shadow": "kvtier-dev-plugin/disk-shadow-1 state, never a window"}
 
 
 def test_the_rank_file_carries_the_disks_own_verdict(tier, worker_class,
@@ -1940,7 +1948,10 @@ def test_the_rank_file_carries_the_disks_own_verdict(tier, worker_class,
     assert disk_section["root"] == str(tier)
     assert disk_section["files_written"] == 0
     assert disk_section["note"].startswith("THE DISK TIER'S OWN VERDICT")
-    assert document["writer"]["contributions"]["written"] == ["disk"]
+    # TWO sections since 0.2.36 (the spill tier's verdict and the shadow verifier's);
+    # the claim pinned here is that the second one arrives THROUGH `worker_diag` too,
+    # and that the required fields above it are still intact.
+    assert document["writer"]["contributions"]["written"] == ["disk", "disk_shadow"]
 
 
 def test_the_boot_line_states_the_verdict_and_is_logged_once(tier, worker_class,

@@ -410,7 +410,7 @@ ARG_SPECS: dict[str, dict] = {
     config.ROUTE_DISK: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm", "spill-one",
                                           "ls", "contains", "offers", "authority",
-                                          "failures")},
+                                          "failures", "shadow")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         "fingerprint": {"kind": "str", "max_chars": 32},
@@ -422,7 +422,8 @@ ARG_SPECS: dict[str, dict] = {
                         # key any more (0.2.31): the per-request opt-in marker it
                         # governed is gone, so a caller still sending it gets
                         # "unsupported request keys" instead of a posture it did not
-                        # ask for.
+                        # ask for. `op=shadow` (0.2.36) uses the same key for the
+                        # read-only shadow verifier's in-process latch.
                         "enabled": {"kind": "bool"},
                         # `ls` has always accepted a shard filter engine-side
                         # (`disk_store._op_ls`); it was unreachable because it was not

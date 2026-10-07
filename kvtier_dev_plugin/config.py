@@ -357,6 +357,19 @@ ENV_DISK_CEILING_BUDGET_SECONDS = "VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS"
 # twice and the pass's accounting does not depend on this number.
 ENV_DISK_EVICT_THREADS = "VLLM_E2_TIER_DISK_EVICT_THREADS"
 
+# THE SHADOW VERIFIER (`disk_shadow.py`, 0.2.36). The read-only witness that compares
+# a completed store's GPU bytes against the bytes the spill path captured for the same
+# block, and publishes the disagreement - with staleness classified, never counted as
+# corruption. DEFAULT OFF, and it stays off unless the operator names it: this reads
+# REAL KV BYTES off the device on the engine's step thread (bounded to
+# `MAX_BLOCKS_PER_STEP` blocks per bind window), and "a launcher script must not be
+# able to turn a facility that reads real KV bytes on" is this package's rule for
+# `guard_mode` and `blockdump` - so the default here is off in the same way theirs is.
+# The live lever is `POST /plugins/kvtier/disk {"op":"shadow"}`, which arms the process
+# that answers (it writes no control file: this module opens no file handle for
+# writing). It never changes a spill or a restore decision.
+ENV_DISK_SHADOW = "VLLM_E2_TIER_DISK_SHADOW"
+
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
 # env-only on purpose: an HTTP argument naming a path the engine appends to would
@@ -531,6 +544,39 @@ def disk_boot_enable() -> dict:
     return {"enabled": True, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_ON_WORDS,
             "env_var": ENV_DISK_BOOT_ENABLE}
+
+
+def disk_shadow_enable() -> dict:
+    """The shadow verifier's boot posture, read by `disk_shadow.py`. The MIRROR of
+    `disk_boot_enable()` in every respect except the default, and the default is the
+    whole point:
+
+      * UNSET or empty -> `{"enabled": False, "source": "default"}`. OFF. The spill
+        tier defaults ON because serving is its job; the shadow defaults OFF because it
+        reads REAL KV BYTES off the device on the engine's step thread, and a facility
+        that does that is opted into, never defaulted into (`guard_mode`, `blockdump`).
+      * `1`/`true`/`yes`/`on` -> enabled.
+      * a disable word -> disabled, the same answer as the default, said with
+        `source: "env"` so a rank file can tell an operator's no from nobody's answer.
+      * anything else -> disabled AND `recognised: False`. The safe direction is the one
+        that does not start reading device memory on a typo, and the unrecognised value
+        is reported verbatim in `raw` rather than guessed at.
+
+    It reads `os.environ` and nothing else: no persisted latch, no arm file, no
+    decision from an earlier boot. The live lever is the POST op, and the two are
+    reported separately by `disk_shadow.enable_state()`.
+    """
+    raw = os.environ.get(ENV_DISK_SHADOW, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_SHADOW}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_SHADOW}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_SHADOW}
 
 
 def token_configured() -> bool:

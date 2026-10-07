@@ -96,6 +96,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS` | **how many seconds one capacity-enforcement pass may spend (0.2.29). Unset = `disk_spill.CEILING_PASS_BUDGET_SECONDS` = 1.5 s.** The pass runs on the spill WRITER thread - the only thing draining the 256-job / 256 MiB spill queue - and before this release its worst case (100,000 directory entries read twice, 20,000 `stat`s, up to 4,096 unlinks) was bounded in files but not in TIME, so a full store could stall the queue and DROP spills at the moment the disk was fullest. When the budget expires the pass stops early and says so (`spill.ceiling_measurement.deadline_hit`, `plan_truncated`), and the next committed spill continues - a partial pass is this tier's normal shape, not an error. **`0` is refused** (a pass that does nothing reads as a configured ceiling that is not one) and a value that will not parse means the shipped default, reported in `env_problems`. See *The eviction clock is a touch clock, and nobody's neighbour is capacity*. |
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
+| `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
@@ -219,7 +220,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` (see `disk_store.py`). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -2621,6 +2622,87 @@ and a removal under a known peer's digest being counted, not buried), plus the r
 doctrine tests in `tests/test_disk_layout.py` and
 `tests/test_touch_promotion_and_peer_eviction.py`.
 
+## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
+
+The spill path captures a slot by reading the **arena** - the worker's
+`cpu_kv_caches`, the copy vLLM itself makes every step - and that is the only copy of
+a block's bytes the tier ever writes. If that read captured the wrong bytes, or
+captured them in an order the restore side does not reassemble, the tier would serve
+silently wrong KV, and **no counter that exists today would move**: a byte-level
+mismatch is invisible to a hit rate. The shadow verifier is the witness for exactly
+that.
+
+It is a measurement, not a gate. Default **OFF**, read-only, fail-open: it never
+changes a spill or a restore decision, never refuses a write, never opens a file
+handle for writing, and touches the GPU only to READ one block of it. At store **bind**
+it retains the GPU block ids the engine named next to the CPU slots (ints only - never
+a tensor, never the metadata object). At store **completion**, for a sampled subset, it
+narrows that one block on the device, copies it to the host on the current stream, and
+compares the bytes against the blob the spill path captured for the same block.
+
+```bash
+# the worker's switch is the environment, because the worker is another process:
+#   VLLM_E2_TIER_DISK_SHADOW=1        (read once at first use; restart to change it)
+# this op reads the counters, and arms the process that ANSWERS (it writes no file):
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"shadow"}' $B/disk
+```
+
+**A mismatch is a QUESTION, and the categories say which one.** A completed store's GPU
+block is the engine's to reuse the moment the store finished, so the shadow re-reads the
+block once and asks whether the GPU's own bytes moved between the two reads:
+
+| counter | what it means | what you do |
+|---|---|---|
+| `equal` | the GPU and the arena agree | nothing; this is the number growing |
+| `mismatch_gpu_changed_on_recheck` | the GPU rewrote the block between the reads | nothing: expected block reuse |
+| `mismatch_stable` | the GPU held still and still differs | **this is the one** - a layout/ordering question |
+| `mismatch_unrechecked` | the re-read could not run | look at `reasons` |
+| `mismatch_rebound_later` | a block that mismatched was named again by a later bind | evidence of reuse, not proof of timing |
+| `width_mismatch` | the GPU's region widths disagree with the arena's | a layout answer, never counted as staleness |
+| `no_gpu_block` / `no_gpu_caches` / `no_blob` | no GPU id, no GPU tensors, or the spill refused | context for the sample rate, not a fault |
+
+The last three are why there is no single "corruption" counter: "the two paths
+disagreed", "there was nothing to compare" and "the engine reused the block" are three
+different facts, and merging them into one integer would make the number useless on a
+busy boot.
+
+**What it costs, and where the bound is.** The copy runs on the engine's step thread, in
+the same tick `MAX_SLOTS_PER_TICK` bounds. `MAX_BLOCKS_PER_STEP` (2) is the hard cap per
+bind window - exceeding it increments `throttled_step` and does no work - with
+`MIN_INTERVAL_SECONDS` (0.5, counted as `throttled_interval`) and 1-store-in-32 sampling
+on top, so the cost is a constant rather than a function of the store rate. One block
+per region is `narrow`ed BEFORE the copy, so it never moves a whole KV cache across the
+link.
+
+**Two invariants it exists to test.** The bytes of a slot are the sum over the region
+tensors and the order of that sum is `sorted(name)`, never dict-insertion order (0.2.8
+shipped that bug) - so the shadow does not re-implement the ordering: it hands the
+copied one-block regions to `disk_spill.read_slot_bytes`, THE SPILL PATH'S OWN READER,
+and a mismatch therefore cannot be "two readers summed differently". And because
+everything downstream is `ctypes.string_at(data_ptr())`, a device pointer read as a host
+address is a SIGSEGV rather than an exception, so the copy's result is checked against
+its OWN `device` field before a byte is read (`_host_landed`).
+
+The verdict goes into the worker's rank file through `worker_diag` as the `disk_shadow`
+section - a guest section, never a second writer, never a second file - and its key set
+is identical whether or not this process can read a GPU at all, so a reader diffing two
+rank files can tell "moved" from "gone". `tests/test_disk_shadow.py` is the executable
+spec; the device->host copy is the single expression it replaces, because that
+environment has no CUDA device.
+
+**Reading a mismatch in the file.** `last_mismatch` is a SHAPE, never bytes:
+`category`, `slot`, `gpu_block`, `bytes`, `first_difference` - the byte offset where the
+two blobs first differ, or `null` when they agree for the whole `scanned_bytes` window
+(`MAX_DIFF_SCAN_BYTES`, 256 KB, is the scan cap, so "they differ past 256 KB" is an
+honest answer and a 11.4 MB Python scan on the step thread is not) - and the two recheck
+verdicts. It is never a trim target and never gains a key. `trimmed` names what the
+section shed to fit its own `MAX_SECTION_BYTES` (3072, tighter than the seam's 4096, so
+the writer never has to refuse it) and `section_trimmed` counts how many times that
+changed shape; the counters are never shed, so a thin section is still a complete set of
+numbers. If a section is over budget after every shed, the writer refuses it and the
+worker log says `section STILL over its byte budget` - a missing `disk_shadow` key with
+that line beside it is a size problem, not a missing facility.
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 The offload tier is steered by wrapping one method of the scheduler-side
@@ -3723,8 +3805,14 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2234 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
-count in this README is a snapshot - trust `pytest --collect-only`). The per-offer
+2303 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+count in this README is a snapshot - trust `pytest --collect-only`). The shadow
+verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
+the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
+block is classified as staleness and a stable one as the layout candidate, that every
+fault (no GPU caches, a device error, a width disagreement, a refused spill) is a
+counter and never an exception on the step thread, and that the spill lands the same
+bytes with the witness on as with it off. The per-offer
 bounds after the fixed 32,000-token cap was deleted are in
 `tests/test_disk_offer_bounds.py`, with the affordability ladder that replaces the cap
 as the guard against un-placeable offers. The 0.2.30

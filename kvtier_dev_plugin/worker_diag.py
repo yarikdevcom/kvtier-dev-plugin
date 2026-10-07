@@ -183,10 +183,11 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 #
 # THREE LIMITS, because a contribution is a guest in someone else's file:
 #   * `CONTRIBUTION_SECTIONS` is a HARD allow-list of the top-level keys a
-#     contributor may add. It is the whole shape of the trust: `"disk"` and
-#     `"disk_restore"` are listed, `"arena"`/`"counters"`/`"version"` are not, so a
-#     contributor cannot overwrite a field the reader REQUIRES. An unknown section
-#     name is refused at register time, not at write time.
+#     contributor may add. It is the whole shape of the trust: `"disk"`,
+#     `"disk_restore"` and `"disk_shadow"` are listed, `"arena"`/`"counters"`/
+#     `"version"` are not, so a contributor cannot overwrite a field the reader
+#     REQUIRES. An unknown section name is refused at register time, not at write
+#     time.
 #   * `MAX_CONTRIBUTIONS` bounds how many sections exist at all.
 #   * `MAX_CONTRIBUTION_BYTES` bounds ONE section, serialized; a section over it is
 #     REFUSED (and counted), never truncated - half a section reads as a fact with
@@ -199,7 +200,7 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 # `rank`/filename mismatch - so the byte ceiling and the required-field rule are
 # enforced here, and `epoch`/`version`/`writer` stay exactly as they were:
 # a contribution never touches them.
-CONTRIBUTION_SECTIONS = ("disk", "disk_restore")
+CONTRIBUTION_SECTIONS = ("disk", "disk_restore", "disk_shadow")
 MAX_CONTRIBUTIONS = 4
 MAX_CONTRIBUTION_BYTES = 4096
 MAX_CONTRIBUTION_NOTES = 4

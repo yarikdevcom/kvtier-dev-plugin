@@ -4,6 +4,7 @@ the real attribute names (see test_snapshot.py)."""
 
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     config,
     disk_boot,
     disk_index,
+    disk_shadow,
     disk_spill,
     disk_store,
     evictions,
@@ -65,7 +67,46 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # off posture while claiming to test the shipped one - and a suite that
             # inherited nothing would be right. Deleting it makes "unset = ON" the fact
             # every test measures, and the tests that want the other value name it.
-            config.ENV_DISK_BOOT_ENABLE)
+            config.ENV_DISK_BOOT_ENABLE,
+            # THE SHADOW VERIFIER (0.2.36). Listed because its DEFAULT IS OFF and the
+            # OFF state is a claim every test of this release makes: a suite that
+            # inherited `VLLM_E2_TIER_DISK_SHADOW=1` from a developer's shell would be
+            # running a device read on the step thread inside tests that assert no GPU
+            # read is ever attempted. Deleting it makes "unset = off" the fact each
+            # test measures, and the tests that want it on name it.
+            config.ENV_DISK_SHADOW)
+
+
+def _isolate(state: dict) -> dict:
+    """A snapshot the test cannot dirty through the original it was taken from.
+
+    `dict(_state)` is a SHALLOW copy, so every nested container in a module's state is
+    the SAME OBJECT the test mutates: `disk_spill._state["digest_groups"][key][g] += 1`
+    writes straight through the snapshot, and the teardown `update(saved)` then hands
+    the NEXT test the object the previous one dirtied. Measured, an in-place write
+    survives that restore in every state dict that owns a nested dict -
+    `disk_shadow._state["counters"]`, `disk_spill._state["refused"]`,
+    `disk_store._state["refused"]` and `disk_index._state["dropped"]` - and on
+    `tests/test_disk_shadow.py` the spill path's `digest_groups` map grows by one event
+    per test and is resurrected after every teardown. Nothing in the suite is
+    order-dependent today only because each module's own `reset_state_for_tests()`
+    happens to rebuild every nested dict it knows about - so a reset that forgets one
+    key (or a module added later, like `disk_shadow` was) is a silent leak, and a leak
+    here is invisible until the file order changes. Copying the snapshot deeply makes
+    the isolation a property of THIS fixture instead of a property of every module's
+    reset list. A value that cannot be copied (a lock, a thread, a module) is one none
+    of these states mutates in place, so it is kept by reference rather than replaced
+    by something that could never be put back. (`disk_store._logged_lines` is a third
+    shape: a module-level list no snapshot covers at all, which is why
+    `disk_store.reset_state_for_tests()` clears it itself.)
+    """
+    out: dict = {}
+    for key, value in state.items():
+        try:
+            out[key] = copy.deepcopy(value)
+        except Exception:  # noqa: BLE001 - un-copyable: keep the reference itself
+            out[key] = value
+    return out
 
 
 @pytest.fixture(autouse=True)
@@ -84,7 +125,7 @@ def enabled(monkeypatch):
 @pytest.fixture
 def reset_snapshot_state():
     """Containment counters are process-wide; keep tests from stacking on them."""
-    saved = dict(snapshot._state)
+    saved = _isolate(snapshot._state)
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0, "epoch": None})
     yield snapshot._state
     snapshot._state.update(saved)
@@ -107,24 +148,29 @@ def reset_dev_state():
     by name to read the live state dicts it yields; requesting it does not run it
     twice, because pytest instantiates one fixture per test.
     """
-    saved = {"snapshot": dict(snapshot._state),
-             "trace": dict(trace_ring._state),
-             "step": dict(step_trace._state),
-             "guard": dict(guard_mode._state),
-             "worker": dict(worker_diag._state),
-             "worker_contributions": dict(worker_diag._contrib_state),
-             "worker_contributors": dict(worker_diag._contributors),
-             "blockdump": dict(blockdump._state),
-             "evictions": dict(evictions._state),
-             "disk_spill": dict(disk_spill._state),
-             "disk_index": dict(disk_index._state),
-             "disk_store": dict(disk_store._state),
+    saved = {"snapshot": _isolate(snapshot._state),
+             "trace": _isolate(trace_ring._state),
+             "step": _isolate(step_trace._state),
+             "guard": _isolate(guard_mode._state),
+             "worker": _isolate(worker_diag._state),
+             "worker_contributions": _isolate(worker_diag._contrib_state),
+             "worker_contributors": _isolate(worker_diag._contributors),
+             "blockdump": _isolate(blockdump._state),
+             "evictions": _isolate(evictions._state),
+             "disk_spill": _isolate(disk_spill._state),
+             "disk_index": _isolate(disk_index._state),
+             "disk_store": _isolate(disk_store._state),
              # THE DISK TIER'S BOOT DEFAULT (0.2.33): an honoured boot default holds an
              # arm, a serve posture and the operator's disarm latch, all process-wide.
              # Without this a test that ran the real boot with a disk root would hand
              # the next file a latch it never set - or an arm it never armed.
-             "disk_boot": dict(disk_boot._state),
-             "lookups": dict(lookup_ledger._state)}
+             "disk_boot": _isolate(disk_boot._state),
+             # THE SHADOW VERIFIER (0.2.36): an enablement latch, a retention map of GPU
+             # block ids and the comparison counters are all process-wide. A test that
+             # armed the shadow must not hand it to the next test, which would then
+             # observe a device read it never asked for.
+             "disk_shadow": _isolate(disk_shadow._state),
+             "lookups": _isolate(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
     guard_mode.reset_state_for_tests()
@@ -154,6 +200,9 @@ def reset_dev_state():
     # operator's disarm latch is standing - both are boot-scoped facts a test must never
     # inherit from another test. Reset before the yield, like every sibling here.
     disk_boot.reset_state_for_tests()
+    # THE SHADOW VERIFIER. Its latch is an enablement, and an enablement a test set is
+    # exactly the state this fixture exists to keep from travelling.
+    disk_shadow.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
@@ -163,6 +212,7 @@ def reset_dev_state():
            "disk_index": disk_index._state,
            "disk_store": disk_store._state,
            "disk_boot": disk_boot._state,
+           "disk_shadow": disk_shadow._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -180,6 +230,7 @@ def reset_dev_state():
                        ("disk_index", disk_index._state),
                        ("disk_store", disk_store._state),
                        ("disk_boot", disk_boot._state),
+                       ("disk_shadow", disk_shadow._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])
