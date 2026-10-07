@@ -99,7 +99,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT` | **where those shadow files go.** Unset = `<the live store root>/../gpu-shadow`, a sibling of the store (so one `cmp -r` compares the two trees and the store's own sweep never walks the evidence). Read once per process; validated like any other root, and subject to the same refusal. |
-| `VLLM_E2_TIER_DISK_RESTORE_VERIFY` | **the RESTORE-side byte verifier (0.2.39), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no spill file is opened and no GPU block is read by this module. `1`/`true`/`yes`/`on` = a sampled restored entry is compared byte-for-byte: the leading `W_g` bytes of the spill file against the leading `W_g` bytes of the GPU block the restore loaded it into, with the file width and the group width checked first and the tail (the other groups' stale bytes) never compared at all. A disagreement is re-read before it is reported, so `mismatch_stable` (a layout candidate) is separable from `mismatch_gpu_changed_on_recheck` (the engine moved). It is a WORKER feature, so this environment variable is the switch that arms a worker; `POST /disk {"op":"restore-verify"}` latches only the answering process and its answer says so. It never changes a restore decision, and the engine's step thread pays a counter and a dict of ints - the file read and the device copy happen on its own bounded thread. See *Do the RESTORED bytes match the file?*. |
+| `VLLM_E2_TIER_DISK_RESTORE_VERIFY` | **the RESTORE-side byte verifier (0.2.39), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no spill file is opened and no GPU block is read by this module. `1`/`true`/`yes`/`on` = a sampled restored entry is compared byte-for-byte: the leading `W_g` bytes of the spill file against the leading `W_g` bytes of the GPU block the restore loaded it into, with the file width and the group width checked first and the tail (the other groups' stale bytes) never compared at all. A disagreement is re-read before it is reported, so `mismatch_stable` (a layout candidate) is separable from `mismatch_gpu_changed_on_recheck` (the engine moved). Since **0.2.40** the same variable arms BOTH roles of the module: the worker's byte comparison above, and the scheduler-side **binding oracle** that re-derives an offered file's name from the engine's own `block_hashes` at the GPU block index the fork actually paired it with (`scheduler_*` counters; a one-slot shift and a group swap are both named findings there). One variable, because arming half a verifier would be the worst of both: it would publish numbers about a check that is not running. `POST /disk {"op":"restore-verify"}` latches only the answering process and its answer says so. It never changes a restore decision, and the engine's step thread pays a counter and a dict of ints - the file read and the device copy happen on its own bounded thread. See *Do the RESTORED bytes match the file?*. |
 | `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` | **how many CPU slots of the host-RAM arena's block pool an offer must NOT take (0.2.38). Unset = `disk_restore.CPU_SLOT_RESERVE` = 64, the value every release before 0.2.38 used.** An offer allocates its *destination* slots out of the same pool the RAM tier parks its own blocks in, and is clamped to `(free - reserve - boundary slots) // slots-per-span` spans - so on a shrunk arena the reserve is an offer-size lever, not a footnote: at the operator's 166 free slots per rank on the wide PP1 pair, reserve 64 leaves **98 spans (313,600 tokens)** and reserve 16 leaves **146**. `0` is **honoured** ("an offer may take the arena's last slot" - it leaves the RAM tier nothing to park, see the section). A non-integer or a negative falls back to 64 and logs once (`DISK[reserve] IGNORED`); there is deliberately **no ceiling**, because a reserve larger than the arena correctly declines every offer as `no_cpu_slots` instead of oversubscribing. The value in force, its origin (`env` / `default` / `ignored`) and the spans it leaves are published in `restore.limits`, `restore.offer_pool`, `last_offer_pool` and the boot line's `cpu_slot_reserve=64(default)`. See *Sizing the CPU-slot reserve an offer leaves alone*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
@@ -2825,7 +2825,7 @@ retention removed is counted as ours going away and never as the store's absence
 shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
 published key set does not change shape.
 
-## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39)
+## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39-0.2.40)
 
 The two modules above answer a WRITE question: after the arena spilled a block, does the
 GPU still hold those bytes, and can those bytes be written straight to NVMe? This module
@@ -2928,16 +2928,212 @@ query parameter on that route, so a `<img>` preload must not be able to arm it. 
 proxy host's reader requires inside its own byte ceiling). It publishes the whole counter set
 with a stable key set, the geometry it read off its own worker (`window_bytes`,
 `group_bytes`, the align group ids, and the note when a config has none), the pending queue,
-the last mismatch with its offset and its excluded tail, and the oracle's state. The verb,
-`status()` and the section are built by ONE builder, so a number cannot differ by door.
+the last mismatch with its offset and its excluded tail, and the oracle's state - and, since
+0.2.40, the SCHEDULER half beside it: the `scheduler_*` counters, `scheduler_jobs_now`,
+`scheduler_mismatch_samples`, `scheduler_oracle`, `roles` and `oracle_rule`. The rank FILE is
+written by workers, so the scheduler's numbers reach a reader through `/snapshot` and
+`/disk {"op":"restore-verify"}` in the EngineCore; the section is the same object either way.
+The verb, `status()` and the section are built by ONE builder, so a number cannot differ by
+door.
 
 **Two limits, stated where they cannot be missed.** The truncation shape is counted at BATCH
 granularity, so a batch containing two requests that both lost the same align entry counts
-once - under-counting, never inventing. And the binding oracle is unreachable in a worker
-process on this fork, so `oracle_checked` stays 0 in production while
+once - under-counting, never inventing. And the worker's binding oracle is unreachable in a
+worker process on this fork, so `oracle_checked` stays 0 in production while
 `oracle_unavailable` counts every verified entry: the recomputation is real code (tested
 against the same key helpers the offer path is tested against) waiting for a provider, not a
 stub.
+
+## THE OTHER HALF OF THE SAME MODULE: did we offer the RIGHT file? (0.2.40)
+
+Assertion 4 above - the binding oracle - is unreachable **in a worker**, and for 0.2.39
+that was the honest end of the story. It is not the end of the check. The pairing that a
+worker cannot see was made one process earlier, by the **scheduler**, and for one moment
+per step the scheduler holds both halves of it in its hands:
+
+```text
+sched/scheduler.py:1412-1425   builds KVConnectorBlockState for a step that has a connector
+sched/scheduler.py:1475        attaches it to SchedulerOutput
+sched/scheduler.py:1479        -> manager.build_connector_meta(scheduler_output)
+                               -> this plugin's wrapper -> disk_restore._build_load_paths
+sched/scheduler.py:1497        CLEARS the field - a worker can never see it
+```
+
+At that instant `_build_load_paths` knows, for one entry, **(a)** the file this module's own
+ledger named for the CPU slot - a name built by `make_block_hash_with_group_id` over
+`resolve_block_hashes(...)`, i.e. produced by the engine's own keying - and **(b)** the GPU
+block id the fork put beside that CPU slot in `load_gpu_blocks`, whose position in the
+request's own per-group table (`kv_connector_block_state.get_block_ids(rid)`,
+`output.py:208-221`) is the engine's **block index**. So 0.2.40 re-derives the name the
+engine would have used for *that index of that group* and compares it with the name in the
+file:
+
+```python
+view   = resolve_block_hashes(request.block_hashes,             # the engine's own helper
+                              manager.hash_block_size,
+                              manager.group_block_sizes[group])
+expect = make_block_hash_with_group_id(view[index], group)      # what the name MUST be
+key16(expect) == key16(the name we offered)                     # equal, or a finding
+```
+
+**Nothing in this module re-hashes or re-packs.** Both calls go through
+`disk_restore._key_helpers()`, the same resolver the OFFER path uses, so the code that wrote
+the name and the code that re-derives it cannot disagree about which bytes are the group.
+A plugin that invented its own derivation would eventually differ from the engine about
+exactly that, and that difference is a file read under the wrong name.
+
+**Both negative controls fail loudly, and the tests assert the classification.** A
+**one-slot shift** - the failure every list-vs-list check in this plugin is blind to,
+because a shift moves the index-aligned lists together and every count still agrees - is
+`scheduler_mismatch_neighbour_index`, and the sample carries the SIGNED offset (which way it
+moved is the diagnosis: a walk that names files off-by-one is not a walk that pairs them
+off-by-one). A **group swap** is `scheduler_mismatch_other_group`, in both of its shapes: a
+name whose own 4-byte group suffix contradicts the group the entry is paired with (a
+contradiction this module can see with NO engine input, so it outranks the digest
+comparison - the file is named by both halves, and the digest matching does not make a wrong
+group right), and a name with the RIGHT suffix built from the WRONG GROUP'S HASH VIEW, which
+is what a per-group view resolved with another group's `block_size` produces and which no
+suffix check can see. A **GPU block outside the request's own table** for that group is
+`scheduler_mismatch_gpu_block_not_in_table`: no expected name exists for it, and that is
+reported as a FINDING rather than a refusal, because "the destination is not a block this
+request owns" is the most alarming thing this role can say. A name that matches none of
+these is `scheduler_mismatch_unknown` - reported under that name rather than guessed at,
+because a wrong classification is how a wrong fix ships.
+
+**The reachability of the inputs, because this is the claim the whole design turns on.**
+`request.block_hashes` is reachable because the fork holds the `Request` in
+`manager._reqs_to_load[rid].request` (`manager.py:85-89`, written at `:483-484`, and
+`_abandoned_reqs_to_load` for a preempted one) - the same object it feeds its own
+`resolve_block_hashes` at `manager.py:842-844`. The GPU block table is reachable because
+`kv_connector_block_state` is attached at `scheduler.py:1475` and cleared only at `:1497`,
+after the connector's metadata is built. The GPU block pool's own `block_hash` field is NOT
+used and never will be: `_maybe_evict_cached_block` resets it when a block is handed out,
+so a block taken for a restore carries no hash at all, and it cannot answer "which token
+block is this" in either direction.
+
+**An oracle that cannot be built is a named fault, not a silent skip.** `block_hashes`
+unreachable, the request gone from both maps, `kv_connector_block_state` absent on a step
+that has no connector, or no `kv_cache_utils` in the process all count
+`scheduler_oracle_unavailable` and publish a sentence naming which. They are NEVER a
+mismatch (nothing was derived, so nothing was contradicted) and never nothing either. A
+built oracle that answers badly - an entry with no GPU block beside it, a group outside the
+table, an index past the end of the resolved view - is `scheduler_oracle_refused`, with
+`index_out_of_range` counted separately.
+
+**And the payload says which role produced a number, because the two `oracle_unavailable`
+counters do not mean the same thing at all.** The scheduler's counters all begin
+`scheduler_`; the worker's stay exactly as they were. The section publishes `roles`
+(which string came from which process, and `"never add the two"`) and `oracle_rule`:
+
+```jsonc
+"oracle_rule": "worker oracle_unavailable is EXPECTED (a worker has no requests); scheduler_oracle_unavailable means the check is NOT running"
+```
+
+A worker's `oracle_unavailable` growing is a permanent fact of this fork and means nothing.
+A `scheduler_oracle_unavailable` growing means the addressing check is not running in the
+one process that CAN run it, and that is an outage. Collapsing them would be the one change
+that made this section read wrong on purpose, so the distinction is in the payload and not
+in a comment.
+
+**What a boot with one caught shift looks like** (the whole section is one object; this is
+the scheduler half of it, plus the keys that interpret it):
+
+```jsonc
+{
+  "scheduler_steps_seen": 41, "scheduler_entries_seen": 126, "scheduler_sampled_out": 122,
+  "scheduler_retained": 4, "scheduler_retained_dropped": 0, "scheduler_jobs_now": 0,
+  "scheduler_checked": 4, "scheduler_equal": 3, "scheduler_mismatch": 1,
+  "scheduler_mismatch_stable": 1, "scheduler_mismatch_unstable": 0,
+  "scheduler_mismatch_neighbour_index": 1, "scheduler_mismatch_other_group": 0,
+  "scheduler_mismatch_gpu_block_not_in_table": 0, "scheduler_mismatch_unknown": 0,
+  "scheduler_oracle_unavailable": 0, "scheduler_oracle_refused": 0,
+  "scheduler_index_out_of_range": 0, "scheduler_errors": 0,
+  "scheduler_mismatch_samples": [
+    {"request_id": "cmpl-a91f3c07b4-0", "group": 5, "index": 12,
+     "key16": "0d6a1f47c2b58a90", "expected_key16": "77b2e0c4a19d3f65",
+     "name_group": 5, "gpu_block": 1484, "classification": "neighbour_index",
+     "offset": 1, "stable": true}],
+  "scheduler_oracle": {"unreachable_reason": "nothing unavailable yet", "checked": 4,
+                       "equal": 3, "mismatch": 1, "unavailable": 0, "refused": 0,
+                       "index_out_of_range": 0},
+  "roles": {"worker_apply_point": false, "scheduler_offer_point": true,
+            "worker": "worker: the apply point",
+            "scheduler": "scheduler: the offer point",
+            "meaning": "unprefixed counters = a WORKER's apply point; scheduler_* = the EngineCore's offer point; never add the two"},
+  "oracle_rule": "worker oracle_unavailable is EXPECTED (a worker has no requests); scheduler_oracle_unavailable means the check is NOT running",
+  "neighbour_window": 2, "max_scheduler_mismatch_samples": 2,
+  "reasons": ["scheduler_mismatch:neighbour_index: a one-slot shift (+1): the name carries the digest of block index 13 while the GPU block the fork paired it with is the engine's block index 12. A shift moves both index-aligned lists together, so it is invisible to every list-vs-list check this plugin has"]
+}
+```
+
+The sample is the newest verdict and there is no separate `scheduler_last_mismatch` key:
+publishing the same object twice cost 440 B of a 4096 B section budget to repeat a fact a
+reader can index. `neighbour_window` says how far the classifier looked for the digest the
+name ACTUALLY carries - a shift larger than the window is still a mismatch, it simply cannot
+say by how much, which is the difference between "the start block is off by one" and "the
+start block is off, somewhere".
+
+**What it costs the scheduler's step thread.** Nothing but bookkeeping, and less of it than
+the worker side pays: the sampling decision is taken BEFORE any foreign state is read, so an
+unsampled entry costs one counter increment and nothing else; the block table is resolved at
+most ONCE per request id per step (`MAX_SCHED_RIDS_PER_STEP` caps how many ids that covers,
+and the resolve copies a table); the record that goes to the shared thread holds ints, the
+clipped request id, a CLIPPED COPY of `block_hashes` and a copy of the group's id list -
+never the engine's live objects, because the scheduler runs while this module's thread reads
+them. The hashing, the packing and the neighbour walk happen on the same single daemon
+thread the worker half already had: no second thread is started, and `run_pass()` drains the
+scheduler's ring FIRST so a shutdown that takes the worker cannot strand the pairing
+verdicts (which are the verdicts about the scheduler's own addressing, taken while the
+scheduler was alive).
+
+**Its own named counters, all of them in the section's mandatory key set:**
+`scheduler_steps_seen`, `scheduler_entries_seen`, `scheduler_sampled_out`,
+`scheduler_retained`, `scheduler_retained_dropped`, `scheduler_thread_unavailable`,
+`scheduler_checked`, `scheduler_equal`, `scheduler_mismatch`,
+`scheduler_mismatch_stable`, `scheduler_mismatch_unstable`,
+`scheduler_mismatch_neighbour_index`, `scheduler_mismatch_other_group`,
+`scheduler_mismatch_gpu_block_not_in_table`, `scheduler_mismatch_unknown`,
+`scheduler_oracle_unavailable`, `scheduler_oracle_refused`,
+`scheduler_index_out_of_range`, `scheduler_errors`. Stability means something different for
+this role than for the worker's: the scheduler's inputs are objects the engine MUTATES as a
+request runs (`block_hashes` grows; a preemption moves a table), so its stability witness
+re-derives the expected key from the SAME captured references and calls a disagreement
+`scheduler_mismatch_unstable` - a race, not a layout candidate.
+
+**No new contribution, and that was forced.** `worker_diag.MAX_CONTRIBUTIONS` is 5 and its
+allow-list holds exactly 5 names; `worker_diag` REFUSES an unregistered contribution rather
+than truncating it, so a sixth section would not have been "not truncated" - it would have
+made `disk_restore_verify` the section missing from `diagnostics-rank.json`. Both roles are
+therefore the SAME section, told apart by prefix, and the rank file gains no key it could
+fail to write. The EngineCore's numbers are readable through `POST /disk
+{"op":"restore-verify"}` and `/snapshot` (`dev_state_sections()` publishes the section);
+no new op was added, and the scheduler role needs none.
+
+**A section that bounds itself.** The budget is `MAX_SECTION_BYTES`, checked before the
+section is handed to the seam (which refuses over-cap sections), and 0.2.40 added roughly
+1 KiB of mandatory content to it - 19 named counters and the sentences that attribute them.
+`_fit()` sheds in a stated order (reason text, then the boundary illustration lists, then
+the scheduler's mismatch samples oldest first, then the explanatory prose, then the
+reasons), and the order is an argument: `roles`/`oracle_rule` are shed LAST because a reader
+who cannot tell which process wrote a number cannot act on it, while a second mismatch
+sample is only a nicer-to-read version of a fact the counters and the `reasons` ring carry
+in full. Samples carry numbers and no sentence for the same reason; the sentence is the
+`scheduler_mismatch:<classification>` line in `reasons`.
+
+`tests/test_disk_restore_verify_scheduler.py` (31 tests) is that spec: the correctly-paired
+offer is CONFIRMED (without the positive case every negative case below is hollow), five
+entries whose GPU ids are shuffled out of table order are all confirmed by index, a shift
+and its mirror are classified with the right SIGN, a digest from another group's view and a
+name with a contradicting suffix are both `other_group`, a GPU block the request does not own
+is a finding and not a refusal, each unavailability is named and never a mismatch, a
+preempted request in `_abandoned_reqs_to_load` is still checked, a hostile entry never raises
+into the step, `MAX_SCHED_RIDS_PER_STEP` and the per-step bounds do their job, the real
+thread drains what the step handed it, a step with the verifier OFF calls no block table and
+moves no counter (proved with both readers instrumented to RAISE), the section's key set is
+identical fresh / after a step / after a mismatch / fat and fits the seam's cap under the
+five-section arithmetic, `/snapshot` publishes it, and the REAL
+`disk_restore.offer -> build_load_paths` path confirms its own names and calls every one of
+them a shift when the pairing is rotated - the hook site pinned by the product, not assumed.
 
 `tests/test_disk_restore_verify.py` (44 tests) is the executable spec: that the default reads
 no file and no device and moves no counter (proved with the readers instrumented to RAISE,

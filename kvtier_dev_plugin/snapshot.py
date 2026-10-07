@@ -1108,6 +1108,25 @@ def dev_state_sections() -> dict:
         _error(exc, "disk restore section")
         out["disk_restore"] = {"error": f"{type(exc).__name__}"[:200]}
         out["disk_restore_installed"] = None
+    try:
+        # THE RESTORE VERIFIER, BOTH ROLES, in the payload a poller already reads. The
+        # rank files carry the WORKER half (a rank is a worker's identity), so the
+        # SCHEDULER-side counters - the ones that can see a one-slot shift, and produced
+        # in THIS process - would otherwise be reachable only through the verb. Same
+# `section()` builder as the rank file and the verb, so a number cannot differ by
+        # door; it reads no file, no tensor and no engine state beyond this module's own
+        # counters, so it stays safe on a path a dashboard polls. `roles`/`role_note` in
+        # the payload say which half is whose.
+        from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
+            disk_restore_verify,
+        )
+        out["disk_restore_verify"] = disk_restore_verify.section()
+        out["disk_restore_verify_enabled"] = bool(
+            disk_restore_verify.effective_enabled())
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk restore verify section")
+        out["disk_restore_verify"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["disk_restore_verify_enabled"] = None
     return out
 
 

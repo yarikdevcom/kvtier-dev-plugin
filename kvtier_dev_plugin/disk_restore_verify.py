@@ -15,7 +15,7 @@ index-aligned lists together.
 
 THE VERDICT THIS PROVES, per sampled restored entry:
 
-    file[0 : W_g]  ==  gpu_window[gpu_block_id][0 : W_g]
+file[0 : W_g]  ==  gpu_window[gpu_block_id][0 : W_g]
 
 where `gpu_window[gpu_block_id]` is `base + gpu_block_id * bytes_per_block` and `W_g` is
 THE GROUP'S OWN block width (`arena.block_bytes_by_group[group]`, i.e.
@@ -36,58 +36,55 @@ device bytes are sliced to `[:W_g]` before the compare. `tail_bytes_excluded` in
 "we compared 1,638,400 bytes and they matched" from "we compared 11,468,800".
 
 THE FIVE THINGS IT CHECKS, and what each one would mean if it failed
--------------------------------------------------------------------------------
-  1. `file_size == bytes_per_block` - the rank's own slot width (`disk_spill.
-     measured_slot_bytes` / the fingerprint's `total_bytes_per_block`; 11,468,800 on PP0
-     and 12,902,400 on PP1 are DIFFERENT NUMBERS, so a file that is the other rank's
-     width is a PP-crossing bug and `file_not_window_wide` is how it shows up). A file
-     that is not window-wide is REFUSED, not compared: a width disagreement has an
-     explanation and a comparison against it explains nothing.
-  2. `W_g <= file_size` (`group_wider_than_file`). A group wider than the file it is
-     named in is a geometry contradiction; comparing would read past EOF and call the
-     zeros a mismatch.
-  3. the leading-`W_g` byte equality, above, with staleness classified by a re-read.
-  4. THE BINDING ORACLE. The name in the path is derived from a hash, so name-vs-name is
-     blind. The oracle recomputes the group's expected `key16` for the GPU index the
-     fork ACTUALLY used, from the engine's own hash derivation -
-     `resolve_block_hashes(request.block_hashes, hash_block_size, group_size)` and
-     `make_block_hash_with_group_id(digest, group)`, the same two helpers the fork uses
-     for the same purpose (`manager.py:897-900`, and the per-group view at
-     `manager.py:1591-1601`) and the same two `disk_restore._key_helpers()` resolves. It
-     then requires the recomputed `key16` to equal the `key16` in the restore path's
-     file name. REACHABILITY IS SAID HONESTLY, NOT FAKED: a WORKER never sees a request.
-     The fork's worker metadata carries `load_event_to_reqs` - request IDs - and the
-     file that defines it says so out loud: "Job->req_id translation is handled by the
-     scheduler-side manager ... the worker never knows about request identities"
-     (`vllm/v1/simple_kv_offload/metadata.py`). So `block_hashes` is not reachable from
-     this process on this fork, and every entry counts `oracle_unavailable`. That is a
-     counted, named, published outcome, not a skip: the counter is how an operator
-     learns the binding check is not running, and `oracle_note` names the ONE thing that
-     would make it run - carrying the per-entry hash view to the worker, or arming the
-     seam below from a process that has requests. The recomputation itself is real code,
-     exercised by tests, behind `set_oracle()`: a fork patch that carries the view, or a
-     harness, hands this module a provider and the check goes live with no change here.
-  5. THE TRUNCATION SHAPE (`boundary_entry_missing`). The fork truncates each group's
-     hit list with `n_take_g = cdiv(num_external_tokens, g_block_size)`
-     (`manager.py:445-448`), and a `boundary_state` group's hit list is `[null_block] *
-     (n - 1) + [one real state block]` (`disk_restore._group_contract`'s cite of
-     `single_type_kv_cache_manager.py:1591-1607`). So a truncation that lands before the
-     run's last block drops the boundary group's ONLY real entry while every positional
-     group keeps its entries - a restore of a prefix whose state block never arrived,
-     which is the Gate B shape. Worker-side, a boundary group is one whose spec says
-     `mamba_cache_mode == "align"` (a field only `MambaSpec` carries,
-     `kv_cache_interface.py:992-998`, and the same value `disk_restore._group_contract`
-     reads as the fork's own reason). A batch that restored entries for some groups and
-     NOTHING for a known boundary group is counted. THE GRANULARITY IS BATCH-LEVEL AND
-     SAY SO: one batch can hold spans from several requests, so a boundary entry that
-     DID arrive for one of them masks the one that did not. It under-counts; it cannot
-     over-count in the way that matters, because "no entry for a group this boot knows
-     is align-mode, in a batch that restored something" is a fact about that batch.
+------------------------------------------------------------------------------- 1.
+`file_size == bytes_per_block` - the rank's own slot width (`disk_spill.
+measured_slot_bytes` / the fingerprint's `total_bytes_per_block`; 11,468,800 on PP0 and
+12,902,400 on PP1 are DIFFERENT NUMBERS, so a file that is the other rank's width is a
+PP-crossing bug and `file_not_window_wide` is how it shows up). A file that is not
+window-wide is REFUSED, not compared: a width disagreement has an explanation and a
+comparison against it explains nothing. 2. `W_g <= file_size` (`group_wider_than_file`).
+A group wider than the file it is named in is a geometry contradiction; comparing would
+read past EOF and call the zeros a mismatch. 3. the leading-`W_g` byte equality, above,
+with staleness classified by a re-read. 4. THE BINDING ORACLE. The name in the path is
+derived from a hash, so name-vs-name is blind. The oracle recomputes the group's
+expected `key16` for the GPU index the fork ACTUALLY used, from the engine's own hash
+derivation - `resolve_block_hashes(request.block_hashes, hash_block_size, group_size)`
+and `make_block_hash_with_group_id(digest, group)`, the same two helpers the fork uses
+for the same purpose (`manager.py:897-900`, and the per-group view at
+`manager.py:1591-1601`) and the same two `disk_restore._key_helpers()` resolves. It then
+requires the recomputed `key16` to equal the `key16` in the restore path's file name.
+REACHABILITY IS SAID HONESTLY, NOT FAKED: a WORKER never sees a request. The fork's
+worker metadata carries `load_event_to_reqs` - request IDs - and the file that defines
+it says so out loud: "Job->req_id translation is handled by the scheduler-side manager
+... the worker never knows about request identities"
+(`vllm/v1/simple_kv_offload/metadata.py`). So `block_hashes` is not reachable from this
+process on this fork, and every entry counts `oracle_unavailable`. That is a counted,
+named, published outcome, not a skip: the counter is how an operator learns the binding
+check is not running, and `oracle_note` names the ONE thing that would make it run -
+carrying the per-entry hash view to the worker, or arming the seam below from a process
+that has requests. The recomputation itself is real code, exercised by tests, behind
+`set_oracle()`: a fork patch that carries the view, or a harness, hands this module a
+provider and the check goes live with no change here. 5. THE TRUNCATION SHAPE
+(`boundary_entry_missing`). The fork truncates each group's hit list with `n_take_g =
+cdiv(num_external_tokens, g_block_size)` (`manager.py:445-448`), and a `boundary_state`
+group's hit list is `[null_block] * (n - 1) + [one real state block]`
+(`disk_restore._group_contract`'s cite of `single_type_kv_cache_manager.py:1591-1607`).
+So a truncation that lands before the run's last block drops the boundary group's ONLY
+real entry while every positional group keeps its entries - a restore of a prefix whose
+state block never arrived, which is the Gate B shape. Worker-side, a boundary group is
+one whose spec says `mamba_cache_mode == "align"` (a field only `MambaSpec` carries,
+`kv_cache_interface.py:992-998`, and the same value `disk_restore._group_contract` reads
+as the fork's own reason). A batch that restored entries for some groups and NOTHING for
+a known boundary group is counted. THE GRANULARITY IS BATCH-LEVEL AND SAY SO: one batch
+can hold spans from several requests, so a boundary entry that DID arrive for one of
+them masks the one that did not. It under-counts; it cannot over-count in the way that
+matters, because "no entry for a group this boot knows is align-mode, in a batch that
+restored something" is a fact about that batch.
 
 WHERE THE WORK HAPPENS, AND WHAT THE STEP THREAD PAYS
--------------------------------------------------------------------------------
-Nothing in this module runs file I/O or a device copy on the engine's threads. The step
-thread pays ONE call, at the apply point in `disk_restore._worker_before_load`, after
+------------------------------------------------------------------------------- Nothing
+in this module runs file I/O or a device copy on the engine's threads. The step thread
+pays ONE call, at the apply point in `disk_restore._worker_before_load`, after
 `span_shape` has made `failed` final: enablement, a counter, a sampling cursor, a
 bounded scan, a handful of int comparisons, and at most `MAX_RETAINED_PER_STEP` small
 dicts of ints and one path string. It reads no file, touches no tensor, and issues no
@@ -137,18 +134,108 @@ for writing anywhere - its whole safety story). It never changes a restore decis
 reads the batch the apply point already decided on, and cannot prune, reorder or re-file
 anything.
 
+THE SCHEDULER-SIDE ROLE (0.2.40): THE CHECK THAT CAN SEE A ONE-SLOT SHIFT
+------------------------------------------------------------------------------- The
+worker-side oracle above is unreachable where it lives, and the reason is structural
+(`metadata.py`: a worker has no requests). The SCHEDULER side of the same plugin does
+have requests, and it is the side that DECIDES the pairing. So this module has a second
+role, armed by the SAME `VLLM_E2_TIER_DISK_RESTORE_VERIFY` (the EngineCore inherits the
+environment just as the workers do - one drop-in line arms both roles, and every counter
+name says which role produced it: every scheduler-side counter begins `scheduler_`).
+
+THE COMPARISON, per sampled offered entry:
+
+key16 in the file name we offered for (group g, span p) ==  key16 of `view_g[j]` packed
+with g,
+
+where `view_g` is the engine's own `resolve_block_hashes(request.block_hashes,
+hash_block_size, group_block_sizes[g])` and `j` is the position, IN THE REQUEST'S OWN
+BLOCK TABLE FOR GROUP g, of the GPU block the fork put beside our CPU slot - not an
+index taken from our lists. That is the whole point: a one-slot shift moves
+`load_cpu_blocks` and `load_gpu_blocks` together, so every comparison BETWEEN them is
+blind, and the answer has to come from outside them. The fork's own pairing is
+`group_gpu_ids[gpu_ext_start + i]` (`manager.py:461-468`); the digest of the block it
+landed on is what this role asks for.
+
+WHAT IS REACHABLE THERE, PROVEN RATHER THAN HOPED (fork HEAD 10b8e07): *
+`request.block_hashes` - `LoadRequestState` carries `request`
+(`vllm/v1/simple_kv_offload/manager.py:85-89`) and the fork writes it at `:483-484` when
+it builds the transfer meta whose two lists are in the metadata; the load lists this
+module reads are built FROM that dict at `:523-531`, so the request is present at the
+moment we look. Read via `manager._reqs_to_load` (and `_abandoned_reqs_to_load`, the
+preemption copy at `:1275`). * the request's per-group GPU block table - the field
+`scheduler_output.kv_connector_block_state` (`vllm/v1/core/sched/output.py:208-221`),
+built by the scheduler with `resolve_block_ids=self.kv_cache_manager.get_block_ids`
+(`sched/scheduler.py:1412-1425`), attached to the SchedulerOutput at `:1475` and cleared
+at `:1497` AFTER the connector's metadata is built (`:1479`) precisely so it never
+reaches a worker. It is therefore the fork's own connector-only channel for exactly this
+question, and the fork reads it the same way inside the same `build_connector_meta` call
+(`manager.py:657`). * what is NOT reachable, and was rejected on purpose: the GPU block
+pool's `blocks[gpu_id].block_hash` (the store side's witness, `manager.py:846-847`). A
+load DESTINATION is taken from the free queue, and `BlockPool.get_new_blocks` calls
+`_maybe_evict_cached_block`, which RESETS the hash metadata (`core/block_pool.py:686`,
+`:726-747`) - so at load time that field is None or belongs to the previous tenant.
+Comparing against it would invent mismatches.
+
+WHAT A FAILURE MEANS, and it is four different things with four different fixes, so the
+classification is a name and not a number: `neighbour_index` (the name carries the
+digest of the block at index j +/- 1..N: a one-slot shift, the finding this role exists
+for), `other_group` (the digest is real but belongs to another group's view of the same
+index, or the group suffix INSIDE the name contradicts the group the entry is paired
+with), `gpu_block_not_in_table` (the GPU block the fork paired with our slot is not in
+this request's table for that group at all), and `unknown`. A name's OWN group suffix
+outranks the digest comparison, so a suffix that contradicts the entry is a mismatch
+even when the digest part matches exactly: the file is named by BOTH halves
+(`disk_layout.build_slot_path` writes the group into the name), so a `key16`-only
+equality would call a wrong group a match. Like the worker side's `mismatch_stable`, a
+scheduler mismatch is re-derived before it is called stable: `scheduler_mismatch_stable`
+means the same captured inputs re-derived the same expected key, so the disagreement is
+not a half-mutated `block_hashes` view; `_unstable` means the engine's own inputs moved
+under us and the sample is not evidence.
+
+WHAT THE SCHEDULER THREAD PAYS, AND WHAT IT DOES NOT. `observe_offer` is the only call
+on an engine thread and it does: enablement, counters, a sample decision, one
+`kv_cache_manager.get_block_ids(rid)` resolve PER REQUEST ID per step (a list of ints
+the fork builds fresh, cached for the step, capped by `MAX_SCHED_RIDS_PER_STEP`), a
+`list.index` of one int, and at most `MAX_RETAINED_PER_STEP` small dicts. It does no
+hashing: `resolve_block_hashes` + `make_block_hash_with_group_id` + the key split run on
+the module's ONE existing daemon thread, off the scheduler's way, bounded by
+`MAX_CHECKS_PER_PASS` and the same `MIN_INTERVAL_SECONDS` floor. The references it
+carries to that thread are a `block_hashes` list and one group's freshly-built id list,
+both plain ints and bytes - no tensor, no file handle, and the ring holds at most
+`MAX_RETAINED_JOBS` of them for at most `JOB_MAX_AGE_SECONDS`.
+
+WHY IT LIVES IN THIS MODULE AND NOT A NEW ONE: `worker_diag.MAX_CONTRIBUTIONS` is 5 and
+the contribution allow-list is EXACTLY those five names, so a sixth section is refused
+at register time and an operator would read a rank file that silently lacks the verdict.
+The scheduler role therefore reports into the same `disk_restore_verify` section, with
+every one of its counters prefixed so the two roles can never be added together by
+accident, and with `roles` and `oracle_rule` in the payload saying WHICH process
+produced which number - a sentence rather than a comment, because the two roles'
+`oracle_unavailable` counters mean opposite things (a worker's is a permanent fact of
+the fork and says nothing; a scheduler's says the addressing check is not running where
+it COULD run) and a reader holding one payload must not have to infer which one he has.
+
+One published shape note, because it was a deliberate subtraction: there is no
+`scheduler_last_mismatch` key. `scheduler_mismatch_samples` is the ring of the newest
+`MAX_SCHED_MISMATCH_SAMPLES` verdicts and its last element IS the newest, and publishing
+the same object twice cost 440 B of a section whose budget the seam ENFORCES by refusal.
+The samples carry numbers and no sentence for the same reason - the sentence is the
+`scheduler_mismatch:<classification>` line in `reasons`, once per finding, in full.
+
 WHAT IT NEVER DOES
--------------------------------------------------------------------------------
-  * writes any file, anywhere, ever (the only file operation is a read of a path the
-    restore path itself already chose to read);
-  * changes a restore outcome - `observe_apply` cannot raise, cannot prune and is called
-    after every decision the apply point makes;
-  * blocks the step thread (no I/O, no CUDA, no torch symbol, no unbounded loop);
-  * imports `torch`/`vllm`/`cuda`/`numpy` (the same package invariant
-    `tests/test_snapshot.py::test_no_heavy_imports_in_the_read_side` enforces; the
-    device read needs no symbol, because it is `disk_shadow`'s method call);
-  * keeps a reference to a worker it cannot prove is alive (a weakref; a worker that is
-    gone is `worker_gone`, and the pass stops rather than copying from freed memory).
+------------------------------------------------------------------------------- * writes
+any file, anywhere, ever (the only file operation is a read of a path the restore path
+itself already chose to read); * mutates the engine: it reads a request, a block table
+and a metadata it was handed and returns nothing to the offer path. It cannot prune,
+reorder or re-file an entry, and the call site is after the paths have been written; *
+changes a restore outcome - `observe_apply` cannot raise, cannot prune and is called
+after every decision the apply point makes; * blocks the step thread (no I/O, no CUDA,
+no torch symbol, no unbounded loop); * imports `torch`/`vllm`/`cuda`/`numpy` (the same
+package invariant `tests/test_snapshot.py::test_no_heavy_imports_in_the_read_side`
+enforces; the device read needs no symbol, because it is `disk_shadow`'s method call); *
+keeps a reference to a worker it cannot prove is alive (a weakref; a worker that is gone
+is `worker_gone`, and the pass stops rather than copying from freed memory).
 """
 
 from __future__ import annotations
@@ -216,6 +303,26 @@ MAX_ENTRIES_SCANNED = 64
 MAX_REASON_SAMPLES = 6
 MAX_REASON_CHARS = 120
 
+# --- THE SCHEDULER-SIDE ROLE'S BOUNDS ----------------------------------------
+# How far the classification looks for the digest a name ACTUALLY carries. A shift of
+# more than this is still reported as a MISMATCH (that is the finding); the window only
+# decides whether the sample can also say BY HOW MUCH, which is the difference between
+# "the start block is off by one" and "the start block is off, somewhere".
+NEIGHBOUR_WINDOW = 2
+
+# Published mismatch samples: NEWEST LAST, oldest dropped. There is deliberately no
+# separate `scheduler_last_mismatch` key - the ring's last element IS the newest
+# verdict, and publishing it twice cost 440 B of a 4096 B section budget to say the same
+# thing. TWO is the cap, and the arithmetic behind it is this section's own: the
+# mandatory content (71 counters, two roles' oracle states, and the sentences that tell
+# the roles apart) measures about 3.4 KiB, so the illustration a reader gets is what is
+# left under `MAX_SECTION_BYTES` - and a section the seam REFUSES for being 100 B fat
+# carries NO samples at all, which is the failure mode the cap exists to prevent. The
+# counters, which are the load-bearing numbers, see every single mismatch.
+MAX_SCHED_MISMATCH_SAMPLES = 2
+MAX_SCHED_RIDS_PER_STEP = 8        # block-table resolves per step, whatever the batch
+MAX_SCHED_ID_CHARS = 32            # a request id, clipped the way `disk_restore` clips
+
 # The first-difference scan, and why it is chunked: `memcmp` per 4 KiB block, so the
 # only Python-level byte loop runs inside the ONE chunk that differs. A full-window
 # Python scan of 11.4 MB to produce an offset is not worth the offset.
@@ -225,7 +332,14 @@ MAX_DIFF_SCAN_BYTES = 262_144
 MAX_BOUNDARY_GROUPS_PUBLISHED = 8
 TRIM_BOUNDARY_GROUPS = 4
 TRIM_REASON_CHARS = 42
-MAX_SECTION_BYTES = 3072
+# 3072 was the budget while this section described ONE role. The scheduler role adds
+# nineteen counters, an oracle state and a bounded mismatch sample to the same section
+# (it must be the same section: `worker_diag.MAX_CONTRIBUTIONS` is 5 and its allow-list
+# is exactly five names, so a sixth is refused at register time and the verdict would be
+# SILENTLY ABSENT from the rank file). The new number keeps the section below the seam's
+# own `MAX_CONTRIBUTION_BYTES` = 4096 with a margin, which is the only ceiling that can
+# make this key disappear.
+MAX_SECTION_BYTES = 3800
 
 # The fork's own reason for calling a group's blocks positionally unstable, read from
 # the group's spec on the worker (`kv_cache_interface.py:992-998`: only `MambaSpec`
@@ -282,9 +396,61 @@ _COUNTER_KEYS = (
     "oracle_mismatch",
     "oracle_unavailable",
     "oracle_refused",
+    # --- THE SCHEDULER-SIDE ORACLE (0.2.40). Every one of these begins `scheduler_`
+    # because a number that can be confused with the worker's own is worse than a
+    # missing one: the worker's `oracle_unavailable` is EXPECTED in production, while
+    # `scheduler_oracle_unavailable` means the oracle did not get built far enough to
+    # be useful. Never add the two together.
+    "scheduler_steps_seen",
+    "scheduler_entries_seen",
+    "scheduler_sampled_out",
+    "scheduler_retained",
+    "scheduler_retained_dropped",
+    "scheduler_thread_unavailable",
+    "scheduler_checked",
+    "scheduler_equal",
+    "scheduler_mismatch",
+    "scheduler_mismatch_stable",
+    "scheduler_mismatch_unstable",
+    "scheduler_mismatch_neighbour_index",
+    "scheduler_mismatch_other_group",
+    "scheduler_mismatch_gpu_block_not_in_table",
+    "scheduler_mismatch_unknown",
+    "scheduler_oracle_unavailable",
+    "scheduler_oracle_refused",
+    "scheduler_index_out_of_range",
+    "scheduler_errors",
     "section_trimmed",
     "errors",
 )
+
+# The four scheduler-side mismatch classifications, and the counter each one moves.
+SCHED_CLASS_SHIFT = "neighbour_index"
+SCHED_CLASS_GROUP = "other_group"
+SCHED_CLASS_NOT_IN_TABLE = "gpu_block_not_in_table"
+SCHED_CLASS_UNKNOWN = "unknown"
+_SCHED_CLASS_COUNTERS = {
+    SCHED_CLASS_SHIFT: "scheduler_mismatch_neighbour_index",
+    SCHED_CLASS_GROUP: "scheduler_mismatch_other_group",
+    SCHED_CLASS_NOT_IN_TABLE: "scheduler_mismatch_gpu_block_not_in_table",
+    SCHED_CLASS_UNKNOWN: "scheduler_mismatch_unknown",
+}
+
+# What the published section says about who produced a number, so a reader of a rank
+# file and a reader of `/snapshot` cannot read the same payload as the same process.
+# These strings are in the PAYLOAD, so they are priced in bytes: the seam refuses a
+# section over `MAX_CONTRIBUTION_BYTES` rather than truncating it, and every hundred
+# characters of prose is a hundred characters no counter could use.
+WORKER_ROLE = "worker: the apply point"
+SCHEDULER_ROLE = "scheduler: the offer point"
+ROLE_MEANING = ("unprefixed counters = a WORKER's apply point; scheduler_* = the "
+                "EngineCore's offer point; never add the two")
+# The one sentence that keeps the two oracles from being read as one facility. A
+# worker's `oracle_unavailable` is a fact of the fork; a `scheduler_oracle_unavailable`
+# means the check is not running where it could - the distinction an operator acts on.
+ORACLE_RULE = ("worker oracle_unavailable is EXPECTED (a worker has no requests); "
+               "scheduler_oracle_unavailable means the check is NOT running")
+SCHED_NOTHING_UNAVAILABLE = "nothing unavailable yet"
 
 
 def _fresh_state() -> dict:
@@ -310,6 +476,15 @@ def _fresh_state() -> dict:
         "last_mismatch": None,
         "last_oracle": None,
         "oracle": None,          # (provider, note), see `set_oracle`
+        # THE SCHEDULER-SIDE ROLE: its own ring, its own cursor, its own samples. The
+        # thread is SHARED (one daemon thread for both roles, so this module can never
+        # grow a second one by accident).
+        "scheduler_seq": 0,
+        "scheduler_pending": {},
+        "scheduler_sample_cursor": 0,
+        "scheduler_mismatch_samples": [],
+        "scheduler_last_oracle": None,
+        "scheduler_unreachable_reason": None,
         "notes": {}, "reasons": [], "reason_seen": set(), "last_trim": None,
         "counters": {key: 0 for key in _COUNTER_KEYS},
     }
@@ -380,10 +555,14 @@ def _resolve_env() -> dict:
         if read["enabled"]:
             _note_once("env-on",
                        f"[disk_restore_verify] ENABLED by "
-                       f"{config.ENV_DISK_RESTORE_VERIFY}={read['raw']!r}: one "
-                       f"restored entry in {SAMPLE_EVERY_N_RESTORES} has its leading "
-                       f"group width compared between the file and the GPU window, at "
-                       f"most {MAX_CHECKS_PER_PASS} per pass on this module's thread",
+                       f"{config.ENV_DISK_RESTORE_VERIFY}={read['raw']!r}: in a WORKER "
+                       f"one restored entry in {SAMPLE_EVERY_N_RESTORES} has its "
+                       f"leading group width compared between the file and the GPU "
+                       f"window; in the EngineCore one OFFERED entry in the same "
+                       f"{SAMPLE_EVERY_N_RESTORES} has its file name re-derived from "
+                       f"the engine's own block_hashes at the block index the fork "
+                       f"paired it with - at most {MAX_CHECKS_PER_PASS} per role per "
+                       f"pass on this module's thread",
                        level="info")
         elif read["raw"] is not None and not read["recognised"]:
             _reason("env_value_unrecognised",
@@ -422,21 +601,26 @@ def set_enabled(on: bool) -> dict:
     """The POST op's decision: IN-PROCESS ONLY, and said out loud in the answer.
 
     No control file is written - this module opens no file handle for writing anywhere -
-    so a POST that arrives at the EngineCore latches the EngineCore, where no restore is
-    ever applied. The process that applies restores is a WORKER, and a worker is armed
-    with `VLLM_E2_TIER_DISK_RESTORE_VERIFY=1` in the engine's environment. `scope` says
-    that instead of letting an operator believe he armed the worker.
+    so a POST that arrives at the EngineCore latches the EngineCore. Since 0.2.40 that
+    is NOT the nothing it used to be: the EngineCore is where the SCHEDULER-side runs,
+    so the latch arms the offer-point oracle (`scheduler_*` counters) in the answering
+    process. What the latch still cannot do is arm a WORKER's byte comparison, because a
+    worker is a different process - that one is armed with
+    `VLLM_E2_TIER_DISK_RESTORE_VERIFY=1` in the engine's environment. `scope` says both
+    halves instead of letting an operator believe he armed the worker.
     """
     with _lock:
         _state["latch"] = bool(on)
         _state["latch_set"] = True
         answer = enable_state()
-    answer["scope"] = ("this process only; the worker that restores is armed with "
-                       f"{config.ENV_DISK_RESTORE_VERIFY}=1")
+    answer["scope"] = ("this process only: the scheduler-side oracle in the process "
+                       "answers this op), while the worker that applies a restore is "
+                       f"armed with {config.ENV_DISK_RESTORE_VERIFY}=1")
     if on:
         _note_once("latch-on",
                    "[disk_restore_verify] enabled in this process by the POST op "
-                   "(scope: the answering process, not where a restore applies)",
+                   "(scope: the answering process - its scheduler-side offer oracle - "
+                   "and not the worker that applies a restore)",
                    level="info")
     return answer
 
@@ -1082,12 +1266,14 @@ def oracle_state() -> dict:
                 "note": (installed[1] if installed else None),
                 "reachable": bool(installed),
                 "unreachable_reason": (None if installed else
+                                       # IN THE PAYLOAD, so it is priced in bytes like
+                                       # every other string here: the file, the reason
+                                       # and the consequence, and nothing else.
                                        "a worker receives no request identities "
                                        "(vllm/v1/simple_kv_offload/metadata.py), so "
-                                       "request.block_hashes is unreachable from the "
-                                       "process that applies a restore; every entry "
-                                       "counts oracle_unavailable until set_oracle() "
-                                       "installs a provider"),
+                                       "block_hashes is unreachable where a restore is "
+                                       "applied; entries count oracle_unavailable "
+                                       "until set_oracle() installs a provider"),
                 "checked": int(counters["oracle_checked"]),
                 "equal": int(counters["oracle_equal"]),
                 "mismatch": int(counters["oracle_mismatch"]),
@@ -1203,35 +1389,668 @@ def _oracle_check(record: dict) -> dict:
             "expected_key16": expected["key16"]}
 
 
-# --- THE PASS ------------------------------------------------------------------
-def run_pass(worker=None) -> dict:
-    """At most `MAX_CHECKS_PER_PASS` retained entries. ONE bounded pass; never raises.
+# --- THE SCHEDULER-SIDE ROLE (0.2.40): THE OFFER-POINT ORACLE ----------------
+# Everything below runs in the EngineCore. The engine-thread entry point is
+# `observe_offer`, called by `disk_restore._build_load_paths` at the one moment the
+# scheduler sees a CPU slot WE allocated paired with the GPU block the fork will DMA it
+# into; everything above it in this file is a worker's apply point.
+def _sched_unavailable(tag: str, detail: str) -> dict:
+    """The oracle could not be BUILT for this entry: counted, reasoned, published.
 
-    The thread's body, and the function a test drives directly (the `disk_gpu_shadow`
-    idiom: monkeypatch `_ensure_thread` to keep the thread off and call this).
+    THE most important thing this role can say, and it is said as a sentence. A
+    `scheduler_oracle_unavailable` that grows with traffic means the addressing check is
+    not running in the one process that can run it - which is a different fact from a
+    worker's `oracle_unavailable` (that one is expected forever) and must never be
+    collapsed into it.
+    """
+    text = str(detail)[:MAX_REASON_CHARS]
+    with _lock:
+        _count("scheduler_oracle_unavailable")
+        _state["scheduler_unreachable_reason"] = f"{tag}: {text}"
+    _reason(f"scheduler_oracle:{tag}", text)
+    return {"state": "scheduler_oracle_unavailable", "reason": tag}
+
+
+def _sched_refused(tag: str, detail: str) -> dict:
+    """The oracle was built and answered badly: a refusal, never a silent skip."""
+    with _lock:
+        _count("scheduler_oracle_refused")
+    _reason(f"scheduler_oracle:{tag}", str(detail))
+    return {"state": "scheduler_oracle_refused", "reason": tag}
+
+
+def _scheduler_sizes(manager) -> dict:
+    """`resolve_block_hashes`' two remaining arguments, read off the manager.
+
+    `hash_block_size` and `group_block_sizes` are the manager's own fields (the same two
+    the fork feeds its own `resolve_block_hashes` at `manager.py:842-844` and the same
+    two `_disk_run` uses for the offer), so this module derives no block geometry of its
+    own.
+    """
+    hash_block = _int_or_none(getattr(manager, "hash_block_size", None))
+    sizes = getattr(manager, "group_block_sizes", None)
+    if not hash_block or hash_block <= 0:
+        return {"ok": False, "kind": "no_hash_block_size",
+                "reason": "the manager exposes no usable `hash_block_size`, so the "
+                          "engine's own hash view cannot be built"}
+    if not isinstance(sizes, (list, tuple)) or not sizes:
+        return {"ok": False, "kind": "no_group_block_sizes",
+                "reason": "the manager exposes no `group_block_sizes`, so the view for "
+                          "this entry's group cannot be built"}
+    cleaned = [_int_or_none(value) for value in list(sizes)[:worker_diag.MAX_GROUPS]]
+    return {"ok": True, "hash_block_size": int(hash_block),
+            "group_block_sizes": cleaned}
+
+
+def _load_request(manager, request_id):
+    """The `Request` the fork holds for a load, or None.
+
+    `LoadRequestState` carries `request` (`manager.py:85-89`) and the fork writes it
+    when it creates the transfer meta whose two lists this metadata carries
+    (`:483-484`). The abandoned map (`:1275`, the preemption copy) is asked SECOND and
+    only if the live one has nothing, because a preempted load's table is the one place
+    a block id may already have moved.
+    """
+    for attribute in ("_reqs_to_load", "_abandoned_reqs_to_load"):
+        table = getattr(manager, attribute, None)
+        if not isinstance(table, dict):
+            continue
+        try:
+            state = table.get(request_id)
+        except Exception:  # noqa: BLE001,S112 - a ledger that cannot be read holds no
+            # request for us: that IS the answer, not a fault to log loudly
+            continue
+        request = getattr(state, "request", None)
+        if request is not None:
+            return request
+    return None
+
+
+def _block_table_verdict(state, request_id: str) -> dict:
+    """Ask the fork's connector channel for one request's block table."""
+    if state is None:
+        return {"ok": False, "kind": "no_kv_connector_block_state",
+                "reason": "scheduler_output.kv_connector_block_state is None on this "
+                          "step, so the request's own GPU block table is unreadable "
+                          "here (`sched/scheduler.py:1412-1425` builds it only for a "
+                          "step that has a connector)"}
+    getter = getattr(state, "get_block_ids", None)
+    if not callable(getter):
+        return {"ok": False, "kind": "block_state_without_get_block_ids",
+                "reason": "kv_connector_block_state carries no callable "
+                          "get_block_ids: the fork renamed the channel"}
+    try:
+        table = getter(request_id)
+    except Exception as exc:  # noqa: BLE001 - the fork's channel is not ours to trust
+        return {"ok": False, "kind": "get_block_ids_raised",
+                "reason": f"get_block_ids raised {type(exc).__name__}"}
+    if table is None:
+        return {"ok": False, "kind": "block_state_does_not_cover_request",
+                "reason": "the request id is not in this step's "
+                          "kv_connector_block_state.req_ids, so the table is not "
+                          "offered for it (`output.py:218-221` says so by returning "
+                          "None rather than by guessing a table)"}
+    if not isinstance(table, (list, tuple)) or not table:
+        return {"ok": False, "kind": "empty_block_table",
+                "reason": f"get_block_ids answered {type(table).__name__} with no "
+                          "groups, which is not a block table"}
+    return {"ok": True, "table": table}
+
+
+def _block_table(scheduler_output, request_id: str, cache: dict) -> dict:
+    """The request's own per-group GPU block-id table, through the fork's channel.
+
+    `KVConnectorBlockState.get_block_ids(req_id)` (`output.py:208-221`) answers from
+    `kv_cache_manager.get_block_ids` and returns a FRESH tuple of lists per call, which
+    is why holding one for a millisecond on this module's thread is safe: it is a
+    snapshot, not a live view. The fork clears the field after the connector's metadata
+    is built (`sched/scheduler.py:1497`), so a worker can never see it - the reason this
+    is a SCHEDULER-side check and could never be a worker-side one.
+
+    Resolved at most once per request id per step (`cache`), capped by
+    `MAX_SCHED_RIDS_PER_STEP`: the resolve copies a table, and a step with more disk
+    loads than that cap is a step this role stops looking at rather than a step it slows
+    down.
+    """
+    if request_id in cache:
+        return cache[request_id]
+    if len(cache) >= MAX_SCHED_RIDS_PER_STEP:
+        return {"ok": False, "kind": "too_many_request_ids_this_step",
+                "reason": f"this step carries more than {MAX_SCHED_RIDS_PER_STEP} "
+                          "request ids with disk entries, so no block table was "
+                          "resolved for it (a bound, not a fault)"}
+    verdict = _block_table_verdict(
+        getattr(scheduler_output, "kv_connector_block_state", None), request_id)
+    cache[request_id] = verdict
+    return verdict
+
+
+def _scheduler_record(manager, scheduler_output, sizes: dict, tables: dict,
+                      entry) -> dict | None:
+    """One offered entry, in the shape the thread can hash. NOTHING IS HASHED HERE.
+
+    The four things it captures are the four the comparison needs: the name we offered
+    (and the group the run says it belongs to), the GPU block the fork paired it with,
+    the engine's raw `block_hashes`, and the request's own block-table position of that
+    GPU block. The LAST of those is the one that comes from outside our lists, and it is
+    the reason this oracle can see a shift that every list-vs-list comparison cannot.
+    """
+    if not isinstance(entry, dict):
+        return None
+    request_id = entry.get("request_id")
+    group = _int_or_none(entry.get("group"))
+    gpu_block = _int_or_none(entry.get("gpu_block"))
+    key_hex = entry.get("key")
+    if not isinstance(request_id, str) or not request_id:
+        _sched_refused("no_request_id", "the offer witness handed an entry with no "
+                                        "request id, so no request and no block table "
+                                        "can be found for it")
+        return None
+    if group is None or group < 0:
+        _sched_refused("no_group", "the entry names no group, and a key16 without a "
+                                   "group is exactly the pre-fix identity that put two "
+                                   "groups in one file")
+        return None
+    if not isinstance(key_hex, str) or not key_hex:
+        _sched_refused("no_key", "the ledger's identity for this entry carries no "
+                                 "key, so there is no offered name to re-derive")
+        return None
+    split = disk_layout.split_block_key(key_hex)
+    if not split.get("ok"):
+        _sched_refused("offered_key_shape", f"the key we offered this entry under is "
+                                            f"not a block hash: {split.get('reason')}")
+        return None
+    if not sizes["ok"]:
+        _sched_unavailable(sizes["kind"], sizes["reason"])
+        return None
+    request = _load_request(manager, request_id)
+    if request is None:
+        _sched_unavailable(
+            "no_request_in_load_state",
+            "this request id is in neither manager._reqs_to_load nor "
+            "_abandoned_reqs_to_load, so its request (and therefore its "
+            "block_hashes) is unreachable here")
+        return None
+    hashes = getattr(request, "block_hashes", None)
+    if not isinstance(hashes, (list, tuple)) or not hashes:
+        _sched_unavailable(
+            "no_block_hashes",
+            "the request the fork holds for this load carries no block_hashes, so the "
+            "engine's own key cannot be re-derived for it")
+        return None
+    table = _block_table(scheduler_output, request_id, tables)
+    if not table["ok"]:
+        _sched_unavailable(table["kind"], table["reason"])
+        return None
+    groups = table["table"]
+    if group >= len(groups):
+        _sched_unavailable("group_outside_block_table",
+                           f"group {group} is outside a block table of "
+                           f"{len(groups)} group(s): the run named a group the "
+                           "allocator has no table for")
+        return None
+    group_table = groups[group]
+    if not isinstance(group_table, (list, tuple)):
+        _sched_unavailable("block_table_group_shape",
+                           f"group {group}'s block table is "
+                           f"{type(group_table).__name__}, not a list of block ids")
+        return None
+    ids = list(group_table)
+    index = None
+    if gpu_block is None:
+        _sched_refused("no_gpu_block", "this step's metadata carries no GPU block id "
+                                       "beside this CPU slot (the two lists are not "
+                                       "aligned), so there is no destination to ask "
+                                       "about")
+        return None
+    try:
+        index = ids.index(int(gpu_block))
+    except ValueError:
+        # Not a refusal: a MISMATCH with its own name, raised by the thread-side verdict
+        # so the sample carries the table it searched and the id it could not find.
+        index = None
+    except Exception:  # noqa: BLE001 - an unreadable table is a refusal, not a raise
+        _sched_unavailable("block_table_unreadable",
+                           f"group {group}'s block table could not be searched "
+                           "for a block id")
+        return None
+    group_size = (sizes["group_block_sizes"][group]
+                  if group < len(sizes["group_block_sizes"]) else None)
+    if not group_size:
+        _sched_unavailable("no_group_block_size",
+                           f"the manager gives no `group_block_sizes` entry for group "
+                           f"{group}, so the engine's view for it cannot be built")
+        return None
+    with _lock:
+        _state["scheduler_seq"] = int(_state["scheduler_seq"]) + 1
+        record_id = int(_state["scheduler_seq"])
+    return {"id": record_id, "rid": request_id[:MAX_SCHED_ID_CHARS],
+            "group": int(group), "span": _int_or_none(entry.get("span")),
+            "key": key_hex[:72], "key16": split["key16"],
+            "name_group": int(split["group_id"]),
+            "cpu_block": _int_or_none(entry.get("cpu_block")),
+            "gpu_block": int(gpu_block), "index": index,
+            "hashes": hashes, "hash_block_size": int(sizes["hash_block_size"]),
+            "group_bytes": int(group_size),
+            "group_block_sizes": list(sizes["group_block_sizes"]),
+            "table": list(group_table)[:4096],
+            "mono": time.monotonic()}
+
+
+def _retain_scheduler(record: dict) -> bool:
+    """Queue one scheduler-side record on the module's ONE thread. False = dropped."""
+    with _lock:
+        pending = _state["scheduler_pending"]
+        while len(pending) >= MAX_RETAINED_JOBS:
+            pending.pop(next(iter(pending)))
+            _count("scheduler_retained_dropped")
+        pending[record["id"]] = record
+        _count("scheduler_retained")
+    if not _ensure_thread():
+        with _lock:
+            _count("scheduler_thread_unavailable")
+            _state["scheduler_pending"].pop(record["id"], None)
+        return False
+    return True
+
+
+def observe_offer(manager, scheduler_output, entries) -> dict:
+    """THE SCHEDULER DOOR: what did the fork pair the file we offered with?
+
+    Called by `disk_restore._build_load_paths` after the length rule has been satisfied
+    and the paths have been written, with the entries of this step that are OURS (the
+    ones whose CPU slot this module's ledger named a file for). Bookkeeping only: it
+    cannot change the step, cannot prune an entry and cannot reorder a list, and every
+    path inside is a counter.
+
+    The sampling decision is taken BEFORE any block table is resolved, so an unarmed or
+    unsampled step costs this role nothing at all.
     """
     try:
         if not effective_enabled():
-            return {"ran": False, "reason": "disabled", "checked": 0}
+            return {"seen": 0, "retained": 0, "reason": "disabled"}
+        if not entries:
+            return {"seen": 0, "retained": 0, "reason": "no entries"}
+        with _lock:
+            _count("scheduler_steps_seen")
+        scanned = list(entries)[:MAX_ENTRIES_SCANNED]
+        sizes = _scheduler_sizes(manager)
+        tables: dict = {}
+        seen = 0
+        retained = 0
+        for entry in scanned:
+            seen += 1
+            with _lock:
+                _count("scheduler_entries_seen")
+                cursor = int(_state["scheduler_sample_cursor"])
+                _state["scheduler_sample_cursor"] = cursor + 1
+                selected = (cursor % max(1, SAMPLE_EVERY_N_RESTORES)) == 0
+                room = retained < MAX_RETAINED_PER_STEP
+            if not selected or not room:
+                # The per-step bound is a BOUND: hitting it is normal on a wide step and
+                # one reason per step would be a reason per step.
+                with _lock:
+                    _count("scheduler_sampled_out")
+                continue
+            record = _scheduler_record(manager, scheduler_output, sizes, tables, entry)
+            if record is None:
+                continue      # the refusal was counted and named where it happened
+            if not _retain_scheduler(record):
+                break
+            retained += 1
+        return {"seen": seen, "retained": retained, "reason": None}
+    except Exception as exc:  # noqa: BLE001 - never into the scheduler's step path
+        with _lock:
+            _count("scheduler_errors")
+        _reason("observe_offer",
+                f"the scheduler-side witness raised {type(exc).__name__}")
+        return {"seen": 0, "retained": 0, "reason": f"error_{type(exc).__name__}"}
+
+
+def _scheduler_helpers() -> dict:
+    """The engine's OWN two view-builders, or a named unavailability.
+
+    `disk_restore._key_helpers()` is the one resolver of `make_block_hash_with_group_id`
+    and `resolve_block_hashes` in this package, so the offer that NAMED the file and
+    this check that RE-DERIVES the name go through the same two functions. Nothing here
+    re-hashes or re-packs: a plugin that invented its own derivation would eventually
+    disagree with the engine about which bytes are the group, and that disagreement is a
+    file read under the wrong name - the exact failure this oracle exists to catch.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports nothing that imports us
+    try:
+        helpers = disk_restore._key_helpers()
+    except Exception as exc:  # noqa: BLE001 - a resolver that raises is a refusal
+        return {"ok": False, "kind": "key_helpers_raised",
+                "reason": f"_key_helpers raised {type(exc).__name__}"}
+    if not helpers.get("ok"):
+        return {"ok": False, "kind": helpers.get("reason_kind") or "no_key_helpers",
+                "reason": str(helpers.get("reason"))}
+    return {"ok": True, "pack": helpers["pack"], "resolve": helpers["resolve"]}
+
+
+def _scheduler_view(helpers: dict, record: dict, group_bytes=None) -> dict:
+    """One call to the engine's `resolve_block_hashes`, or a named refusal."""
+    try:
+        view = helpers["resolve"](record["hashes"], record["hash_block_size"],
+                                  int(record["group_bytes"] if group_bytes is None
+                                      else group_bytes))
+    except Exception as exc:  # noqa: BLE001 - the engine's helper is not ours to trust
+        return {"ok": False, "kind": "resolve_raised",
+                "reason": f"resolve_block_hashes raised {type(exc).__name__}"}
+    if not isinstance(view, (list, tuple)):
+        return {"ok": False, "kind": "resolve_shape",
+                "reason": f"resolve_block_hashes answered "
+                          f"{type(view).__name__}, not a sequence"}
+    return {"ok": True, "view": view}
+
+
+def _scheduler_key16(helpers: dict, view, index, group) -> dict:
+    """The `key16` the engine says block `index` of group `group` is named under."""
+    if index is None or index < 0 or index >= len(view):
+        return {"ok": False, "kind": "index_out_of_range",
+                "reason": f"index {index} is outside a resolved view of "
+                          f"{len(view)} entries"}
+    digest = view[index]
+    if not isinstance(digest, bytes):
+        return {"ok": False, "kind": "digest_not_bytes",
+                "reason": f"the engine's block hash at index {index} is "
+                          f"{type(digest).__name__}, not bytes"}
+    try:
+        key_hex = bytes(helpers["pack"](digest, int(group))).hex()
+    except Exception as exc:  # noqa: BLE001 - the packer is not ours either
+        return {"ok": False, "kind": "pack_raised",
+                "reason": f"make_block_hash_with_group_id raised "
+                          f"{type(exc).__name__}"}
+    split = disk_layout.split_block_key(key_hex)
+    if not split.get("ok"):
+        return {"ok": False, "kind": "key_shape",
+                "reason": f"the recomputed key is not a block hash: "
+                          f"{split.get('reason')}"}
+    return {"ok": True, "key16": split["key16"], "group_id": split["group_id"]}
+
+
+def _scheduler_classify(record: dict, helpers: dict, view) -> tuple:
+    """Which addressing failure this is: shift, group, or neither (yet).
+
+    The order is the order an operator acts in. The name's OWN group suffix is checked
+    first because it is a fact about our own run that needs no engine input at all: the
+    engine carries the group INSIDE the key (`kv_cache_utils.py:83`, read back by
+    `disk_layout.split_block_key`, the one place this package reads that suffix), so a
+    name whose suffix contradicts the group the entry is paired with is a group swap
+    inside our own walk. THEN the neighbour window, then the other groups' views of the
+    same index.
+    """
+    group = int(record["group"])
+    index = record["index"]
+    if record.get("name_group") is not None and int(record["name_group"]) != group:
+        return (SCHED_CLASS_GROUP, None,
+                f"a group swap on our own offer path: the name we offered ends with "
+                f"group id {record['name_group']} while the entry is paired with group "
+                f"{group}. The group a key belongs to is carried inside the key "
+                "itself, so this contradicts itself without any engine input")
+    for delta in range(1, NEIGHBOUR_WINDOW + 1):
+        for candidate in (int(index) + delta, int(index) - delta):
+            found = _scheduler_key16(helpers, view, candidate, group)
+            if found["ok"] and found["key16"] == record["key16"]:
+                return (SCHED_CLASS_SHIFT, (delta if candidate > index else -delta),
+                        f"a one-slot shift ({delta:+d}): the name carries"
+                        f" the digest of block index {candidate} while the GPU"
+                        f" block the fork paired it with is the engine's block index "
+                        f"{index}. A shift moves both index-aligned lists"
+                        " together, so it is invisible to every list-vs-list check this"
+                        " plugin has")
+    try:
+        for other, size in enumerate(record.get("group_block_sizes") or ()):
+            if other == group or not size:
+                continue
+            other_view = _scheduler_view(helpers, record, group_bytes=size)
+            if not other_view["ok"]:
+                continue      # another group's view may legitimately not exist here
+            found = _scheduler_key16(helpers, other_view["view"], index, other)
+            if found["ok"] and found["key16"] == record["key16"]:
+                return (SCHED_CLASS_GROUP, None,
+                        f"a group swap: the name carries group {other}'s digest for "
+                        f"block index {index} while the entry is paired with group "
+                        f"{group}. The digest is real but belongs to another group's "
+                        "hash view, so a file is read for one group and restored as "
+                        "another")
+    except Exception:  # noqa: BLE001 - a classification walk never loses the mismatch
+        return (SCHED_CLASS_UNKNOWN, None,
+                "the mismatch is real but its classification walk raised, so it is "
+                "reported under its own name rather than guessed at")
+    return (SCHED_CLASS_UNKNOWN, None,
+            "no shape this module has a word for: the name's digest matches neither "
+            f"index {index} for group {group}, nor a neighbour within "
+            f"{NEIGHBOUR_WINDOW}, nor another group's view of that index - a wrong "
+            "name reported under its own name rather than guessed at")
+
+
+def _scheduler_sample(record: dict, expected=None, classification=None, offset=None,
+                      stable=None) -> dict:
+    """The diagnosable shape of one scheduler-side verdict, clipped and bounded.
+
+    Every field here answers a question an operator asks of a bad name: WHICH REQUEST,
+    which group, which block, what the file was named for, what the engine says it
+    should have been named for, and what KIND of wrong that is - with `offset` the shift
+    and `index` the position the pairing implied.
+
+    It carries NO sentence, and that is a byte-budget decision rather than an oversight:
+    the explanation of a scheduler mismatch is the `scheduler_mismatch:<classification>`
+    line in `reasons`, which says it once per finding in full, while a sample's numbers
+    are what makes a rank file actionable. `span`/`cpu_block`/`table_len` are out for
+    the same reason - the ledger and the path already carry them.
+    """
+    return {"request_id": record["rid"], "group": record["group"],
+            "key16": record["key16"], "expected_key16": expected,
+            "name_group": record.get("name_group"),
+            "gpu_block": record["gpu_block"],
+            "index": record["index"],
+            "classification": classification, "offset": offset, "stable": stable}
+
+
+def _scheduler_mismatch(record: dict, classification: str, detail: str,
+                        expected=None, offset=None) -> dict:
+    """A scheduler-side finding: classify it, re-derive it, publish the sample."""
+    stable = None
+    if expected is not None:
+        # THE SCHEDULER SIDE'S STABILITY WITNESS. The worker re-reads a GPU block
+        # because the engine hands blocks out again; the scheduler's inputs are two
+        # Python objects the engine mutates as a request runs (`block_hashes` grows,
+        # and a preemption can move a table), so the equivalent question is whether the
+        # SAME captured inputs re-derive the SAME expected key. If they do not, the
+        # disagreement came from reading the view mid-mutation and the sample is not
+        # evidence.
+        helpers = _scheduler_helpers()
+        again = None
+        if helpers["ok"] and record.get("index") is not None:
+            view = _scheduler_view(helpers, record)
+            if view["ok"]:
+                again = _scheduler_key16(helpers, view["view"], record["index"],
+                                         record["group"])
+        stable = bool(again and again["ok"]
+                      and again["key16"] == expected)
+    sample = _scheduler_sample(record, expected=expected,
+                               classification=classification, offset=offset,
+                               stable=stable)
+    with _lock:
+        _count("scheduler_mismatch")
+        _count(_SCHED_CLASS_COUNTERS.get(classification, "scheduler_mismatch_unknown"))
+        _count("scheduler_mismatch_stable" if stable
+               else "scheduler_mismatch_unstable")
+        samples = _state["scheduler_mismatch_samples"]
+        samples.append(dict(sample))
+        while len(samples) > MAX_SCHED_MISMATCH_SAMPLES:
+            samples.pop(0)
+    _reason(f"scheduler_mismatch:{classification}", detail)
+    return {"checked": True, "equal": False, "state": "scheduler_mismatch",
+            "classification": classification, "stable": stable, "offset": offset,
+            "expected_key16": expected, "reason": detail[:MAX_REASON_CHARS]}
+
+
+def _verify_scheduler_record(record: dict) -> dict:
+    """One retained offered entry, on this module's thread. Never raises."""
+    try:
+        return _verify_scheduler_inner(record)
+    except Exception as exc:  # noqa: BLE001 - an entry never kills the pass
+        with _lock:
+            _count("scheduler_errors")
+        _reason("scheduler_verify",
+                f"verifying one scheduler entry raised {type(exc).__name__}")
+        return {"checked": False, "reason": f"error_{type(exc).__name__}"}
+
+
+def _verify_scheduler_inner(record: dict) -> dict:
+    """The comparison, in the order that makes each refusal nameable on its own."""
+    if (time.monotonic() - float(record.get("mono") or 0.0)) > JOB_MAX_AGE_SECONDS:
+        with _lock:
+            _count("scheduler_retained_dropped")
+        return {"checked": False, "reason": "stale"}
+    if record.get("index") is None:
+        # Not a comparison - no expected key exists - and the most alarming thing this
+        # role can report: the destination the fork chose is not in the request's own
+        # table for this group, so "which token block is this GPU block" has no answer.
+        return _scheduler_mismatch(
+            record, SCHED_CLASS_NOT_IN_TABLE,
+            # THE CONCLUSION FIRST: `reason` is clipped at `MAX_REASON_CHARS`, and the
+            # sentence a reader acts on is "this block is not one this request owns",
+            # with the ids that prove it inside the same clip.
+            f"not one this request owns for group {record['group']}: GPU block "
+            f"{record['gpu_block']} is not in request {record['rid']}'s table of "
+            f"{len(record.get('table') or ())} ids, so the destination of this "
+            "restore is a block this request does not have")
+    helpers = _scheduler_helpers()
+    if not helpers["ok"]:
+        _sched_unavailable(helpers["kind"], helpers["reason"])
+        return {"checked": False, "reason": helpers["kind"]}
+    view = _scheduler_view(helpers, record)
+    if not view["ok"]:
+        if view["kind"] == "index_out_of_range":
+            with _lock:
+                _count("scheduler_index_out_of_range")
+        _sched_refused(view["kind"], view["reason"])
+        return {"checked": False, "reason": view["kind"]}
+    expected = _scheduler_key16(helpers, view["view"], record["index"],
+                                record["group"])
+    if not expected["ok"]:
+        if expected["kind"] == "index_out_of_range":
+            with _lock:
+                _count("scheduler_index_out_of_range")
+        _sched_refused(expected["kind"], expected["reason"])
+        return {"checked": False, "reason": expected["kind"]}
+    # THE NAME HAS TWO HALVES, AND BOTH ARE CHECKED. `key16` is the digest part, and it
+    # is what the equality comparison compares - but the FILE is named by the digest AND
+    # the group (`disk_layout.build_slot_path` writes the group into the file name), so
+    # a name whose own suffix names a different group than the entry is paired with
+    # points at a different file, whatever its digest says. A `key16`-only equality
+    # would call that a match; it is the one contradiction this module can see with no
+    # engine input at all, so it outranks the digest comparison rather than following
+    # it.
+    name_conflict = (record.get("name_group") is not None
+                     and int(record["name_group"]) != int(record["group"]))
+    if expected["key16"] == record["key16"] and not name_conflict:
+        with _lock:
+            _count("scheduler_checked")
+            _count("scheduler_equal")
+            _state["scheduler_last_oracle"] = {
+                "equal": True, "expected_key16": expected["key16"],
+                "name_key16": record["key16"], "group": record["group"],
+                "index": record["index"], "gpu_block": record["gpu_block"],
+                "request_id": record["rid"]}
+        return {"checked": True, "equal": True, "state": "scheduler_equal",
+                "index": record["index"], "key16": record["key16"],
+                "expected_key16": expected["key16"]}
+    classification, offset, detail = _scheduler_classify(record, helpers, view["view"])
+    return _scheduler_mismatch(record, classification, detail,
+                               expected=expected["key16"], offset=offset)
+
+
+def _drain_scheduler(batch) -> tuple:
+    """Verify the scheduler records this pass took. Returns (results, comparisons)."""
+    results: list = []
+    checked = 0
+    if not batch:
+        return results, checked
+    with _lock:
+        for record in batch:
+            _state["scheduler_pending"].pop(record["id"], None)
+    for record in batch:
+        verdict = _verify_scheduler_record(record)
+        if verdict.get("checked"):
+            checked += 1
+        results.append({"id": record["id"], **verdict})
+    return results, checked
+
+
+def scheduler_state() -> dict:
+    """The scheduler-side oracle's state. A stable key set on every path.
+
+    NOTE THE ASYMMETRY WITH the worker's `oracle_state()`, and it is deliberate: the
+    worker's `unreachable_reason` is a PERMANENT fact of the fork (`metadata.py` says a
+    worker has no request identities), so it is a fixed sentence. The scheduler's
+    `unreachable_reason` is a FAULT: it names why the oracle could not be built on the
+    one process that CAN build it, and a non-None value there means the addressing check
+    is not running. When nothing has been unavailable yet, the field says so rather than
+    reading like a missing feature.
+
+    It carries NO `last` and NO role string, on purpose: `scheduler_mismatch_samples`
+    and `roles` already publish those, and a section whose byte budget is enforced by
+    REFUSAL cannot afford to say the same thing twice.
+    """
+    with _lock:
+        counters = _state["counters"]
+        return {"unreachable_reason": (_state["scheduler_unreachable_reason"]
+                                       or SCHED_NOTHING_UNAVAILABLE),
+                "checked": int(counters["scheduler_checked"]),
+                "equal": int(counters["scheduler_equal"]),
+                "mismatch": int(counters["scheduler_mismatch"]),
+                "unavailable": int(counters["scheduler_oracle_unavailable"]),
+                "refused": int(counters["scheduler_oracle_refused"]),
+                "index_out_of_range": int(counters["scheduler_index_out_of_range"])}
+
+
+# --- THE PASS ------------------------------------------------------------------
+def run_pass(worker=None) -> dict:
+    """At most `MAX_CHECKS_PER_PASS` retained entries PER ROLE. One pass; never raises.
+
+    The thread's body, and the function a test drives directly (the `disk_gpu_shadow`
+    idiom: monkeypatch `_ensure_thread` to keep the thread off and call this).
+
+    THE SCHEDULER HALF GOES FIRST, on purpose: it needs no worker, so a `worker_gone` in
+    the middle of a shutdown cannot strand the offered-entry verdicts - which are the
+    verdicts about the SCHEDULER's own addressing, taken while the scheduler was alive.
+    """
+    try:
+        if not effective_enabled():
+            return {"ran": False, "reason": "disabled", "checked": 0,
+                    "scheduler_checked": 0}
         now = time.monotonic()
         with _lock:
             last = _state["last_pass_mono"]
             if last is not None and (now - float(last)) < MIN_INTERVAL_SECONDS:
                 _count("throttled_interval")
-                return {"ran": False, "reason": "throttled_interval", "checked": 0}
+                return {"ran": False, "reason": "throttled_interval", "checked": 0,
+                        "scheduler_checked": 0}
             _state["last_pass_mono"] = now
             _state["pass_used"] = 0
             _state["recheck_used"] = 0
             batch = [record for record in list(_state["pending"].values())
                      [:MAX_CHECKS_PER_PASS]]
-            if not batch:
-                return {"ran": True, "reason": "nothing retained", "checked": 0}
+            sched_batch = [record for record
+                           in list(_state["scheduler_pending"].values())
+                           [:MAX_CHECKS_PER_PASS]]
+            if not batch and not sched_batch:
+                return {"ran": True, "reason": "nothing retained", "checked": 0,
+                        "scheduler_checked": 0}
             _count("passes")
+        drained = _contained(lambda: _drain_scheduler(sched_batch)) or ([], 0)
+        sched_results, sched_checked = drained
         target = _resolve_worker(worker)
         if target is None:
             # Every retained entry goes with it: they were retained against a worker
             # that is gone, and re-verifying them against a future one would compare one
-            # boot's file against another boot's GPU.
+            # boot's file against another boot's GPU. The SCHEDULER records are
+            # untouched by that reasoning, which is why they were drained above.
             with _lock:
                 _count("worker_gone")
                 dropped = len(_state["pending"])
@@ -1239,7 +2058,9 @@ def run_pass(worker=None) -> dict:
             _reason("worker_gone",
                     f"the worker this module retained is gone, so {dropped} retained "
                     "entries were dropped unread")
-            return {"ran": True, "reason": "worker_gone", "checked": 0}
+            return {"ran": True, "reason": "worker_gone", "checked": 0,
+                    "scheduler_checked": sched_checked,
+                    "scheduler_results": sched_results}
         results = []
         still_waiting: list = []
         for record in batch:
@@ -1256,7 +2077,9 @@ def run_pass(worker=None) -> dict:
                     _state["pending"][record["id"]] = record
         return {"ran": True, "reason": None,
                 "checked": sum(1 for item in results if item.get("checked")),
-                "waiting": len(still_waiting), "results": results}
+                "waiting": len(still_waiting), "results": results,
+                "scheduler_checked": sched_checked,
+                "scheduler_results": sched_results}
     except Exception as exc:  # noqa: BLE001 - a pass never escapes its thread
         with _lock:
             _count("errors")
@@ -1268,6 +2091,14 @@ def run_pass(worker=None) -> dict:
 def counters() -> dict:
     with _lock:
         return dict(_state["counters"])
+
+
+def scheduler_counters() -> dict:
+    """Only the `scheduler_`-prefixed ones, for a reader who must not add them to the
+    worker's."""
+    with _lock:
+        return {key: int(_state["counters"][key]) for key in _COUNTER_KEYS
+                if key.startswith("scheduler_")}
 
 
 def _dump_size(payload) -> int:
@@ -1302,27 +2133,82 @@ def _fit(out: dict) -> dict:
     `worker_diag` refuses an over-cap section rather than truncating it, so an over-fat
     payload's failure mode is that the ENTIRE `disk_restore_verify` key vanishes from
     the rank file on the boot with the most to report. So the section bounds itself, in
-    the order a reader acts on: the reason TEXT first (the leading tag survives - the
-    tag is what names the category), then the boundary-group illustration lists (the
-    COUNTS above them never move), then the reasons themselves. The counters and
-    `last_mismatch` are NEVER trim targets: they are why the section exists, they are
-    fixed-size, and a trimmed section that gained or lost a key is a section a reader
-    cannot diff. Every top-level key survives every step, which is what keeps "the key
-    set never changes" true under pressure too.
+    the order a reader acts on, numbered in the body: the reason TEXT first (the leading
+    tag survives - the tag is what names the category), then the boundary-group
+    illustration lists (the COUNTS above them never move), then the scheduler's mismatch
+    SAMPLES oldest first, then the explanatory PROSE (clipped, never removed as keys),
+    then the reasons themselves.
+
+    Illustration goes before explanation on purpose. `roles`/`oracle_rule` are what make
+    an unprefixed `oracle_unavailable` readable as "expected, this is a worker" and not
+    as "the check is not running here", and that distinction is the 0.2.40 role split; a
+    second mismatch sample is a nicer-to-read version of a fact the counters and the
+    `reasons` ring already carry in full.
+
+    The counters and `last_mismatch` are NEVER trim targets: they are why the section
+    exists, they are fixed-size, and a trimmed section that gained or lost a key is a
+    section a reader cannot diff. Every top-level key survives every step, which is what
+    keeps "the key set never changes" true under pressure too - a clipped value is not a
+    missing key.
     """
     trimmed = out["trimmed"] = []
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return out
+    # 1. THE REASON TEXT FIRST. The leading tag survives - the tag is what names the
+    # category - so a clipped reason still says WHICH condition is standing.
     out["reasons"] = [str(line)[:TRIM_REASON_CHARS] for line in out["reasons"]]
     trimmed.append(f"reason_chars:{TRIM_REASON_CHARS}")
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return _counted_trim(out)
+    # 2. THE BOUNDARY GROUPS' ILLUSTRATION LISTS. The COUNTS above them never move, so
+    # this costs the reader a list of which groups and buys back a hundred bytes.
     boundary = out["boundary"]
     if isinstance(boundary, dict):
         boundary["missing_by_group"] = dict(list(boundary["missing_by_group"].items())
                                             [:TRIM_BOUNDARY_GROUPS])
         boundary["groups"] = list(boundary["groups"])[:TRIM_BOUNDARY_GROUPS]
         trimmed.append(f"boundary:{TRIM_BOUNDARY_GROUPS}")
+    if _dump_size(out) <= MAX_SECTION_BYTES:
+        return _counted_trim(out)
+    # 3. THE SCHEDULER'S SAMPLES, oldest first. They are the scheduler half's only
+    # variable-size field and their findings are DUPLICATED in kind: every one is a
+    # counter, and their sentences are in `reasons`. They go BEFORE the explanatory
+    # prose, because the sentences telling a worker's number from a scheduler's are what
+    # the 0.2.40 role split exists to publish, and a reader who cannot tell which
+    # process wrote a number cannot act on it - while one sample instead of two still
+    # leaves the newest finding and every number.
+    samples = out.get("scheduler_mismatch_samples")
+    if isinstance(samples, list) and len(samples) > 1:
+        out["scheduler_mismatch_samples"] = samples[-1:]
+        trimmed.append("scheduler_samples:1")
+    if _dump_size(out) <= MAX_SECTION_BYTES:
+        return _counted_trim(out)
+    if isinstance(samples, list) and samples:
+        out["scheduler_mismatch_samples"] = []
+        trimmed.append("scheduler_samples")
+    if _dump_size(out) <= MAX_SECTION_BYTES:
+        return _counted_trim(out)
+    # 4. THE EXPLANATORY PROSE, clipped (never removed as keys). Every counter, every
+    # oracle number and every last-verdict field survives this step untouched.
+    clipped = 0
+    for key in ("note", "oracle_rule"):
+        if isinstance(out.get(key), str) and len(out[key]) > TRIM_REASON_CHARS:
+            out[key] = out[key][:TRIM_REASON_CHARS]
+            clipped += 1
+    for name in ("oracle", "scheduler_oracle"):
+        block = out.get(name)
+        reason = block.get("unreachable_reason") if isinstance(block, dict) else None
+        if isinstance(reason, str) and len(reason) > TRIM_REASON_CHARS:
+            block["unreachable_reason"] = reason[:TRIM_REASON_CHARS]
+            clipped += 1
+    if isinstance(out.get("roles"), dict):
+        for key in ("worker", "scheduler", "meaning"):
+            value = out["roles"].get(key)
+            if isinstance(value, str) and len(value) > TRIM_REASON_CHARS:
+                out["roles"][key] = value[:TRIM_REASON_CHARS]
+                clipped += 1
+    if clipped:
+        trimmed.append(f"notes:{TRIM_REASON_CHARS}")
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return _counted_trim(out)
     out["reasons"] = []
@@ -1359,16 +2245,25 @@ def section() -> dict:
 
     The counters, the enablement, the limits in force, the geometry the comparison used,
     the boundary-group accounting, the oracle's reachability, and the shape of the last
-    mismatch. The degraded view is built by this same function, which is what makes "the
-    key set does not change when there is no GPU" a structural property rather than a
-    copy.
+    mismatch - for BOTH roles: the worker's apply-point counters are unprefixed and the
+    EngineCore's offer-point counters all begin `scheduler_`, and `roles`/`oracle_rule`
+    say which process produces which. The degraded view is built by this same function,
+    which is what makes "the key set does not change when there is no GPU" a structural
+    property rather than a copy.
     """
     with _lock:
         out = {key: int(_state["counters"][key]) for key in _COUNTER_KEYS}
         out["reasons"] = copy.deepcopy(_state["reasons"])
         out["retained_jobs_now"] = len(_state["pending"])
+        out["scheduler_jobs_now"] = len(_state["scheduler_pending"])
         out["last_mismatch"] = (copy.deepcopy(_state["last_mismatch"])
                                 if _state["last_mismatch"] else None)
+        # THE SCHEDULER'S VERDICTS, as a ring only. There is no
+        # `scheduler_last_mismatch` key: the ring's last element is the newest verdict,
+        # and publishing the same object twice cost 440 B of a 4096 B budget to repeat a
+        # fact a reader can index.
+        out["scheduler_mismatch_samples"] = copy.deepcopy(
+            _state["scheduler_mismatch_samples"])
         missing_by_group = dict(_state["boundary_missing_groups"])
         boundary_groups = list(_state["boundary_groups"])
         last_boundary = copy.deepcopy(_state["last_boundary"])
@@ -1391,13 +2286,24 @@ def section() -> dict:
                        "missing_by_group": missing_by_group,
                        "last": last_boundary}
     out["oracle"] = oracle_state()
+    # --- THE SCHEDULER-SIDE ROLE, in the same section and under its own prefix. See the
+    # module docstring for why a separate contribution is not available (the seam holds
+    # five and its allow-list is five), and for the reachability proof of the two inputs
+    # this half reads that the worker half cannot.
+    out["scheduler_oracle"] = scheduler_state()
+    out["roles"] = {"worker_apply_point": bool(out["batches_seen"]),
+                    "scheduler_offer_point": bool(out["scheduler_steps_seen"]),
+                    "worker": WORKER_ROLE, "scheduler": SCHEDULER_ROLE,
+                    "meaning": ROLE_MEANING}
+    out["oracle_rule"] = ORACLE_RULE
+    out["neighbour_window"] = int(NEIGHBOUR_WINDOW)
+    out["max_scheduler_mismatch_samples"] = int(MAX_SCHED_MISMATCH_SAMPLES)
     out["thread_alive"] = bool(_thread is not None and _thread.is_alive())
     out["section"] = MODULE
     out["writer"] = OWNER_TAG
-    out["note"] = ("a mismatch is a QUESTION, not a verdict: only mismatch_stable is a "
-                   "layout candidate, and only the leading W_g bytes of the window are "
-                   "compared, because the tail belongs to the other groups by "
-                   "construction (tail_bytes_excluded says how much)")
+    out["note"] = ("a mismatch is a QUESTION: only mismatch_stable is a layout "
+                   "candidate, and only the leading W_g bytes of the window are "
+                   "compared; the tail is other groups' by construction")
     return _fit(out)
 
 
@@ -1410,24 +2316,38 @@ def register_contribution() -> dict:
     """Offer this module's verdict to the rank-file writer. Idempotent.
 
     Registered by `disk_restore.install()` beside its own `disk_restore` section, i.e.
-    only where a restore can actually be applied. An EngineCore or an API-server process
-    registers neither, so its rank file carries no `disk_restore_verify` key at all
-    rather than an empty object claiming a facility that process does not have.
+    only where a restore can actually be applied. The rank FILES are written by workers
+    (a worker is the process with a `PP<n>_TP<m>` identity to name a file after), so in
+    practice this is the worker's section. THE SCHEDULER-SIDE ROLE still needs no
+    contribution of its own: the EngineCore answers `/disk {"op":"restore-verify"}` and
+    `/snapshot`, and `snapshot.dev_state_sections()` publishes the SAME `section()`
+    there, so both roles are readable through one shape and neither process invents a
+    second file, a second contract or a sixth contribution.
     """
     return worker_diag.register_contribution(
         MODULE, worker_report,
         # OWNER_TAG's claim, kept true: this reports a STATE, never an age. What moves
         # with no counter moving is the ENABLEMENT and the ORACLE - either can change
         # between two writes of the file with nothing compared in between, and a reader
-        # must be able to see that without diffing the file by hand.
+        # must be able to see that without diffing the file by hand. The two scheduler
+        # terms join them for one reason: a scheduler-side MISMATCH is a finding worth a
+        # rewrite the second it happens, while a role that has merely seen its first
+        # step changes the signature once per boot and nothing after that.
         owner=f"{OWNER_TAG} state, never a window",
         signal=lambda: (int(bool(enable_state()["enabled"])),
-                        int(bool(oracle_state()["provider"]))))
+                        int(bool(oracle_state()["provider"])),
+                        int(bool(scheduler_state()["mismatch"])),
+                        int(bool(scheduler_counters()["scheduler_steps_seen"]))))
 
 
 def status() -> dict:
-    """The verb's view: the enablement, the limits, the geometry, the oracle and the
-    counters. `section()` builds it, so the verb and the rank file cannot disagree."""
+    """The verb's view: the enablement, the limits, the geometry, both roles' counters,
+    both oracle states and the last verdicts.
+
+    `section()` builds it, so the verb, `worker_report()` and the rank file cannot
+    disagree. In the EngineCore - the process that answers this verb - this is the ONLY
+    door to the scheduler-side oracle, which is why 0.2.40 added no new op.
+    """
     out = {"ok": True, "reason": None, "module": MODULE}
     out.update(section())
     return out
@@ -1490,4 +2410,9 @@ def view() -> dict:
                               "last_mismatch": _state["last_mismatch"],
                               "reasons": list(_state["reasons"]),
                               "oracle_note": (_state["oracle"][1]
-                                              if _state["oracle"] else None)})
+                                              if _state["oracle"] else None),
+                              "scheduler_pending": _state["scheduler_pending"],
+                              "scheduler_mismatch_samples":
+                                  _state["scheduler_mismatch_samples"],
+                              "scheduler_unreachable_reason":
+                                  _state["scheduler_unreachable_reason"]})

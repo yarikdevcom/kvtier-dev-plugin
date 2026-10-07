@@ -5741,7 +5741,7 @@ def _sweep_loads(manager) -> int:
 
 # --- the scheduler's door 2: name the files, index-aligned --------------------
 
-def build_load_paths(manager, metadata) -> dict:
+def build_load_paths(manager, metadata, scheduler_output=None) -> dict:
     """Fill `metadata.load_paths` for the fork's own `load_cpu_blocks`.
 
     THE LENGTH RULE IS THE CONTRACT: one entry per load entry, always, with ""
@@ -5751,19 +5751,28 @@ def build_load_paths(manager, metadata) -> dict:
     make unreachable. So the length is asserted on the way out and a violation is
     counted and blanked rather than shipped.
 
-    Mutates the metadata in place and returns a report; the WRAPPER returns the
-    fork's object untouched either way, so a refusal here is invisible to the fork.
+    Mutates the metadata in place and returns a report; the WRAPPER returns the fork's
+    object untouched either way, so a refusal here is invisible to the fork.
+
+    `scheduler_output` (0.2.40) is passed THROUGH, untouched and unread except by the
+    offer-point witness, for one reason: `kv_connector_block_state` is the fork's own
+    connector-only channel to a request's GPU block table, and the fork clears the field
+    after this call returns (`sched/scheduler.py:1479` then `:1497`), so this is the ONE
+    moment a connector can ask which token block the GPU block it just paired our file
+    with actually is. A caller that has no SchedulerOutput to hand (a test, a later
+    replay) simply gets the witness without the table: it counts
+    `scheduler_oracle_unavailable` rather than guessing.
     """
     _sweep_loads(manager)
     try:
-        return _build_load_paths(metadata)
+        return _build_load_paths(metadata, scheduler_output, manager)
     except Exception as exc:  # noqa: BLE001 - a step without paths is a normal step
         _state["errors"] += 1
         snapshot._error(exc, "disk_restore build_load_paths")
         return _fail(f"the path emission raised {type(exc).__name__}")
 
 
-def _build_load_paths(metadata) -> dict:
+def _build_load_paths(metadata, scheduler_output=None, manager=None) -> dict:
     cpu_blocks = getattr(metadata, FIELD_LOAD_CPU, None)
     if not isinstance(cpu_blocks, (list, tuple)):
         return _ok(emitted=False, reason="the step carries no load_cpu_blocks")
@@ -5774,6 +5783,11 @@ def _build_load_paths(metadata) -> dict:
         _set_load_paths(metadata, paths)
         return _ok(emitted=False, entries=0, reason="the step has no load entries")
     named = 0
+    # THE OFFER-POINT WITNESS (0.2.40). Asked ONCE, before the walk, so that a disabled
+    # verifier costs this loop nothing at all: no identity index, no dict, no call.
+    witness_on = disk_restore_verify.effective_enabled()
+    witness: list = []
+    identities_by_cpu: dict = {}
     if len(cpu_blocks) > MAX_PATHS_PER_STEP:
         _note(f"a step carried {len(cpu_blocks)} load entries; the cap is "
               f"{MAX_PATHS_PER_STEP}, so nothing was attributed")
@@ -5805,6 +5819,31 @@ def _build_load_paths(metadata) -> dict:
                     if (gpu_id is not None and isinstance(mapped, list)
                             and gpu_id not in mapped):
                         mapped.append(gpu_id)
+                    if witness_on and gpu_id is not None:
+                        # THE ONE PLACE THE SCHEDULER SEES BOTH HALVES OF OUR OWN CLAIM:
+                        # the file this module's ledger named for this CPU slot, and the
+                        # GPU block the fork put beside it. Handed to the verifier as
+                        # FACTS this module owns: the identity came from our run, so
+                        # the verifier needs no private access here and the witness can
+                        # add no opinion about the step.
+                        identity = identities_by_cpu.get(held[0])
+                        if identity is None:
+                            identity = {}
+                            for item in record.get("identities") or ():
+                                if not isinstance(item, dict):
+                                    continue
+                                slot = _int(item.get("cpu_block_id"))
+                                if slot is not None:
+                                    identity.setdefault(slot, item)
+                            identities_by_cpu[held[0]] = identity
+                        named_for = identity.get(cpu_block_id)
+                        if isinstance(named_for, dict) and named_for.get("key"):
+                            witness.append(
+                                {"request_id": held[0], "cpu_block": cpu_block_id,
+                                 "gpu_block": gpu_id,
+                                 "group": named_for.get("group"),
+                                 "span": named_for.get("span"),
+                                 "key": named_for.get("key")})
     if len(paths) != len(cpu_blocks):
         # Unreachable by construction; counted rather than trusted.
         _state["path_length_violations"] += 1
@@ -5816,6 +5855,11 @@ def _build_load_paths(metadata) -> dict:
     if named:
         _state["paths_emitted_steps"] += 1
         _mark_adopted()
+    if witness:
+        # AFTER the paths are written, so the witness can neither prune nor reorder an
+        # entry, and contained by its own module: a verifier that raised cannot cost a
+        # step its restore. It is counted at the door (`observe_offer` never raises).
+        disk_restore_verify.observe_offer(manager, scheduler_output, witness)
     return _ok(emitted=bool(named), entries=len(paths), named=named)
 
 
@@ -8084,7 +8128,9 @@ def make_wrapper(name: str, original):
     elif name == METHOD_BUILD_META:
         def wrapper(self, scheduler_output):
             metadata = original(self, scheduler_output)
-            build_load_paths(self, metadata)   # contained: never raises
+            # THE SCHEDULER OUTPUT TRAVELS WITH THE METADATA (0.2.40): see
+            # `build_load_paths` for why this is the only moment it is readable.
+            build_load_paths(self, metadata, scheduler_output)  # contained
             return metadata                    # THE FORK'S OBJECT, UNTOUCHED
     elif name == METHOD_UPDATE_OUTPUT:
         def wrapper(self, connector_output):
