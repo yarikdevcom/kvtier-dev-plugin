@@ -23,6 +23,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     blockdump,
     config,
     disk_boot,
+    disk_gpu_shadow,
     disk_index,
     disk_shadow,
     disk_spill,
@@ -74,7 +75,16 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # running a device read on the step thread inside tests that assert no GPU
             # read is ever attempted. Deleting it makes "unset = off" the fact each
             # test measures, and the tests that want it on name it.
-            config.ENV_DISK_SHADOW)
+            config.ENV_DISK_SHADOW,
+            # THE GPU-DIRECT SHADOW WRITER (0.2.37). Same rule, and a heavier one: this
+            # one WRITES FILES. A suite that inherited
+            # `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES=1` from a developer's shell would be
+            # writing KV files into a directory the tests never asked for, from tests
+            # that assert nothing is ever written. `..._ROOT` is listed for the mirror
+            # reason: an inherited root would point a test's shadow files somewhere
+            # outside its `tmp_path`, which is the opposite of what a temp-directory
+            # test suite means.
+            config.ENV_DISK_GPU_SHADOW_WRITES, config.ENV_DISK_GPU_SHADOW_ROOT)
 
 
 def _isolate(state: dict) -> dict:
@@ -170,6 +180,11 @@ def reset_dev_state():
              # armed the shadow must not hand it to the next test, which would then
              # observe a device read it never asked for.
              "disk_shadow": _isolate(disk_shadow._state),
+             # THE GPU-DIRECT SHADOW WRITER (0.2.37): its latch, its resolved root, the
+             # pending-comparison list and its write/compare counters are all
+             # process-wide, and unlike the read side it holds a THREAD. A test that
+             # armed it must not hand a live writer to the next one.
+             "disk_gpu_shadow": _isolate(disk_gpu_shadow._state),
              "lookups": _isolate(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -203,6 +218,10 @@ def reset_dev_state():
     # THE SHADOW VERIFIER. Its latch is an enablement, and an enablement a test set is
     # exactly the state this fixture exists to keep from travelling.
     disk_shadow.reset_state_for_tests()
+    # THE GPU-DIRECT SHADOW WRITER. Same reason, plus its writer thread: the reset stops
+    # the thread and drops the queue, so a shadow file queued by one test cannot be
+    # written into a directory the next test is asserting is empty.
+    disk_gpu_shadow.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
@@ -213,6 +232,7 @@ def reset_dev_state():
            "disk_store": disk_store._state,
            "disk_boot": disk_boot._state,
            "disk_shadow": disk_shadow._state,
+           "disk_gpu_shadow": disk_gpu_shadow._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -231,6 +251,7 @@ def reset_dev_state():
                        ("disk_store", disk_store._state),
                        ("disk_boot", disk_boot._state),
                        ("disk_shadow", disk_shadow._state),
+                       ("disk_gpu_shadow", disk_gpu_shadow._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])

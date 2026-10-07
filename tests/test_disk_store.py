@@ -1900,11 +1900,11 @@ def test_install_offers_the_section_only_where_a_worker_class_exists(tier,
     registers NOTHING and the rank file carries no `disk` key at all - rather than an
     empty object claiming a facility this process does not have.
 
-    A worker registers TWO sections since 0.2.36: the spill tier's own verdict and the
-    shadow verifier's. The claim this test holds - nothing is registered where there is
-    no worker class - is unchanged by that; what changed is the list a worker answers
-    with. Both are registered from `install()` and nowhere else, which is the property
-    being pinned.
+    A worker registers THREE sections since 0.2.37: the spill tier's own verdict, the
+    shadow verifier's, and the GPU-direct shadow writer's. The claim this test holds -
+    nothing is registered where there is no worker class - is unchanged by that; what
+    changed is the list a worker answers with. All three are registered from `install()`
+    and nowhere else, which is the property being pinned.
     """
     saved = sys.modules.pop(disk_store.TARGET_MODULE, None)
     try:
@@ -1914,10 +1914,18 @@ def test_install_offers_the_section_only_where_a_worker_class_exists(tier,
         if saved is not None:
             sys.modules[disk_store.TARGET_MODULE] = saved
     assert disk_store.install()["installed"] is True
-    assert worker_diag.contributions()["registered"] == ["disk", "disk_shadow"]
+    # THREE sections since 0.2.37: the spill tier's verdict, the shadow verifier's, and
+    # the GPU-direct shadow writer's. The claim this test holds - nothing is registered
+    # where there is no worker class - is unchanged by that; what changed is the list a
+    # worker answers with. All three are registered from `install()` and nowhere else,
+    # which is the property being pinned.
+    assert worker_diag.contributions()["registered"] == [
+        "disk", "disk_shadow", "disk_gpu_shadow"]
     assert worker_diag.contributions()["owners"] == {
         "disk": "kvtier-dev-plugin/disk-store",
-        "disk_shadow": "kvtier-dev-plugin/disk-shadow-1 state, never a window"}
+        "disk_shadow": "kvtier-dev-plugin/disk-shadow-1 state, never a window",
+        "disk_gpu_shadow": "kvtier-dev-plugin/disk-gpu-shadow-1 state, never a "
+                           "window"}
 
 
 def test_the_rank_file_carries_the_disks_own_verdict(tier, worker_class,
@@ -1948,10 +1956,13 @@ def test_the_rank_file_carries_the_disks_own_verdict(tier, worker_class,
     assert disk_section["root"] == str(tier)
     assert disk_section["files_written"] == 0
     assert disk_section["note"].startswith("THE DISK TIER'S OWN VERDICT")
-    # TWO sections since 0.2.36 (the spill tier's verdict and the shadow verifier's);
-    # the claim pinned here is that the second one arrives THROUGH `worker_diag` too,
-    # and that the required fields above it are still intact.
-    assert document["writer"]["contributions"]["written"] == ["disk", "disk_shadow"]
+    # THREE sections since 0.2.37 (the spill tier's verdict, the shadow verifier's and
+    # the GPU-direct shadow writer's); the claim pinned here is that the guest sections
+    # arrive THROUGH `worker_diag` and that the required fields above them are intact.
+    # `written` is the SORTED list (the seam writes them in name order), unlike
+    # `registered`, which is insertion order.
+    assert document["writer"]["contributions"]["written"] == [
+        "disk", "disk_gpu_shadow", "disk_shadow"]
 
 
 def test_the_boot_line_states_the_verdict_and_is_logged_once(tier, worker_class,

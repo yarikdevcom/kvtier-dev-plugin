@@ -177,6 +177,33 @@ the file contract the proxy host's reader expects):
                              read, whether it came from the environment or the
                              default, and how to turn it off.
 
+  THE GPU-DIRECT BYTE WITNESSES (`disk_shadow.py`, `disk_gpu_shadow.py`) ------
+
+  VLLM_E2_TIER_DISK_SHADOW   the READ half of the GPU-direct proof (0.2.36). OFF by
+                             default: unset, or a value in neither the on nor the off
+                             vocabulary, reads no device memory and reports
+                             `enabled: false`. `1`/`true`/`yes`/`on` compares one
+                             completed store in 32 - the GPU's own bytes against the
+                             blob the arena path captured for the same block - and
+                             publishes the verdict (with staleness classified, never
+                             counted as corruption) in the worker's rank file.
+  VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES
+                             the WRITE half (0.2.37), and the same grammar with the
+                             same default. ON, a block the read half just called
+                             `equal` is written AGAIN from the GPU's bytes into a
+                             SEPARATE directory under the live store's own file name,
+                             and the two files are compared - that diff is the gate on
+                             the GPU -> NVMe route. It never writes the live store and
+                             refuses a shadow root that is or contains it.
+  VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT
+                             where those shadow files go. UNSET = a sibling of the live
+                             store root, `<store>/../gpu-shadow`. Read once per process.
+                             Both are read ONCE at first use (a live boot's environment
+                             does not change) and both have a POST latch that arms only
+                             the process answering - the worker is armed by the
+                             environment. See README's
+                             *Does the GPU still hold what the arena spilled?*.
+
   THE SPILL HOOK (`disk_store.py`) HAS NO ENV VAR OF ITS OWN, and never will. It
   is installed in every worker whenever the plugin is on, and its per-step cost
   while unarmed is two `os.environ.get` calls; the two switches that make it do
@@ -369,6 +396,25 @@ ENV_DISK_EVICT_THREADS = "VLLM_E2_TIER_DISK_EVICT_THREADS"
 # that answers (it writes no control file: this module opens no file handle for
 # writing). It never changes a spill or a restore decision.
 ENV_DISK_SHADOW = "VLLM_E2_TIER_DISK_SHADOW"
+
+# THE GPU-DIRECT SHADOW WRITER (`disk_gpu_shadow.py`, 0.2.37). Step 2 of the
+# GPU -> NVMe route: for a block `disk_shadow` has already called `equal`, write the
+# GPU's bytes AGAIN, to a directory that is not the live store, named exactly the way
+# the store names that block, so the two trees can be diffed on real traffic. It is
+# the first code in this package that writes KV bytes from a GPU-direct read, so the
+# default is OFF for the same reason the verifier's is: a launcher script must not be
+# able to turn on a facility that writes files from a device read. The one difference
+# from `ENV_DISK_SHADOW` is what it can touch: this module never opens the live store
+# for writing and REFUSES a shadow root that is or contains it
+# (`refused_root_conflict`), so nothing here can ever become authoritative.
+ENV_DISK_GPU_SHADOW_WRITES = "VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES"
+# WHERE the shadow files go. UNSET = `<the live store root>/../gpu-shadow`, a SIBLING of
+# the store (the two trees stay diffable and the store's own sweep never sees them).
+# Set it to a path on the same device you want to measure, and note that the same
+# refusal applies to it: same-as or nested-in the live store is refused, not merged.
+# Read ONCE per process, like the enablement. Not a `VLLM_E2_TIER_*` behaviour switch:
+# it names a location, and it is validated by `disk_layout.validate_root`.
+ENV_DISK_GPU_SHADOW_ROOT = "VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT"
 
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
@@ -577,6 +623,39 @@ def disk_shadow_enable() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_SHADOW}
+
+
+def disk_gpu_shadow_writes() -> dict:
+    """The GPU-direct shadow writer's boot posture, read by `disk_gpu_shadow.py`. The
+    SAME grammar as `disk_shadow_enable()` - unset is OFF, an on word is ON, a disable
+    word is OFF said with `source: "env"`, and anything else is OFF *and* reported as
+    unrecognised. There is no fourth case and there must never be one: this is the flag
+    that turns on "write a KV file from bytes read off the device", and the direction a
+    typo can move in is the one that writes nothing.
+    """
+    raw = os.environ.get(ENV_DISK_GPU_SHADOW_WRITES, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_GPU_SHADOW_WRITES}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_GPU_SHADOW_WRITES}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_GPU_SHADOW_WRITES}
+
+
+def disk_gpu_shadow_root() -> dict:
+    """Where the shadow files go, as the operator named it. `raw` is None when he did
+    not name it, which is the interesting case: `disk_gpu_shadow` then derives a sibling
+    of the live store root. No validation here on purpose - the shape rules and the
+    refusal of the live store itself belong to `disk_gpu_shadow._resolve_root`, next to
+    the code that writes, and a second validator here is how two sites disagree about
+    one path. Empty-after-strip is `None`, not "the empty path": `X=` means "I said
+    nothing", the same reading every other variable here gives."""
+    raw = os.environ.get(ENV_DISK_GPU_SHADOW_ROOT, "").strip()
+    return {"raw": raw or None, "env_var": ENV_DISK_GPU_SHADOW_ROOT}
 
 
 def token_configured() -> bool:

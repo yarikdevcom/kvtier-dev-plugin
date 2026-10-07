@@ -906,6 +906,24 @@ def test_the_seam_bounds_how_many_sections_exist(writes_to, monkeypatch):
     assert second["registered"] is False
 
 
+def test_every_allow_listed_section_can_actually_be_registered(writes_to):
+    """The cap and the allow-list are the SAME number, and that is an invariant.
+
+    `disk_store.install()` registers every section it owns, so a cap below the list
+    means one section is REFUSED at register time and the rank file simply lacks it -
+    silently, because a refusal is a list entry in the seam's own accounting and not an
+    error in the file. 0.2.37 added the fourth section (`disk_gpu_shadow`) and hit the
+    cap exactly, which is the day this assertion starts earning its place: the next
+    section must raise `MAX_CONTRIBUTIONS` in the same change that adds it, and this is
+    the test that says so.
+    """
+    assert len(worker_diag.CONTRIBUTION_SECTIONS) == worker_diag.MAX_CONTRIBUTIONS
+    registered = [worker_diag.register_contribution(name, lambda: {}, owner=name)
+                  for name in worker_diag.CONTRIBUTION_SECTIONS]
+    assert all(report["registered"] for report in registered), [
+        report["reason"] for report in registered]
+
+
 def test_contributions_are_dropped_before_any_required_field(writes_to, monkeypatch,
                                                              worker_class):
     """The byte ceiling is the reader's `malformed` trigger, so the triage sheds the

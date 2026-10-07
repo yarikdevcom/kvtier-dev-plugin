@@ -632,8 +632,16 @@ def snapshot(handler, event, slot: int, key=None) -> dict | None:
                 return None
             _state["step_used"] += 1
             _state["last_read_mono"] = now
+            # `gpu` is the hand-off to `disk_gpu_shadow` (0.2.37), declared here so the
+            # plan's shape is documented in one place: `settle` fills it by reference
+            # with the host copy it read off the device, and ONLY on the `equal` path.
+            # The sibling key `blob` is filled by `disk_spill.request_spill` the same
+            # way. Nothing else in this module reads `gpu`, and no byte is copied a
+            # second time - it is the reason the GPU-direct writer needs no device read
+            # and no copy seam of its own.
             return {"handler": handler, "event": event, "slot": int(slot),
-                    "key": key, "gpu_block": int(gpu_block), "blob": None}
+                    "key": key, "gpu_block": int(gpu_block), "blob": None,
+                    "gpu": None}
     except Exception as exc:  # noqa: BLE001 - never into the engine's step path
         with _lock:
             _count("errors")
@@ -689,6 +697,15 @@ def settle(plan, answer=None) -> dict | None:
             _count("gpu_read_ok")
             gpu = read["bytes"]
         if gpu == blob:
+            # THE ONLY HAND-OFF THE GPU-DIRECT SHADOW WRITER IS GIVEN. `plan["gpu"]` is
+            # the device's own bytes, in the spill path's `sorted(name)` order, and the
+            # verdict beside them is `equal` - which is the whole admission rule for
+            # writing a shadow file downstream: a block this module could not vouch for
+            # is never written, because a block the engine already reused would produce
+            # evidence that lies. Nothing is copied a second time (`disk_gpu_shadow`
+            # document the interface; `disk_store` hands the plan and this verdict to
+            # it, and this module never calls into it).
+            plan["gpu"] = gpu
             with _lock:
                 _count("checked")
                 _count("equal")

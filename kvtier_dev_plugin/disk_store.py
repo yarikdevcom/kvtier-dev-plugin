@@ -184,7 +184,15 @@ import os
 import sys
 import time
 
-from . import config, disk_index, disk_layout, disk_shadow, disk_spill, snapshot
+from . import (
+    config,
+    disk_gpu_shadow,
+    disk_index,
+    disk_layout,
+    disk_shadow,
+    disk_spill,
+    snapshot,
+)
 
 # The engine's logging posture is why this module logs at WARNING, not INFO: a
 # plugin logger is not one of the `vllm.*` loggers the engine configures, so an
@@ -292,8 +300,9 @@ MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
-             "authority", "failures", "shadow")
-MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow")
+             "authority", "failures", "shadow", "gpu-shadow")
+MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
+                     "gpu-shadow")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -1270,7 +1279,14 @@ def on_store_completed(handler, before) -> dict:
                                               key=key)
                 answer = disk_spill.request_spill(worker=handler, slot=slot, key=key,
                                                   shadow=shadow)
-                disk_shadow.settle(shadow, answer)
+                verdict = disk_shadow.settle(shadow, answer)
+                # THE GPU-DIRECT SHADOW WRITER SEES THE SAME VERDICT. Contained and
+                # default-off: it is handed the plan and the verdict it just produced,
+                # and writes the GPU's bytes to a SECOND tree (never this store) for the
+                # blocks the verifier called `equal` (`disk_gpu_shadow`). It is a step-
+                # thread function only in name - no I/O, one `put_nowait` - and it can
+                # neither change `answer` nor delay this loop by a file write.
+                disk_gpu_shadow.consider(shadow, verdict)
                 if answer.get("ok"):
                     _state["spill_queued"] = int(_state["spill_queued"]) + 1
                     report["queued"] = int(report["queued"]) + 1
@@ -3167,10 +3183,49 @@ def _op_shadow(body: dict) -> dict:
     return {"ok": True, "reason": None, "shadow": disk_shadow.status()}
 
 
+def _op_gpu_shadow(body: dict) -> dict:
+    """The GPU-DIRECT SHADOW WRITER: read its counters, or arm it in this process.
+
+    `{"op":"gpu-shadow"}` alone READS (the counters, the enablement, where the files go
+    and why they might not go there, the comparison's verdicts, the retention's
+    measurements). `{"op":"gpu-shadow","enabled":true|false}` latches the switch - the
+    same shape as `_op_shadow` above and for the same reasons: a key that is PRESENT is
+    an instruction, a key that is absent is a question, and a value that is not a real
+    boolean is refused rather than guessed at.
+
+    IT IS LISTED AS MUTATING, and here the case is stronger than `shadow`'s: it writes
+    no control file either, but arming this makes a process WRITE KV FILES from bytes
+    read off the device. A browser that can issue a GET must not be able to do that,
+    exactly as with `offers`, `authority` and `shadow`.
+
+    THE SCOPE IS SAID IN THE ANSWER, and it matters more here than anywhere else on this
+    verb: the POST latches the process that ANSWERS (usually the EngineCore), while the
+    process that spills, compares and writes is a WORKER, armed with
+    `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES=1` in the engine's environment. `scope` says so
+    instead of letting an operator believe he armed a writer that is still off.
+    """
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        value = body["enabled"]
+        if not isinstance(value, bool):
+            return {"ok": False,
+                    "reason": f"enabled must be a JSON boolean, got {value!r}: "
+                              "nothing changed",
+                    "gpu_shadow": disk_gpu_shadow.status()}
+        applied = disk_gpu_shadow.set_enabled(value)
+        applied["changed"] = True
+        return {"ok": True, "reason": None, "gpu_shadow": applied,
+                "note": ("the latch is this process only; the worker that spills and "
+                         "writes is armed with "
+                         f"{config.ENV_DISK_GPU_SHADOW_WRITES}=1")}
+    return {"ok": True, "reason": None, "gpu_shadow": disk_gpu_shadow.status()}
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
              "offers": _op_offers, "authority": _op_authority,
-             "failures": _op_failures, "shadow": _op_shadow}
+             "failures": _op_failures, "shadow": _op_shadow,
+             "gpu-shadow": _op_gpu_shadow}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring
@@ -3677,6 +3732,13 @@ def install() -> dict:
         # answer about the same spill path, both are relevant only in a process that
         # has this hook, and `worker_diag` remains the only writer of the rank file.
         disk_shadow.register_contribution()
+        # THE GPU-DIRECT SHADOW WRITER'S VERDICT TRAVELS WITH BOTH. It reports the same
+        # spill path from the same process, and `worker_diag` remains the only writer of
+        # the rank file. This is the FOURTH and last section the seam's own
+        # `MAX_CONTRIBUTIONS` allows, so adding a fifth means raising that cap in the
+        # same change that adds it - a silent refusal at register time is how a section
+        # goes missing.
+        disk_gpu_shadow.register_contribution()
         report.update({"installed": True, "class": cls.__name__,
                        "reason": (f"{cls.__name__}.{METHOD_BIND_METADATA} and "
                                   f"{cls.__name__}.{METHOD_GET_FINISHED} now spill "

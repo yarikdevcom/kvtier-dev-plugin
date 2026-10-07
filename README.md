@@ -97,6 +97,8 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
+| `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
+| `VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT` | **where those shadow files go.** Unset = `<the live store root>/../gpu-shadow`, a sibling of the store (so one `cmp -r` compares the two trees and the store's own sweep never walks the evidence). Read once per process; validated like any other root, and subject to the same refusal. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
@@ -220,7 +222,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -2703,6 +2705,116 @@ numbers. If a section is over budget after every shed, the writer refuses it and
 worker log says `section STILL over its byte budget` - a missing `disk_shadow` key with
 that line beside it is a size problem, not a missing facility.
 
+Its `equal` verdict is also the *admission rule* for the next step of the route - writing
+those GPU bytes to a second tree and diffing the two files - see *Writing the block twice:
+the GPU-direct shadow* below.
+
+## Writing the block twice: the GPU-direct shadow (`disk_gpu_shadow.py`, 0.2.37)
+
+Entry 27 of the plan established that the host-RAM arena cannot simply be deleted: it is
+the spill trigger, the byte source, the restore landing pad and the only GPU<->host
+copier. Entry 28 decided the route - build a GPU-direct write and a GPU-direct read, and
+prove each one as a shadow before letting either be authoritative. The verifier above
+(`disk_shadow.py`) is step 1 and it said `equal` in production. **This module is step 2:**
+the GPU-direct WRITE path, still not authoritative.
+
+For a block the verifier has just called `equal`, this module writes those same GPU bytes
+a second time, to a **separate directory**, under **exactly the name the live store uses**
+for that block - and then compares the two files. The live store's file remains the only
+thing any read path loads. Nothing in a spill, a restore, an offer or an eviction decision
+reads a byte written here. Default OFF, fail-open, and its output is disposable evidence
+with a retention cap of its own.
+
+```bash
+# the worker's switch is the environment, because the worker is the process that writes:
+#   VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES=1     (read once at first use; restart to change)
+#   VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT=/path   (optional; default = <store>/../gpu-shadow)
+# this op reads the counters, and arms the process that ANSWERS (which is usually NOT
+# the worker - the answer says so in `scope`):
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"gpu-shadow"}' $B/disk
+```
+
+**Files land beside the store, never inside it.** With the box's store at
+`/home/user/kv-tier/disk`, the shadow tree is `/home/user/kv-tier/gpu-shadow/<shard>/
+kvslot-<key16>-g<group>-<geodigest12>.bin` - the same relative name, a different root. A
+shadow root that IS the live store, or is nested in it in either direction, is REFUSED
+(`refused_root_conflict`, one log line, nothing written): merging would put bytes in the
+store's shard tree that a restore could load, which is the one outcome this module exists
+to make impossible. `/a/store` and `/a/store2` are compared on path components and are
+not confusable.
+
+**The one command that reads the result.** Run it on the box, after the feature has been
+on through some real traffic:
+
+```bash
+diff -rq /home/user/kv-tier/disk /home/user/kv-tier/gpu-shadow | grep -v '^Only in '
+```
+
+**When everything agrees it prints nothing.** `Only in ...` lines are expected and mean
+nothing is wrong: the shadow tree holds only the sampled subset (one store in 32, capped
+per bind window), so the live store always has files it does not. What must never appear
+is a line of the form
+`Files /home/user/kv-tier/disk/3f/kvslot-....bin and /home/user/kv-tier/gpu-shadow/3f/kvslot-....bin differ`
+- one of those is a fault in the GPU-direct write path (or a live file that changed after
+the spill), and the module raises the same alarm in the worker log when it sees one. The
+counters cross-check the same claim without reading files:
+
+| counter | what it means | what you do |
+|---|---|---|
+| `written`, `bytes_written` | shadow files committed | nothing; this is the number growing |
+| `pairs_checked` / `pairs_identical` | files compared against the live store's file of the same name, and byte-identical | nothing; `identical == checked` is the gate |
+| `pairs_differing` | a same-named pair disagrees | **this is the one** - look at `last_difference.first_difference` and `differing_names` |
+| `pairs_size_disagree` | the same-named pair has different lengths | a truncated or half-written shadow file |
+| `pairs_unpaired_expired` | the live partner never appeared | the spill refused, was evicted, or the name is not the same file |
+| `pairs_shadow_missing` | the SHADOW file went away before its pair was compared (retention shed it, or the directory was cleared) | raise `MAX_SHADOW_FILES`/`MAX_SHADOW_BYTES` if you want every pair decided; it is never counted against the store |
+| `refused_not_equal` | the verifier did not vouch for the block, so nothing was written | nothing; this is the admission rule working |
+| `refused_not_checked` | there was nothing to compare (a device fault, a refused spill) | context, not a fault |
+| `refused_root_conflict` | the shadow root is the live store or nested in it | fix the environment; nothing is written meanwhile |
+| `refused_write_failed` / `refused_*` | the directory refused the write, the queue is full, the name disagreed | look at `reasons` |
+| `retention_removed`, `walk_truncated` | the cap (`MAX_SHADOW_FILES`/`MAX_SHADOW_BYTES`) shed evidence, or the walk hit its bound | normal; the files are evidence, not data |
+
+**What the diff proves, said exactly.** Only blocks the verifier called `equal` are
+written, and the bytes written are the bytes that vouching read - so the two files agree
+by construction *at capture time*, and the diff is not re-answering "do the GPU and the
+arena hold the same bytes?" (the verifier answers that per block, live, in its own
+counters). What the diff does prove is everything this module ADDS: that
+`disk_layout.build_slot_path` under a different root produces the same relative name the
+store wrote (the identity a restore looks up - the module checks the two naming sites
+agree and writes nothing if they ever differ), that what landed is a whole slot and not
+half of one, that the `.part`/`os.replace` discipline held under real traffic, and that
+across a store turnover the GPU-direct tree and the arena tree are the same files.
+
+**It inherits the ordering rule instead of re-implementing it.** The bytes come from
+`disk_shadow._read_gpu_slot` - the ONE device->host seam in the package - which sums the
+copied one-block regions through `disk_spill.read_slot_bytes`, the spill path's own
+reader, in `sorted(name)` order. This module never walks `gpu_kv_caches`, never orders
+anything and never forms an address, so it cannot disagree with the store about layout,
+and there is no second device-copy mechanism to get wrong. The same reader's width check
+is also what refuses the second trap in entry 28: the KV groups OVERLAY one backing
+allocation (the slot is the MAX over groups, not the sum), so a design that walked group
+specs would try to write a 43 MB file into an 11.5 MB name.
+
+**It never blocks the engine.** The only function the step thread calls is `consider()`
+- two dict lookups, a width check, a cap check, one `put_nowait`, and no `stat` or
+`makedirs` anywhere in it. Naming, writing, comparing and pruning happen on this module's
+own daemon writer thread, bounded at `MAX_QUEUE_JOBS`/`MAX_QUEUED_BYTES` for the queue,
+`MAX_PAIRS_PER_PASS` pairs and one slot width of scanning per comparison pass, and
+`MAX_SHADOW_FILES`/`MAX_SHADOW_BYTES` for the directory. Retention deletes through
+`disk_layout.execute_unlink_plan`, which re-validates every path at the instant of
+deletion - so "this never deletes anything outside its own root" is that proven
+function's property, tested by planting a file in the live store with the same name as a
+shadow file and watching which one disappears.
+
+`tests/test_disk_gpu_shadow.py` (25 tests) is the executable spec: the default creates no
+directory, an `equal` block produces a file whose bytes ARE the arena's, a block the
+verifier did not vouch for produces none, the LIVE STORE is byte-for-byte what it would
+have been without the feature, a device fault changes nothing on disk, a shadow root that
+is the store is refused, a queue that is full refuses on the step thread instead of
+growing or waiting, retention stays inside its own directory, a pair whose shadow file
+retention removed is counted as ours going away and never as the store's absence, the
+shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
+published key set does not change shape.
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 The offload tier is steered by wrapping one method of the scheduler-side
@@ -3805,14 +3917,22 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2303 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2331 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
 block is classified as staleness and a stable one as the layout candidate, that every
 fault (no GPU caches, a device error, a width disagreement, a refused spill) is a
 counter and never an exception on the step thread, and that the spill lands the same
-bytes with the witness on as with it off. The per-offer
+bytes with the witness on as with it off. The GPU-direct shadow writer is
+`tests/test_disk_gpu_shadow.py`: that the default creates no directory, that an `equal`
+block produces a file whose bytes ARE the arena's bytes and a block the verifier did not
+vouch for produces none, that the LIVE STORE is byte-for-byte what it would have been
+without the feature, that a writer which raises or a root that cannot be written is a
+counter and not a crash, that retention removes its own file and not a same-named file in
+the store, that the shadow file is the `sorted(name)` concatenation and not the
+insertion-order one, and that a fat published section sheds its illustrations rather than
+its numbers. The per-offer
 bounds after the fixed 32,000-token cap was deleted are in
 `tests/test_disk_offer_bounds.py`, with the affordability ladder that replaces the cap
 as the guard against un-placeable offers. The 0.2.30
