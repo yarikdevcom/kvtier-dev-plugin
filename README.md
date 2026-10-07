@@ -99,6 +99,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT` | **where those shadow files go.** Unset = `<the live store root>/../gpu-shadow`, a sibling of the store (so one `cmp -r` compares the two trees and the store's own sweep never walks the evidence). Read once per process; validated like any other root, and subject to the same refusal. |
+| `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` | **how many CPU slots of the host-RAM arena's block pool an offer must NOT take (0.2.38). Unset = `disk_restore.CPU_SLOT_RESERVE` = 64, the value every release before 0.2.38 used.** An offer allocates its *destination* slots out of the same pool the RAM tier parks its own blocks in, and is clamped to `(free - reserve - boundary slots) // slots-per-span` spans - so on a shrunk arena the reserve is an offer-size lever, not a footnote: at the operator's 166 free slots per rank on the wide PP1 pair, reserve 64 leaves **98 spans (313,600 tokens)** and reserve 16 leaves **146**. `0` is **honoured** ("an offer may take the arena's last slot" - it leaves the RAM tier nothing to park, see the section). A non-integer or a negative falls back to 64 and logs once (`DISK[reserve] IGNORED`); there is deliberately **no ceiling**, because a reserve larger than the arena correctly declines every offer as `no_cpu_slots` instead of oversubscribing. The value in force, its origin (`env` / `default` / `ignored`) and the spans it leaves are published in `restore.limits`, `restore.offer_pool`, `last_offer_pool` and the boot line's `cpu_slot_reserve=64(default)`. See *Sizing the CPU-slot reserve an offer leaves alone*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
@@ -1217,7 +1218,7 @@ PP0 shape):
 |---|---|---|---|
 | store depth (contiguous run in the index) | measured, not a constant | **~11 spans measured live** - the real limit | ~11 spans |
 | bounce-buffer pool | 1 GiB / 11,468,800 B = 93 jobs | 93 - 4 = **89 spans** (284,800 tok) | (93 - 4) / 3 = **29 spans** |
-| CPU slots, live free count | `free - CPU_SLOT_RESERVE(64) - boundary` / per_span | the engine's own pool: ~119 spans at a ~187-block arena | **~39 spans** - binds before 84 |
+| CPU slots, live free count | `(free - reserve - boundary) / per_span`, where **the reserve is `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` since 0.2.38 (default 64)** | the engine's own pool: **98 spans** (313,600 tok) at the operator's 166-slot PP1 arena, 119 at the 187-slot PP0 one. At **reserve 16**: 146 spans of arithmetic on PP1, which the 128-span walk cap below then trims to 128 | **32 spans** at 166 free slots (48 at reserve 16) - binds before 84 |
 | CPU slots, the cap | `MAX_SLOTS_PER_OFFER` = 256 | (256-4)/1 = 252 spans | (256-4)/3 = **84 spans** |
 | reader queue | `MAX_QUEUE_DEPTH` = 256 jobs | 252 spans (ties the slot cap exactly) | 84 spans (ties it) |
 | block cap | `MAX_RESTORE_BLOCKS_PER_OFFER` = 128 | **128 spans** (409,600 tok), reachable only once the pool affords 132 jobs (~1.4 GiB = 1,513,881,600 B) | unreachable (84 < 128) |
@@ -1226,9 +1227,17 @@ PP0 shape):
 Read it as: the pool is the operative bound today on both geometries (89 and 29 spans),
 the store's own depth is what actually shortens a live restore (~11 spans), and the queue
 now ties the CPU-slot cap instead of undercutting it - so for a multi-group model the CPU
-slot bound, at 84 spans (or ~39 once the pool's *live* free count and the 64-slot reserve
-are taken off), is the wall a raised pool will meet next. Nothing in this change moves
-`MAX_SLOTS_PER_OFFER` or its clamp semantics.
+slot bound, at 84 spans (or 32 once the arena's *live* free count and the reserve are
+taken off a shrunken 166-slot arena), is the wall a raised pool will meet next. Nothing
+in this change moves `MAX_SLOTS_PER_OFFER` or its clamp semantics.
+
+**The CPU-slot reserve in that row is an env var now (0.2.38), and it has a floor below
+which it buys nothing.** Lowering `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` raises the
+affordable span count by exactly the slots it gives back - 98 to 146 on the wide rank
+between reserve 64 and 16 - but the positional walk stops at
+`MAX_RESTORE_BLOCKS_PER_OFFER` (128 spans), so a reserve below ~34 on a 166-slot rank
+(and ~55 on a 187-slot one) cannot make a *single* offer any longer: it only spends the
+headroom the RAM tier was given. See *Sizing the CPU-slot reserve an offer leaves alone*.
 
 **A failed disk load is not offered twice, and since 0.2.32 a raced load is.** The
 engine recovers from a KV load failure by resetting the request and rescheduling it,
@@ -2815,6 +2824,92 @@ retention removed is counted as ours going away and never as the store's absence
 shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
 published key set does not change shape.
 
+## Sizing the CPU-slot reserve an offer leaves alone (`disk_restore.py`, 0.2.38)
+
+An offer does not own a KV byte, but it does own **destination slots**: the blocks a disk
+restore reads INTO come out of the host-RAM arena's CPU block pool, the same pool the RAM
+tier parks its own blocks in and the same pool the spill path reads OUT of. So an offer
+that drained the pool would trade a recompute for a spill that can never happen - which
+is why the offer path holds a **reserve** back and clamps itself to
+
+```text
+spans = (free_slots - reserve - boundary_slots) // slots_per_span
+```
+
+`free_slots` is the engine's own `cpu_block_pool.get_num_free_blocks()`, read exactly the
+way the offer reads it; `slots_per_span` is the number of prefix-cacheable positional
+groups (1 on the live Qwen3.8-Flash-Next box, whose four GDN groups are *boundary states*
+and cost one slot each at the run's end); and `reserve` **was the constant 64 and is now
+`VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE`**, defaulting to 64.
+
+**Why it became a knob: the arena it was sized for is gone.** 64 slots was chosen against
+a 64 GiB arena. The operator has since run the engine at 8 GiB, which leaves **187
+allocatable slots per rank on the PP0 (narrow) pair and 166 on the PP1 (wide) one** - so
+the reservation is 41% of what is left on the wide rank before the offer path sees a
+slot, and the whole difference is restorable tokens that are already sitting on the SSD:
+
+| free slots/rank | reserve 64 (shipped default) | reserve 32 | reserve 16 | reserve 0 |
+|---|---|---|---|---|
+| **166** (PP1, 8 GiB arena) | **98 spans = 313,600 tok** | 130 spans of arithmetic -> **128** (walk cap) | **146** -> **128** (walk cap) | 162 -> **128** (walk cap) |
+| **187** (PP0, 8 GiB arena) | **119 spans = 380,800 tok** | 151 -> **128** (walk cap) | **167** -> **128** (walk cap) | 183 -> **128** (walk cap) |
+
+Tokens are spans x the engine's 3,200-token scheduler block. **Read the cap column, not
+the arithmetic column**: `MAX_RESTORE_BLOCKS_PER_OFFER` is 128 spans, so a *single* offer
+cannot exceed 128 spans (409,600 tokens) whatever the reserve says. That makes **~34 slots
+the useful floor on a 166-slot rank and ~55 on a 187-slot one**: below that, a smaller
+reserve buys no longer offers and spends the RAM tier's headroom for nothing.
+
+**And what the reserve is worth below that floor, stated as a failure mode** - because the
+first reader of a "lower it" instruction will reach for 0:
+
+- **0 is honoured**, and it means *"an offer may take the arena's last free slot."* The
+  arithmetic stays correct, so this is a posture and not a dead knob - but a burst of disk
+  offers then takes the arena to zero free, the RAM tier above has nowhere to park, the
+  next spill has no destination, and an offer can even allocate the last slot out from
+  under a request that was about to need it. Honourable on a box that restores everything
+  from SSD and parks nothing in RAM; the reason the default is 64 and not 0.
+- **A reserve at or above the free count declines offers** (`no_cpu_slots`), allocates
+  nothing, and raises nothing. This is why there is **no ceiling** on the variable: the
+  reserve can only ever make an offer *smaller*, so honouring an absurd value is the safe
+  direction, while clamping it would silently replace the machine the operator asked for
+  with the one they didn't.
+- **A non-integer or a negative value falls back to 64 and logs once**, `DISK[reserve]
+  IGNORED: ...; the shipped default 64 stands`. A negative is refused as grammar, not as
+  policy: `free - (-1)` would hand the offer more slots than the pool has, and the fork's
+  own `get_new_blocks` raises when a count exceeds the free list.
+
+**What it looks like at boot** - the same line that prints the other per-offer bounds,
+with its origin, because the number alone cannot answer "did my drop-in arrive?":
+
+```text
+DISK[restore] installed=YES ... offer_block_cap=128 offer_block_cap_tokens=409600 \
+  cpu_slot_reserve=16(env) ...
+```
+
+`(default)` when the variable is unset, `(env)` when the environment's number won,
+`(env-ignored)` when the grammar refused what was typed.
+
+**Where to read it without grepping the log.** The value in force is published in the
+restore section's `limits.cpu_slot_reserve` (with `cpu_slot_reserve_default` /
+`_source` / `_env_var`), in `offer_pool` beside `jobs_the_pool_can_carry`, in the
+per-offer `last_offer_pool` next to the bound it decided
+(`cpu_slots_free`, `spans_the_cpu_slots_can_carry`, and `bounded_by: ["cpu_slots"]` when
+it was the one that cut), in the boot verdict's `arena` dict, and inside the
+`no_cpu_slots` refusal reason. So the question *"why was my offer only 98 jobs?"* is
+answered by the payload: `166 free - 64 reserved - 4 boundary states = 98 spans of 1
+slot`. The rank file deliberately gained nothing: it lives inside
+`worker_diag.MAX_CONTRIBUTION_BYTES`.
+
+`tests/test_disk_cpu_slot_reserve.py` (24 tests) is the executable spec: the unset boot
+reserves 64 and the pool-with-no-room-above-64 refusal still fires, the affordability
+table above is asserted as arithmetic at both ranks' real free counts, the live offer path
+is measured at the real 12,902,400-byte width (98 spans at reserve 64, 146 at 16, a
+difference of exactly the 48 slots freed), an over-large reserve declines without
+allocating or raising, 0 is honoured, every invalid value falls back with one log line,
+the value reaches every surface that names the bound, no key set moves when the knob
+moves, and an AST scan pins that the bare constant is read by exactly one function - the
+resolver - so the default can never become a second source of truth.
+
 ## Steering and vetoing the tier at runtime (`store_hook.py`)
 
 The offload tier is steered by wrapping one method of the scheduler-side
@@ -3917,7 +4012,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2331 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2355 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU

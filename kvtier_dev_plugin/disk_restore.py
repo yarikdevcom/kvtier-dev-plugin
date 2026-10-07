@@ -382,7 +382,124 @@ MAX_TRACKED_SLOTS = 4096             # cpu-slot -> identity entries
 MAX_INVALID_BLOCKS = 4096            # GPU block ids awaiting one report
 MAX_STRING_CHARS = 160
 MAX_BOOT_LINE_CHARS = 160
-CPU_SLOT_RESERVE = 64                # CPU slots the offer must leave free
+CPU_SLOT_RESERVE = 64                # THE DEFAULT: CPU slots an offer leaves free
+"""CPU slots an offer must leave FREE in the arena's CPU block pool - THE SHIPPED
+DEFAULT, and since 0.2.38 NOT necessarily the number in force.
+
+What it is for: an offer allocates its DESTINATION slots out of `cpu_block_pool`, the
+same pool the RAM tier parks its own blocks in, so an offer that takes the pool to its
+last slot leaves the tier above nothing to work with. The reserve is that headroom.
+
+Why it is an env var now (`VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE`): the 64 was chosen when
+the arena was 64 GiB. The operator has since run the engine at 8 GiB, which leaves 166
+free slots per rank on the PP1 pair and 187 on PP0 - so 64 reserved slots are 41% of
+what is left on the wide rank BEFORE the offer path sees a slot, and an offer is clamped
+to `free - reserve - boundary_slots` spans. Tuning it is the cheapest host-RAM win left
+on that box: at 166 slots, reserve 64 buys 98 spans of offer and reserve 16 buys 146.
+
+THE NUMBER THAT DECIDES IS `cpu_slot_reserve()`, which resolves this constant against
+the environment. Read the function, not this name: this one is the fallback.
+"""
+
+
+def cpu_slot_reserve_verdict() -> dict:
+    """The CPU-slot reserve IN FORCE here, resolved, with its origin beside it.
+
+    WHY A VERDICT AND NOT JUST AN INT. "Why was my offer only 98 jobs?" is a question
+    about a number nobody remembers setting, and the two answers that look identical in
+    a payload - "64 because the operator set 64" and "64 because the operator's `16.0`
+    was not an integer" - need opposite fixes. So `source` names which of the three
+    happened (`env`, `default`, `ignored`), `raw_value` carries what the environment
+    actually said, and `env_problems` carries the grammar's complaint verbatim.
+
+    NEVER RAISES, and reports a raised read as the default, because the reserve is an
+    offer-size input and nothing about an offer size is worth a fault on the step path.
+
+    The value is re-read every call, like every other env knob in this package: a
+    systemd drop-in cannot appear mid-boot, but a test's `monkeypatch.setenv` can, and
+    an offer-size input that lags the environment by a process lifetime is the
+    half-migration this constant was about to become.
+    """
+    out = {"cpu_slot_reserve": int(CPU_SLOT_RESERVE),
+           "default_slots": int(CPU_SLOT_RESERVE),
+           "env_var": config.ENV_DISK_CPU_SLOT_RESERVE,
+           "raw_value": None,
+           # `default` = the variable is unset; `env` = the environment's number won;
+           # `ignored` = the environment SAID something and the grammar refused it.
+           "source": "default",
+           "env_problems": []}
+    try:
+        env = config.cpu_slot_reserve_env()
+    except Exception as exc:  # noqa: BLE001 - an offer bound is never worth a fault
+        snapshot._error(exc, "disk_restore cpu slot reserve")
+        return out
+    problems = [str(problem) for problem in (env.get("problems") or [])]
+    out["env_problems"] = problems
+    out["raw_value"] = env.get("raw_value")
+    slots = env.get("slots")
+    if slots is not None:
+        out["cpu_slot_reserve"] = int(slots)
+        out["source"] = "env"
+    elif problems:
+        out["source"] = "ignored"
+        # ONE LINE PER DISTINCT COMPLAINT, per boot and not per offer: an offer runs
+        # on the request path and the same typo would be logged thousands of times a
+        # minute.
+        # The line names the fallback too, because "unset" and "ignored" otherwise read
+        # identically in the log and only this line separates them.
+        notice_once(f"cpu-slot-reserve-{'; '.join(problems)[:120]}",
+                    f"DISK[reserve] IGNORED: {'; '.join(problems)[:300]}; the shipped "
+                    f"default {CPU_SLOT_RESERVE} stands (an UNSET "
+                    f"{config.ENV_DISK_CPU_SLOT_RESERVE} reads the same way and only "
+                    f"this line separates the two)")
+    return out
+
+
+def cpu_slot_reserve() -> int:
+    """THE reserve in force, as a bare number. Every reader of the bound calls this.
+
+    The module-level constant `CPU_SLOT_RESERVE` is the DEFAULT and is read by nothing
+    but this resolver (`test_no_code_reads_the_cpu_slot_reserve_constant_directly` keeps
+    that true), so an offer, a boot verdict or a payload that reports "the reserve" is
+    reporting this function's answer.
+    """
+    return int(cpu_slot_reserve_verdict()["cpu_slot_reserve"])
+
+
+def cpu_slot_affordance(free_blocks, per_span: int = 1,
+                        boundary_slots: int = 0,
+                        reserve: int | None = None) -> dict:
+    """How many SPANS the arena can pay a destination for, WITH its arithmetic.
+
+    THE WHOLE RULE, in one place so the offer path, the boot verdict and the payload
+    cannot each re-derive it slightly differently: a span costs `per_span` positional
+    slots and a run additionally costs `boundary_slots` slots for its GDN/linear
+    boundary states, and `reserve` slots are not the offer's to take -
+
+        spans = max(0, free - reserve - boundary_slots) // per_span
+
+    Publishing the terms is the point. An offer clamped to 98 spans reads as a mystery
+    until a reader knows the pool held 166, the reserve 64 and the run's geometry 1
+    slot/span plus 4 boundary states; with those four numbers the arithmetic is a
+    one-line check, which is what the operator needed to decide to tune the reserve.
+
+    `reserve=None` resolves the environment rather than assuming the constant, so a
+    caller that omits it cannot be the half-migration this knob was at risk of.
+    """
+    free = max(0, int(free_blocks or 0))
+    per = max(1, int(per_span or 1))
+    boundary = max(0, int(boundary_slots or 0))
+    held = max(0, int(cpu_slot_reserve() if reserve is None else reserve))
+    spans = max(0, free - held - boundary) // per
+    return {"free_blocks": free,
+            "cpu_slot_reserve": held,
+            "boundary_slots": boundary,
+            "per_span": per,
+            "spans_affordable": int(spans),
+            # THE SLOTS THAT WOULD BE SPENT, boundary states included: the number the
+            # offer's `needed` is comparable against, and the one the queue and the
+            # per-offer slot cap are also priced in.
+            "slots_affordable": int(spans * per + boundary)}
 MAX_PATHS_PER_STEP = 512             # load_paths entries one step may carry
 MIN_WITNESS_LOG_SECONDS = 30.0       # SECONDS between witness re-emissions
 MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
@@ -665,7 +782,14 @@ OFFER_REFUSAL_WHY = {
                                 "so offering it would park the request for a load "
                                 "the scheduler discards",
     "no_cpu_slots": "the CPU pool cannot spare a whole span's slots above the "
-                    "reserve, so a destination does not exist",
+                    "reserve, so a destination does not exist. The reserve in force, "
+                    "the pool's free count and the spans that are left are published "
+                    "beside every offer as `cpu_slot_reserve`, `cpu_slots_free` and "
+                    "`spans_the_cpu_slots_can_carry`; the reserve is "
+                    "`VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` (default 64 slots, and 64 "
+                    "slots is a number sized for an arena far larger than an 8 GiB "
+                    "one), so on a small arena this is the refusal to LOWER THE "
+                    "RESERVE for rather than the one to widen the pool",
     "alloc_refused": "the CPU pool refused the allocation outright",
     "no_channel": "no diagnostics directory, so no identity could be handed to a "
                   "worker",
@@ -2336,7 +2460,8 @@ def counters_view(out: dict) -> dict:
         "last_offer_pool": "the most recent offer's bounce-buffer arithmetic: bytes "
                            "per job and where that price came from, the pool budget "
                            "and what was committed, jobs needed versus jobs the pool "
-                           "can carry, and `bounded_by`",
+                           "can carry, the arena reserve in force with the spans the "
+                           "CPU slots can carry, and `bounded_by`",
         "load_failures": "load-failure RECORDS written by this process (one per "
                          "refused or failed read), bounded by the ring cap",
         "load_failures_overwritten": "records the ring recycled at its cap",
@@ -2737,14 +2862,18 @@ def arena_verdict(manager) -> dict:
     are NOT visible from EngineCore; their absence is already reported where it is
     known (`fingerprint_incomplete` in a rank file, `no_worker_proof` in the gate) and
     this function says `no_manager` rather than inventing a worker-side verdict it
-    cannot take. A pool that cannot hold `CPU_SLOT_RESERVE + 1` free blocks can never
-    pass the offer arithmetic, which is the smallest claim this module ever makes.
+    cannot take. A pool that cannot hold `cpu_slot_reserve() + 1` free blocks can never
+    pass the offer arithmetic, which is the smallest claim this module ever makes - and
+    the reserve it measures against is the one IN FORCE, not the shipped constant, or a
+    boot that lowered the reserve would be told its arena is too small by a number that
+    no longer applies to it.
 
     Never raises, and reports its own failure as `unreadable` rather than as `ok`: a
     boot verdict that swallows its error is how a dead tier reads as a live one.
     """
+    reserve = cpu_slot_reserve()
     out = {"state": "no_manager", "pool_total_blocks": None,
-           "free_blocks": None, "cpu_slot_reserve": CPU_SLOT_RESERVE,
+           "free_blocks": None, "cpu_slot_reserve": reserve,
            "blocks_usable_for_an_offer": None,
            "reason": "no connector manager was handed to the boot verdict, so no "
                      "CPU block pool can be read here"}
@@ -2776,29 +2905,29 @@ def arena_verdict(manager) -> dict:
                              "`get_num_free_blocks()`, so the arena's size is unknown "
                              "and an offer cannot be priced against it")
             return out
-        usable = free - CPU_SLOT_RESERVE
+        usable = free - reserve
         out["blocks_usable_for_an_offer"] = int(usable)
         if usable < 1:
             out["state"] = "tiny"
             out["reason"] = (f"the arena has {free} free CPU block(s) and "
-                             f"{CPU_SLOT_RESERVE} are reserved, leaving {usable} for a "
-                             "disk offer: one span needs at least one destination "
-                             "slot, so every offer dies at `no_cpu_slots`. Check "
-                             "KV_OFFLOAD_SIZE / VLLM_USE_SIMPLE_KV_OFFLOAD: a tier "
-                             "whose arena clamps to a slot or two per rank cannot be "
-                             "serviced from disk at any pool size")
+                             f"{reserve} are reserved, leaving {usable}: every "
+                             "offer dies at `no_cpu_slots`. Lower "
+                             "`VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` (64 by default) "
+                             "or fix KV_OFFLOAD_SIZE / VLLM_USE_SIMPLE_KV_OFFLOAD: "
+                             "an arena that clamps to a slot or two per rank cannot "
+                             "be serviced from disk at any pool size")
             return out
         out["state"] = "ok"
         out["reason"] = (f"the arena has {free} free of "
                          f"{total if total is not None else '?'} CPU block(s), "
                          f"{usable} usable once the "
-                         f"{CPU_SLOT_RESERVE}-block reserve is held: an offer can be "
+                         f"{reserve}-block reserve is held: an offer can be "
                          "given a destination slot")
         return out
     except Exception as exc:  # noqa: BLE001 - a verdict is never worth a fault
         snapshot._error(exc, "disk_restore arena verdict")
         return {"state": "unreadable", "pool_total_blocks": None,
-                "free_blocks": None, "cpu_slot_reserve": CPU_SLOT_RESERVE,
+                "free_blocks": None, "cpu_slot_reserve": cpu_slot_reserve(),
                 "blocks_usable_for_an_offer": None,
                 "reason": f"reading the CPU block pool raised "
                           f"{type(exc).__name__}"}
@@ -4320,11 +4449,26 @@ def _offer_pool_view() -> dict:
     afford = disk_read.afford_reads(price)
     pool_jobs = int(afford.get("jobs_at_empty_pool") or 0)
     queue_jobs = _read_queue_jobs()
+    reserve = cpu_slot_reserve_verdict()
     return {"bytes_per_job": int(price),
             "price_source": _clip(source, 160),
             "pool_budget_bytes": int(afford.get("pool_budget_bytes") or 0),
             "pool_committed_bytes": int(afford.get("pool_committed_bytes") or 0),
             "jobs_the_pool_can_carry": pool_jobs,
+            # THE RESERVE IN FORCE, BESIDE THE JOB COUNTS (0.2.38). The two other bounds
+            # published here (the pool's bytes, the queue's depth) each got their own
+            # numbers years ago; the arena reservation that clamps an offer to
+            # `free - reserve - boundary slots` spans was only ever a constant in the
+            # source, which is how a 64-slot reserve sized for a 64 GiB arena ended up
+            # deciding offer size on an 8 GiB one unnoticed. `cpu_slot_reserve_source`
+            # separates "the operator set it" from "unset" from "ignored", and
+            # `cpu_slot_reserve_problems` is the grammar's complaint, verbatim.
+            "cpu_slot_reserve": int(reserve["cpu_slot_reserve"]),
+            "cpu_slot_reserve_default": int(reserve["default_slots"]),
+            "cpu_slot_reserve_source": str(reserve["source"]),
+            "cpu_slot_reserve_env_var": _clip(reserve["env_var"], 160),
+            "cpu_slot_reserve_problems": [str(problem)
+                                          for problem in reserve["env_problems"]],
             # THE QUEUE BESIDE THE POOL, and the minimum the offer is cut to (0.2.35).
             # Publishing one number and calling it "what the offer can carry" is the
             # half-truth this field existed to fix; both ceilings and the minimum are
@@ -4349,7 +4493,15 @@ def _offer_pool_view() -> dict:
                      "`bounded_by` names which of the two cut. Two full-size offers "
                      "in the same step still divide the pool between them, and the "
                      "surplus is refused at bind as `buffer_cap`: this view publishes "
-                     "`jobs_that_fit_now` so that case is at least visible")}
+                     "`jobs_that_fit_now` so that case is at least visible. A THIRD "
+                     "bound stands in front of both and is not a byte count at all: "
+                     "the offer's destination slots come out of the arena's CPU block "
+                     "pool and `cpu_slot_reserve` of them are held back for the RAM "
+                     "tier, which clamps an offer to "
+                     "`(free - cpu_slot_reserve - boundary slots) // slots per span` "
+                     "spans and is the bound that `bounded_by` reports as `cpu_slots` "
+                     "(the per-offer figure, with the pool's free count beside it, is "
+                     "`last_offer_pool.spans_the_cpu_slots_can_carry)")}
 
 
 def _span_parts(run) -> tuple:
@@ -4703,10 +4855,21 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     if free is None:
         _refuse("no_cpu_slots", "the CPU pool exposes no get_num_free_blocks()")
         return ram_result
-    affordable = max(0, (free - CPU_SLOT_RESERVE - boundary_slots)) // max(1, per_span)
+    # THE ARENA'S SHARE, RESOLVED AND PUBLISHED, NOT ASSUMED (0.2.38). The reserve was
+    # a constant when this line was written, which meant a 64-slot reservation sized for
+    # a 64 GiB arena silently decided the size of every offer on an 8 GiB one - 41% of
+    # the 166 free slots on the live wide rank, and nothing in the payload said so. Now
+    # the terms of the arithmetic travel WITH the arithmetic (`cpu_slot_affordance`), so
+    # "why is my offer only 98 spans?" is answered by the payload instead of by reading
+    # this function.
+    reserve = cpu_slot_reserve_verdict()
+    affordability = cpu_slot_affordance(free, per_span, boundary_slots,
+                                        reserve["cpu_slot_reserve"])
+    affordable = affordability["spans_affordable"]
     if affordable <= 0:
         _refuse("no_cpu_slots", f"the CPU pool has {free} free blocks, "
-                                f"{CPU_SLOT_RESERVE} are reserved and "
+                                f"{reserve['cpu_slot_reserve']} are reserved "
+                                f"({reserve['source']}) and "
                                 f"{boundary_slots} go to boundary states, so not "
                                 "even one span can be given a destination")
         return ram_result
@@ -4782,6 +4945,20 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                     "jobs_affordable": jobs_ceiling,
                     "jobs_that_fit_now": int(afford.get("jobs_now") or 0),
                     "bytes_the_offer_needs": jobs_wanted * int(price_bytes),
+                    # THE ARENA'S RESERVE AS IT ACTUALLY APPLIED TO THIS OFFER
+                    # (0.2.38). `bounded_by` says `cpu_slots` when the reserve is what
+                    # cut an offer, and until now that was the end of the story: the
+                    # number, where it came from and what the pool had free were only
+                    # recoverable by reading this function. The three together are the
+                    # arithmetic - `spans_the_cpu_slots_can_carry` IS
+                    # `(cpu_slots_free - cpu_slot_reserve - boundary slots) // slots per
+                    # span`, and the operator who reads it is the one who decides to
+                    # lower `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE`.
+                    "cpu_slot_reserve": int(reserve["cpu_slot_reserve"]),
+                    "cpu_slot_reserve_source": str(reserve["source"]),
+                    "cpu_slot_reserve_env_var": _clip(reserve["env_var"], 160),
+                    "cpu_slots_free": int(free),
+                    "spans_the_cpu_slots_can_carry": int(affordable),
                     # THE PER-OFFER BOUND THAT STOOD WHEN THIS OFFER WAS PRICED, beside
                     # the pool arithmetic `bounded_by` names it next to (0.2.32): a
                     # reader asking "was this offer short because of a cap or because of
@@ -7546,6 +7723,17 @@ def boot_line() -> str:
         ceiling = offer_block_ceiling()
         parts.append("offer_block_cap={}".format(int(ceiling["blocks"])))
         parts.append("offer_block_cap_tokens={}".format(int(ceiling["tokens"])))
+        # THE ARENA RESERVE, on the same line as the other bounds that size an offer,
+        # and with its ORIGIN, because this one became tunable in 0.2.38 and a boot line
+        # that printed only the number could not answer the operator's actual question
+        # ("did my drop-in arrive?"). `default` = the variable is unset, `env` = the
+        # environment's number won, `env-ignored` = the grammar refused what was typed
+        # and the 64 stood (the `DISK[reserve] IGNORED` line names the complaint).
+        boot_reserve = cpu_slot_reserve_verdict()
+        parts.append("cpu_slot_reserve={}({})".format(
+            int(boot_reserve["cpu_slot_reserve"]),
+            {"env": "env", "ignored": "env-ignored"}.get(boot_reserve["source"],
+                                                          "default")))
         parts.append("authority_lookups={}".format(
             int(_state["authority_lookups"])))
         parts.append("suppressed={}".format(int(_state["suppressions"])))
@@ -8420,13 +8608,22 @@ def section() -> dict:
     view = counters()
     view["gate"] = gate()
     view["deadline_seconds"] = RESTORE_DEADLINE_SECONDS
+    reserve = cpu_slot_reserve_verdict()
     view["limits"] = {
         "max_restore_blocks_per_offer": MAX_RESTORE_BLOCKS_PER_OFFER,
         "max_slots_per_offer": MAX_SLOTS_PER_OFFER,
         "max_tracked_loads": MAX_TRACKED_LOADS,
         "max_tracked_slots": MAX_TRACKED_SLOTS,
         "max_paths_per_step": MAX_PATHS_PER_STEP,
-        "cpu_slot_reserve": CPU_SLOT_RESERVE,
+        # THE ARENA RESERVE IN FORCE (0.2.38), and not the constant: this field used to
+        # publish `CPU_SLOT_RESERVE` while the offer path was free to use a different
+        # number, which is the worst kind of payload field - one that reads as the bound
+        # while a bound nobody published decided the offer. `cpu_slot_reserve_source`
+        # is what separates an unset variable from an ignored one.
+        "cpu_slot_reserve": int(reserve["cpu_slot_reserve"]),
+        "cpu_slot_reserve_default": int(reserve["default_slots"]),
+        "cpu_slot_reserve_source": str(reserve["source"]),
+        "cpu_slot_reserve_env_var": _clip(reserve["env_var"], 160),
         "identity_digest_placeholder": IDENTITY_DIGEST_PLACEHOLDER,
         # THE BOUND ONE OFFER MAY CARRY (0.2.32), as the blocks that define it plus the
         # tokens they are worth and where that block size came from. The fixed
@@ -8981,7 +9178,9 @@ def scheduler_section() -> dict:
                                    "files at the last proof read, from counters()",
             "offer_pool": "what an offer costs the BOUNCE-BUFFER POOL: the bytes one "
                           "read needs, the pool's budget, how many jobs it can carry, "
-                          "and the last offer's pricing with `bounded_by` naming which "
+                          "the arena's CPU-slot reserve in force and where it came "
+                          "from, and the last offer's pricing with `bounded_by` naming "
+                          "which "
                           "constraint shortened it (`pool_budget` = bounce buffers, "
                           "`read_queue` = the reader's job queue, a JOB bound the byte "
                           "budget does not imply, and a job refused there arrives as a "
@@ -9004,8 +9203,9 @@ def scheduler_section() -> dict:
                                    "budget`), from counters()",
             "last_offer_pool": "the byte arithmetic of the most recent pricing: price "
                                "per job and its source, the pool budget, jobs needed "
-                               "versus jobs the pool AND the queue can carry, and "
-                               "`bounded_by`",
+                               "versus jobs the pool AND the queue can carry, the "
+                               "arena reserve that clamped the offer with the spans "
+                               "the CPU slots could carry, and `bounded_by`",
             "recent_load_failures": "the load-failure records an operator can read "
                                     "without opening a rank file: this process's ring "
                                     "merged with what the live rank files carried, "

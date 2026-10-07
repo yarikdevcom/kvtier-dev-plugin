@@ -84,7 +84,14 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # reason: an inherited root would point a test's shadow files somewhere
             # outside its `tmp_path`, which is the opposite of what a temp-directory
             # test suite means.
-            config.ENV_DISK_GPU_SHADOW_WRITES, config.ENV_DISK_GPU_SHADOW_ROOT)
+            config.ENV_DISK_GPU_SHADOW_WRITES, config.ENV_DISK_GPU_SHADOW_ROOT,
+            # THE CPU-SLOT RESERVE (0.2.38). Listed for the same reason as the pool
+            # size, and this one bites the ARITHMETIC rather than the bytes: the whole
+            # claim of the release is that an unset variable still reserves 64 slots,
+            # and a suite that inherited `=0` from a developer's shell would be
+            # offering the arena's last slot while asserting the shipped bound. The
+            # affordability tests below `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` name it.
+            config.ENV_DISK_CPU_SLOT_RESERVE)
 
 
 def _isolate(state: dict) -> dict:

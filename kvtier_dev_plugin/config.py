@@ -138,6 +138,27 @@ the file contract the proxy host's reader expects):
                                       `evict_threads_requested` beside
                                       `evict_threads_configured` when they differ).
 
+  THE CPU-SLOT RESERVE AN OFFER LEAVES ALONE (`disk_restore.py`, 0.2.38) ------
+
+  VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE
+                                      CPU slots of the host-RAM arena's block pool that
+                                      an offer must NOT take. UNSET = `disk_restore.
+                                      CPU_SLOT_RESERVE` (64), the value every release
+                                      before 0.2.38 used and the value an unset boot
+                                      still uses. LOWER IT TO MAKE OFFERS BIGGER on a
+                                      small arena: at 166 free slots per rank a reserve
+                                      of 64 leaves 98 spans of an offer, a reserve of
+                                      16 leaves 146 (before the 128-block walk cap).
+                                      0 IS HONOURED = "an offer may take the arena's
+                                      last slot", which leaves the RAM tier nothing to
+                                      park with. A NON-INTEGER or a NEGATIVE value is
+                                      refused, falls back to 64, and is announced once
+                                      as `DISK[reserve] IGNORED`; there is NO ceiling,
+                                      because a reserve larger than the arena correctly
+                                      declines every offer as `no_cpu_slots`. See
+                                      `cpu_slot_reserve_env` and README's
+                                      *Sizing the CPU-slot reserve*.
+
   THE DISK TIER'S BOOT DEFAULT (`disk_boot.py`, 0.2.33) -----------------------
 
   KVTIER_DISK_BOOT_ENABLE    the SSD tier's BOOT posture, and the ONE flag that
@@ -415,6 +436,35 @@ ENV_DISK_GPU_SHADOW_WRITES = "VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES"
 # Read ONCE per process, like the enablement. Not a `VLLM_E2_TIER_*` behaviour switch:
 # it names a location, and it is validated by `disk_layout.validate_root`.
 ENV_DISK_GPU_SHADOW_ROOT = "VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT"
+
+# HOW MANY CPU SLOTS AN OFFER MUST LEAVE FREE IN THE ARENA (`disk_restore.py`,
+# 0.2.38) ---------------------------------------------------------------
+# `disk_restore.CPU_SLOT_RESERVE` (64) was a constant, and it is a number that was
+# sized for an arena 8x the size of the one the operator is now running: shrinking the
+# engine's KV arena from 64 GiB to 8 GiB left 166 free slots per rank on the PP1 pair,
+# so the reservation ate 41% of the arena BEFORE the offer path saw a single slot. It
+# is now a floor the operator can lower, which is the cheapest remaining host-RAM win
+# because it converts reserved slots into restorable tokens with no engine change.
+#
+# WHAT THE RESERVE IS FOR, and so what it is safe to set it to: an offer allocates its
+# destination slots OUT OF THIS POOL, and the pool is the arena the RAM tier needs to
+# park its own blocks. The reserve is the headroom an offer deliberately leaves for
+# that traffic - a reserve of 0 means "a disk offer may take the arena to its last
+# slot", which is legal and honoured (see below) but leaves the RAM tier nothing.
+#
+# 0 IS HONOURED HERE, which is the opposite of `ceiling_env`'s and `disk_read_env`'s
+# floors, and the reason is that 0 is a real posture rather than a dead knob: it means
+# "spend the whole arena on restore". Only a NON-INTEGER or a NEGATIVE value is
+# refused, and both fall back to the shipped default of 64 and are announced once in
+# the engine log, because a value that quietly stopped being what the operator typed is
+# the failure shape this package refuses everywhere else.
+#
+# THERE IS NO CEILING, deliberately. An absurd value (say 10,000) is honoured, and the
+# arithmetic then declines every offer with `no_cpu_slots` - the safe direction, since
+# the reserve's whole job is to make an offer SMALLER. Clamping it here would turn "the
+# operator asked for a reserve larger than the arena" into "the operator asked for
+# 64", which is a silently different machine.
+ENV_DISK_CPU_SLOT_RESERVE = "VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE"
 
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
@@ -970,6 +1020,56 @@ def ceiling_env() -> dict:
                 evict_threads = wanted
     return {"budget_seconds": budget, "problems": problems,
             "evict_threads": evict_threads}
+
+
+def cpu_slot_reserve_env() -> dict:
+    """The CPU-slot reserve the operator asked for, parsed and NOT interpreted.
+
+    The same split as `settle_env`, `disk_read_env` and `ceiling_env`: the grammar
+    ("what did the operator write") lives here, the policy that spends the number
+    (`disk_restore.cpu_slot_reserve`, which the offer arithmetic, the boot verdict and
+    the payload all read) lives with the arithmetic it belongs to. So there is no
+    default of 64 in this function: `slots=None` means "the operator said nothing" and
+    the consumer answers with its own constant, which is the ONLY way the constant at
+    `disk_restore.CPU_SLOT_RESERVE` stays a fact a reader can check instead of a number
+    that has quietly stopped deciding anything.
+
+    WHERE THIS KNOB IS DIFFERENT FROM THE OTHERS, and why: `ceiling_env` refuses 0
+    because a ceiling pass with a 0-second budget does nothing while reading as
+    configured, and `disk_read_env` refuses 0 threads for the same reason. This one
+    HONOURES 0. A reserve of 0 is not a dead knob - it is the posture "a disk offer may
+    take the arena's last free slot", which is exactly what an operator running a small
+    arena on purpose may want to buy, and the arithmetic below it stays correct at 0
+    (`free - 0 - boundary_slots`). A NEGATIVE value is a different animal: it would
+    hand the offer MORE slots than the pool has, so it is refused as a grammar error
+    and reported, and there is no arithmetic that can reach it.
+
+    No ceiling either, for the reason in the constant's comment: an over-large reserve
+    declines offers, which is the direction the reserve exists to bias. A non-integer
+    (`16.0`, `16 slots`, an empty-but-present drop-in value) is left as None and named
+    in `problems`, which `disk_restore.cpu_slot_reserve` logs ONCE per distinct
+    complaint as `DISK[reserve] IGNORED` - one line per boot, not one per offer.
+    """
+    problems: list = []
+    raw = os.environ.get(ENV_DISK_CPU_SLOT_RESERVE, "").strip()
+    slots: int | None = None
+    if raw:
+        try:
+            wanted = int(raw)
+        except ValueError:
+            problems.append(f"{ENV_DISK_CPU_SLOT_RESERVE}={raw!r} is not an integer "
+                            "and was ignored")
+            wanted = None
+        if wanted is not None:
+            if wanted < 0:
+                problems.append(
+                    f"{ENV_DISK_CPU_SLOT_RESERVE}={raw!r} is below 0 and was ignored "
+                    "(a negative reserve would hand the offer more CPU slots than the "
+                    "arena has)")
+            else:
+                slots = wanted
+    return {"slots": slots, "raw_value": raw or None,
+            "env_var": ENV_DISK_CPU_SLOT_RESERVE, "problems": problems}
 
 
 def canonical_policy_path() -> Path:
