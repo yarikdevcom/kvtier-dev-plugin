@@ -300,9 +300,9 @@ MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
-             "authority", "failures", "shadow", "gpu-shadow")
+             "authority", "failures", "shadow", "gpu-shadow", "restore-verify")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
-                     "gpu-shadow")
+                     "gpu-shadow", "restore-verify")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -3221,11 +3221,59 @@ def _op_gpu_shadow(body: dict) -> dict:
     return {"ok": True, "reason": None, "gpu_shadow": disk_gpu_shadow.status()}
 
 
+def _op_restore_verify(body: dict) -> dict:
+    """THE RESTORE-SIDE VERIFIER: read its counters, or arm it in this process.
+
+    `{"op":"restore-verify"}` alone READS (the counters, the enablement, the geometry
+    the comparisons used, the oracle's reachability, the limits in force).
+    `{"op":"restore-verify","enabled":true|false}` latches the switch - the same shape
+    as `shadow` and `gpu-shadow` above: a key that is PRESENT is an instruction, a key
+    that is absent is a question, and a value that is not a real boolean is refused
+    rather than guessed at.
+
+    IT IS LISTED AS MUTATING, and here the case is `shadow`'s rather than
+    `gpu-shadow`'s: it writes NOTHING anywhere, but it CHANGES WHAT THE PROCESS DOES - a
+    worker that was comparing nothing starts reading restored GPU blocks off the device
+    and opening spill files for reading on its own thread. A browser that can issue a
+    GET must not be able to do that, exactly as with `offers`, `authority` and `shadow`.
+
+    THE SCOPE IS SAID IN THE ANSWER, and for this op it matters more than for the other
+    two: what is being armed lives at the RESTORE APPLY POINT, which is code only a
+    WORKER runs. This module writes no control file (it opens no file handle for writing
+    anywhere, which is its whole safety story), so a POST that arrives at the EngineCore
+    latches a process that will never apply a restore, and it reports `checked: 0`
+    forever for that reason alone. `scope` says so, instead of letting an operator read
+    a zero as an all-clear. The worker is armed with
+    `VLLM_E2_TIER_DISK_RESTORE_VERIFY=1`.
+    """
+    # Lazy for the same reason `_op_failures` reaches `disk_restore` lazily: the restore
+    # half owns this module's registration, and the import is one dict lookup per call
+    # on a path an operator drives by hand.
+    from . import disk_restore_verify  # noqa: PLC0415 - it is installed by disk_restore
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        value = body["enabled"]
+        if not isinstance(value, bool):
+            return {"ok": False,
+                    "reason": f"enabled must be a JSON boolean, got {value!r}: "
+                              "nothing changed",
+                    "restore_verify": disk_restore_verify.status()}
+        applied = disk_restore_verify.set_enabled(value)
+        applied["changed"] = True
+        return {"ok": True, "reason": None, "restore_verify": applied,
+                "note": ("the latch is this process only; the worker that applies a "
+                         "restore is armed with "
+                         f"{config.ENV_DISK_RESTORE_VERIFY}=1")}
+    return {"ok": True, "reason": None,
+            "restore_verify": disk_restore_verify.status()}
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
              "offers": _op_offers, "authority": _op_authority,
              "failures": _op_failures, "shadow": _op_shadow,
-             "gpu-shadow": _op_gpu_shadow}
+             "gpu-shadow": _op_gpu_shadow,
+             "restore-verify": _op_restore_verify}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

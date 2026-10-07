@@ -25,6 +25,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     disk_boot,
     disk_gpu_shadow,
     disk_index,
+    disk_restore_verify,
     disk_shadow,
     disk_spill,
     disk_store,
@@ -91,7 +92,17 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # and a suite that inherited `=0` from a developer's shell would be
             # offering the arena's last slot while asserting the shipped bound. The
             # affordability tests below `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` name it.
-            config.ENV_DISK_CPU_SLOT_RESERVE)
+            config.ENV_DISK_CPU_SLOT_RESERVE,
+            # THE RESTORE-SIDE VERIFIER (0.2.39). Listed for `disk_shadow`'s reason and
+            # sharper one: this one reads a GPU block AND opens a spill FILE for
+            # reading on its own thread, from the apply point. A suite that inherited
+            # `VLLM_E2_TIER_DISK_RESTORE_VERIFY=1` from a developer's shell would be
+            # running device copies and file opens inside tests that assert the apply
+            # point touches neither - and, because the work is on another thread, it
+            # would be NON-DETERMINISTIC rather than merely wrong. Deleting it makes
+            # "unset = off" the fact every test measures, and tests that want it on name
+            # it out loud.
+            config.ENV_DISK_RESTORE_VERIFY)
 
 
 def _isolate(state: dict) -> dict:
@@ -192,6 +203,12 @@ def reset_dev_state():
              # process-wide, and unlike the read side it holds a THREAD. A test that
              # armed it must not hand a live writer to the next one.
              "disk_gpu_shadow": _isolate(disk_gpu_shadow._state),
+             # THE RESTORE-SIDE VERIFIER (0.2.39): its latch, its retained-entry map
+             # (which holds a path and a worker weakref), its geometry cache and its
+             # counters are all process-wide, and it owns a THREAD. A test that armed it
+             # must not hand a live verifier - or a retained path from a `tmp_path` that
+             # is about to be deleted - to the next one.
+             "disk_restore_verify": _isolate(disk_restore_verify._state),
              "lookups": _isolate(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -229,6 +246,10 @@ def reset_dev_state():
     # the thread and drops the queue, so a shadow file queued by one test cannot be
     # written into a directory the next test is asserting is empty.
     disk_gpu_shadow.reset_state_for_tests()
+    # THE RESTORE-SIDE VERIFIER. Same reason, plus its thread: the reset stops the
+    # thread and drops the retained entries, so an entry retained against one test's
+    # fake worker cannot be verified against the next test's.
+    disk_restore_verify.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
@@ -240,6 +261,7 @@ def reset_dev_state():
            "disk_boot": disk_boot._state,
            "disk_shadow": disk_shadow._state,
            "disk_gpu_shadow": disk_gpu_shadow._state,
+           "disk_restore_verify": disk_restore_verify._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -259,6 +281,7 @@ def reset_dev_state():
                        ("disk_boot", disk_boot._state),
                        ("disk_shadow", disk_shadow._state),
                        ("disk_gpu_shadow", disk_gpu_shadow._state),
+                       ("disk_restore_verify", disk_restore_verify._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])

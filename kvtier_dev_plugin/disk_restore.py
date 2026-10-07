@@ -162,6 +162,7 @@ from . import (
     disk_index,
     disk_layout,
     disk_read,
+    disk_restore_verify,
     disk_spill,
     disk_store,
     snapshot,
@@ -6988,6 +6989,17 @@ def _worker_before_load(worker) -> dict:
     shape = span_shape(batch, failed)
     _note_span_shape(shape)
     window["span_shape"] = shape
+    # THE RESTORE-SIDE VERIFIER (0.2.39), and THIS is the only place it touches an
+    # engine thread. `failed` is final here and the prune below has not run, so the
+    # entries in `batch["jobs"]` absent from `failed` are exactly the ones whose bytes
+    # were memmoved into the CPU slot this step - the ones the fork is about to DMA into
+    # the GPU blocks named beside them. BOOKKEEPING ONLY: it counts, samples and retains
+    # ints and one path string, and the file read and the device read happen on ITS OWN
+    # bounded thread - there is no file I/O and no GPU sync here. It runs AFTER every
+    # decision this function makes and it cannot raise, so it can observe a step and can
+    # never be the reason a step did what it did. Default OFF: with
+    # `VLLM_E2_TIER_DISK_RESTORE_VERIFY` unset it returns on the enablement test.
+    disk_restore_verify.observe_apply(worker, batch, failed)
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
     batch_jobs = batch.get("jobs") or {}
@@ -8011,11 +8023,17 @@ def register_contribution() -> dict:
     in the first place (`_tier_arm_verdict`).
     """
     from . import worker_diag  # noqa: PLC0415 - one writer, and no import cycle
-    return worker_diag.register_contribution(
+    report = worker_diag.register_contribution(
         "disk_restore", worker_report, owner=OWNER_TAG,
         signal=lambda: (int(bool(disk_spill.is_armed())),
                         int(bool(_state["worker_fitted"])),
                         int(bool(_state["installed"]))))
+    # THE RESTORE-SIDE VERIFIER REGISTERS HERE, not from `disk_store.install()`: the
+    # facts it reports are THIS module's apply point's, and a process that cannot apply
+    # a restore has nothing to say about whether restored bytes reached a GPU window.
+    # Same installer, same half, same rank file.
+    disk_restore_verify.register_contribution()
+    return report
 
 
 # --- install / uninstall ------------------------------------------------------

@@ -99,6 +99,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT` | **where those shadow files go.** Unset = `<the live store root>/../gpu-shadow`, a sibling of the store (so one `cmp -r` compares the two trees and the store's own sweep never walks the evidence). Read once per process; validated like any other root, and subject to the same refusal. |
+| `VLLM_E2_TIER_DISK_RESTORE_VERIFY` | **the RESTORE-side byte verifier (0.2.39), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no spill file is opened and no GPU block is read by this module. `1`/`true`/`yes`/`on` = a sampled restored entry is compared byte-for-byte: the leading `W_g` bytes of the spill file against the leading `W_g` bytes of the GPU block the restore loaded it into, with the file width and the group width checked first and the tail (the other groups' stale bytes) never compared at all. A disagreement is re-read before it is reported, so `mismatch_stable` (a layout candidate) is separable from `mismatch_gpu_changed_on_recheck` (the engine moved). It is a WORKER feature, so this environment variable is the switch that arms a worker; `POST /disk {"op":"restore-verify"}` latches only the answering process and its answer says so. It never changes a restore decision, and the engine's step thread pays a counter and a dict of ints - the file read and the device copy happen on its own bounded thread. See *Do the RESTORED bytes match the file?*. |
 | `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` | **how many CPU slots of the host-RAM arena's block pool an offer must NOT take (0.2.38). Unset = `disk_restore.CPU_SLOT_RESERVE` = 64, the value every release before 0.2.38 used.** An offer allocates its *destination* slots out of the same pool the RAM tier parks its own blocks in, and is clamped to `(free - reserve - boundary slots) // slots-per-span` spans - so on a shrunk arena the reserve is an offer-size lever, not a footnote: at the operator's 166 free slots per rank on the wide PP1 pair, reserve 64 leaves **98 spans (313,600 tokens)** and reserve 16 leaves **146**. `0` is **honoured** ("an offer may take the arena's last slot" - it leaves the RAM tier nothing to park, see the section). A non-integer or a negative falls back to 64 and logs once (`DISK[reserve] IGNORED`); there is deliberately **no ceiling**, because a reserve larger than the arena correctly declines every offer as `no_cpu_slots` instead of oversubscribing. The value in force, its origin (`env` / `default` / `ignored`) and the spans it leaves are published in `restore.limits`, `restore.offer_pool`, `last_offer_pool` and the boot line's `cpu_slot_reserve=64(default)`. See *Sizing the CPU-slot reserve an offer leaves alone*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
@@ -223,7 +224,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -2824,6 +2825,132 @@ retention removed is counted as ours going away and never as the store's absence
 shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
 published key set does not change shape.
 
+## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39)
+
+The two modules above answer a WRITE question: after the arena spilled a block, does the
+GPU still hold those bytes, and can those bytes be written straight to NVMe? This module
+answers the READ question, which is the one nobody had answered: **after a disk restore,
+does the GPU block hold what the spill file holds?** Default OFF, worker-side, read-only,
+sampled, and it changes no restore decision.
+
+Why the question is not already answered by the ledger. A disk restore is a chain of
+**index-aligned lists**: the scheduler's `token_load_job_list` carries a
+`(cpu_block_id, gpu_block_id)` per entry, `_worker_bind` walks the lists beside each other,
+`disk_read` fills a CPU slot, the plugin memmoves that slot into the bounce buffer the
+entry names, and the fork's `start_load_kv` DMAs the slot into `gpu_block_id`. Every step
+is index arithmetic, and a **one-slot shift moves the aligned lists together** - the name
+stays well-formed, the ledger row is complete, the counters agree, and the engine serves a
+window that belongs to a different token boundary. Nothing in the stack compares the bytes
+at the destination, which is exactly the check `disk_shadow` provides for the write path.
+
+**The five assertions, in the order that makes each failure nameable on its own.**
+
+1. **The file is window-wide.** `os.path.getsize == bytes_per_block` for this rank. A file
+   that is 12 B (or double-wide) is a geometry or a rank-crossing answer, so it is refused
+   as `file_not_window_wide` with BOTH widths in the reason and never compared - comparing
+   under a width that cannot be right manufactures a finding.
+2. **The group is narrower than the file.** A group whose own `page_size_bytes` exceeds the
+   slot width would read past EOF and call the zeros a mismatch: `group_wider_than_file`,
+   refused before the file is opened.
+3. **The leading `W_g` bytes agree - and only those.** `W_g` is the GROUP's width, and the
+   rest of the window is the other groups' bytes, stale by construction. So the file is
+   read with `read(W_g)` (the tail is never read from disk at all) and the device bytes are
+   sliced `[:W_g]` before they reach the compare. The refusal is structural, not a
+   convention: a verifier that compared the whole window would report a mismatch on every
+   narrow group forever, and the one real finding would drown in it. `tail_bytes_excluded`
+   is published beside every verdict so the reader can see how much nobody claimed.
+4. **The name comes from the blocks the restore was asked for** - the binding oracle. It
+   re-derives the file's `key16` from `block_hashes` through the engine's OWN helpers
+   (`make_block_hash_with_group_id` + `resolve_block_hashes`) and compares that against the
+   name in the path. Name-vs-name cannot catch a one-slot shift, because a shift moves the
+   index-aligned lists together and both strings stay well-formed; re-derivation from the
+   blocks at the index actually used can. **On this fork a worker has no requests** - the
+   fork's own metadata module states that "the worker never knows about request identities"
+   - so in production every entry counts `oracle_unavailable` and the reason names the file
+   that says so. That is the honest answer, published rather than a silent skip, and
+   `set_oracle(provider)` is the seam that changes it the moment a source exists.
+5. **The truncation shape.** A batch that restored the positional groups and named NOTHING
+   for an align-mode group is the Gate B shape: `n_take_g` (`manager.py:445-448`) truncates
+   each group's hit list, and an align group's list is `[null]*(n-1) + [one real block]`,
+   so a truncation before the run's end removes that group's ONLY real entry while every
+   positional group keeps its bytes. The verifier cannot see a missing entry, so it counts
+   its ABSENCE (`boundary_entry_missing`, per group). The align groups come from the worker's
+   own specs (`spec.mamba_cache_mode == "align"`, a field only `MambaSpec` carries); an entry
+   that was present and whose read FAILED is excluded - that is `disk_restore`'s finding,
+   already counted where it happened.
+
+**Where the GPU bytes come from: `disk_shadow`'s seam and no other.**
+`disk_shadow._read_gpu_slot` -> `_copy_slot_to_host` -> the host-landing guard ->
+`disk_spill.read_slot_bytes`. There is no second device-copy mechanism in this package and
+no `ctypes` read of a device address in this module (the module has no `import ctypes` at
+all), because the hazard there is a segmentation fault rather than an exception, and because
+one seam means the two witnesses cannot disagree about what a failed device read means. The
+comparison also waits for the fork's own completion watermark (`worker._load_hwm >= event`):
+the apply point runs BEFORE the DMA is issued, so comparing at the apply point would read
+bytes that have not arrived; a worker with no watermark gets `no_load_hwm` and is never
+compared.
+
+**What it costs, and on which thread.** The engine's step thread pays `observe_apply()`,
+which is bookkeeping only - a counter, a sample decision, and a dict of ints plus one path
+string. No file I/O and no device read happen on a step thread; both happen on this module's
+single lazy daemon thread, bounded to `MAX_CHECKS_PER_PASS` comparisons and
+`MAX_RECHECKS_PER_PASS` re-reads per pass with a `MIN_INTERVAL_SECONDS` floor that COUNTS
+(`throttled_interval`) instead of sleeping, because a floor that slept would put a wait on
+whoever called it. Retention is `MAX_RETAINED_PER_STEP` per apply point inside
+`MAX_RETAINED_JOBS` overall, dropping the OLDEST first: an entry that has waited longest has
+had longest for its GPU block to be handed out again, so it is the least likely to be
+evidence. Entry `i` is sampled every `SAMPLE_EVERY_N_RESTORES` (32nd), counted both ways
+(`applies_seen` / `sampled_out`) so the sample rate is a rate over restores that actually
+moved bytes.
+
+**A disagreement is classified, never proclaimed.** A GPU block is handed out again at any
+time, so a mismatch is re-read before it is reported: a re-read that differs is
+`mismatch_gpu_changed_on_recheck` (the engine moved - an expected race), a re-read that held
+still is `mismatch_stable` (a layout candidate, the ONLY one an operator acts on), and a
+re-read that the device refused is `mismatch_unrechecked`. Collapsing those three would make
+the number an operator acts on the number he cannot act on.
+
+**How to turn it on.** It is a WORKER feature, so the environment is the switch that matters:
+
+```bash
+#   VLLM_E2_TIER_DISK_RESTORE_VERIFY=1        (read once at first use; restart to change)
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"restore-verify"}' $B/disk
+```
+
+The POST latches only the process that answers - which for this module is the EngineCore,
+NOT the worker that applies a restore - so the answer carries `scope` and says so. It is
+POST-only because it changes what the process does (reads device memory), and `op` is a
+query parameter on that route, so a `<img>` preload must not be able to arm it. A non-boolean
+`enabled` is refused (`JSON boolean` expected) and changes nothing.
+
+**Reading it.** `rank-<rank>.json` gains a fifth contributed section, `disk_restore_verify`
+(the seam's allow-list is five sections now, and the rank file still carries every field the
+proxy host's reader requires inside its own byte ceiling). It publishes the whole counter set
+with a stable key set, the geometry it read off its own worker (`window_bytes`,
+`group_bytes`, the align group ids, and the note when a config has none), the pending queue,
+the last mismatch with its offset and its excluded tail, and the oracle's state. The verb,
+`status()` and the section are built by ONE builder, so a number cannot differ by door.
+
+**Two limits, stated where they cannot be missed.** The truncation shape is counted at BATCH
+granularity, so a batch containing two requests that both lost the same align entry counts
+once - under-counting, never inventing. And the binding oracle is unreachable in a worker
+process on this fork, so `oracle_checked` stays 0 in production while
+`oracle_unavailable` counts every verified entry: the recomputation is real code (tested
+against the same key helpers the offer path is tested against) waiting for a provider, not a
+stub.
+
+`tests/test_disk_restore_verify.py` (44 tests) is the executable spec: that the default reads
+no file and no device and moves no counter (proved with the readers instrumented to RAISE,
+not with the module reporting its own silence); that one flipped byte inside `W_g` is
+`mismatch_stable` while a difference confined to the tail is `equal`; that a destination one
+slot off FAILS rather than passes; that a reused block is classified on the re-read; that a
+file which is not window-wide and a group wider than the window are refused without being
+compared; that an entry waits for its DMA and a watermark-less worker is never compared; that
+the oracle catches a shifted index name-vs-name cannot see, and counts itself unreachable
+when no provider is installed; that the apply point touches no file and no device and barely
+counts; and that two tests drive the REAL `worker_bind` -> `worker_before_load` path so the
+hook site and the field names it reads are pinned by the product rather than by a fake.
+
 ## Sizing the CPU-slot reserve an offer leaves alone (`disk_restore.py`, 0.2.38)
 
 An offer does not own a KV byte, but it does own **destination slots**: the blocks a disk
@@ -4012,7 +4139,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2355 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2401 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -4027,7 +4154,16 @@ without the feature, that a writer which raises or a root that cannot be written
 counter and not a crash, that retention removes its own file and not a same-named file in
 the store, that the shadow file is the `sorted(name)` concatenation and not the
 insertion-order one, and that a fat published section sheds its illustrations rather than
-its numbers. The per-offer
+its numbers. The restore-side verifier is `tests/test_disk_restore_verify.py`: that
+the default opens no file and reads no device (proved with both readers instrumented
+to raise), that a flipped byte inside `W_g` is a stable mismatch while a difference
+confined to the tail is `equal`, that a destination one slot off FAILS rather than
+passes, that a reused GPU block is classified on the re-read, that a file which is
+not window-wide is refused rather than compared, that an entry waits for the fork's
+DMA watermark, that the binding oracle catches a shifted index that name-vs-name
+cannot see and counts itself unreachable when no provider is installed, and that two
+tests drive the real `worker_bind` -> `worker_before_load` path so the hook site is
+pinned by the product. The per-offer
 bounds after the fixed 32,000-token cap was deleted are in
 `tests/test_disk_offer_bounds.py`, with the affordability ladder that replaces the cap
 as the guard against un-placeable offers. The 0.2.30

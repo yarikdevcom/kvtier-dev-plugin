@@ -437,6 +437,23 @@ ENV_DISK_GPU_SHADOW_WRITES = "VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES"
 # it names a location, and it is validated by `disk_layout.validate_root`.
 ENV_DISK_GPU_SHADOW_ROOT = "VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT"
 
+# THE RESTORE-SIDE VERIFIER (`disk_restore_verify.py`, 0.2.39). The read-only witness
+# for the OTHER direction: for a sampled restored entry, do the bytes now in the GPU
+# window match the bytes in the spill file, over the GROUP'S OWN leading width?
+# `ENV_DISK_SHADOW` proves that what we SHIPPED to NVMe is what the GPU held; this
+# proves that what came BACK from NVMe is what the GPU now holds - which is where a
+# one-slot index shift would actually be visible, because a shift moves the
+# index-aligned lists together and so every file name stays well-formed while the
+# engine serves the wrong token boundary. DEFAULT OFF for the same reason both other
+# device-reading flags are: it reads REAL KV BYTES off the device and opens spill files
+# for reading on a live box, so a launcher script must not be able to turn it on. The
+# work runs on the module's own bounded thread - the step thread pays a counter and a
+# small dict of ints at the apply point - and it never changes a restore decision. The
+# live lever is `POST /plugins/kvtier/disk {"op":"restore-verify"}`, which latches the
+# ANSWERING process and writes no control file; the process that applies a restore is a
+# worker, and a worker is armed here.
+ENV_DISK_RESTORE_VERIFY = "VLLM_E2_TIER_DISK_RESTORE_VERIFY"
+
 # HOW MANY CPU SLOTS AN OFFER MUST LEAVE FREE IN THE ARENA (`disk_restore.py`,
 # 0.2.38) ---------------------------------------------------------------
 # `disk_restore.CPU_SLOT_RESERVE` (64) was a constant, and it is a number that was
@@ -673,6 +690,31 @@ def disk_shadow_enable() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_SHADOW}
+
+
+def disk_restore_verify_enable() -> dict:
+    """The restore-side verifier's boot posture, read by `disk_restore_verify.py`. The
+    SAME grammar as `disk_shadow_enable()`, because it deserves the same sentence: unset
+    is OFF, an on word is ON, a disable word is OFF said with `source: "env"`, and
+    anything else is OFF *and* reported as unrecognised. There is no fourth case.
+
+    WHY OFF IS THE ONLY SAFE DEFAULT, in one line: this flag turns on "read a KV block
+    off the device and open a spill file for reading while the box serves traffic". The
+    one difference from `disk_shadow` is what it reads - a block that a RESTORE just
+    wrote, at the apply point, instead of a block a STORE just read - and the answer it
+    is looking for: the group's own leading width, never the window's tail.
+    """
+    raw = os.environ.get(ENV_DISK_RESTORE_VERIFY, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_RESTORE_VERIFY}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_RESTORE_VERIFY}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_RESTORE_VERIFY}
 
 
 def disk_gpu_shadow_writes() -> dict:
