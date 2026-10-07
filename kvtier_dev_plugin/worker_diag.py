@@ -188,16 +188,23 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 #     `"disk_restore"`, `"disk_shadow"` and `"disk_gpu_shadow"` are listed,
 #     `"arena"`/`"counters"`/`"version"` are not, so a contributor cannot overwrite a
 #     field the reader REQUIRES. An unknown section name is refused at register time,
-#     not at write time. `disk_restore_verify` (0.2.39) is the fifth name on that list
+#     not at write time. `disk_restore_verify` (0.2.39) was the fifth name on that list
 #     and the fifth `MAX_CONTRIBUTIONS`: the restore-side verifier has a worker-side
 #     verdict (did the bytes that came back from NVMe reach the GPU window?) that no
 #     other process can report, and it registers beside `disk_restore` from
-#     `disk_restore.install()`. THE CAP MOVING 4 -> 5 IS THE WHOLE RISK OF THAT CHANGE,
-#     and it is a risk to the FILE rather than to the reader: five sections can ask for
-#     5 x `MAX_CONTRIBUTION_BYTES` = 20 KiB of a `MAX_FILE_BYTES` = 32 KiB file, so the
+#     `disk_restore.install()`. `disk_gpu_write` (0.2.43) is the SIXTH, and it moved the
+#     cap for the reason this comment exists: the cap and the allow-list were the same
+#     five names, and the seam REFUSES an unregistered section, so a sixth section
+#     without the raise would have been SILENTLY ABSENT from the rank file - the one
+#     outcome a diagnostic can least afford, on the flag that writes into live KV. Its
+#     verdict (did OUR OWN copy land where we addressed it?) is likewise reportable by
+#     no other process, and it registers from the same installer.
+#     THE CAP MOVING 4 -> 5, AND NOW 5 -> 6, IS THE WHOLE RISK OF THAT CHANGE, and it is
+#     a risk to the FILE rather than to the reader: six sections can ask for
+#     6 x `MAX_CONTRIBUTION_BYTES` = 24 KiB of a `MAX_FILE_BYTES` = 32 KiB file, so the
 #     contributions stay the first thing `_clip_document` sheds and every field the
 #     reader REQUIRES survives a full house of them - asserted, not assumed, by
-#     `tests/test_disk_restore_verify.py`, which writes a rank file carrying all five
+#     `tests/test_disk_restore_verify.py`, which writes a rank file carrying all six
 #     sections and checks the required keys survive and the file stays under the cap.
 #   * `MAX_CONTRIBUTIONS` bounds how many sections exist at all.
 #   * `MAX_CONTRIBUTION_BYTES` bounds ONE section, serialized; a section over it is
@@ -212,17 +219,18 @@ WRITER_TAG = "kvtier-dev-plugin/1"
 # enforced here, and `epoch`/`version`/`writer` stay exactly as they were:
 # a contribution never touches them.
 CONTRIBUTION_SECTIONS = ("disk", "disk_restore", "disk_shadow", "disk_gpu_shadow",
-                         "disk_restore_verify")
-# FIVE. `disk_gpu_shadow` (0.2.37) was the fourth and `disk_restore_verify` (0.2.39) the
-# fifth, and note that they are NOT registered by one installer: `disk_store.install()`
-# owns `disk`, `disk_shadow` and `disk_gpu_shadow`, while `disk_restore.install()` owns
-# `disk_restore` and `disk_restore_verify`. So no single process necessarily registers
-# all five, and the cap is the size of the whole allow-list rather than of one
+                         "disk_restore_verify", "disk_gpu_write")
+# SIX. `disk_gpu_shadow` (0.2.37) was the fourth, `disk_restore_verify` (0.2.39) the
+# fifth and `disk_gpu_write` (0.2.43) the sixth, and note that they are NOT registered
+# by one installer: `disk_store.install()` owns `disk`, `disk_shadow` and
+# `disk_gpu_shadow`, while `disk_restore.install()` owns `disk_restore`,
+# `disk_restore_verify` and `disk_gpu_write`. So no single process necessarily registers
+# all six, and the cap is the size of the whole allow-list rather than of one
 # installer's share of it. Cap and tuple are the same number by construction, and
 # raising one without the other means a new section is REFUSED at register time and the
 # rank file simply lacks it - which is why the two are asserted against each other in
 # `tests/test_worker_diag.py`.
-MAX_CONTRIBUTIONS = 5
+MAX_CONTRIBUTIONS = 6
 MAX_CONTRIBUTION_BYTES = 4096
 MAX_CONTRIBUTION_NOTES = 4
 

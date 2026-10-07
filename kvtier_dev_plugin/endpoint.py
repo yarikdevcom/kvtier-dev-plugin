@@ -411,7 +411,7 @@ ARG_SPECS: dict[str, dict] = {
                                "values": ("status", "arm", "disarm", "spill-one",
                                           "ls", "contains", "offers", "authority",
                                           "failures", "shadow", "gpu-shadow",
-                                          "restore-verify")},
+                                          "restore-verify", "gpu-write")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         "fingerprint": {"kind": "str", "max_chars": 32},
@@ -425,10 +425,11 @@ ARG_SPECS: dict[str, dict] = {
                         # "unsupported request keys" instead of a posture it did not
                         # ask for. `op=shadow` (0.2.36) uses the same key for the
                         # read-only shadow verifier's in-process latch,
-                        # `op=gpu-shadow` (0.2.37) the GPU-direct shadow writer's, and
-                        # `op=restore-verify` (0.2.39) the RESTORE-side verifier's - the
-                        # one whose scope note matters most, because the apply point it
-                        # arms is code only a worker runs.
+                        # `op=gpu-shadow` (0.2.37) the GPU-direct shadow writer's,
+                        # `op=restore-verify` (0.2.39) the RESTORE-side verifier's and
+                        # `op=gpu-write` (0.2.43) the GPU-DIRECT WRITE's - the last two
+                        # being the pair whose scope note matters most: the apply point
+                        # they arm is code only a worker runs.
                         "enabled": {"kind": "bool"},
                         # `ls` has always accepted a shard filter engine-side
                         # (`disk_store._op_ls`); it was unreachable because it was not

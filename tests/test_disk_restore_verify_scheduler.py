@@ -938,8 +938,15 @@ def test_the_section_publishes_both_roles_and_never_changes_its_key_set(armed, s
 
 
 def test_the_scheduler_role_extends_the_existing_section_rather_than_a_new_one():
-    """The seam holds FIVE contributions and its allow-list has exactly five names."""
-    assert worker_diag.MAX_CONTRIBUTIONS == 5
+    """The seam holds SIX contributions and its allow-list has exactly six names.
+
+    Six, not the five this test was written against: the sixth slot is `disk_gpu_write`
+    (0.2.43), which had to raise `MAX_CONTRIBUTIONS` because the seam refuses an
+    unregistered section. What this test is about has not moved - the SCHEDULER added no
+    section of its own - so only the number changes, and it changes with the allow-list
+    it is compared against rather than being restated as a fresh constant.
+    """
+    assert worker_diag.MAX_CONTRIBUTIONS == 6
     state = worker_diag.contributions()
     assert len(state["allow_list"]) == worker_diag.MAX_CONTRIBUTIONS
     assert "disk_restore_verify" in state["allow_list"]

@@ -1264,30 +1264,33 @@ def test_the_section_key_set_never_changes_and_fits_the_contribution_cap():
     disk_restore_verify.reset_state_for_tests()
 
 
-def test_the_fifth_contribution_is_registered_and_the_rank_file_survives_five():
-    """The allow-list grew to five; the required fields and the cap still hold.
+def test_the_fifth_contribution_is_registered_and_the_rank_file_survives_six():
+    """The allow-list now holds SIX; the required fields and the cap still hold.
 
-    The risk of `MAX_CONTRIBUTIONS` 4 -> 5 is a FILE risk, not a reader risk: five
-    sections can ask for 20 KiB of a 32 KiB ceiling. So this writes a rank file carrying
-    all five sections and asserts (a) all five were written, (b) every `KEEP_KEYS` field
-    the proxy host's reader requires is present, and (c) the file stays under the
-    ceiling - and it asserts the cap and the allow-list moved together, which is the
-    drift that makes a new section silently absent.
+    The risk of `MAX_CONTRIBUTIONS` 4 -> 5 was a FILE risk, not a reader risk, and 5 ->
+    6 is the same risk one step further: six sections can ask for 24 KiB of a 32 KiB
+    ceiling. THE RAISE WAS NOT THIS MODULE'S ASK - `disk_gpu_write` (0.2.43) needed the
+    sixth slot, and because the seam REFUSES an unregistered section, without the raise
+    the new diagnostic would have been silently ABSENT from the rank file. So this
+    writes a rank file carrying all SIX sections and asserts (a) all six were written,
+    (b) every `KEEP_KEYS` field the proxy host's reader requires is present, and (c) the
+    file stays under the ceiling - and it asserts the cap and the allow-list moved
+    together, which is the drift that makes a new section silently absent.
     """
-    assert len(worker_diag.CONTRIBUTION_SECTIONS) == worker_diag.MAX_CONTRIBUTIONS == 5
+    assert len(worker_diag.CONTRIBUTION_SECTIONS) == worker_diag.MAX_CONTRIBUTIONS == 6
     assert "disk_restore_verify" in worker_diag.CONTRIBUTION_SECTIONS
     registered = disk_restore_verify.register_contribution()
     assert registered["registered"] is True, registered
     assert worker_diag.contributions()["registered"] == ["disk_restore_verify"]
-    for name in ("disk", "disk_restore", "disk_shadow", "disk_gpu_shadow"):
+    for name in ("disk", "disk_restore", "disk_shadow", "disk_gpu_shadow",
+                 "disk_gpu_write"):
         made = worker_diag.register_contribution(
             name, lambda: {"note": "a section standing in for its owner"},
             owner=f"test/{name}")
         assert made["registered"] is True, made
     document = worker_diag.build_document(None, "PP0_TP0", "env")
     written = document["writer"]["contributions"]["written"]
-    for name in ("disk", "disk_restore", "disk_shadow", "disk_gpu_shadow",
-                 "disk_restore_verify"):
+    for name in worker_diag.CONTRIBUTION_SECTIONS:
         assert name in written, name
     for key in ("version", "epoch", "ts", "role", "rank", "arena", "counters"):
         assert key in document, key

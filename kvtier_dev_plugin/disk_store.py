@@ -300,9 +300,10 @@ MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
-             "authority", "failures", "shadow", "gpu-shadow", "restore-verify")
+             "authority", "failures", "shadow", "gpu-shadow", "restore-verify",
+             "gpu-write")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
-                     "gpu-shadow", "restore-verify")
+                     "gpu-shadow", "restore-verify", "gpu-write")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -3268,12 +3269,59 @@ def _op_restore_verify(body: dict) -> dict:
             "restore_verify": disk_restore_verify.status()}
 
 
+def _op_gpu_write(body: dict) -> dict:
+    """THE GPU-DIRECT WRITE: read its counters, or arm it in this process.
+
+    `{"op":"gpu-write"}` alone READS (the enablement, the limits, the pinned pool's live
+    shape, the counters, the geometry the comparison used and the last verdicts).
+    `{"op":"gpu-write","enabled":true|false}` latches the switch - the same shape as
+    `_op_restore_verify` above and for the same reasons: a key that is PRESENT is an
+    instruction, a key that is absent is a question, and a value that is not a real
+    boolean is refused rather than guessed at.
+
+    IT IS LISTED AS MUTATING, and the case is the strongest on this verb: it writes no
+    control file, but arming it makes the process issue ITS OWN host->device copy into a
+    live KV window at the restore apply point. A browser that can issue a GET must not
+    be able to do that, exactly as with `offers`, `authority`, `shadow` and
+    `gpu-shadow`.
+
+    THE SCOPE IS SAID IN THE ANSWER, and for this op it matters more than for any other:
+    the write happens at the RESTORE APPLY POINT, which is code only a WORKER runs. This
+    module writes no control file, so a POST that arrives at the EngineCore latches a
+    process that can never write a window, and it will report `writes: 0` forever for
+    that reason alone. `scope` says so instead of letting an operator read a zero as an
+    all-clear. The worker is armed with
+    `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE=1`.
+    """
+    # Lazy for the same reason `_op_restore_verify` reaches `disk_restore_verify`
+    # lazily: the restore half owns this module's registration, and the import is one
+    # dict lookup per call on a path an operator drives by hand.
+    from . import disk_gpu_write  # noqa: PLC0415 - it is installed by disk_restore
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        value = body["enabled"]
+        if not isinstance(value, bool):
+            return {"ok": False,
+                    "reason": f"enabled must be a JSON boolean, got {value!r}: "
+                              "nothing changed",
+                    "gpu_write": disk_gpu_write.status()}
+        applied = disk_gpu_write.set_enabled(value)
+        applied["changed"] = True
+        return {"ok": True, "reason": None, "gpu_write": applied,
+                "note": ("the latch is this process only; the worker that applies a "
+                         "restore is armed with "
+                         f"{config.ENV_DISK_GPU_DIRECT_WRITE}=1")}
+    return {"ok": True, "reason": None,
+            "gpu_write": disk_gpu_write.status()}
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
              "offers": _op_offers, "authority": _op_authority,
              "failures": _op_failures, "shadow": _op_shadow,
              "gpu-shadow": _op_gpu_shadow,
-             "restore-verify": _op_restore_verify}
+             "restore-verify": _op_restore_verify,
+             "gpu-write": _op_gpu_write}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

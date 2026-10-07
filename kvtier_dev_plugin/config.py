@@ -454,6 +454,29 @@ ENV_DISK_GPU_SHADOW_ROOT = "VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT"
 # worker, and a worker is armed here.
 ENV_DISK_RESTORE_VERIFY = "VLLM_E2_TIER_DISK_RESTORE_VERIFY"
 
+# THE GPU-DIRECT WRITE (`disk_gpu_write.py`, 0.2.43) ----------------------------
+# The one flag in this package that WRITES INTO LIVE KV MEMORY, so the sentence about
+# what it does has to be exact: for one applied restore entry in
+# `SAMPLE_EVERY_N_APPLIED`, the plugin issues its OWN host->device copy of that entry's
+# pinned CPU slot into the GPU
+# window the fork is about to load, on the tier's own `load_stream`, and then reads the
+# window back TWICE and compares the leading `W_g` bytes with the spill file. It is a
+# SECOND WRITER of the destination, never a replacement: the fork's own arena->GPU copy
+# is submitted after ours on the same stream and therefore has the last word on every
+# byte, which is what makes a wrong addressing guess here a wrong WITNESS rather than a
+# wrong answer. The ordering is structural, not hoped for: the hook runs inside
+# `start_load_kv`'s wrapper before `original(self, ...)`, and `original` is what submits
+# the fork's copy.
+#
+# WHY OFF IS THE ONLY HONEST DEFAULT: this is the only dev flag here whose failure mode
+# is a device write. Everything it does is contained and fail-open - a refusal is a name
+# and the fork's copy runs alone, exactly as it does when this is unset - but "the
+# diagnostic is contained" is not the same as "it writes nothing by default". The live
+# lever is `POST /plugins/kvtier/disk {"op":"gpu-write"}`, which latches the ANSWERING
+# process and writes no control file; only a WORKER applies a restore, so only a worker
+# can actually write, and a worker is armed here.
+ENV_DISK_GPU_DIRECT_WRITE = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE"
+
 # HOW MANY CPU SLOTS AN OFFER MUST LEAVE FREE IN THE ARENA (`disk_restore.py`,
 # 0.2.38) ---------------------------------------------------------------
 # `disk_restore.CPU_SLOT_RESERVE` (64) was a constant, and it is a number that was
@@ -715,6 +738,34 @@ def disk_restore_verify_enable() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_RESTORE_VERIFY}
+
+
+def disk_gpu_direct_write_enable() -> dict:
+    """The GPU-direct write's boot posture, read by `disk_gpu_write.py`. The SAME
+    grammar as `disk_shadow_enable()`: unset is OFF, an on word is ON, a disable word is
+    OFF said with `source: "env"`, and anything else is OFF *and* reported as
+    unrecognised. There is no fourth case, and for this flag that is not a style rule:
+    it is the switch behind "issue a host->device copy into a live KV window", so the
+    direction a typo can move in must be the direction that writes nothing.
+
+    THE ONE THING THAT MAKES THIS FLAG DIFFERENT from the two device-READING flags: what
+    it turns on writes as well as reads. What makes it SAFE to offer at all is that the
+    fork's own copy of the same bytes is submitted after ours on the same stream, so it
+    keeps the last word on every byte and a wrong guess by this plugin is a wrong
+    witness rather than a wrong answer (see `disk_gpu_write.py`'s module docstring for
+    the ordering argument and for the two counters that keep it honest).
+    """
+    raw = os.environ.get(ENV_DISK_GPU_DIRECT_WRITE, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_GPU_DIRECT_WRITE}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_GPU_DIRECT_WRITE}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_GPU_DIRECT_WRITE}
 
 
 def disk_gpu_shadow_writes() -> dict:

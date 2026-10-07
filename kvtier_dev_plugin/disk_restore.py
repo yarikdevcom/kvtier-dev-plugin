@@ -159,6 +159,7 @@ import time
 
 from . import (
     config,
+    disk_gpu_write,
     disk_index,
     disk_layout,
     disk_read,
@@ -7049,6 +7050,20 @@ def _worker_before_load(worker) -> dict:
     # never be the reason a step did what it did. Default OFF: with
     # `VLLM_E2_TIER_DISK_RESTORE_VERIFY` unset it returns on the enablement test.
     disk_restore_verify.observe_apply(worker, batch, failed)
+    # THE GPU-DIRECT WRITE (0.2.43), and it is the ONE dev feature in this package that
+    # WRITES into live KV memory - which is exactly why it sits at this site and not
+    # anywhere else. `failed` is final, so the entries it may write are exactly the ones
+    # whose bytes `_apply_buffer` has already memmoved into a pinned CPU slot; the call
+    # runs inside `worker_before_load(self)`, which `_wrapped_start_load` calls on the
+    # line BEFORE `return original(self, ...)`, so the copy it enqueues on the
+    # tier's own `load_stream` is enqueued BEFORE the fork's copy is submitted. The
+    # fork's copy then
+    # runs after ours on that stream and keeps the last word on every byte, so a wrong
+    # addressing guess by this module is a wrong WITNESS and not a wrong answer. It
+    # awaits nothing, allocates nothing on this thread and cannot raise; every refusal
+    # is a name and leaves the entry entirely to the fork's copy. Default OFF: with
+    # `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` unset it returns on the enablement test.
+    disk_gpu_write.observe_apply(worker, batch, failed)
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
     batch_jobs = batch.get("jobs") or {}
@@ -8082,6 +8097,13 @@ def register_contribution() -> dict:
     # a restore has nothing to say about whether restored bytes reached a GPU window.
     # Same installer, same half, same rank file.
     disk_restore_verify.register_contribution()
+    # THE GPU-DIRECT WRITE REGISTERS HERE TOO, for the same reason: its facts are this
+    # apply point's, and a process that cannot apply a restore cannot write a KV window.
+    # THIS ONE NEEDED `worker_diag.MAX_CONTRIBUTIONS` to move 5 -> 6 (its allow-list was
+    # exactly five names and the seam REFUSES an unregistered section, so without the
+    # raise the section would have been silently absent from the rank file). See
+    # `disk_gpu_write.MAX_SECTION_BYTES` for the byte arithmetic of six sections.
+    disk_gpu_write.register_contribution()
     return report
 
 

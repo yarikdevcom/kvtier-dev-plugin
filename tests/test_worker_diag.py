@@ -915,7 +915,10 @@ def test_every_allow_listed_section_can_actually_be_registered(writes_to):
     error in the file. 0.2.37 added the fourth section (`disk_gpu_shadow`) and hit the
     cap exactly, which is the day this assertion starts earning its place: the next
     section must raise `MAX_CONTRIBUTIONS` in the same change that adds it, and this is
-    the test that says so.
+    the test that says so. The rule has been exercised once since: `disk_gpu_write`
+    (0.2.43) needed the sixth slot and raised the cap from five to six in the same
+    change that registered it, which is the behaviour this docstring asks for - and the
+    reason the two numbers are compared here instead of each being asserted on its own.
     """
     assert len(worker_diag.CONTRIBUTION_SECTIONS) == worker_diag.MAX_CONTRIBUTIONS
     registered = [worker_diag.register_contribution(name, lambda: {}, owner=name)

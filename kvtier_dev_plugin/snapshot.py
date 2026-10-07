@@ -1127,6 +1127,24 @@ def dev_state_sections() -> dict:
         _error(exc, "disk restore verify section")
         out["disk_restore_verify"] = {"error": f"{type(exc).__name__}"[:200]}
         out["disk_restore_verify_enabled"] = None
+    try:
+        # THE GPU-DIRECT WRITE (0.2.43), published for the same reason and by the same
+        # `section()` builder. For THIS one the honest zero matters more than usual:
+        # ONLY a WORKER applies a restore, so the EngineCore that answers `/snapshot`
+        # reports `writes: 0` even when an operator has armed it, and
+        # `pool`/`enable_source` are
+        # what let a reader tell "not armed" from "armed in the wrong process" from
+        # "armed and refused because the pinned pool is empty". It reads no file, no
+        # tensor and no engine state, so it stays safe on a path a dashboard polls.
+        from . import (  # noqa: PLC0415 - cycle, see dev_state_sections'
+            disk_gpu_write,
+        )
+        out["disk_gpu_write"] = disk_gpu_write.section()
+        out["disk_gpu_write_enabled"] = bool(disk_gpu_write.effective_enabled())
+    except Exception as exc:  # noqa: BLE001
+        _error(exc, "disk gpu write section")
+        out["disk_gpu_write"] = {"error": f"{type(exc).__name__}"[:200]}
+        out["disk_gpu_write_enabled"] = None
     return out
 
 

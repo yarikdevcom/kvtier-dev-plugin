@@ -24,6 +24,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     config,
     disk_boot,
     disk_gpu_shadow,
+    disk_gpu_write,
     disk_index,
     disk_restore_verify,
     disk_shadow,
@@ -102,7 +103,17 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # would be NON-DETERMINISTIC rather than merely wrong. Deleting it makes
             # "unset = off" the fact every test measures, and tests that want it on name
             # it out loud.
-            config.ENV_DISK_RESTORE_VERIFY)
+            config.ENV_DISK_RESTORE_VERIFY,
+            # THE GPU-DIRECT WRITE (0.2.43). The sharpest case in this list: this one
+            # ISSUES A HOST->DEVICE COPY INTO A LIVE KV WINDOW from the apply point, on
+            # the step thread. A suite that inherited
+            # `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE=1` from a developer's shell would be
+            # running device copies inside tests that assert the apply point touches no
+            # device - and, because the module also allocates pinned rows on its own
+            # thread, the interference would be non-deterministic rather than merely
+            # wrong. Deleting it makes "unset = off" the fact every test measures, and
+            # tests that want it on name it out loud.
+            config.ENV_DISK_GPU_DIRECT_WRITE)
 
 
 def _isolate(state: dict) -> dict:
@@ -209,6 +220,12 @@ def reset_dev_state():
              # must not hand a live verifier - or a retained path from a `tmp_path` that
              # is about to be deleted - to the next one.
              "disk_restore_verify": _isolate(disk_restore_verify._state),
+             # THE GPU-DIRECT WRITE (0.2.43): its latch, its in-flight records (which
+             # hold PINNED TENSORS and a worker weakref), its pinned-row pool, its byte
+             # accounting and its counters are all process-wide, and it owns a THREAD. A
+             # test that armed it must not hand a live writer - or rows allocated
+             # against a fake worker about to be garbage-collected - to the next.
+             "disk_gpu_write": _isolate(disk_gpu_write._state),
              "lookups": _isolate(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -250,6 +267,10 @@ def reset_dev_state():
     # thread and drops the retained entries, so an entry retained against one test's
     # fake worker cannot be verified against the next test's.
     disk_restore_verify.reset_state_for_tests()
+    # THE GPU-DIRECT WRITE. Same reason, plus its thread and its pinned pool: the reset
+    # stops the thread and forgets every row, so a row allocated against one test's fake
+    # worker can never be handed to another test's copy.
+    disk_gpu_write.reset_state_for_tests()
     snapshot._state.update({"calls": 0, "errors": 0, "logged": 0})
     yield {"trace": trace_ring._state, "guard": guard_mode._state,
            "worker": worker_diag._state, "step": step_trace._state,
@@ -262,6 +283,7 @@ def reset_dev_state():
            "disk_shadow": disk_shadow._state,
            "disk_gpu_shadow": disk_gpu_shadow._state,
            "disk_restore_verify": disk_restore_verify._state,
+           "disk_gpu_write": disk_gpu_write._state,
            "lookups": lookup_ledger._state}
     # Teardown ORDER matters: unwrap first (the fake classes are shared per name,
     # see fakes_debug._named_class), then reset the counters. The eviction wrap
@@ -282,6 +304,7 @@ def reset_dev_state():
                        ("disk_shadow", disk_shadow._state),
                        ("disk_gpu_shadow", disk_gpu_shadow._state),
                        ("disk_restore_verify", disk_restore_verify._state),
+                       ("disk_gpu_write", disk_gpu_write._state),
                        ("lookups", lookup_ledger._state)):
         state.clear()
         state.update(saved[key])
