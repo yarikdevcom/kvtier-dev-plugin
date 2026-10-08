@@ -1784,6 +1784,12 @@ def reset_state_for_tests() -> None:
     for samples in _apply_samples.values():
         del samples[:]
     _notices.clear()
+    # THE PROOF'S STATE MACHINE starts fresh: a new "boot" has not read the proof yet,
+    # so the first read of the next test says its own AT BOOT line instead of inheriting
+    # a predecessor's idea of which side the gate was on. Without this, transition tests
+    # would see no transition at all (or a false one) depending on suite order.
+    _proof_transition.update({"open": None, "since_mono": None, "boot_line": None,
+                              "closures": 0, "openings": 0, "last_line": None})
     _witness_state.update({"line": None, "emitted_mono": None, "key": None})
     _proof_cache.update({"mono": None, "result": None})
     _deferred_finished.clear()
@@ -2199,11 +2205,28 @@ def counters() -> dict:
     out["methods_fitted"] = list(_state["methods_fitted"])
     out["missing_methods"] = list(_state["missing_methods"])
     out["role_here"] = role_here()
+    # THE PROOF'S STATE MACHINE, in the payload (0.2.47). `refused.no_worker_proof` says
+    # how many offers the proof refused; these say whether the gate is open NOW, when it
+    # last moved, and the exact line that said so - so the question "did it close mid-
+    # boot, and did it come back?" is a read and not a grep.
+    out["proof_gate_open"] = _proof_transition["open"]
+    out["proof_closures"] = int(_proof_transition["closures"])
+    out["proof_openings"] = int(_proof_transition["openings"])
+    out["proof_last_transition"] = (_proof_transition["last_line"]
+                                    or _proof_transition["boot_line"])
     return counters_view(out)
 
 
 def counters_view(out: dict) -> dict:
     out["units"] = {
+        # THE PROOF'S STATE MACHINE (0.2.47): the two counts, in transitions, and the
+        # sentence they belong to. A `refused: {no_worker_proof: N}` without these tells
+        # an operator how often and nothing else; with them the same payload says the
+        # gate closed once, when, and whether it opened again.
+        "proof_closures": "times the worker-proof gate went from open to CLOSED in "
+                          "this process, one log line each (DISK[proof] GATE CLOSED)",
+        "proof_openings": "times the worker-proof gate went from CLOSED to open in "
+                          "this process, one log line each (DISK[proof] GATE OPEN)",
         "lookups": "lookups reaching the restore path",
         "offers": "requests a disk offer was made for",
         "offered_tokens": "tokens offered beyond the host-RAM hit",
@@ -3012,6 +3035,15 @@ def gate() -> dict:
 
 _proof_cache: dict = {"mono": None, "result": None}
 
+# THE PROOF'S OWN STATE MACHINE (0.2.47): which side the gate was on the last time this
+# process read it, when it last moved, and the two lines that say so. Lock-free like
+# `_proof_cache` beside it - the proof is read on the scheduler's lookup path and by
+# verbs, and a lost increment under a race costs a counter, never a line: the transition
+# itself is decided from `_proof_transition["open"]`, and a duplicated line from two
+# threads racing through one flip is worth less than a lock on the lookup path.
+_proof_transition: dict = {"open": None, "since_mono": None, "boot_line": None,
+                           "closures": 0, "openings": 0, "last_line": None}
+
 
 def worker_proof(force: bool = False) -> dict:
     """Has a WORKER process attested that its restore layer is fitted?
@@ -3043,6 +3075,9 @@ def worker_proof(force: bool = False) -> dict:
     _proof_cache["result"] = result
     _state["ranks_proven"] = int(result["count"])
     _state["ranks_seen"] = int(result.get("ranks_seen") or 0)
+    # THE TRANSITION LINE (0.2.47), emitted at most once per flip. Before the cache
+    # returns, so a boot that never re-reads the proof still said once what it decided.
+    _note_proof_transition(result)
     return result
 
 
@@ -3130,7 +3165,26 @@ def _rank_failure_records(raw) -> list:
     return out
 
 
-def _rank_file_proves_restore(path) -> dict | None:
+def _rank_file_verdict_row(notes, name: str, verdict: str, age=None) -> None:
+    """Record WHY one rank file did or did not answer, for the transition line (0.2.47).
+
+    `notes` is a caller-owned list, so nothing here is shared state and no lock is
+    needed; a `None` notes argument (the verb callers) costs nothing. Every row carries
+    the file's own measured age when age was computable at all, because the sentence an
+    operator needs is not `no_worker_proof` - it is `no_worker_proof because the
+    freshest
+    rank file is 1008 s old`, or `because no rank file carries a disk_restore section`.
+    Those two say completely different things and until now counted identically.
+    """
+    if notes is None or len(notes) >= MAX_RANK_FILES_PROBED:
+        return
+    notes.append({"file": str(name)[:64], "verdict": verdict,
+                  "age_seconds": (round(float(age), 3)
+                                  if isinstance(age, (int, float))
+                                  and not isinstance(age, bool) else None)})
+
+
+def _rank_file_proves_restore(path, notes: list | None = None) -> dict | None:
     """What one rank file says about ITS worker: a verdict dict, or None.
 
     None means "this file is not evidence of anything" (unreadable, too big, no
@@ -3160,12 +3214,16 @@ def _rank_file_proves_restore(path) -> dict | None:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             raw = handle.read(MAX_RANK_FILE_BYTES + 1)
         if len(raw) > MAX_RANK_FILE_BYTES:
+            _rank_file_verdict_row(notes, getattr(path, "name", path), "too_large")
             return None  # unreadable by the reader too, so not evidence of anything
         document = json.loads(raw)
         if not isinstance(document, dict):
+            _rank_file_verdict_row(notes, getattr(path, "name", path),
+                                   "not_an_object")
             return None
         stamp = document.get("ts")
         if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            _rank_file_verdict_row(notes, getattr(path, "name", path), "no_stamp")
             return None
         age = time.time() - float(stamp)
         if age < 0.0:
@@ -3173,12 +3231,26 @@ def _rank_file_proves_restore(path) -> dict | None:
             # future would sail past the staleness test forever and vouch for a worker
             # that died with it. Rank files live on a directory shared with another
             # host's clock, so the skew is real and has to be one-sided.
+            _rank_file_verdict_row(notes, getattr(path, "name", path), "clock_ahead",
+                                   age)
             return None
         if age > RANK_FILE_FRESH_SECONDS:
+            _rank_file_verdict_row(notes, getattr(path, "name", path), "stale", age)
             return None  # a heartbeat from a worker that may be gone
         section = document.get("disk_restore")
         if not isinstance(section, dict):
+            # THE SILENT ALTERNATIVE TO STALENESS (0.2.47). A FRESH file with no
+            # `disk_restore` section is just as useless to the gate as a stale one, and
+            # it means something entirely different: a contributor that raised, or one
+            # that overran its byte cap, or a worker whose restore half never fitted
+            # as a worker. The
+            # worker counts that in its own `_contrib_state`, which lives in a process
+            # with no HTTP route - so without this row the two conditions are one
+            # counter and the operator is left guessing which outage they have.
+            _rank_file_verdict_row(notes, getattr(path, "name", path),
+                                   "no_restore_section", age)
             return None
+        _rank_file_verdict_row(notes, getattr(path, "name", path), "fresh", age)
         rank = document.get("rank")
         name = str(rank)[:32] if rank is not None else str(path.name)[:64]
         installed = section.get("installed") is True
@@ -3215,6 +3287,7 @@ def _rank_file_proves_restore(path) -> dict | None:
                     section.get("last_failures")),
                 "reason": _clip(section.get("reason"), 160)}
     except Exception as exc:  # noqa: BLE001 - one bad file is not evidence, that's all
+        _rank_file_verdict_row(notes, getattr(path, "name", path), "unreadable")
         snapshot._error(exc, "disk_restore rank file")
         return None
 
@@ -3242,6 +3315,128 @@ def _tier_arm_verdict() -> tuple:
         return False, f"the arm file could not be read: {type(exc).__name__}"
 
 
+def _rank_file_verdict_summary(verdicts: list) -> dict:
+    """The AGGREGATE of what the rank files did and did not answer (0.2.47).
+
+    Attached to every `worker_proof()` result so a refusal carries its own diagnosis.
+    The two numbers that matter are `stale_rank_files` and `sectionless_rank_files`: the
+    first says the workers stopped WRITING, the second says they are writing something
+    that does not answer the question. Both used to arrive as `no_worker_proof`, and the
+    difference between them is the difference between "the heartbeat died" and "a
+    contributor vanished from the file" - two outages, two fixes, one counter.
+
+    `youngest_rank_file_age_seconds` is the one that answers "WHEN did this start?": it
+    is the age of the freshest rank file read, so a closure at 23:51:21 with a youngest
+    age of 1008 s says the last proof was written at 23:34:33, which is the number the
+    request log could not give.
+    """
+    ages = [row["age_seconds"] for row in verdicts
+            if isinstance(row.get("age_seconds"), (int, float))
+            and not isinstance(row.get("age_seconds"), bool)]
+    kinds = [str(row.get("verdict")) for row in verdicts]
+    return {
+        "rank_files_read": len(verdicts),
+        "rank_files_not_evidence": sum(1 for kind in kinds if kind != "fresh"),
+        "fresh_rank_files": sum(1 for kind in kinds if kind == "fresh"),
+        "stale_rank_files": sum(1 for kind in kinds if kind == "stale"),
+        "sectionless_rank_files": sum(1 for kind in kinds
+                                      if kind == "no_restore_section"),
+        "unreadable_rank_files": sum(1 for kind in kinds
+                                     if kind in ("unreadable", "too_large",
+                                                 "not_an_object", "no_stamp")),
+        "future_stamped_rank_files": sum(1 for kind in kinds
+                                         if kind == "clock_ahead"),
+        "youngest_rank_file_age_seconds": (round(min(ages), 3) if ages else None),
+        "oldest_rank_file_age_seconds": (round(max(ages), 3) if ages else None),
+        "fresh_window_seconds": RANK_FILE_FRESH_SECONDS,
+    }
+
+
+def _proof_clock_text(age) -> str:
+    """"when the last proof was written", as a wall clock and an age. Never raises."""
+    try:
+        if age is None:
+            return "never"
+        stamp = time.time() - float(age)
+        return (f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(stamp))} "
+                f"({round(float(age), 1)}s ago)")
+    except Exception:  # noqa: BLE001 - a log field is never worth a fault
+        return "unknown"
+
+
+def _note_proof_transition(result: dict) -> None:
+    """ONE TIMESTAMPED LINE PER GATE TRANSITION, never one per poll (0.2.47).
+
+    WHY THIS EXISTED AS A BUG. `refused=no_worker_proof:1` in the request log says HOW
+    MANY offers the proof refused. It does not say WHEN the proof went bad, WHY it went
+    bad, or whether the gate was ever open at all - which is exactly why a single
+    `no_worker_proof` at 23:51 could not be told apart from a boot that had been closed
+    since 23:23. Three lines now, each emitted at most once per episode, on the model of
+    `notice_once` and `disk_gpu_write`'s `_settle_refusal_logged`:
+
+      * `GATE AT BOOT ...`  - the posture the boot started in, said once.
+      * `GATE CLOSED ...`   - open to closed, once per closure, naming the reason kind,
+                              the per-file verdict counts and the freshest rank file's
+                              age and wall clock.
+      * `GATE OPEN ...`     - closed to open, once, saying how long it was shut.
+
+    It rides `worker_proof()`, the only reader of the proof, which is cached for
+    `PROOF_CACHE_SECONDS`; the log is guarded by the transition itself, so a poller that
+    asks every second gets one line for the whole episode.
+    """
+    try:
+        ok = bool(result.get("ok"))
+        kind = result.get("reason_kind") or ("open" if ok else "closed")
+        ages = (f"youngest={result.get('youngest_rank_file_age_seconds')}s "
+                f"oldest={result.get('oldest_rank_file_age_seconds')}s "
+                f"window={RANK_FILE_FRESH_SECONDS}s")
+        files = (f"rank_files={result.get('rank_files_read', 0)} "
+                 f"fresh={result.get('fresh_rank_files', 0)} "
+                 f"stale={result.get('stale_rank_files', 0)} "
+                 f"sectionless={result.get('sectionless_rank_files', 0)} "
+                 f"unreadable={result.get('unreadable_rank_files', 0)} "
+                 f"future_stamped={result.get('future_stamped_rank_files', 0)}")
+        ranks = (f"ranks={result.get('ranks_armed', 0)}/"
+                 f"{result.get('ranks_seen', 0)}")
+        last_write = _proof_clock_text(
+            result.get("youngest_rank_file_age_seconds"))
+        was = _proof_transition["open"]
+        since = _proof_transition["since_mono"]
+        shut = (round(time.monotonic() - float(since), 1)
+                if isinstance(since, (int, float)) else None)
+        if was is None:
+            _proof_transition["open"] = ok
+            _proof_transition["since_mono"] = time.monotonic()
+            _proof_transition["boot_line"] = (
+                f"DISK[proof] GATE AT BOOT open={ok} reason_kind={kind} {ranks} "
+                f"{files} {ages} last_proof_written={last_write}")
+            _logger.warning("kvtier-dev-plugin: %s", _proof_transition["boot_line"])
+            return
+        if was == ok:
+            return
+        _proof_transition["open"] = ok
+        closed_for = shut
+        _proof_transition["since_mono"] = time.monotonic()
+        if ok:
+            _proof_transition["openings"] = int(_proof_transition["openings"]) + 1
+            _proof_transition["last_line"] = (
+                f"GATE OPEN after {closed_for}s closed: {ranks} {files} {ages}")
+            _logger.warning("kvtier-dev-plugin: DISK[proof] GATE OPEN again after "
+                            "%ss closed; %s %s %s last_proof_written=%s",
+                            closed_for, ranks, files, ages, last_write)
+        else:
+            _proof_transition["closures"] = int(_proof_transition["closures"]) + 1
+            _proof_transition["last_line"] = (
+                f"GATE CLOSED reason_kind={kind}: {ranks} {files} {ages}")
+            _logger.warning(
+                "kvtier-dev-plugin: DISK[proof] GATE CLOSED reason_kind=%s %s %s "
+                "%s last_proof_written=%s; reason: %s",
+                kind, ranks, files, ages, last_write,
+                _clip(result.get("reason"), 220))
+    except Exception as exc:  # noqa: BLE001 - a transition line never breaks a lookup
+        snapshot._error(exc, "disk_restore proof transition")
+
+
 def _read_worker_proof() -> dict:
     """Read the rank files NOW (no cache). See `worker_proof`.
 
@@ -3266,6 +3461,12 @@ def _read_worker_proof() -> dict:
     armed verdict).
     """
     directory = config.diagnostics_dir()
+    # THE WHY OF A CLOSED PROOF (0.2.47), attached to EVERY shape this returns so a
+    # reader never has to infer it from a counter. `no_worker_proof` on the live box on
+    # 2026-10-21 meant one of two completely different things - four rank files had gone
+    # stale, or no rank file carried a `disk_restore` section - and the payload said
+    # which of the two it was by saying nothing.
+    summary = _rank_file_verdict_summary([])
     if directory is None:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
                 "ranks_seen": 0, "reads_applied": 0, "tier_armed": False,
@@ -3273,7 +3474,7 @@ def _read_worker_proof() -> dict:
                 "reason_kind": "no_worker_proof",
                 "reason": f"{config.ENV_DIAG_DIR} is not set, so no worker's rank "
                           "file can be read to prove the worker half of this path "
-                          "is fitted"}
+                          "is fitted", **summary}
     try:
         names = sorted(name for name in os.listdir(directory)
                        if name.startswith(RANK_FILE_PREFIX)
@@ -3284,14 +3485,14 @@ def _read_worker_proof() -> dict:
                 "stale_arm_claims": 0, "arm_file_reason": None,
                 "reason_kind": "no_worker_proof",
                 "reason": "the diagnostics directory could not be listed: "
-                          f"{type(exc).__name__}"}
+                          f"{type(exc).__name__}", **summary}
     if not names:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
                 "ranks_seen": 0, "reads_applied": 0, "tier_armed": False,
                 "stale_arm_claims": 0, "arm_file_reason": None,
                 "reason_kind": "no_worker_proof",
                 "reason": "no worker has written a rank file yet, so nothing proves "
-                          "the worker half of this path is fitted"}
+                          "the worker half of this path is fitted", **summary}
     tier_armed, arm_reason = _tier_arm_verdict()
     armed, silent = [], []
     stale_claims = 0
@@ -3305,9 +3506,10 @@ def _read_worker_proof() -> dict:
     # and the operator reads the scheduler.
     widths: list = []
     failures: list = []
+    verdicts: list = []
     probed = names[:MAX_RANK_FILES_PROBED]
     for name in probed:
-        said = _rank_file_proves_restore(directory / name)
+        said = _rank_file_proves_restore(directory / name, verdicts)
         if said is None:
             continue
         width = said.get("bytes_per_file")
@@ -3354,6 +3556,7 @@ def _read_worker_proof() -> dict:
         reverse=True)[:MAX_FAILURES_PUBLISHED]
     widest = max(widths) if widths else None
     _state["ranks_bytes_per_file_max"] = widest
+    summary = _rank_file_verdict_summary(verdicts)
     if not tier_armed:
         # THE ARM FILE OUTRANKS EVERY RANK FILE (0.2.28). No rank file can arm a
         # disarmed tier by claiming `armed: true` - the arm carries the boot fence
@@ -3368,7 +3571,7 @@ def _read_worker_proof() -> dict:
                 "reason": f"the disk tier's arm file does not arm this boot "
                           f"({arm_reason}): the arm is a boot fact read from its "
                           "authoritative copy, and rank files cannot substitute "
-                          "for it (a reboot must not arm a cold box)"}
+                          "for it (a reboot must not arm a cold box)", **summary}
     if armed and not silent:
         return {"ok": True, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
@@ -3377,7 +3580,7 @@ def _read_worker_proof() -> dict:
                 "bytes_per_file_ranks": len(widths),
                 "load_failures": list(_state["rank_failure_records"]),
                 "stale_arm_claims": stale_claims, "arm_file_reason": None,
-                "reason_kind": None, "reason": None}
+                "reason_kind": None, "reason": None, **summary}
     if silent and armed:
         return {"ok": False, "count": len(armed), "ranks": armed[:8],
                 "ranks_armed": len(armed), "ranks_seen": seen,
@@ -3391,7 +3594,7 @@ def _read_worker_proof() -> dict:
                           f"{len(silent)} do not ({'; '.join(silent)[:160]}): the "
                           "load event spans every rank, so the ones that serve would "
                           "still leave blocks the fork committed to "
-                          f"(ranks_armed={len(armed)}/{seen})"}
+                          f"(ranks_armed={len(armed)}/{seen})", **summary}
     if silent:
         return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
                 "ranks_seen": seen, "reads_applied": reads,
@@ -3403,7 +3606,8 @@ def _read_worker_proof() -> dict:
                           f"({'; '.join(silent)[:160]}): an offer would allocate CPU "
                           "slots nothing fills, the fork would report the load failed "
                           "and reschedule the request - ranks_armed="
-                          f"0/{seen}, the exact shape of the 2026-10-05 loop"}
+                          f"0/{seen}, the exact shape of the 2026-10-05 loop",
+                          **summary}
     return {"ok": False, "count": 0, "ranks": [], "ranks_armed": 0,
             "ranks_seen": 0, "reads_applied": reads, "tier_armed": True,
             "stale_arm_claims": stale_claims, "arm_file_reason": None,
@@ -3411,7 +3615,7 @@ def _read_worker_proof() -> dict:
             "reason": f"{len(probed)} rank file(s) were read and none reports a "
                       "fitted disk restore layer (disk_restore.installed) - so the "
                       "worker half of this path is not live, and offering disk "
-                      "tokens would DMA slots nobody filled"}
+                      "tokens would DMA slots nobody filled", **summary}
 
 
 # --- the identity: which file holds the next span? ----------------------------

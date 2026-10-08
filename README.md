@@ -815,16 +815,21 @@ EngineCore-only. So a worker reports through a **file**: one per rank, into
 * **The fork's return values are untouched.** `bind_connector_metadata` counts the
   blocks this rank was handed; `get_finished` writes after the fork's own work, and
   both wrappers are contained, so a full disk cannot fail a step.
-* **It has a heartbeat (0.2.45).** The rank file is this rank's PROOF OF LIFE, and
-  `disk_restore` refuses to offer a disk restore on a file older than
-  `RANK_FILE_FRESH_SECONDS` (900 s). Writing it only from `get_finished` meant an IDLE
-  worker wrote nothing, its proof aged out, and the scheduler stopped serving from disk
-  for a worker that was perfectly alive - so the worker writer now runs its own bounded
-  daemon thread (`kvtier-worker-diag-heartbeat`, 60 s, floor
-  `HEARTBEAT_MIN_INTERVAL_SECONDS` 5 s) through the SAME write path a step uses. Started
-  at `install()`, not at the first step. Read `heartbeat_alive`,
-  `last_heartbeat_age_seconds` and `heartbeat_beats_in_window`; see
-  *An idle engine keeps its disk proof alive* below.
+* **It has a heartbeat (0.2.45; the beat is supervised since 0.2.47).** The rank file is
+  this rank's PROOF OF LIFE, and `disk_restore` refuses to offer a disk restore on a file
+  older than `RANK_FILE_FRESH_SECONDS` (900 s). Writing it only from `get_finished` meant
+  an IDLE worker wrote nothing, its proof aged out, and the scheduler stopped serving from
+  disk for a worker that was perfectly alive - so the worker writer keeps its own beat
+  through the SAME write path a step uses, started at `install()` and not at the first
+  step. Since 0.2.47 each beat runs in its own bounded thread (budget
+  `HEARTBEAT_BEAT_BUDGET_SECONDS` 20 s, at most `HEARTBEAT_MAX_INFLIGHT_BEATS` 3 of them)
+  and catches `BaseException`, so one contributor blocked on a lock cannot stop the proof
+  and one raising `SystemExit` cannot end it. **Read the state in the rank file -
+  `writer.heartbeat.state`** (`beating`, `alive_not_beating`, `started_not_alive`,
+  `never_started`, `not_applicable`): `heartbeat_alive` in `snapshot` describes the
+  process that SERVED the snapshot, which is the API server, so for a worker it is `false`
+  by construction. See *Silence is not death, part two* below, and
+  *An idle engine keeps its disk proof alive*.
 * **The schema is the reader's contract**: `version` 1, a per-boot `epoch`, `ts`,
   `role: "worker"`, `rank` matching the file name (the reader calls a mismatch
   `malformed`), `arena.bytes_total`/`bytes_used`/`num_blocks` (plus
@@ -2741,6 +2746,20 @@ plus `heartbeat_alive` / `last_heartbeat_age_seconds` / `heartbeat_beats_in_wind
 section, which answer "is this worker's proof being kept alive, and how tight is it?"
 without arithmetic. Tests: `tests/test_idle_engine_keeps_its_disk_proof_alive.py`.
 
+**And what that fix could not see (0.2.47).** The 0.2.45 suite passed on a box where the
+tier still went dark, for two reasons that are each other. The suite drove `install()`
+directly, with the worker class handed to it and the interval shortened; in production
+the worker's install lands on the handshake, and the ONLY thing that re-arms a dead
+supervisor is `heartbeat_status(force=True)` inside the wrapped `get_finished` - an engine
+step, which is exactly what an idle worker does not take. And every field that could
+answer "is the pulse running?" lived in the process that served the snapshot, which for
+this plugin is the API server: a worker answers no HTTP route, so `heartbeat_alive`,
+`last_heartbeat_age_seconds` and `beats_in_window` read `false` / `None` / `0` about a
+process that has no rank file to keep, and `heartbeats: 0` in a snapshot is a fact about
+the API server, never about a worker. The one artifact a worker definitely writes is the
+rank file, and it carried no heartbeat state at all. See *Silence is not death, part two*
+below for what 0.2.47 changed.
+
 ## Presence is per rank: a peer's journal cannot decide what my rank may read (0.2.46)
 
 **The store keeps one file per rank; the index answered as if it kept one.** A parked span is
@@ -2866,6 +2885,191 @@ rules that test exists to check are what it checks.
 `stat` per entry on the serving path (the live numbers are sampled, and named `sampled_*`), no
 new `worker_diag` contribution (the cap of 6 is untouched), and `contains()`/`membership()` only
 gained fields. Tests: `tests/test_disk_rank_presence.py`.
+
+## Silence is not death, part two: the beat was running and the proof still died (0.2.47)
+
+> **"The thread is running" is not a proof of life. A file being written is.**
+
+The box that already had the 0.2.45 heartbeat went dark again: a **16.8-minute idle gap
+(1008 s, past the 900 s window) and then `gate_reason_kind: "no_worker_proof"` on the one
+request that followed it.** The plugin could not say whether the heartbeat was running at
+the time, and - this is the part that made it a code change and not only a logging change
+- it could not have said, in any artifact, by any means. What was read off the live box
+(read-only, with the engine serving traffic) explains both halves.
+
+* **Four workers, four fresh rank files, and a beat that DOES run.** All four of
+  `PP0_TP0`, `PP0_TP1`, `PP1_TP0`, `PP1_TP1` were 0.1-0.2 s old, each carrying
+  `writer.writes` 2717 / 2716 / 2710 / 2710 with `writer.steps_since_write: 102`. Sampled
+  again six seconds later, `writes` and `steps_since_write` were unchanged while the age
+  had grown to 6.2 s - and because a step-driven write RESETS `steps_since_write` to 0, a
+  file written 0.2 s ago reading `steps_since_write: 102` can only have been written by
+  the heartbeat. **The thread starts in production and it beats.** The operator's
+  hypothesis ("it never starts in a worker") is wrong, and the fix is not a starter.
+* **The snapshot's `worker_diag` block is about the wrong process, always.** The same
+  moment, from `GET /plugins/kvtier/snapshot`:
+
+  ```
+  "worker_diag": { "configured": true, "dir": "/tmp/kv-tier-diagnostics",
+      "installs": 0, "heartbeat_started": false, "heartbeat_alive": false,
+      "heartbeats": 0, "heartbeat_threads": 0, "heartbeat_respawns": 0,
+      "heartbeat_errors": 0, "last_heartbeat_age_seconds": null,
+      "heartbeat_window_seconds": 900.0, "heartbeat_beats_in_window": 15 }
+  ```
+
+  `installs: 0` in that same block is the tell: the process that served the snapshot
+  fitted no worker writer, so it has no rank file to keep and every liveness field in it
+  is `false` / `0` / `null` **by construction, whether or not all four workers are
+  beating**. This is precisely the read the README told the operator to take, and it
+  answers a question no worker was ever asked.
+* **The rank file - the only artifact a worker definitely writes - said nothing.** The
+  live files' `counters` are
+  `['load_events_pending', 'restored_hits', 'store_events_pending', 'stored']`: there is
+  **no `heartbeats`, no `heartbeat_errors`, no `heartbeat_respawns` in a worker's rank
+  file at all** (the 0.2.45 runbook command reads `counters.heartbeats` and gets `None` on
+  every rank on this box). The nearest thing to a pulse was `writer.writes` - a monotonic
+  write count that says "no write happened" when it freezes and never says WHY.
+* **The refusal itself has no timestamp anywhere.** The engine log's witness line for that
+  boot (pid 2386, engine started 10-08 23:21:34) reads
+  `refused=no_boundary_anchor:51,no_disk_run:208,no_worker_proof:1,suppressed_after_failure:4`.
+  One `no_worker_proof` refusal, a monotonic counter, and no record of when it happened or
+  how old the freshest rank file was at that instant - which is the only question an
+  idle-spell outage asks. (This box also runs `VLLM_E2_TIER_WORKER_WRITE_INTERVAL_STEPS=50`
+  and a 1.0 s write floor, so its step path writes far more often than the defaults; the
+  beat only ever matters when the steps stop.)
+
+**Why the mechanism dies anyway.** Three defects, all found by reading the code against
+the failure:
+
+* **The only re-arming was driven by the thing whose absence is the fault.** A beat is
+  issued by `heartbeat_status(force=True)`, and its sole caller with `force=True` is the
+  wrapped `get_finished` - an ENGINE STEP. A supervisor that died during an idle spell
+  stayed dead for the whole spell. This is the 0.2.44 cold-start lesson ("started at
+  `install()` and NOT at the first step") wearing a third outfit: the STARTER moved to
+  `install()`, the RE-ARMER never left the step path. It is also why the 0.2.45 suite
+  passed: `test_a_thread_lost_at_cold_start...` deliberately *takes a step* to bring the
+  thread back, so it asserts the very design that cannot recover unattended.
+* **A beat ran inline in the supervisor's loop.** A contributor that blocks - six other
+  modules are asked for their section, and their lock may be held across a long NVMe pass
+  - stops the proof exactly as dead does, while `alive` keeps answering True because the
+  thread is alive and parked. No budget, no in-flight bound, no counter for it.
+  `heartbeat_alive: true` beside a stale rank file was a reachable, guaranteed state.
+* **The exception classes were wrong at all three levels.** The beat, the contributor loop
+  and the supervisor each caught `Exception`. A `SystemExit` (a C extension, a library
+  that decides to exit) escaped the beat, escaped the containment and ended the thread -
+  and then needed an engine step to come back.
+
+**What changed.** A beat is now *issued*, not *run*: the supervisor's loop only launches
+short-lived beat threads (`kvtier-worker-diag-beat`), each bounded by
+`HEARTBEAT_BEAT_BUDGET_SECONDS` (20 s) with at most `HEARTBEAT_MAX_INFLIGHT_BEATS` (3)
+alive, so a wedged beat costs one tick and never the tier; a beat that outlives its budget
+is counted (`heartbeat_stalled`) and, past the bound, named (`heartbeat_jammed`); and the
+loop catches `BaseException`, because with beats off-loop the loop is the last line. The
+contributor loop catches `BaseException` per contributor: **a contributor is a guest, it
+may cost its own section and nothing else** (asserted with a `SystemExit` contributor whose
+rank file keeps moving). `start_heartbeat()` re-opens the beat gate that `stop_heartbeat()`
+closes, so a supervisor cannot be re-armed into silence.
+
+**And what the worker now says about itself.** `writer.heartbeat` is a new block in the
+rank file - the one artifact a worker definitely writes - with `state` as the one-word
+answer and a FIXED key set in all five states:
+
+| `state` | meaning |
+|---|---|
+| `beating` | alive, and its last beat wrote |
+| `alive_not_beating` | **alive and not writing**: budget, gate, or the floor refused it; `state_reason` says which |
+| `started_not_alive` | it started and its thread is gone; `respawns` says whether anything has re-armed it |
+| `never_started` | the start was refused, with the reason that refused it |
+| `not_applicable` | no worker writer in this process, so there is no proof to keep alive |
+
+Beside it: `beat_writes` / `beat_seconds_since` / `beat_budget_exceeded` / `beat_errors` /
+`beat_inflight` / `beat_stalled` / `beat_jammed`, the window the reader will apply
+(`window_seconds`) and how many beats fit inside it (`beats_in_window`), and the writer's
+own `writer_pid`, so a reader can ask whether that process still exists.
+
+**The refusal now has a timestamp.** `worker_proof()` logs **one line per transition**
+(never per poll - the `notice_once` rule this repo already holds for the sleep-notice and
+the settle-refusal), with the reason kind, the per-file counts, and both the age and the
+wall-clock time of the freshest rank file:
+
+```
+DISK[proof] GATE AT BOOT open=False reason_kind=no_worker_proof ranks=0/0 rank_files=0 ...
+DISK[proof] GATE OPEN again after 0.4s closed; ranks=2/2 rank_files=2 fresh=2 stale=0 ...
+DISK[proof] GATE CLOSED reason_kind=no_worker_proof ranks=0/0 rank_files=2 fresh=0 stale=2 \
+    youngest=965.2s last_proof_written=2026-10-08T23:34:11 (965.2s ago); reason: ...
+```
+
+A rank file that is too OLD to count and a rank file that is FRESH BUT SAYS NOTHING (no
+`disk_restore` section: a contributor raised, overran its byte cap, or the restore layer
+never fitted) are both `no_worker_proof`, and from the scheduler's side they were one
+number - because the reason for the second lives in the worker's `_contrib_state`, again in
+a process nobody polls. They are now `stale=N` and `sectionless=N` on that line, and
+`stale_rank_files` / `sectionless_rank_files` / `youngest_rank_file_age_seconds` /
+`youngest_rank_file_written_at` in every `worker_proof()` and `gate()` verdict. The gate's
+edges are counters too: `disk_restore.counters()` publishes `proof_gate_open`,
+`proof_closures`, `proof_openings` and `proof_last_transition`, so a monotonic closure
+count across a window names the first refusal instead of hiding it.
+
+**The commands, and what each can honestly see.** The rank file is on the GPU box and needs
+no engine call. The gate's log lives in the ENGINE log, because in production
+`disk_restore` runs inside the engine process, not in this plugin's API server:
+
+```bash
+# 1. THE PULSE, per rank, in the one artifact a worker definitely writes. `state` is the
+#    answer; `beat_writes` frozen while `state` is not `beating` IS the outage.
+ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do
+  python3 -c "import json,sys,time
+  d=json.load(open(sys.argv[1])); h=(d.get(\"writer\",{}).get(\"heartbeat\") or {})
+  print(sys.argv[1].rsplit(\"/\",1)[-1], int(time.time()-d[\"ts\"]), h.get(\"state\"),
+        \"writes=\"+str(h.get(\"beat_writes\")), \"stalled=\"+str(h.get(\"beat_stalled\")),
+        \"jammed=\"+str(h.get(\"beat_jammed\")), \"pid=\"+str(h.get(\"writer_pid\")),
+        \"reason=\"+str(h.get(\"state_reason\")))" "$f"
+done'
+
+# 2. THE GATE'S OWN TIMELINE: when it shut, on what evidence, and when it came back.
+ssh llm "grep -a 'DISK\[proof\] GATE' /tmp/vllm-serve.log | tail -20"
+
+# 3. THE POSTURE AND THE TALLY, from the process that decides.
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' -H "$H" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin)['disk_restore']; c=d['counters']
+  print(d['gate']['open'], d['gate']['reason_kind'],
+        {k: c[k] for k in ('proof_gate_open','proof_closures','proof_openings') if k in c},
+        c.get('proof_last_transition'))"
+```
+
+* `state: "beating"` with a `ts` younger than 900 s means the proof is being kept. If the
+  gate is shut anyway, the answer is in the `disk_restore` section of the same file
+  (`installed`, `worker_fitted`, `not_configured_reason`) or on the GATE line - not in the
+  heartbeat.
+* `state: "alive_not_beating"` is the state that used to be invisible: a live thread that
+  is not writing. `beat_budget_exceeded: true` means the beat is still waiting on a lock;
+  `gate_open: false` means a `stop_heartbeat()` nobody followed with a start.
+* `state: "never_started"` plus `state_reason` is the boot-time answer this repo could not
+  get before: the reason `install()` used to swallow, now in the file and, when the
+  diagnostics directory is the cause, in the engine log once at WARNING.
+* **`heartbeat_alive` in `snapshot` is NOT the worker's pulse.** Read `installs` in that
+  same block first: for a deployment whose HTTP surface is the API server it is `0`, and
+  then `heartbeat_alive: false`, `heartbeats: 0` and `last_heartbeat_age_seconds: null` are
+  facts about a process that has no rank file to keep. `heartbeat_beats_in_window: 15` is
+  arithmetic, not evidence - it reads the same in a process where nothing beats.
+* `writer.writes` and `writer.steps_since_write` remain the cross-check: a file that is
+  fresh with `steps_since_write` above the write interval was written by a BEAT (a step
+  write resets that field), which is how the four ranks above were shown to be beating
+  with no steps in flight.
+
+**What this does NOT do.** The 900 s window is unchanged and the gate keeps its teeth: a
+worker that is genuinely gone stops being believed on time (a stopped beat, a
+future-stamped file, and a stripped `disk_restore` section are each asserted CLOSED by
+`tests/test_idle_worker_proof_stays_alive_and_legible.py`). The beat's cadence is
+unchanged at 60 s, so the fifteen-beats-inside-900 margin is exactly as it was - the
+supervisor makes a beat *reliable*, never more frequent. Three beats in flight is the
+ceiling, and past it the supervisor stops launching rather than parking a thread per tick
+for the life of the process. And nothing here makes an idle worker produce steps: it
+removes the step path from the recovery of a proof that was never supposed to depend on
+one.
+
+Tests: `tests/test_idle_worker_proof_stays_alive_and_legible.py` (24 tests, driven from
+`engine_side.register()` plus the handshake hook exactly as a worker does, with zero engine
+steps, and the READER's clock moved so a test can wait fifteen minutes).
 
 ## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
 
@@ -4593,36 +4797,61 @@ watchdog**, not systemd, so do not add `Restart=`. Until the restart the running
 engine still has the arena allocated - use the runtime disarm above to stop it
 scheduling right now.
 
-### The disk tier went off by itself on a quiet box (0.2.45)
+### The disk tier went off by itself on a quiet box (0.2.45; corrected 0.2.47)
 
-> **A rank file is a proof of life, and a proof of life needs a pulse.**
+> **A rank file is a proof of life, and a proof of life needs a pulse - and the pulse has
+> to be READ where the worker writes it.**
 
 If `gate().reason_kind` is `no_worker_proof` (or the disk path simply stopped serving
 after a quiet period) while the engine is healthy and idle, the rank files are stale, not
-absent. Since 0.2.45 each worker writer keeps its own file alive on a 60 s daemon thread,
-started at `install()` - so the question is whether that thread is running, which is a
-read:
+absent. Since 0.2.45 each worker writer keeps its own file alive on a 60 s beat - so the
+question is whether that beat is running, which is a read:
 
 ```bash
-# The worker's own answer, per rank: the file's stamp, and how many beats it has
-# written. A stamp older than 900 s with a live engine is the defect, not a fault.
+# The worker's own answer, per rank. SINCE 0.2.47 the state is IN THE FILE: a worker
+# answers no HTTP route, so `writer.heartbeat` is the only place its own pulse can be
+# read. A stamp older than 900 s with a live engine is the symptom, not a fault.
 ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do
-  python3 -c "import json,sys,time; d=json.load(open(sys.argv[1])); c=d[\"counters\"]
-  print(sys.argv[1], int(time.time()-d[\"ts\"]), c.get(\"heartbeats\"),
-        c.get(\"heartbeat_errors\"), c.get(\"heartbeat_respawns\"))" "$f"
+  python3 -c "import json,sys,time
+  d=json.load(open(sys.argv[1])); h=(d.get(\"writer\",{}).get(\"heartbeat\") or {})
+  print(sys.argv[1].rsplit(\"/\",1)[-1], int(time.time()-d[\"ts\"]), h.get(\"state\"),
+        \"beat_writes=\"+str(h.get(\"beat_writes\")),
+        \"stalled=\"+str(h.get(\"beat_stalled\")), \"jammed=\"+str(h.get(\"beat_jammed\")),
+        \"respawns=\"+str(h.get(\"respawns\")),
+        \"written_by_beat=\"+str((d.get(\"writer\") or {}).get(\"steps_since_write\", 0) > 0))" "$f"
 done'
+
+# And WHEN the gate shut, with what evidence: one line per transition in the ENGINE log
+# (in production `disk_restore` runs in the engine process, not in the API server).
+ssh llm "grep -a 'DISK\[proof\] GATE' /tmp/vllm-serve.log | tail -20"
 ```
 
-* `heartbeat_alive: false`, or `heartbeats` frozen while `applies_seen`/steps climb, means
-  the heartbeat is not running in that process - and `heartbeat_respawns` says whether a
-  step has re-armed it (the step-driven path re-arms a thread this process can see is gone).
-* `heartbeat_errors` climbing names a beat that raised (a filesystem, a contributor's
-  producer); the beat is contained, so the loop survives and counts it.
-* `heartbeat_beats_in_window` is the margin: the shipped 60 s inside 900 s is fifteen
-  beats, so an operator who raises the interval is one missed tick from closing the disk
-  path again, and this field is what makes that visible before it happens.
+* `state` is the one-word answer: `beating`, `alive_not_beating` (a live thread that is
+  not writing - the state that was invisible before 0.2.47), `started_not_alive`,
+  `never_started` (with `state_reason`, the reason `install()` used to swallow), or
+  `not_applicable` (no worker writer in this process). `beat_writes` frozen while `state`
+  is not `beating` IS the outage.
+* `written_by_beat: True` on a fresh file is independent corroboration: a step-driven write
+  RESETS `writer.steps_since_write`, so a fresh file whose `steps_since_write` is above the
+  write interval was written by the heartbeat and not by a step.
+* **Do not read `heartbeat_alive`, `heartbeats`, `heartbeat_threads`,
+  `heartbeat_respawns`, `heartbeat_errors`, `last_heartbeat_age_seconds` or
+  `heartbeat_beats_in_window` from `snapshot` as the worker's pulse.** That block is read
+  in the process that served the HTTP request, and `installs: 0` inside it says outright
+  that this process fitted no worker writer: for that process the fields are `false` / `0`
+  / `null` whether or not every worker on the box is beating. Measured on a live box with
+  four fresh rank files written by a running beat: `heartbeat_alive: false`, `heartbeats:
+  0`, `heartbeat_threads: 0`, `last_heartbeat_age_seconds: null`. `heartbeat_beats_in_window
+  : 15` is `900 // 60`, arithmetic about the shipped cadence, and it reads the same in a
+  process where nothing beats at all.
+* `heartbeat_beats_in_window` remains the MARGIN, in the rank file now as `beats_in_window`:
+  the shipped 60 s inside 900 s is fifteen beats, so an operator who raises
+  `VLLM_E2_TIER_WORKER_HEARTBEAT_SECONDS` is one missed tick from closing the disk path
+  again, and this field makes that visible before it happens.
 * **Before 0.2.45 this symptom had no cause to find.** An idle worker simply wrote nothing
-  and the 900 s window elapsed. Nothing was broken; a heartbeat was missing.
+  and the 900 s window elapsed. Nothing was broken; a heartbeat was missing. Before 0.2.47
+  the CAUSE was still unfalsifiable, because the fix's own counters lived in a process that
+  answers no request - see *Silence is not death, part two* above.
 
 ### Confirm what state the engine is actually in
 
@@ -4850,7 +5079,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2489 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2564 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -5108,6 +5337,7 @@ The debugger verbs add six files:
 | `tests/test_quiet_rank_bytes_are_not_dead_bytes.py` | 12 | a rank that has not written for 300 s keeps its bytes while its worker is alive and publishing that digest (the defect, on a real filesystem); the peer map dropping a quiet rank's digest is not evidence of death; liveness from the RANK FILES, not the digest map; `stale_geometry` reclaim still runs and still runs ahead of this rank's own cold bytes; `stale_geometry_removed` and `peer_files_removed_live` separate the two doctrines; an empty peer map claims nothing, so no identity may be called dead on it; `identity_known`/`liveness_source` name the evidence a pass had |
 | `tests/test_index_forgets_no_bytes_on_disk.py` | 13 | eviction is LRU-by-TOUCH and not insertion order (a just-restored identity is the last to leave, and on the unpatched tree it was the first); a read that promotes a file touches the index on the throttled path too; `VLLM_E2_TIER_DISK_INDEX_ENTRIES` configures the cap and a bad value falls back and reports; `entries_dropped` balances its three reason counters exactly; `entries_dropped_file_present` counts the index forgetting a live file and never guesses at an unchecked one (`unverified`); `note_restored_path` re-admits an identity a restore proved |
 | `tests/test_idle_engine_keeps_its_disk_proof_alive.py` | 10 | install alone with ZERO engine steps produces and refreshes the rank file (the defect: only a step used to write it); `disk_restore.worker_proof` stays open across an idle spell and re-opens after a forced-stale file with no step in sight; the heartbeat starts at `install()` and never stacks a thread; it is a daemon with a findable name; the handler is held WEAKLY and a beat with no handler still writes; the write floor bounds forced beats; no `VLLM_E2_TIER_DIAG` means no thread and no file; the shipped interval fits the 900 s window with four beats to spare (pinned against the UNPATCHED default); the payload reports age and margin; a dead thread is respawned and counted |
+| `tests/test_idle_worker_proof_stays_alive_and_legible.py` | 24 | THE 0.2.47 SUITE, driven from `engine_side.register()` plus the handshake hook exactly as a worker walks them (the plugin-load install must DECLINE there, the handshake must land it), with zero engine steps and the READER's clock moved so a test can wait fifteen minutes: the gate stays open across two idle spells nearly the length of the window and still closes on a beat that stopped, on a future-stamped file, and on a file whose `disk_restore` section is gone; a contributor wedged for three budgets cannot stop the rank file moving; a beat raising `SystemExit` cannot kill the supervisor; a `SystemExit` contributor costs its own section only; the in-flight bound says `jammed` instead of leaking threads; `writer.heartbeat` in all five states with one key set inside its byte budget; `GATE AT BOOT` / `GATE CLOSED` / `GATE OPEN again` once per flip, naming the reason, the per-file counts and the freshest file's age AND wall clock, and distinguishing `stale=` from `sectionless=`; the refusal that never started is said once at WARNING; the shipped cadence is pinned against the UNPATCHED default |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
 

@@ -439,11 +439,26 @@ def _on_worker_report(connector) -> None:
 
 
 def _brief_report(report) -> str:
-    """One install report, in the space of a log field. Never raises."""
+    """One install report, in the space of a log field. Never raises.
+
+    THE HEARTBEAT VERDICT TRAVELS WITH IT (0.2.47). `worker_diag`'s install and its
+    heartbeat are two different facts and the boot line used to print only the first, so
+    a worker whose proof-of-life thread never started read as a clean install. `YES`,
+    `YES+heartbeat=NO(reason)` and `NO(reason)` are now three different strings, and
+    `grep 'worker hook install'` answers "did the idle-proof mechanism come up in this
+    worker?" for every rank in the boot.
+    """
     try:
         if not isinstance(report, dict):
             return str(report)[:48]
         if report.get("installed"):
+            pulse = report.get("heartbeat")
+            if isinstance(pulse, dict) and "started" in pulse:
+                if pulse.get("started"):
+                    return "YES+heartbeat=YES"
+                return "YES+heartbeat=NO({})".format(
+                    str(pulse.get("reason") or "no reason given")[:48]
+                    .replace("\n", " "))
             return "YES"
         return "NO({})".format(str(report.get("reason")
                                   or report.get("skip_reason")
