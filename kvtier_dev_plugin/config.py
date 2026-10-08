@@ -294,6 +294,23 @@ ENV_DISK_ROOT = "VLLM_E2_TIER_DISK_ROOT"
 # 11.4 MB). Unset or unparseable = no ceiling (never 0: a 0 ceiling would mean
 # "evict everything", which is a destructive reading of a typo).
 ENV_DISK_BYTES = "VLLM_E2_TIER_DISK_BYTES"
+# HOW MANY IDENTITIES THE RESTORE INDEX MAY HOLD IN MEMORY. Unset = the shipped default
+# (`disk_index.MAX_INDEX_ENTRIES`). This is the ONE knob that decides how much of the
+# store the index can REMEMBER: an identity that falls out of the index is a file that
+# is
+# still on the disk, whole and readable, which `contains()` will answer `not_present`
+# for
+# - a missed restore, invisible except as a wasted span and a recompute.
+#
+# WHY AN OPERATOR NEEDS IT. The cap used to be a module constant, so the only way to
+# raise
+# it was to patch the plugin. The live store holds 12,738 files across four ranks
+# under a
+# 148 GiB ceiling and can reach ~30,000, and a converged drain over a big store lives AT
+# the cap: the number has to be settable from the environment, next to the ceiling that
+# decides how many files there will be. Grammar only here; the floor, the clamp and the
+# reason live with the memory they buy (`disk_index.entry_cap`).
+ENV_DISK_INDEX_ENTRIES = "VLLM_E2_TIER_DISK_INDEX_ENTRIES"
 # WHERE THE SPILL JOURNAL LIVES, separately from everything else in the
 # diagnostics directory. UNSET = fall back to VLLM_E2_TIER_DIAG, which is the
 # pre-0.2.19 behaviour and changes nothing for an existing deployment.
@@ -963,6 +980,43 @@ def diagnostics_rank() -> str | None:
     if not raw or len(raw) > MAX_DIAG_RANK_CHARS:
         return None
     return raw
+
+
+def disk_index_env() -> dict:
+    """The restore index's entry cap, parsed and NOT interpreted.
+
+    The same split as `settle_env` and `ceiling_env`: the grammar lives here, the policy
+    that spends the number (the floor, the ceiling and the clamp reason in
+    `disk_index.entry_cap`) lives with the index. Unreadable means None, which the index
+    reads as "the operator said nothing" and answers with its shipped default - so a
+    typo
+    in a systemd drop-in gives an index that remembers the usual amount, never one that
+    remembers three entries and quietly stops offering the store.
+
+    Zero and negatives are REFUSED by the grammar, like `ceiling_env` refuses a 0
+    budget:
+    a cap of 0 would mean "hold nothing", which reads as "the index is configured" while
+    making every disk offer a miss - the silent-failure shape this tier keeps being
+    bitten
+    by. How large is too large is policy, and lives with the memory figure.
+    """
+    problems: list = []
+    raw = os.environ.get(ENV_DISK_INDEX_ENTRIES, "").strip()
+    entries: int | None = None
+    if raw:
+        try:
+            wanted = int(raw)
+        except ValueError:
+            problems.append(f"{ENV_DISK_INDEX_ENTRIES}={raw!r} is not an integer and "
+                            "was ignored (the index keeps its shipped cap)")
+            wanted = None
+        if wanted is not None and wanted <= 0:
+            problems.append(f"{ENV_DISK_INDEX_ENTRIES}={raw!r} is not above 0 and was "
+                            "ignored (a cap of 0 would remember nothing and refuse "
+                            "every disk offer)")
+            wanted = None
+        entries = wanted
+    return {"entries": entries, "problems": problems}
 
 
 def settle_env() -> dict:

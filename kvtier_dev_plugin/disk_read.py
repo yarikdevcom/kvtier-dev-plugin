@@ -80,7 +80,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from . import disk_layout, snapshot
+from . import disk_index, disk_layout, snapshot
 
 # --- the caps, and the unit of every one of them ----------------------------
 
@@ -1249,6 +1249,16 @@ def promote_recency(path, now: float | None = None) -> str:
         if verdict != TOUCH_PROMOTED:
             with _state_lock:
                 _state["recency_promotions_throttled"] += 1
+            # THE INDEX GETS THE TOUCH TOO (0.2.45), on a THROTTLED hit as much as on a
+            # promoted one: both mean "this file produced bytes just now", and the
+            # throttle exists to spare the DEVICE a metadata transaction,
+            # not to make the
+            # in-memory LRU clock lie. Without this the file's `st_mtime`
+            # moves while the
+            # index that maps to it stays where it was inserted, and the tier ends up
+            # evicting the MAP of its hottest spans while keeping the spans - the one
+            # inversion that makes an index worse than no index.
+            disk_index.note_restored_path(text)
             return verdict
         # `os.utime(path, None)` is the API's own "both timestamps to the current
         # time", in the clock that OWNS st_mtime (wall). An explicit `ns` built from
@@ -1259,6 +1269,8 @@ def promote_recency(path, now: float | None = None) -> str:
         os.utime(text, None, follow_symlinks=False)
         with _state_lock:
             _state["recency_promotions"] += 1
+        # The promoted path gets the same index touch (see the throttled branch).
+        disk_index.note_restored_path(text)
         return verdict
     except Exception as exc:  # noqa: BLE001 - a bump is never worth losing a read
         with _state_lock:

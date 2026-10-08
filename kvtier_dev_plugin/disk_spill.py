@@ -319,7 +319,14 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from . import blockdump, config, disk_index, disk_layout, snapshot
+from . import (
+    blockdump,
+    config,
+    disk_index,
+    disk_layout,
+    snapshot,
+    worker_diag,
+)
 
 # --- the caps, and the unit of every one of them ----------------------------
 
@@ -401,27 +408,89 @@ CEILING_PASS_BUDGET_SECONDS = 1.5    # SECONDS one pass may spend, by default
 CEILING_BUDGET_SECONDS_MAX = 60.0    # the clamp: an env typo must not restore an
                                      # unbounded pass while claiming to bound it
 
-# THE LIVE PEER RANKS (0.2.29). Four ranks share ONE spill root and each rank's
-# evictor sees the other three's committed files as names carrying a digest that is
-# not its own. `disk_layout.classify_name` can call those files `peer_rank` (live
-# data, shed LAST) instead of `stale_geometry` (pure capacity, shed FIRST) - but only
-# if it is TOLD the sibling digests, and nothing in the engine hands them over.
-# They are therefore LEARNED from the walk this pass already does: a foreign digest
-# with committed files written inside `PEER_DIGEST_FRESH_SECONDS` is a rank that is
-# WRITING RIGHT NOW, which is the only definition of "live" this module can observe.
+# THE LIVE PEER RANKS (0.2.29, re-pointed 0.2.45). Four ranks share ONE spill root and
+# each rank's evictor sees the other three's committed files as names carrying a
+# digest that is not its own. `disk_layout.classify_name` can call those files
+# `peer_rank` (live data, shed LAST) instead of `stale_geometry` (pure capacity, shed
+# FIRST) - but only if it is TOLD the sibling digests, and nothing in the engine hands
+# them over. They are therefore LEARNED, and since 0.2.45 they are learned from TWO
+# witnesses:
+#
+# 1. WRITE ACTIVITY (this map): a foreign digest with committed files written inside
+#    `PEER_DIGEST_FRESH_SECONDS` is a rank that is WRITING RIGHT NOW.
+# 2. THE RANK FILE (`_peer_identity_view`): a live worker publishes its own current
+#    geometry digest in `rank-<rank>.json`, which is already this tier's liveness proof.
+#
+# WITNESS 1 ALONE WAS THE DEFECT THIS RELEASE REMOVES. A digest is dropped from this map
+# when it goes quiet (`PEER_DIGEST_FRESH_SECONDS` with no write), and a digest outside a
+# map that is still CONFIRMED by some other sibling was `ATTRIBUTION_DEAD` - "positively
+# nobody's" - which `SHED_ORDER_BY_CLASSIFICATION` puts at bucket 0, the first thing
+# every busy rank unlinked. So a rank that simply had no request for two minutes had its
+# live, restorable KV treated as free capacity, and 5,910 removals in one boot on the
+# live box came from exactly this path. The write-activity witness stays (it is a PROOF
+# of liveness, and it is what makes the protection work on a box with no diagnostics
+# directory) but it is no longer the only one, and its silence is no longer read as
+# death.
+#
+# WHAT STILL DECIDES `dead`, and why that is not an age rule over cached bytes: a
+# digest NO live rank publishes and NO live rank is writing. That is what a
+# configuration change
+# leaves behind (the operator moved `KV_OFFLOAD_SIZE` 64 -> 8 GiB on 2026-10-07: slot
+# width moved, so the digest moved, and every pre-change file became
+# unservable-by-anybody), and what a rank whose WORKER has gone leaves behind. Both are
+# statements about IDENTITY and about a PROCESS's liveness, never about how long a byte
+# has been sitting on the disk.
 #
 # FAIL-SAFE DIRECTION, and it is deliberate: if no digest qualifies, the pass behaves
-# exactly as it did before 0.2.29 (foreign first). The worst case of being too
-# conservative is therefore the old behaviour - peers' live files get shed - and it is
-# NEVER "cannot release capacity", because this boot's own files and the truly
-# unreadable ones stay sheddable whatever the peer map says. The opposite direction
-# (assume every foreign digest is a live sibling) is the dangerous one: a store of
-# dead geometry from old boots would become unsheddable and the ceiling would stop
-# being a ceiling. A digest is only believed with `PEER_DIGEST_MIN_SIGHTINGS` fresh
-# files, so one stray recent file from an old boot cannot protect a whole digest.
+# exactly as it did before 0.2.29 (foreign first) unless the identity view says it
+# cannot name every live rank - in which case foreign committed bytes are
+# `unattributable`, are withheld, and the ceiling is allowed to come up SHORT. The worst
+# case of being too conservative is a spill refusal and a filesystem an operator can
+# see; the worst case of being too free is a `file_missing` hole in a serving path. A
+# digest is only believed with `PEER_DIGEST_MIN_SIGHTINGS` fresh files, so one stray
+# recent file from an old boot cannot protect a whole digest.
 PEER_DIGEST_FRESH_SECONDS = 120.0    # SECONDS a foreign digest counts as "writing now"
 PEER_DIGEST_MIN_SIGHTINGS = 2        # FRESH committed files before a digest is believed
 MAX_PEER_DIGESTS = 32                # DIGESTS remembered (a 4-rank fleet needs 3)
+
+#
+# THE SECOND WITNESS: A LIVE WORKER'S OWN PUBLISHED IDENTITY (0.2.45)
+# -----------------------------------------------------------------------------
+# `worker_diag` writes one small JSON file per rank, atomically, into the diagnostics
+# directory (`VLLM_E2_TIER_DIAG`, the same directory the ARM FILE lives in), and
+# `disk_store.worker_report()` publishes that rank's CURRENT geometry digest inside
+# it. That file is already this tier's proof that a fitted worker is alive -
+# `disk_restore` refuses every disk offer without it - so reading the digest out of it
+# costs nothing new and asks a question that is already being answered somewhere.
+#
+# WHY THIS IS THE WITNESS THAT FIXES THE QUIET RANK. Write activity asks "is this rank
+# SPILLING?", which a healthy rank with a warm prefix stops doing indefinitely; a rank
+# file asks "is this rank's WORKER ALIVE?", which a healthy rank answers for as long
+# as it lives. A rank whose worker has gone stops rewriting its file, so its digest
+# stops being protected and its orphaned bytes revert to `stale_geometry` and are
+# reclaimed under the quota by whoever can prove ownership - which is how a genuinely-
+# gone rank's bytes are eventually freed WITHOUT a timer over cached bytes. (0.2.45
+# also makes the file a real heartbeat - `worker_diag` now rewrites it on its own
+# thread, so an idle engine's proof stays true instead of expiring. That is what makes
+# this witness usable at all.)
+# THREE-VALUED BY DESIGN. `known` means "I can name every live rank's identity right
+# now", and it is the flag `attribute_name` needs to call a foreign digest dead. A
+# fresh rank file WITHOUT a readable digest (a mixed-version fleet, a rank whose
+# report raised) makes it FALSE, because "not in my list" is not evidence of absence.
+# A rank that cannot read the directory at all falls back to the write-activity
+# reading, which is exactly the pre-0.2.45 behaviour: this change never makes the
+# stale-geometry reclaim path harder to reach than it was, it only stops it from being
+# reached by silence alone.
+PEER_RANK_FILE_FRESH_SECONDS = 900.0
+# SECONDS a rank file may be old and still vouch for its writer's IDENTITY. Deliberately
+# the same number as `disk_restore.RANK_FILE_FRESH_SECONDS`: one file, one liveness
+# window, two readers. A bound over a PROCESS's liveness, not a lifetime over cached
+# bytes - and pinned equal by `tests/test_quiet_rank_bytes_are_not_dead_bytes.py`, so a
+# future edit to one cannot silently drift from the other.
+MAX_PEER_RANK_FILES = 8              # RANK FILES probed (disk_restore's own bound)
+MAX_PEER_RANK_FILE_BYTES = 256 * 1024  # BYTES one rank file may reach
+PEER_IDENTITY_CACHE_SECONDS = 1.0    # SECONDS one identity read stands for
+MAX_PEER_DIGEST_CHARS = 64           # CHARS of a published digest accepted from a file
 
 # THE FAIR SHARE: ONE CEILING IS NOT FOUR CEILINGS (0.2.30)
 # -----------------------------------------------------------------------------
@@ -675,6 +744,40 @@ _state: dict = {
     "peer_files_removed_bytes": 0,
     "peer_files_removed_last_pass": 0,
     "peer_files_removed_known_peer": 0,
+    # WHICH JUSTIFICATION PAID FOR EACH REMOVAL (0.2.45). The operator's question,
+    # read off one line: "did I delete 76 GB of a LIVE SIBLING's bytes, or 76 GB
+    # of bytes a CONFIGURATION CHANGE orphaned?" Those two used to be the same
+    # number. Every removal is still counted in `peer_files_removed`; the two
+    # below say which classification licensed it, and they are disjoint, so
+    # `peer_files_removed` minus the two of them is the residue a reader has to
+    # explain (`peer_files_removed_known_peer` is the subset of
+    # `peer_files_removed`, never a third bucket).
+    "stale_geometry_removed": 0,
+    "stale_geometry_removed_bytes": 0,
+    "stale_geometry_removed_last_pass": 0,
+    "stale_key_shape_removed": 0,
+    "stale_key_shape_removed_bytes": 0,
+    # A LIVE rank's file, unlinked, by a capacity pass. Since 0.2.45 the planner
+    # cannot put one in a plan and the executor refuses it, so these two are the
+    # alarm: they are the incident counter, spelled separately from the cleanup
+    # counter above.
+    "peer_files_removed_live": 0,
+    "peer_files_removed_live_bytes": 0,
+    # THE IDENTITY VIEW (0.2.45): what this rank could SEE about who is alive, at
+    # its last `_peer_identity_view()` read. `peer_liveness_source` names the
+    # witness that decided (`rank_files`, or `write_activity` when no rank file
+    # was readable here at all) and `peer_identity_known` is the flag that lets a
+    # foreign digest be called dead.
+    "peer_liveness_source": None,
+    "peer_identity_reads": 0,
+    "peer_identity_available": False,
+    "peer_identity_known": False,
+    "peer_identity_digests": 0,
+    "peer_identity_own_published": False,
+    "peer_identity_files_unnamed": 0,
+    "peer_identity_files_stale": 0,
+    "peer_identity_files_unreadable": 0,
+    "peer_identity_reason": None,
     # THE FAIR SHARE (0.2.30): WHOSE BYTES THIS RANK IS ACCOUNTABLE FOR. Split out of
     # the one store-wide `estimated_bytes`, because that single number is what the four
     # ranks each read as "156 GiB, over my 148 GiB ceiling" and each acted on.
@@ -807,6 +910,20 @@ def reset_state_for_tests() -> None:
         "ceiling_plan_short_reason": None, "peer_files_removed": 0,
         "peer_files_removed_bytes": 0, "peer_files_removed_last_pass": 0,
         "peer_files_removed_known_peer": 0,
+        # The removal JUSTIFICATIONS and the identity view (0.2.45): a reset
+        # that left these behind would hand the next test another test's
+        # justification tally, or a `peer_identity_known: true` it never
+        # earned - and the second one is a licence to delete a foreign digest.
+        "stale_geometry_removed": 0, "stale_geometry_removed_bytes": 0,
+        "stale_geometry_removed_last_pass": 0, "stale_key_shape_removed": 0,
+        "stale_key_shape_removed_bytes": 0,
+        "peer_files_removed_live": 0, "peer_files_removed_live_bytes": 0,
+        "peer_liveness_source": None,
+        "peer_identity_reads": 0, "peer_identity_available": False,
+        "peer_identity_known": False, "peer_identity_digests": 0,
+        "peer_identity_own_published": False,
+        "peer_identity_files_unnamed": 0, "peer_identity_files_stale": 0,
+        "peer_identity_files_unreadable": 0, "peer_identity_reason": None,
         # The fair share (0.2.30). Left behind by a reset, one test's peer count would
         # hand the next test a share of 1/N it never earned, and a share that is too
         # small over-evicts - the exact defect this release exists to remove.
@@ -834,6 +951,11 @@ def reset_state_for_tests() -> None:
     # would let that test's store protect this test's files from eviction.
     with _peer_lock:
         _peer_sightings.clear()
+    # And so does the identity read's cache: a view of "who is alive" carried across a
+    # test boundary is a licence to call a foreign digest dead, which is destructive.
+    with _identity_lock:
+        _peer_identity_cache["view"] = None
+        _peer_identity_cache["mono"] = None
     # And so does the eviction pool: a worker left alive would unlink files the next
     # test believes it is only planning about.
     shutdown_evict_pool()
@@ -2039,7 +2161,7 @@ def _maybe_seed_estimate() -> None:
     # first ceiling decision of a boot is a fair-share decision, not a store-wide one.
     # That ordering is the whole reason the fail-safe direction is cheap: by the time a
     # pass is expensive enough to matter, this rank has already walked the store once.
-    attribution = _attribute_walk_bytes(walk, _live_peer_digests())
+    attribution = _attribute_walk_bytes(walk, *_peer_liveness())
     _apply_attribution(attribution, int(walk["estimated_total_bytes"]),
                        _share_of_ceiling(int(ceiling), attribution["divisor"],
                                          attribution["source"]))
@@ -2063,10 +2185,13 @@ def _observe_peer_digest(seen_digest, mtime_ns: int) -> None:
     digest is not this boot's. Cost: one dict lookup per such file, no syscall - the
     `stat` and the parse the pass already paid are the only real work here.
 
-    This only OBSERVES. Whether a digest is believed to belong to a LIVE sibling is
-    `_live_peer_digests`' decision, made at the moment the plan is built, so a digest
-    learned at 10:00 cannot still be protecting a peer's files at 18:00 after that
-    rank stopped writing.
+    This only OBSERVES. Whether a digest may be called a LIVE sibling's is
+    `_peer_liveness`' decision, made at the moment the plan is built, from this map AND
+    the rank files (`_peer_identity_view`) - because one witness going quiet proves
+    nothing on its own. Since 0.2.45 a digest that is NOT believed live is not
+    automatically free capacity either: it is only free when this rank can name every
+    live rank's identity, and a rank that cannot is told so (`peer_liveness_source`,
+    `peer_identity_known`) and withholds those bytes instead of shedding them.
     """
     own = _state["geometry_digest"]
     if not isinstance(seen_digest, str) or not seen_digest \
@@ -2079,9 +2204,11 @@ def _observe_peer_digest(seen_digest, mtime_ns: int) -> None:
         row = _peer_sightings.get(key)
         if row is None:
             if len(_peer_sightings) >= MAX_PEER_DIGESTS:
-                # Bounded witness. Dropping a sighting costs the fail-safe direction
-                # (the digest is not believed, so its files shed first), never the
-                # dangerous one.
+                # Bounded witness. This map is one of TWO liveness witnesses, so a
+                # digest dropped here can still be protected by its owner's rank file;
+                # and since 0.2.45 a digest no witness believes is not automatically
+                # sheddable either - it is `unattributable` unless this rank can name
+                # every live rank. The cap therefore costs a fair share, never data.
                 _state["peer_digests_dropped"] += 1
                 return
             row = {"sightings": 0, "fresh_sightings": 0, "last_mtime_s": 0.0,
@@ -2096,17 +2223,25 @@ def _observe_peer_digest(seen_digest, mtime_ns: int) -> None:
 
 
 def _live_peer_digests() -> tuple:
-    """Which foreign digests this rank may call a LIVE sibling's, as a sorted tuple.
+    """Which foreign digests this rank's WALK says are writing now, as a sorted tuple.
 
     TWO conditions, both required, and both observable rather than assumed: at least
     `PEER_DIGEST_MIN_SIGHTINGS` committed files seen inside the freshness window, and
-    the most recently written of them inside it. A digest that stops being written
-    ages out of the map here - a rank that died an hour ago is no longer a live
-    sibling, and its files go back to being the pure capacity they actually are.
+    the most recently written of them inside it. This is the WRITE-ACTIVITY witness: it
+    can say "alive" with certainty (a file was just written under that digest) and
+    it can
+    NEVER say "dead" with certainty, which is the whole 0.2.45 point - a rank with a
+    warm
+    prefix stops spilling, and a rank that stops spilling is not a rank that has gone.
+    Ageing a digest out of THIS map is therefore only a statement about write
+    traffic: it
+    stops counting toward this rank's fair share, and `_peer_identity_view` decides
+    separately whether the bytes under it are still anybody's.
 
-    Empty means "I cannot tell", and the caller must then pass NOTHING to
-    `disk_layout`: that is today's behaviour, the fail-safe direction, and it is
-    counted (`peer_digests_unconfirmed`) rather than left as a silence.
+    Empty means "nothing is writing", and `_peer_liveness` turns that into either "I
+    know
+    who is alive" (the rank files named them) or "I cannot tell" - never, as it used to,
+    into "those bytes belong to nobody".
     """
     wall_now = time.time()
     live: list = []
@@ -2134,6 +2269,223 @@ def _live_peer_digests() -> tuple:
     return tuple(sorted(live))
 
 
+# --- the second witness: a live worker's own published identity (0.2.45) ----
+
+# {"mono": float, "view": dict} - the last identity read, so one ceiling pass costs ONE
+# directory read however many times `_peer_liveness` is asked. `disk_restore` caches its
+# read of the SAME files for the same reason (`PROOF_CACHE_SECONDS`).
+_peer_identity_cache: dict = {"mono": None, "view": None}
+_identity_lock = threading.Lock()
+
+
+def _peer_rank_files() -> list:
+    """The rank-file paths to probe, sorted, capped. Never raises; [] means none.
+
+    The same directory the ARM FILE lives in (`VLLM_E2_TIER_DIAG`), and the same naming
+    contract `worker_diag` writes: `rank-<PPn_TPm>.json`. Hidden files (the `.tmp`
+    halves
+    of an atomic replace) are skipped by name, and the cap is `disk_restore`'s own bound
+    on how many it will probe, so a directory full of junk cannot make this unbounded.
+    """
+    directory = config.diagnostics_dir()
+    if directory is None:
+        return []
+    try:
+        names = sorted(os.listdir(str(directory)))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not name.startswith(worker_diag.RANK_FILE_PREFIX) \
+                or not name.endswith(worker_diag.RANK_FILE_SUFFIX) \
+                or name.startswith("."):
+            continue
+        out.append(os.path.join(str(directory), name))
+        if len(out) >= MAX_PEER_RANK_FILES:
+            break
+    return out
+
+
+def _published_digest(document) -> str | None:
+    """The digest one rank document says is its CURRENT one, or None. Never raises.
+
+    `disk_store.worker_report()` publishes it as `disk.digest`, and it is the same value
+    `fingerprint_digest` computed from this rank's own fingerprint - which is what
+    makes it
+    a statement about IDENTITY ("the bytes I write now carry this digest") rather than a
+    statement about traffic. Untrusted input: a non-string, an over-long or a
+    non-lowercase-hex value is refused, and refusing it is a fail-CLOSED choice (an
+    unreadable identity means "I cannot name every live rank", never "that digest is
+    nobody's").
+    """
+    try:
+        section = document.get("disk")
+        if not isinstance(section, dict):
+            return None
+        digest = section.get("digest")
+        if not isinstance(digest, str):
+            return None
+        text = digest.strip().lower()
+        if not text or len(text) > MAX_PEER_DIGEST_CHARS:
+            return None
+        if any(character not in "0123456789abcdef" for character in text):
+            return None
+        return text
+    except Exception:  # noqa: BLE001 - an unreadable identity is a fact, not a fault
+        return None
+
+
+def _peer_identity_view(*, force: bool = False) -> dict:
+    """WHO IS ALIVE and what digest each live rank writes under, from the rank files.
+
+    Returns `{"available": bool, "known": bool, "digests": tuple, "own_published": bool,
+    "files_read": n, "files_unnamed": n, "files_stale": n, "files_unreadable": n,
+    "reason": str}`. Bounded by `MAX_PEER_RANK_FILES` x `MAX_PEER_RANK_FILE_BYTES`,
+    cached
+    for `PEER_IDENTITY_CACHE_SECONDS`, and it never raises: every failure is a
+    counter and
+    a reason, because a rank that cannot read the directory must keep spilling.
+
+    THE THREE READINGS, and the `known` flag is the whole point of the function:
+      * `available`, `known` - the directory yielded at least one FRESH rank
+      document and
+        every fresh one published a readable digest. This rank can name every live rank,
+        so a foreign digest outside the set is a digest nobody writes under: an
+        old boot's
+        or a configuration change's, i.e. `stale_geometry`, and reclaimable.
+      * `available`, NOT `known` - at least one FRESH rank file has no readable
+      digest (a
+        mixed-version fleet, a contributor that raised). "Not in my list" is not
+        evidence
+        of absence, so no foreign committed digest may be called dead and the
+        ceiling may
+        come up SHORT.
+      * NOT `available` - no fresh rank document here at all (no `VLLM_E2_TIER_DIAG`, a
+        worker that has not written once, a directory this process cannot read). The
+        caller falls back to the write-activity reading, which is exactly the pre-0.2.45
+        behaviour: the stale-geometry reclaim path is never made harder to reach by this
+        change, it is only no longer reachable through SILENCE.
+
+    A STALE rank file (older than `PEER_RANK_FILE_FRESH_SECONDS`, or stamped in the
+    future) is neither a protection nor an unnameable: it is a worker that has stopped
+    heartbeating, so its digest stops being protected and its orphaned bytes become
+    reclaimable. That is how a genuinely-gone rank frees its bytes without a timer over
+    cached bytes - the bound is on a PROCESS's liveness proof.
+    """
+    cached = _peer_identity_cache.get("view")
+    mono = _peer_identity_cache.get("mono")
+    if not force and isinstance(cached, dict) \
+            and isinstance(mono, (int, float)) \
+            and (time.monotonic() - mono) < PEER_IDENTITY_CACHE_SECONDS:
+        return cached
+    own = _state["geometry_digest"]
+    own_text = own.lower() if isinstance(own, str) else None
+    view = {"available": False, "known": False, "digests": (),
+            "own_published": False, "files_read": 0, "files_unnamed": 0,
+            "files_stale": 0, "files_unreadable": 0, "files_missing_ts": 0,
+            "reason": None}
+    live: set = set()
+    wall_now = time.time()
+    paths = _peer_rank_files()
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_PEER_RANK_FILE_BYTES + 1)
+            if len(raw) > MAX_PEER_RANK_FILE_BYTES:
+                # Unreadable by the proxy host's reader too, so it proves nothing.
+                view["files_unreadable"] += 1
+                continue
+            document = json.loads(raw.decode("utf-8", "replace"))
+            if not isinstance(document, dict):
+                view["files_unreadable"] += 1
+                continue
+        except Exception:  # noqa: BLE001 - one bad file is not evidence, that's all
+            view["files_unreadable"] += 1
+            continue
+        stamp = document.get("ts")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            view["files_missing_ts"] += 1
+            view["files_unreadable"] += 1
+            continue
+        age = wall_now - float(stamp)
+        if age < 0.0 or age > PEER_RANK_FILE_FRESH_SECONDS:
+            # A worker that is not heartbeating any more: the future-stamp refusal is
+            # `disk_restore._read_rank_file`'s rule for the same file, kept identical so
+            # the two readers of one file cannot disagree about who is alive.
+            view["files_stale"] += 1
+            continue
+        view["files_read"] += 1
+        view["available"] = True
+        digest = _published_digest(document)
+        if digest is None:
+            view["files_unnamed"] += 1
+            continue
+        if digest == own_text:
+            view["own_published"] = True
+            continue
+        live.add(digest)
+    view["digests"] = tuple(sorted(live))
+    if view["available"]:
+        view["known"] = view["files_unnamed"] == 0
+        view["reason"] = (
+            f"{view['files_read']} fresh rank document(s): "
+            f"{len(view['digests'])} foreign digest(s) published, "
+            f"{view['files_unnamed']} could not name their digest"
+            + ("" if view["known"] else ", so no foreign digest may be called dead"))
+    else:
+        view["reason"] = (
+            "no fresh rank document here "
+            f"({len(paths)} file(s) probed: {view['files_stale']} stale, "
+            f"{view['files_unreadable']} unreadable), so identity is decided by write "
+            "activity alone - the pre-0.2.45 reading")
+    with _identity_lock:
+        _peer_identity_cache["view"] = view
+        _peer_identity_cache["mono"] = time.monotonic()
+    _state["peer_identity_reads"] = int(_state["peer_identity_reads"]) + 1
+    _state["peer_identity_known"] = bool(view["known"])
+    _state["peer_identity_available"] = bool(view["available"])
+    _state["peer_identity_digests"] = len(view["digests"])
+    _state["peer_identity_own_published"] = bool(view["own_published"])
+    _state["peer_identity_files_unnamed"] = int(view["files_unnamed"])
+    _state["peer_identity_files_stale"] = int(view["files_stale"])
+    _state["peer_identity_files_unreadable"] = int(view["files_unreadable"])
+    _state["peer_identity_reason"] = str(view["reason"])[:MAX_STRING_CHARS]
+    return view
+
+
+def _peer_liveness() -> tuple:
+    """`(live_peer_digests, peers_known)` - the two witnesses, combined honestly.
+
+    `live` is the UNION: a digest is a live sibling's if a sibling is writing under
+    it OR
+    a live worker publishes it as its current digest. A union is the only honest shape,
+    because each witness can produce a false negative and neither can produce a false
+    positive about liveness - a rank that has not spilled for an hour still has a
+    worker,
+    and a rank whose rank file has not landed yet still has files being written.
+
+    `peers_known` is `attribute_name`'s gate on calling a foreign digest `dead`:
+    true only
+    when the rank files named every live rank this rank can see, or - when there are no
+    rank files to read at all - when the write-activity map is non-empty, which is what
+    every release up to 0.2.44 used and what a box with no `VLLM_E2_TIER_DIAG` keeps.
+    """
+    written = _live_peer_digests()
+    view = _peer_identity_view()
+    live = tuple(sorted(set(written) | set(view["digests"])))
+    if view["available"]:
+        known = bool(view["known"])
+        source = "rank_files"
+    else:
+        known = bool(written)
+        source = "write_activity"
+    _state["peer_liveness_source"] = source
+    _state["peer_digests_live"] = len(live)
+    if not live:
+        _state["peer_digests_unconfirmed"] += 1
+    return live, known
+
+
 # --- the fair share: whose bytes is this rank accountable for? ---------------
 
 def _scale_to_store(sample: int, used: int, scaled_total: int) -> int:
@@ -2150,7 +2502,7 @@ def _scale_to_store(sample: int, used: int, scaled_total: int) -> int:
     return int(int(sample) * int(scaled_total) // int(used))
 
 
-def _attribute_walk_bytes(walk: dict, peers) -> dict:
+def _attribute_walk_bytes(walk: dict, peers, peers_known: bool = True) -> dict:
     """WHO owns the bytes one walk measured, and therefore what this rank's share is.
 
     Returns the per-owner byte totals (scaled to the store the way the walk scaled its
@@ -2218,7 +2570,8 @@ def _attribute_walk_bytes(walk: dict, peers) -> dict:
         # that could disagree.
         owner = disk_layout.attribute_name(
             name, digest, peers,
-            parsed=disk_layout.parse_path(name))["attribution"]
+            parsed=disk_layout.parse_path(name),
+            peers_known=peers_known)["attribution"]
         if owner == disk_layout.ATTRIBUTION_OWN:
             own += size
             sheddable.append(row)
@@ -2602,7 +2955,8 @@ def shutdown_evict_pool() -> None:
     _state["evict_threads_alive"] = evict_thread_count_alive()
 
 
-def _run_evict_batches(batches: list, *, peers, deadline) -> tuple:
+def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
+                       deadline) -> tuple:
     """Unlink every batch, on the pool if there is one. Returns per-batch reports.
 
     `batches` is a list of `(directory, paths)` pairs, DISJOINT by construction (they
@@ -2645,7 +2999,8 @@ def _run_evict_batches(batches: list, *, peers, deadline) -> tuple:
             index += 1
             attempted += len(paths)
             _state["evict_batches_serial"] += 1
-            reports.append((directory, _unlink_batch(directory, paths, peers)))
+            reports.append((directory, _unlink_batch(directory, paths, peers,
+                                                      peers_known)))
             if _deadline_expired(deadline):
                 truncated = bool(batches[index:])
                 break
@@ -2656,14 +3011,16 @@ def _run_evict_batches(batches: list, *, peers, deadline) -> tuple:
         for directory, paths in chunk:
             try:
                 futures.append((directory,
-                                pool.submit(_unlink_batch, directory, paths, peers),
+                                pool.submit(_unlink_batch, directory, paths, peers,
+                                            peers_known),
                                 len(paths)))
             except Exception as exc:  # noqa: BLE001 - no pool means inline, not no work
                 snapshot._error(exc, "disk_spill evict submit")
                 _state["evict_fallbacks"] += 1
                 attempted += len(paths)
                 _state["evict_batches_serial"] += 1
-                reports.append((directory, _unlink_batch(directory, paths, peers)))
+                reports.append((directory, _unlink_batch(directory, paths, peers,
+                                                          peers_known)))
         if futures:
             _state["evict_batches_submitted"] += len(futures)
             _state["evict_peak_in_flight"] = max(
@@ -2687,19 +3044,22 @@ def _run_evict_batches(batches: list, *, peers, deadline) -> tuple:
     return reports, attempted, truncated
 
 
-def _unlink_batch(directory, paths, peers) -> dict | None:
+def _unlink_batch(directory, paths, peers, peers_known: bool = True) -> dict | None:
     """ONE directory's unlink batch, on whatever thread owns it. Never raises.
 
     `execute_unlink_plan` re-validates every path against the CURRENT digest and the
     peer digests before it deletes anything, and a directory that is itself a symlink is
     refused outright; none of that is weakened by running it on a worker. The peer list
-    is a tuple, handed in, so a worker never reads the mutable witness map.
+    and the `peers_known` flag are handed in, so a worker never reads the mutable
+    witness
+    map or the identity cache - which is also what keeps a pass self-contained: the
+    decision and the deletion answer to the SAME view of who is alive.
     """
     try:
         return disk_layout.execute_unlink_plan(
             directory, paths, dry_run=False,
             geometry_digest=_state["geometry_digest"], peer_digests=peers,
-            for_capacity=True)
+            for_capacity=True, peers_known=peers_known)
     except Exception as exc:  # noqa: BLE001 - a worker that raises loses its own batch
         snapshot._error(exc, "disk_spill unlink batch")
         return None
@@ -2764,6 +3124,51 @@ def _peer_digest_set(peers) -> set:
         return set()
 
 
+def _removal_justification(path, peers, peers_known) -> str:
+    """WHICH RULE licensed one unlinked file, as one closed-vocabulary name.
+
+    The operator's question, from the live box: `peer_files_removed = 2955` with
+    `peer_files_removed_known_peer = 0` cannot tell "I deleted 38 GB of a live sibling's
+    current bytes" apart from "I deleted 38 GB of bytes an arena-size change orphaned".
+    Those are different facts and the second one is CORRECT cleanup, so every
+    removal now
+    also names its justification, using `disk_layout.attribute_name` - the SAME function
+    the gate used a moment earlier, so a justification can never disagree with the
+    decision that made the file eligible:
+
+      * `stale_geometry`  - a foreign digest no live rank publishes and no live rank is
+                            writing: the
+                            configuration-change case.
+                            Shed-first by design.
+      * `stale_key_shape` - the pre-group key shape, this plugin's own unloadable
+      lineage.
+      * `peer`            - a digest a LIVE rank owns. Structurally unreachable for a
+                            capacity pass since 0.2.45 (a peer's entries never enter the
+                            destructive set), so a non-zero count here is an incident.
+      * `own`             - this rank's own digest (not a cross-rank removal at all).
+      * `unnamed`         - a name carrying no readable digest, or one this tier cannot
+                            classify. Counted so the totals balance and never guessed.
+
+    Name-only: one parse, no syscall.
+    """
+    try:
+        name = os.path.basename(str(path or ""))
+        verdict = disk_layout.attribute_name(
+            name, _state["geometry_digest"], peers, peers_known=peers_known)
+        attribution = verdict["attribution"]
+        if attribution == disk_layout.ATTRIBUTION_OWN:
+            return "own"
+        if attribution == disk_layout.ATTRIBUTION_PEER:
+            return "peer"
+        if verdict["classification"] == disk_layout.NAME_STALE_KEY_SHAPE:
+            return "stale_key_shape"
+        if attribution == disk_layout.ATTRIBUTION_DEAD:
+            return "stale_geometry"
+        return "unnamed"
+    except Exception:  # noqa: BLE001 - a bookkeeping helper never breaks a pass
+        return "unnamed"
+
+
 def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     """One enforcement pass: walk, decide, shed. Deadline-aware, partial by design.
 
@@ -2790,14 +3195,18 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
         # "why is this pass partial" and it is never mistaken for the plan cap.
         _state["plan_truncated"] = True
         _state["ceiling_deadline_hit"] = True
-    # THE SIBLING DIGESTS, decided NOW (freshness is the point) and handed to the
-    # planner AND the executor. Empty is the fail-safe direction: the plan then sees a
-    # foreign digest as `stale_geometry` and sheds it first, exactly as it did before
-    # 0.2.29, and `peer_digests_unconfirmed` counts the fact. Since 0.2.30 the same
-    # tuple does a second job: it IS the rank count, because `n_effective` is 1 plus the
-    # live peers, and that is what turns a 148 GiB ceiling shared by four ranks into
-    # four 37 GiB budgets instead of four ranks each defending 148 GiB of one directory.
-    peers = _live_peer_digests()
+    # THE SIBLING DIGESTS, decided NOW and handed to the planner AND the executor:
+    # the union of the two liveness witnesses, plus the flag that says whether
+    # this rank can name every live rank's identity (`peers_known`). Empty is no
+    # longer the fail-safe direction on its own - with `peers_known` false a
+    # foreign committed digest is UNATTRIBUTABLE and withheld
+    # (`peer_digests_unconfirmed` counts the fact), and with it true a foreign
+    # digest is the dead geometry a configuration change left behind, which must
+    # stay reclaimable. Since 0.2.30 the same tuple does a second job: it IS the
+    # rank count, because `n_effective` is 1 plus the live peers, and that is what
+    # turns a 148 GiB ceiling shared by four ranks into four 37 GiB budgets
+    # instead of four ranks each defending 148 GiB of one directory.
+    peers, peers_known = _peer_liveness()
     # THE DECISION NUMBER. `estimated_total_bytes` equals `used_bytes` whenever the
     # walk measured the whole store, so a store inside the caps cannot tell this
     # from the old code; on a truncated walk it is the sample scaled to the store.
@@ -2820,7 +3229,7 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # WHOSE BYTES THESE ARE, and therefore what this rank's slice of the ceiling is.
     # This is the half the 2026-10-22 over-eviction was missing: four ranks, one
     # directory, one store-wide number each read as its own problem.
-    attribution = _attribute_walk_bytes(walk, peers)
+    attribution = _attribute_walk_bytes(walk, peers, peers_known)
     share = _share_of_ceiling(int(ceiling), attribution["divisor"],
                               attribution["source"])
     accountable = int(attribution["accountable_bytes"])
@@ -2872,7 +3281,8 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
         attribution["sheddable_entries"],
         geometry_digest=_state["geometry_digest"],
         ceiling_bytes=int(share["share_bytes"]), used_bytes=accountable,
-        target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers)
+        target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers,
+        peers_known=peers_known)
     _state["plan_truncated"] = bool(plan.get("truncated"))
     # The planner ran the same gate over the entries it was handed, so it normally
     # reports nothing further to withhold (the attribution already filtered them).
@@ -2938,8 +3348,8 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # shape (a shard's entries leave one directory) and the partition that guarantees no
     # path is attempted by two workers: the groups are disjoint by construction.
     batches = list(by_directory.items())
-    reports, attempted, cut_off = _run_evict_batches(batches, peers=peers,
-                                                     deadline=deadline)
+    reports, attempted, cut_off = _run_evict_batches(
+        batches, peers=peers, peers_known=peers_known, deadline=deadline)
     freed = 0
     unlinked = 0
     failed = 0
@@ -2998,6 +3408,34 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
                         # file was deleted. Non-zero is the incident signature.
                         _state["peer_files_removed_known_peer"] = int(
                             _state["peer_files_removed_known_peer"]) + 1
+                    # WHICH RULE PAID FOR IT (0.2.45). `peer_files_removed` alone could
+                    # not tell a live sibling's bytes from bytes a configuration change
+                    # orphaned, and the two read in opposite directions: one is the
+                    # incident, the other is the reclaim path working as designed. The
+                    # justification comes from `attribute_name`, the same function the
+                    # gate used, so it cannot disagree with the decision.
+                    justification = _removal_justification(action.get("path"),
+                                                           peers, peers_known)
+                    if justification == "stale_geometry":
+                        _state["stale_geometry_removed"] = int(
+                            _state["stale_geometry_removed"]) + 1
+                        _state["stale_geometry_removed_bytes"] = int(
+                            _state["stale_geometry_removed_bytes"]
+                        ) + removed_size
+                        _state["stale_geometry_removed_last_pass"] = int(
+                            _state["stale_geometry_removed_last_pass"]) + 1
+                    elif justification == "stale_key_shape":
+                        _state["stale_key_shape_removed"] = int(
+                            _state["stale_key_shape_removed"]) + 1
+                        _state["stale_key_shape_removed_bytes"] = int(
+                            _state["stale_key_shape_removed_bytes"]) + removed_size
+                    elif justification == "peer":
+                        # A LIVE rank's file, unlinked. Since 0.2.45 a capacity pass
+                        # cannot plan one, so this is the counter to alert on.
+                        _state["peer_files_removed_live"] = int(
+                            _state["peer_files_removed_live"]) + 1
+                        _state["peer_files_removed_live_bytes"] = int(
+                            _state["peer_files_removed_live_bytes"]) + removed_size
                 # EVERY file this plan actually deleted is journalled, so the
                 # scheduler's index stops offering it within one refresh. Without this
                 # half the journal the index would keep offering files whose bytes the
@@ -3919,34 +4357,101 @@ def section() -> dict:
             # which is not a cross-rank removal at all; this one cannot lie.
             "peer_files_removed_known_peer": int(
                 _state["peer_files_removed_known_peer"]),
+            # WHICH RULE PAID FOR EACH REMOVAL (0.2.45), so the two
+            # readings of `peer_files_removed` can be told apart from one
+            # read: `stale_geometry_removed`  = cleanup of bytes a
+            # CONFIGURATION CHANGE orphaned (a digest no live rank
+            # publishes and none is writing). This is the reclaim path
+            # working, and it is the number the operator's 2026-10-07
+            # arena-size change is expected to produce.
+            # `peer_files_removed_live` = a file belonging to a rank that
+            # is ALIVE. A capacity pass cannot plan one since 0.2.45, so
+            # this is the alarm. They are disjoint, and
+            # `peer_files_removed` is their superclass.
+            "stale_geometry_removed": int(_state["stale_geometry_removed"]),
+            "stale_geometry_removed_bytes": int(
+                _state["stale_geometry_removed_bytes"]),
+            "stale_geometry_removed_last_pass": int(
+                _state["stale_geometry_removed_last_pass"]),
+            "stale_key_shape_removed": int(_state["stale_key_shape_removed"]),
+            "stale_key_shape_removed_bytes": int(
+                _state["stale_key_shape_removed_bytes"]),
+            "peer_files_removed_live": int(_state["peer_files_removed_live"]),
+            "peer_files_removed_live_bytes": int(
+                _state["peer_files_removed_live_bytes"]),
+            # THE IDENTITY VIEW (0.2.45): WHO THIS RANK COULD SEE, and on
+            # what evidence. `source` names the witness that decided
+            # (`rank_files` when a live worker's published identity was
+            # readable, `write_activity` when nothing fresh was readable
+            # here and the pre-0.2.45 reading stands). `identity_known` is
+            # the flag that lets a foreign digest be called dead at all:
+            # it says "every live rank I can see, I can also NAME". When
+            # it is false a foreign committed file is UNATTRIBUTABLE, is
+            # withheld, and the ceiling is allowed to come up SHORT.
+            "source": _state["peer_liveness_source"],
+            "identity_reads": int(_state["peer_identity_reads"]),
+            "identity_available": bool(_state["peer_identity_available"]),
+            "identity_known": bool(_state["peer_identity_known"]),
+            "identity_published_digests": int(_state["peer_identity_digests"]),
+            "identity_own_published": bool(_state["peer_identity_own_published"]),
+            "identity_files_unnamed": int(_state["peer_identity_files_unnamed"]),
+            "identity_files_stale": int(_state["peer_identity_files_stale"]),
+            "identity_files_unreadable": int(
+                _state["peer_identity_files_unreadable"]),
+            "identity_reason": _state["peer_identity_reason"],
             "fresh_seconds": PEER_DIGEST_FRESH_SECONDS,
             "min_sightings": PEER_DIGEST_MIN_SIGHTINGS,
             "peer_digest_cap": MAX_PEER_DIGESTS,
-            "note": ("`live_digests` are foreign digests whose committed files are "
-                     "being written now, so their files shed LAST instead of first. "
-                     "`decisions_without_peers` counts the ceiling decisions taken "
-                     "with none known - and since 0.2.34 that is NOT a licence to "
-                     "shed a foreign digest first: with no peer confirmed, a "
-                     "committed file under a digest that is not this rank's is "
-                     "UNATTRIBUTABLE, is withheld from the destructive set "
-                     "(`unattributable_entries_last_pass`, "
-                     "`unattributable_entries_excluded`) and the plan is allowed to "
-                     "come up SHORT (`plan_short`, `plan_short_bytes`, "
-                     "`passes_short`). Exceeding the ceiling is the intended "
-                     "consequence: spilling back-pressures and an operator can act, "
-                     "while deleting a sibling's live restore corrupts a serving path "
-                     "in silence. `peer_files_removed` is the attributable "
-                     "removal - files this rank unlinked under ANOTHER rank's digest, "
-                     "legitimate only beside a non-zero `files_planned_last_pass`. "
-                     "This rank's own files and the bytes positively claimed by no "
-                     "live rank stay sheddable whatever the map says, so a single-rank "
-                     "box never comes up short for want of a peer."),
+            "rank_file_fresh_seconds": PEER_RANK_FILE_FRESH_SECONDS,
+            "note": (
+                "`live_digests` are foreign digests this rank has positive evidence "
+                "for: a sibling is writing under them NOW "
+                "(`PEER_DIGEST_FRESH_SECONDS` of committed files) OR a live worker "
+                "publishes them as its current digest in its rank file. Their files "
+                "shed LAST, and never for capacity. SILENCE IS NOT DEATH (0.2.45): a "
+                "rank that stops SPILLING drops out of the write-activity witness, and "
+                "that alone no longer makes its bytes free capacity - it takes a rank "
+                "file that stopped being rewritten (a worker that is gone) or a digest "
+                "nobody writes under at all (a configuration change) to move those "
+                "bytes to `stale_geometry`. `source` + `identity_known` say how this "
+                "rank decided: with `identity_known: false` it cannot name every live "
+                "rank, so a foreign digest outside its map is UNATTRIBUTABLE, is "
+                "withheld (`unattributable_entries_last_pass`, "
+                "`unattributable_entries_excluded`) and the plan may come up SHORT "
+                "(`plan_short`, `plan_short_bytes`, `passes_short`). Exceeding the "
+                "ceiling is the intended consequence: spilling back-pressures and an "
+                "operator can act, while deleting a sibling's live restore corrupts a "
+                "serving path in silence. TO ANSWER 'IS AN IDLE RANK BEING PROTECTED "
+                "OR SHED?': read `identity_published_digests` (an idle rank still "
+                "publishes -> protected while it is idle, `live_digests` counts it) "
+                "against `stale_geometry_removed` / "
+                "`stale_geometry_removed_bytes` (an idle rank whose WORKER has gone, "
+                "its bytes being reclaimed as orphaned) and "
+                "`peer_files_removed_live` (an idle rank's bytes being shed while it "
+                "is still alive - since 0.2.45 that is a bug, not a behaviour, and it "
+                "is counted separately from the cleanup case so the two cannot be "
+                "confused). This rank's own files and the bytes positively claimed by "
+                "no live rank stay sheddable whatever the map says, so a single-rank "
+                "box never comes up short for want of a peer."),
             "units": disk_layout._units("live_digests", "learned_digests",
                                         "foreign_files_seen",
                                         "decisions_without_peers",
                                         "files_planned_last_pass",
                                         "peer_digests_dropped", "fresh_seconds",
                                         "min_sightings", "peer_digest_cap",
+                                        "rank_file_fresh_seconds",
+                                        "identity_reads",
+                                        "identity_published_digests",
+                                        "identity_files_unnamed",
+                                        "identity_files_stale",
+                                        "identity_files_unreadable",
+                                        "stale_geometry_removed",
+                                        "stale_geometry_removed_bytes",
+                                        "stale_geometry_removed_last_pass",
+                                        "stale_key_shape_removed",
+                                        "stale_key_shape_removed_bytes",
+                                        "peer_files_removed_live",
+                                        "peer_files_removed_live_bytes",
                                         "unattributable_entries_last_pass",
                                         "unattributable_bytes_last_pass",
                                         "unattributable_entries_excluded",

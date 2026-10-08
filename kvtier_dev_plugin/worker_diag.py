@@ -132,10 +132,13 @@ through `snapshot._error`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+import threading
 import time
+import weakref
 
 from . import config, snapshot
 
@@ -171,6 +174,14 @@ MAX_FILE_BYTES = 32 * 1024  # the reader's own cap is 256 KiB; we stay far below
 MAX_STRING_CHARS = 200
 MAX_GROUPS = 32
 WRITER_TAG = "kvtier-dev-plugin/1"
+
+# THE RANK FILE'S NAME, PUBLISHED. `disk_restore` reads `rank-*.json` and `disk_spill`
+# lists the same files to learn which peers exist; both used to carry their own copy of
+# the prefix and suffix, and a writer that renamed its file would have silently disabled
+# both readers (a peer map that sees no rank files believes every sibling is gone). This
+# is the single place the name is spelled, and the two readers import these.
+RANK_FILE_PREFIX = "rank-"
+RANK_FILE_SUFFIX = ".json"
 
 # --- the contribution seam: ONE writer, several contributors -----------------
 # A worker-side module that has facts for the operator (today `disk_store`: the
@@ -265,6 +276,20 @@ _state: dict = {
     "last_path": None,
     "bytes_written": 0,
     "fallbacks": 0,
+    # THE HEARTBEAT (0.2.45). The rank file is a proof of life and it used to have no
+    # pulse of its own: only an engine step rewrote it, so an idle worker's proof aged
+    # past `disk_restore.RANK_FILE_FRESH_SECONDS` and the scheduler stopped offering
+    # disk restores to a worker that was perfectly alive. These keys are how that is
+    # visible instead of inferred.
+    "heartbeats": 0,
+    "heartbeat_threads": 0,
+    "heartbeat_respawns": 0,
+    "heartbeat_floor_skips": 0,
+    "heartbeat_errors": 0,
+    "heartbeat_last_mono": None,
+    "heartbeat_thread_alive": False,
+    # WEAK, on purpose: the handler owns the CPU KV arena (gigabytes on this box).
+    "handler_ref": None,
 }
 
 # The registered producers and the seam's own accounting. Module-level for the
@@ -283,6 +308,12 @@ _contrib_state: dict = {
 
 
 def reset_state_for_tests() -> None:
+    # THE HEARTBEAT THREAD IS STOPPED FIRST. A test that only reset the dict would
+    # leave a live thread writing rank files into the NEXT test's temporary directory -
+    # which is not merely untidy: a file appearing in a directory whose test asserts is
+    # empty is a false pass waiting to happen, and this module's whole subject is files
+    # appearing.
+    stop_heartbeat()
     _state.update({"enabled": False, "installs": 0, "reinstalls": 0,
                    "uninstalls": 0, "skips": 0, "skip_reason": None,
                    "skip_detail": [], "nested": [],
@@ -293,7 +324,11 @@ def reset_state_for_tests() -> None:
                    "store_blocks_submitted": 0, "load_blocks_submitted": 0,
                    "completion_reported": 0, "last_write_mono": None,
                    "last_signature": None, "last_error": None,
-                   "last_path": None, "bytes_written": 0, "fallbacks": 0})
+                   "last_path": None, "bytes_written": 0, "fallbacks": 0,
+                   "heartbeats": 0, "heartbeat_threads": 0,
+                   "heartbeat_respawns": 0, "heartbeat_floor_skips": 0,
+                   "heartbeat_errors": 0, "heartbeat_last_mono": None,
+                   "heartbeat_thread_alive": False, "handler_ref": None})
     _reset_contributions_for_tests()
 
 
@@ -513,6 +548,32 @@ def section() -> dict:
         "last_path": _clip(_state["last_path"], 200),
         "last_error": _state["last_error"],
         "fallbacks": int(_state["fallbacks"]),
+        # THE HEARTBEAT (0.2.45): is this worker keeping its own proof alive, and how
+        # close to the gate is it running? `heartbeat_alive` is READ from the thread and
+        # `last_heartbeat_age_seconds` is the number that distinguishes a worker beating
+        # every minute from one whose thread died an hour ago - the only silent failure
+        # a heartbeat thread can have, so it gets an age, a respawn and an error count.
+        # `heartbeat_beats_in_window` states the MARGIN, so "is this tight?" is a
+        # reading rather than arithmetic an operator has to do under pressure.
+        "heartbeat_interval_seconds": float(HEARTBEAT_INTERVAL_SECONDS),
+        "heartbeat_floor_seconds": float(HEARTBEAT_MIN_INTERVAL_SECONDS),
+        "heartbeat_started": bool(_heartbeat["thread"] is not None
+                                  or _state["heartbeat_thread_alive"]),
+        # READ, not remembered: the flag in `_state` is only refreshed by readers that
+        # ask for it, and reporting a stale False would raise a false alarm about a
+        # worker whose thread is fine.
+        "heartbeat_alive": _heartbeat_loop_alive(),
+        "heartbeats": int(_state["heartbeats"]),
+        "heartbeat_threads": int(_state["heartbeat_threads"]),
+        "heartbeat_respawns": int(_state["heartbeat_respawns"]),
+        "heartbeat_floor_skips": int(_state["heartbeat_floor_skips"]),
+        "heartbeat_errors": int(_state["heartbeat_errors"]),
+        "last_heartbeat_age_seconds": (
+            round(time.monotonic() - float(_state["heartbeat_last_mono"]), 3)
+            if isinstance(_state["heartbeat_last_mono"], (int, float)) else None),
+        "heartbeat_window_seconds": _heartbeat_window_seconds(),
+        "heartbeat_beats_in_window": int(_heartbeat_window_seconds() // max(
+            0.001, float(HEARTBEAT_INTERVAL_SECONDS))),
         "schema_version": SCHEMA_VERSION,
         "file_pattern": "rank-PP<pp>_TP<tp>.json",
         "worker_scope": ("this process is not a worker: these are the configured "
@@ -926,6 +987,300 @@ def _maybe_write(handler) -> dict:
     return report
 
 
+# --- THE HEARTBEAT: an idle worker must LOOK alive, not merely be alive ------
+#
+# WHY THIS EXISTS AT ALL. `disk_restore` may only offer a disk restore when a WORKER
+# process has attested that its restore layer is fitted (they are separate processes,
+# and offering without the proof means `start_load_kv` DMAs CPU slots nobody filled -
+# the request is served from STALE KV, the one silent failure this design has). The
+# attestation is the rank file, and the reader REFUSES a file older than
+# `disk_restore.RANK_FILE_FRESH_SECONDS` (900 s) - because a file a dead worker wrote
+# must not vouch for it forever. Both halves are right. The WIRING was not:
+# `_maybe_write` runs from the wrapped `get_finished`, so the only thing that rewrote
+# the file was an ENGINE STEP. A worker with no request writes nothing, its file ages
+# past the window, and the scheduler stops believing a worker that is perfectly alive -
+# closing the disk path on a quiet box and reopening it only when a burst of steps
+# arrives, which is the worst possible moment because the first request after an idle
+# spell is the one that wanted the disk. Nothing expired and nothing failed; a heartbeat
+# was missing.
+#
+# WHAT THIS IS NOT. It is not a weaker gate: the window stays 900 s, so a worker that
+# has genuinely gone stops being believed on time - that is the gate's whole value, and
+# this file does not touch it. A PROOF IS NOT DATA: nothing here keeps a cached byte
+# alive, it keeps a live worker legible.
+HEARTBEAT_INTERVAL_DEFAULT = 60.0
+HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_DEFAULT
+# THE WRITE FLOOR THE HEARTBEAT HONOURS. `config.worker_min_interval_seconds()` is the
+# engine-driven writer's floor and exists because every write is an fsync'd atomic
+# replace in a directory the SCHEDULER also reads. A thread on its own timer would
+# otherwise be a second writer with no budget at all, so the heartbeat takes its own
+# floor - a separate knob rather than a borrowed one, because "how often may a
+# background thread touch this directory" and "how often may a step" are different
+# questions an operator may want to answer differently.
+HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+HEARTBEAT_THREAD_NAME = "kvtier-worker-diag-heartbeat"
+# THE MARGIN THIS DESIGN IS ALLOWED TO LOSE. 60 s inside a 900 s window is fifteen
+# beats, so four consecutive dropped ticks (a long GIL hold, a slow device, a
+# stop-the-world import) are still safe. Pinned by a test against the UNPATCHED
+# constants, because an operator raising the interval to 500 s would technically stay
+# inside 900 s and still lose the disk path on the first missed beat.
+HEARTBEAT_MIN_BEATS_IN_WINDOW = 4
+
+_heartbeat: dict = {"thread": None, "stop": None}
+_heartbeat_lock = threading.Lock()
+_handler_lock = threading.Lock()
+# THE ONE LOCK THE HEARTBEAT MADE NECESSARY. Every counter update the heartbeat thread
+# makes goes through it. The step-driven path deliberately does NOT take it: one thread,
+# one writer, and a lock per step on the engine's hot path costs real time. The
+# heartbeat writes at 60 s and the counters it touches are its own; `counters()` copies
+# the dict, which CPython makes atomic for us.
+_state_lock = threading.Lock()
+
+
+def note_handler(handler) -> dict:
+    """Remember the worker's handler WEAKLY, so a heartbeat can read it, not own it.
+
+    THE WEAK REFERENCE IS NOT POLITE, IT IS LOAD-BEARING. The handler owns the CPU KV
+    arena - gigabytes on this box - and a diagnostic writer that kept it alive by
+    holding a reference would make the engine's own memory un-collectable for the life
+    of the plugin. So the heartbeat reads the handler when it happens to still be there
+    and writes the same document with nothing measured when it is not, because the FACT
+    the file carries - "this process is alive" - does not need the handler at all.
+    """
+    out = {"stored": False, "reason": None}
+    try:
+        if handler is None:
+            out["reason"] = "no handler was offered"
+            return out
+        with _handler_lock:
+            reference = _state["handler_ref"]
+            if isinstance(reference, weakref.ref) and reference() is handler:
+                out["stored"] = True
+                return out
+            try:
+                _state["handler_ref"] = weakref.ref(handler)
+            except TypeError:
+                # An object that refuses weakreferences (a slotted class, a C type) is
+                # not worth pinning in memory for. The heartbeat writes without it.
+                _state["handler_ref"] = None
+                out["reason"] = ("this handler cannot be referenced weakly, so the "
+                                 "heartbeat writes without reading it")
+                return out
+        out["stored"] = True
+        return out
+    except Exception as exc:  # noqa: BLE001 - remembering a handler is never a fault
+        out["reason"] = f"{type(exc).__name__}"
+        return out
+
+
+def _resolve_handler():
+    """The handler if it is still alive, else None. Never extends its life."""
+    with _handler_lock:
+        reference = _state["handler_ref"]
+    if not isinstance(reference, weakref.ref):
+        return None
+    try:
+        return reference()
+    except Exception:  # noqa: BLE001 - a dead reference is simply no handler
+        return None
+
+
+def _heartbeat_window_seconds() -> float:
+    """The freshness window this heartbeat must stay inside, read from its OWNER.
+
+    `disk_restore` owns the gate, so the interval is checked against the gate's own
+    number rather than a copy of it. Imported lazily because `disk_restore` imports this
+    module's contribution seam at load time: a top-level import would make the package
+    depend on the order modules happen to be imported in.
+    """
+    try:
+        from . import disk_restore
+        return float(disk_restore.RANK_FILE_FRESH_SECONDS)
+    except Exception:  # noqa: BLE001 - a missing reader is no reason to stop proving
+        return 0.0
+
+
+def heartbeat_once() -> dict:
+    """One beat: rewrite the rank file if the floor allows it.
+
+    IT GOES THROUGH THE SAME WRITE PATH A STEP USES, not a second writer. That is what
+    keeps the file's SHAPE identical - one document builder, one atomic replace, one set
+    of contributions - so a reader can never tell a heartbeat-written file from a
+    step-written one, and a mixed-version fleet's reader sees the keys it expects. A
+    separate "heartbeat.json" would have been the obvious implementation and a second
+    source of truth about who is alive.
+    """
+    out = {"written": False, "reason": None, "handler": False}
+    directory = config.diagnostics_dir()
+    if directory is None:
+        out["reason"] = f"{config.ENV_DIAG_DIR} is not set"
+        return out
+    rank, rank_source = rank_id()
+    if rank is None:
+        out["reason"] = f"no usable rank: {rank_source}"
+        return out
+    last = _state["heartbeat_last_mono"]
+    floor = max(0.0, float(HEARTBEAT_MIN_INTERVAL_SECONDS))
+    if isinstance(last, (int, float)) and (time.monotonic() - float(last)) < floor:
+        with _state_lock:
+            _state["heartbeat_floor_skips"] = int(_state["heartbeat_floor_skips"]) + 1
+        out["reason"] = f"floor {floor}s not elapsed since the last beat"
+        return out
+    handler = _resolve_handler()
+    out["handler"] = handler is not None
+    report = write_snapshot(handler, rank, rank_source)
+    with _state_lock:
+        _state["heartbeat_last_mono"] = time.monotonic()
+        if report.get("written"):
+            _state["heartbeats"] = int(_state["heartbeats"]) + 1
+            out["written"] = True
+        else:
+            out["reason"] = str(report.get("reason"))[:MAX_STRING_CHARS]
+    return out
+
+
+def _contained_heartbeat() -> dict:
+    """One heartbeat that CANNOT kill the thread.
+
+    Copied from `disk_gpu_write._contained`, for the reason that module learned it: a
+    Copied from `disk_gpu_write._contained`, for the reason that module learned it: a
+    contributor's producer, a config read or a filesystem can raise, and a heartbeat
+    loop that dies on it stops proving silently - which is indistinguishable from the
+    defect this thread exists to fix, just quieter. Every failure is a counter.
+    """
+    try:
+        return heartbeat_once()
+    except Exception as exc:  # noqa: BLE001 - the loop outlives any single beat
+        with _state_lock:
+            _state["heartbeat_errors"] = int(_state["heartbeat_errors"]) + 1
+            _state["last_error"] = (
+                f"heartbeat: {type(exc).__name__}")[:MAX_STRING_CHARS]
+        snapshot._error(exc, "worker diag heartbeat")
+        return {"written": False, "reason": f"{type(exc).__name__}"}
+
+
+def _heartbeat_loop(stop) -> None:
+    """The tick. Wait, then ONE contained heartbeat, until asked to stop.
+
+    `stop.wait()` FIRST, never after: a loop that writes before its first wait has
+    written a file during `install()`, which is the step-driven path's job and would
+    double the writes at boot. The wait is also what makes an idle worker the ONLY
+    customer - a busy worker's steps already rewrite the file, and a beat that fires
+    anyway costs an fsync to say what the step already said. The write floor is what
+    makes that cheap rather than merely rare.
+    """
+    while not stop.wait(max(0.001, float(HEARTBEAT_INTERVAL_SECONDS))):
+        _contained_heartbeat()
+
+
+def _heartbeat_loop_alive() -> bool:
+    """Is the heartbeat thread actually running? Read, do not assume."""
+    with _heartbeat_lock:
+        thread = _heartbeat["thread"]
+    alive = bool(thread is not None and thread.is_alive())
+    with _state_lock:
+        _state["heartbeat_thread_alive"] = alive
+    return alive
+
+
+def start_heartbeat() -> dict:
+    """Start the heartbeat thread, once, lazily. Never at import.
+
+    STARTED BY `install()`, AND THAT IS THE WHOLE POINT. `disk_gpu_write` shipped this
+    bug in 0.2.43: its thread's only starter sat below the code path that needed what
+    the thread produces, so the first write was unreachable. The equivalent shape here
+    is a heartbeat started by an engine step - an IDLE worker is precisely a worker
+    whose starter never runs, which is the defect this block exists to fix. So
+    `install()` asks, and a worker that never takes a step still proves it is alive.
+
+    Starting allocates nothing: the thread waits its interval before its first write,
+    and with no diagnostics directory there is nothing for it to write, so the disabled
+    tier starts no thread at all.
+    """
+    report = {"started": False, "alive": False, "reason": None}
+    if config.diagnostics_dir() is None:
+        report["reason"] = (f"{config.ENV_DIAG_DIR} is not set: an inert tier starts "
+                            "no thread and writes no file")
+        return report
+    with _heartbeat_lock:
+        thread = _heartbeat["thread"]
+        if thread is not None and thread.is_alive():
+            report.update({"started": True, "alive": True})
+            return report
+        try:
+            stop = threading.Event()
+            new = threading.Thread(target=_heartbeat_loop, args=(stop,),
+                                   name=HEARTBEAT_THREAD_NAME, daemon=True)
+            new.start()
+        except Exception as exc:  # noqa: BLE001 - no thread is a refusal, not a fault
+            report["reason"] = (f"the heartbeat thread could not start: "
+                                f"{type(exc).__name__}")
+            with _state_lock:
+                _state["heartbeat_errors"] = int(_state["heartbeat_errors"]) + 1
+            return report
+        _heartbeat["stop"] = stop
+        _heartbeat["thread"] = new
+    with _state_lock:
+        _state["heartbeat_threads"] = int(_state["heartbeat_threads"]) + 1
+    report.update({"started": True, "alive": True})
+    return report
+
+
+def stop_heartbeat() -> dict:
+    """Ask the thread to stop. Teardown, and the only way a test gets a quiet directory.
+
+    THE TEARDOWN CANNOT RAISE AND MUST NOT SWALLOW LOUDLY EITHER: `contextlib.suppress`
+    is this repo's own idiom for "expected to fail, nothing to do" (`disk_store`,
+    `miss_attribution`), and it is truer here than `except: pass` - an already-dead
+    event or an unjoinable thread are both normal at interpreter shutdown.
+    """
+    with _heartbeat_lock:
+        stop = _heartbeat["stop"]
+        thread = _heartbeat["thread"]
+        _heartbeat["stop"] = None
+        _heartbeat["thread"] = None
+    if stop is not None:
+        with contextlib.suppress(Exception):
+            stop.set()
+    if thread is not None:
+        with contextlib.suppress(Exception):
+            thread.join(timeout=1.0)
+    with _state_lock:
+        _state["heartbeat_thread_alive"] = False
+    return {"stopped": thread is not None}
+
+
+def heartbeat_status(*, force: bool = False) -> dict:
+    """THE OPERATOR'S ANSWER TO "IS THIS WORKER'S PROOF BEING KEPT ALIVE?"
+
+    `alive` is READ from the thread, never inferred from a counter, because a thread
+    that died in the night is exactly the silent failure a heartbeat thread can produce.
+    With `force`, a dead thread is respawned here too - the step-driven path does the
+    same, so a worker that resumes stepping re-arms its own heartbeat for the next idle
+    spell.
+    """
+    alive = _heartbeat_loop_alive()
+    if not alive and force:
+        start_heartbeat()
+        alive = _heartbeat_loop_alive()
+        if alive:
+            with _state_lock:
+                _state["heartbeat_respawns"] = int(_state["heartbeat_respawns"]) + 1
+    last = _state["heartbeat_last_mono"]
+    age = (round(time.monotonic() - float(last), 3)
+           if isinstance(last, (int, float)) else None)
+    window = _heartbeat_window_seconds()
+    return {"started": _heartbeat["thread"] is not None or alive,
+            "alive": alive,
+            "interval_seconds": float(HEARTBEAT_INTERVAL_SECONDS),
+            "window_seconds": window,
+            "beats_in_window": (int(window // float(HEARTBEAT_INTERVAL_SECONDS))
+                                if window else None),
+            "last_heartbeat_age_seconds": age,
+            "heartbeats": int(_state["heartbeats"]),
+            "errors": int(_state["heartbeat_errors"])}
+
+
 # --- the counters (the only per-step work) ----------------------------------
 
 def _count_submitted(metadata) -> None:
@@ -963,11 +1318,28 @@ def _make_bind_metadata(original):
 def _make_get_finished(original):
     def get_finished(self, finished_req_ids):
         result = original(self, finished_req_ids)
+        # THE HANDLER, NOTED EVERY STEP (0.2.45). A weak reference, taken here because
+        # this is the first place a step hands us the live object, and the heartbeat
+        # thread needs it to write a document that measures the arena instead of
+        # reporting nothing. Cheap enough to do every step: one weakref and a lock,
+        # no I/O.
+        try:
+            note_handler(self)
+        except Exception as exc:  # noqa: BLE001 - never into the step
+            _state["fallbacks"] += 1
+            snapshot._error(exc, "worker diag handler note")
         # The write happens AFTER the fork's own work, so a diagnostic can never
         # reorder or replace what the scheduler is told - and it is contained, so
         # it can never replace it either: the disk may be gone, the step returns.
         try:
             _maybe_write(self)
+            # THE SELF-HEALING BEAT (0.2.45). A heartbeat thread that died leaves the
+            # worker proving again only while steps arrive - the correct fallback (a
+            # busy worker needs no heartbeat), except that nothing would ever re-arm it
+            # for the NEXT idle spell. `force=True` respawns a thread this process can
+            # see is gone, and the counter says it happened, so "the disk went off
+            # again" has a reading in the payload instead of a theory.
+            heartbeat_status(force=True)
         except Exception as exc:  # noqa: BLE001 - a file is never a step failure
             _state["fallbacks"] += 1
             snapshot._error(exc, "worker diag write trigger")
@@ -1066,6 +1438,20 @@ def install(cls=None) -> dict:
             if not report["skipped"]:
                 _state["skip_reason"] = None
             _state["skip_detail"] = list(report["skip_detail"])
+        # THE HEARTBEAT STARTS HERE, AT INSTALL, NOT AT THE FIRST STEP (0.2.45).
+        # `disk_gpu_write` shipped this mistake in 0.2.43 (its thread's only starter sat
+        # below the path that needed what the thread produces, so the first write was
+        # unreachable), and the same shape here is the idle-worker defect itself: a
+        # heartbeat begun by an engine step can never begin on a worker that is idle -
+        # and an idle worker is exactly the one whose proof would otherwise age out.
+        # Starting it allocates nothing: the thread waits its interval before its first
+        # write, and with no diagnostics directory `start_heartbeat` refuses rather than
+        # writing, so an inert tier neither spawns a thread nor creates a file.
+        if report["installed"]:
+            heartbeat = start_heartbeat()
+            report["heartbeat"] = heartbeat
+            if not heartbeat.get("started"):
+                report["heartbeat_reason"] = heartbeat.get("reason")
         if report["replaced"]:
             _state["reinstalls"] += 1
         if not report["installed"]:

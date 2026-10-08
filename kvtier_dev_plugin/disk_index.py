@@ -147,12 +147,57 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import OrderedDict
 
 from . import config, disk_layout, snapshot
 
 # --- the caps, and the unit of every one of them ----------------------------
 
-MAX_INDEX_ENTRIES = 65_536          # KEYS held in memory (each drops the oldest)
+# THE ENTRY CAP, and the memory it buys. MEASURED IN THIS REPO, not estimated: a 20,000-
+# entry index holding a real 72-hex identity string and a real entry dict costs 6.8
+# MB, so
+# ~342 bytes an entry. At the default that is UNDER 90 MB AT the cap - and the dict only
+# grows to the identities the journals actually name, so a small store costs what a
+# small
+# store holds and the number below is a ceiling on memory, never an allocation.
+#
+# WHY THE DEFAULT MOVED UP (0.2.45). It was 65,536, which the live store walks into:
+# 12,738
+# files across four ranks under a 148 GiB ceiling today, ~30,000 possible, and a
+# converged
+# drain over a big store lives AT the cap. Walking into it is not an error - it is the
+# index answering `not_present` for files that are sitting on the RAID, whole and
+# readable,
+# which spends real capacity on spans the tier refuses to offer. An operator can set it
+# with `VLLM_E2_TIER_DISK_INDEX_ENTRIES` (`config.disk_index_env` holds the grammar).
+MAX_INDEX_ENTRIES = 262_144         # IDENTITIES held in memory (LRU-by-touch)
+# THE POLICY BOUNDS ON AN OPERATOR'S NUMBER. Below the floor the index remembers so
+# little
+# that every disk offer is a miss, which reads as "configured" while being the most
+# broken
+# state the module can be in; above the ceiling the scheduler process is being asked to
+# hold hundreds of megabytes of map. Either is CLAMPED WITH A REASON, never trusted.
+INDEX_ENTRIES_FLOOR = 1_024         # IDENTITIES: the smallest cap honoured
+INDEX_ENTRIES_CEILING = 4_194_304   # IDENTITIES: ~1.4 GB at the measured 342 B/entry
+# THE PRESENCE SCAN, bounded. When the cap drops an entry the one question worth
+# asking is
+# whether the FILE is still on the store - that is what makes a drop a missed restore
+# instead of bookkeeping. The answer needs a directory listing, and a cap-drop burst is
+# exactly the moment thousands of identities would like one (the 0.2-28 drain dropped
+# 800
+# in a single refresh), so one refresh lists at most this many shard directories and
+# holds
+# at most `PRESENCE_SCAN_MAX_ENTRIES` names per listing. Everything the budget did not
+# reach is counted UNVERIFIED, because "did not look" is a fact and "absent" would be a
+# guess in the comfortable direction.
+PRESENCE_SCAN_MAX_SHARDS_PER_REFRESH = 4
+PRESENCE_SCAN_MAX_ENTRIES = 200_000   # NAMES one shard listing may hold
+# BYTES one index entry costs, MEASURED in this repo (a 20,000-entry index holding a
+# real
+# 72-hex identity and a real entry dict: 6,835,398 bytes, so 342 an entry). Published so
+# the cap can be chosen from arithmetic instead of hope, and so `bytes_at_cap` in
+# `entry_cap()` means what it says.
+ENTRY_BYTES_MEASURED = 342
 MAX_JOURNAL_BYTES = 32 * 1024 * 1024  # BYTES one rank's journal may reach
 MAX_JOURNAL_FILES = 64              # journal FILES one refresh will open
 MAX_LINES_PER_REFRESH = 8_192       # LINES applied per refresh (bounded work)
@@ -266,7 +311,7 @@ DROP_REASONS = ("malformed_line", "bad_op", "bad_key", "bad_size", "bad_seq",
                 "read_cap", "stopped")
 
 _state: dict = {
-    "entries": {},                    # identity -> entry dict (insertion ordered)
+    "entries": OrderedDict(),       # identity -> entry dict, ORDERED BY LAST TOUCH
     # identity -> {rank -> {bytes, journal, seq, seen_ts}}. `entries` is what the OFFER
     # path asks (one claim per identity, the last journal applied wins); this is the
     # SAME replay seen per rank, the only way to answer "is the whole span there, or
@@ -291,6 +336,26 @@ _state: dict = {
     "bytes_read": 0,
     "unread_journals": {},
     "entries_dropped": 0,
+    # WHICH DROPS COST A FILE (0.2.45). `entries_dropped` says the cap evicted an entry;
+    # these three say whether the file it described was still on the store, and they
+    # BALANCE the total so a reader can tell a verified answer from an unverified one.
+    # `_file_present` is the number that matters: a whole span on disk that the
+    # index has
+    # stopped offering. `_file_absent` is not a loss at all - the file was reclaimed and
+    # the entry was the last memory of it. `_unverified` is the scan budget being
+    # spent, or
+    # no store root this process can see, and is deliberately never folded into either.
+    "entries_dropped_file_present": 0,
+    "entries_dropped_file_absent": 0,
+    "entries_dropped_unverified": 0,
+    # THE LRU CLOCK'S OWN LEDGER (0.2.45): how many touches moved an entry to the
+    # back of
+    # the queue, and how many shard listings the presence scan performed. Without
+    # `entries_touched` a reader cannot tell a working LRU from a no-op.
+    "entries_touched": 0,
+    "restores_noted": 0,
+    "presence_scans": 0,
+    "presence_scan_skipped": 0,
     # THE ENTRY CAP'S OWN TRUTH: set the first time the cap drops an entry, and
     # published so no payload can present a capped index as a caught-up one.
     "entry_cap_hit": False,
@@ -355,13 +420,16 @@ def reset_state_for_tests() -> None:
     needs; there is no thread and no open descriptor to stop.
     """
     _state.update({
-        "entries": {}, "rank_lines": {}, "rank_records": 0,
+        "entries": OrderedDict(), "rank_lines": {}, "rank_records": 0,
         "rank_records_dropped": 0, "membership_checks": 0,
         "cursors": {}, "seq": {}, "stopped": {},
         "applied": 0, "spills": 0, "removals": 0, "misses": 0, "hits": 0,
         "boot_drained": False, "converged": False, "bytes_read": 0,
         "unread_journals": {},
         "entries_dropped": 0, "entry_cap_hit": False,
+        "entries_dropped_file_present": 0, "entries_dropped_file_absent": 0,
+        "entries_dropped_unverified": 0, "entries_touched": 0,
+        "restores_noted": 0, "presence_scans": 0, "presence_scan_skipped": 0,
         "dropped": {reason: 0 for reason in DROP_REASONS},
         "journal_writes": 0, "journal_write_errors": 0,
         "journal_last_error": None, "journal_dir": None,
@@ -377,6 +445,9 @@ def reset_state_for_tests() -> None:
         "journal_fs": None, "journal_on_tmpfs": None,
         "journal_tmpfs_warnings": 0, "journal_fs_directory": None,
     })
+    _presence["refresh"] = 0
+    _presence["listings"] = {}
+    _presence["budget"] = PRESENCE_SCAN_MAX_SHARDS_PER_REFRESH
     _notices.clear()
 
 
@@ -1123,6 +1194,11 @@ def refresh(*, force: bool = False) -> dict:
             return out
         _state["refreshes"] += 1
         _state["last_refresh_mono"] = now
+        # A NEW SCAN BUDGET for this refresh, and no listing carried forward:
+        # the presence
+        # question is "is the file there NOW", and a cap-drop burst in one refresh must
+        # not pay for listings another refresh would have needed.
+        _begin_presence_refresh()
         names = _journal_names(directory)
         if not names:
             out["reason"] = ("no spill journal file exists in the diagnostics "
@@ -1556,35 +1632,304 @@ def _stop(path, reason, kind):
     return
 
 
+# --- the cap, the LRU clock, and what a drop actually costed -----------------
+
+def entry_cap() -> dict:
+    """THE CAP THIS INDEX IS HONOURING, and why it is that number.
+
+    `config.disk_index_env()` parses; this decides. The three sources a reader can get,
+    and the one thing each is telling them:
+
+      * `env`      - the operator set `VLLM_E2_TIER_DISK_INDEX_ENTRIES` and it was
+      usable.
+      * `default`  - the operator said nothing, or said something unusable (the
+      problem is
+                     reported by `config.disk_index_env()`, and the
+                     shipped cap stands - a
+                     typo must never leave an index that remembers three entries).
+      * clamped    - a usable number outside [floor, ceiling], with the `reason`
+      naming the
+                     bound that bit. Clamped rather than honoured,
+                     because the two ways to
+                     get this wrong are "the index forgets nearly everything" and "the
+                     scheduler process ate the box", and neither is what was asked for.
+
+    THE MEMORY, so the number can be chosen rather than guessed: ~342 bytes an entry as
+    measured above, so a cap is `cap x 342 B` of map at the MOST, reached only if the
+    journals actually name that many identities.
+
+    `MAX_INDEX_ENTRIES` is read at CALL time, not bound at import, which is what lets a
+    test lower the cap by setting the module attribute - and what means an
+    operator's env
+    value needs no restart of the module to take effect on the next admission.
+    """
+    parsed = config.disk_index_env()
+    wanted = parsed["entries"]
+    shipped = MAX_INDEX_ENTRIES
+    if wanted is None:
+        return {"value": int(shipped), "source": "default", "clamped": False,
+                "reason": None, "floor": INDEX_ENTRIES_FLOOR,
+                "ceiling": INDEX_ENTRIES_CEILING,
+                "problems": list(parsed["problems"]),
+                "bytes_at_cap": int(shipped) * ENTRY_BYTES_MEASURED}
+    clamped = wanted
+    reason = None
+    if wanted < INDEX_ENTRIES_FLOOR:
+        clamped = INDEX_ENTRIES_FLOOR
+        reason = (f"{config.ENV_DISK_INDEX_ENTRIES}={wanted} is below the "
+                  f"{INDEX_ENTRIES_FLOOR}-entry floor and was raised to it: an index "
+                  "that small answers `not_present` for nearly the whole store, which "
+                  "reads as configured while refusing every disk offer")
+    elif wanted > INDEX_ENTRIES_CEILING:
+        clamped = INDEX_ENTRIES_CEILING
+        reason = (f"{config.ENV_DISK_INDEX_ENTRIES}={wanted} is above the "
+                  f"{INDEX_ENTRIES_CEILING}-entry ceiling and was lowered to it: at "
+                  f"~{ENTRY_BYTES_MEASURED} bytes an entry: that is the bound on the "
+                  "map this process is asked to hold")
+    return {"value": int(clamped),
+            "source": "env" if reason is None else "env_clamped",
+            "clamped": reason is not None, "reason": reason,
+            "floor": INDEX_ENTRIES_FLOOR, "ceiling": INDEX_ENTRIES_CEILING,
+            "requested": int(wanted), "problems": [],
+            "bytes_at_cap": int(clamped) * ENTRY_BYTES_MEASURED}
+
+
+def _touch(identity) -> bool:
+    """Move one entry to the BACK of the eviction queue. A touch, not an admission.
+
+    WHY `OrderedDict.move_to_end` AND NOT pop-then-set. This is called from a reader
+    thread (through `note_restored_path`, from `disk_read.promote_recency`) while the
+    scheduler thread may be applying a journal's `-` line for the SAME identity. A
+    pop and
+    re-insert can therefore RESURRECT an entry the journal just removed - a ghost the
+    offer path would offer for a file that is gone, which is the corruption
+    direction, not
+    the waste direction. `move_to_end` relinks without ever dropping the key from the
+    mapping, so a concurrent removal wins and a touch on a vanished entry raises
+    `KeyError`, which is caught here and costs nothing.
+
+    Returns whether a move happened. A touch for an identity this index does not hold is
+    NOT an admission: the cap bounds memory, and a clock that grew the dict would be a
+    leak with a nice name.
+    """
+    entries = _state["entries"]
+    try:
+        entries.move_to_end(identity)
+    except (KeyError, AttributeError):
+        return False
+    _state["entries_touched"] = int(_state["entries_touched"]) + 1
+    return True
+
+
+def note_restored_path(path) -> dict:
+    """A file at `path` produced usable bytes: touch the index entry that names it.
+
+    WHY THE FILE PATH IS ENOUGH. A committed slot name carries the whole identity -
+    `kvslot-<key16>-g<group>-<geodigest12>.bin` - so the index's own key is recoverable
+    from the name the reader already holds, with one parse and no I/O. That is what lets
+    the read-side touch hang off the SINGLE place the tier admits a file was used
+    (`disk_read.promote_recency`, called for a read that produced bytes and for no
+    failed
+    read), instead of inventing a second, drift-prone notion of "recently restored".
+
+    THE POINT IS SYMMETRY: the file's clock is `st_mtime` bumped at that same call,
+    so if
+    the index were left on insertion order the two clocks would mean different
+    things and
+    the tier would evict a span's MAP while keeping the span - the exact inversion this
+    module exists to remove.
+    """
+    out = {"promoted": False, "key16": None, "group_id": None, "reason": None}
+    try:
+        parsed = disk_layout.parse_path(path)
+        if not parsed["ok"]:
+            out["reason"] = str(parsed["reason"])
+            return out
+        key16, group = parsed.get("key16"), parsed.get("group_id")
+        if not isinstance(key16, str) or not _is_plain_int(group):
+            out["reason"] = ("the name carries no complete identity, so no index entry "
+                             "can be moved by it")
+            return out
+        out["key16"], out["group_id"] = key16, int(group)
+        identity = identity_of(key16, int(group))
+        if identity not in _state["entries"]:
+            # The common case for a span this rank restored from a file the index never
+            # held (a boot that started after the spill). Not an admission - see _touch.
+            out["reason"] = ("this index holds no entry for this identity: a touch "
+                             "never admits, because the cap is what bounds memory")
+            return out
+        out["promoted"] = _touch(identity)
+        _state["restores_noted"] = int(_state["restores_noted"]) + 1
+        return out
+    except Exception as exc:  # noqa: BLE001 - a touch is never worth a step fault
+        _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
+        snapshot._error(exc, "disk_index note_restored_path")
+        out["reason"] = f"the touch raised {type(exc).__name__}"
+        return out
+
+
+# --- the presence scan: did a dropped entry still have a file? ---------------
+
+# ONE per process, reset at the top of every refresh: the listings this refresh paid
+# for, and how much of its shard budget is left. Not module state that ages - a scan
+# budget that carries over between refreshes would starve a later burst for no reason.
+_presence: dict = {"refresh": 0, "listings": {}, "budget": 0}
+
+
+def _store_root_for_presence():
+    """The store root to ask about files, or None. Vetted, never created."""
+    raw = os.environ.get(config.ENV_DISK_ROOT, "").strip()
+    if not raw:
+        return None
+    checked = disk_layout.validate_root(raw)
+    return checked["value"] if checked["ok"] else None
+
+
+def _slot_names_in(directory, budget: int) -> set | None:
+    """The identities ONE shard directory names, or None if it could not be listed.
+
+    Bounded by `budget` entries and never recursive. The names are reduced to the
+    index's own identity spelling with string slicing on the fixed shape
+    `kvslot-<key16>-g<group>-<digest>.bin`, because calling `parse_path` on up to
+    `PRESENCE_SCAN_MAX_ENTRIES` names is a per-name parse on the refresh path.
+    """
+    out: set = set()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if len(out) >= budget:
+                    break
+                name = entry.name
+                if not name.startswith(disk_layout.SLOT_FILE_PREFIX) \
+                        or not name.endswith(disk_layout.SUFFIX_DATA):
+                    continue
+                body = name[len(disk_layout.SLOT_FILE_PREFIX):
+                            -len(disk_layout.SUFFIX_DATA)]
+                fields = body.split("-")
+                if len(fields) != 3:
+                    continue
+                key16, group_text = fields[0], fields[1]
+                if not group_text.startswith(disk_layout.GROUP_FIELD_PREFIX):
+                    continue
+                try:
+                    group = int(group_text[len(disk_layout.GROUP_FIELD_PREFIX):])
+                except ValueError:
+                    continue
+                if len(key16) != disk_layout.KEY_DIGEST_CHARS:
+                    continue
+                out.add(f"{key16}{IDENTITY_SEP}{GROUP_PREFIX}{group}")
+    except OSError:
+        return None
+    return out
+
+
+def _classify_drop(identity) -> str:
+    """Was the file one dropped entry described still on the store? Bounded, once.
+
+    `present` / `absent` only from an ACTUAL listing; anything else is `unverified`,
+    which is its own counter and never a stand-in for either. Called from the cap-drop
+    loop, so the whole cost of a 800-drop burst is at most
+    `PRESENCE_SCAN_MAX_SHARDS_PER_REFRESH` listings of shards that burst touched.
+    """
+    fields = str(identity or "").split(IDENTITY_SEP)
+    key16 = fields[0]
+    shard = key16[:disk_layout.SHARD_CHARS]
+    if len(key16) != disk_layout.KEY_DIGEST_CHARS:
+        return "unverified"
+    root = _store_root_for_presence()
+    if root is None:
+        _state["presence_scan_skipped"] = int(_state["presence_scan_skipped"]) + 1
+        return "unverified"
+    listings = _presence["listings"]
+    if shard in listings:
+        found = listings[shard]
+        if found is None:
+            return "unverified"
+        return "present" if identity in found else "absent"
+    if _presence["budget"] <= 0:
+        _state["presence_scan_skipped"] = int(_state["presence_scan_skipped"]) + 1
+        return "unverified"
+    _presence["budget"] -= 1
+    _state["presence_scans"] = int(_state["presence_scans"]) + 1
+    found = _slot_names_in(os.path.join(root, shard), PRESENCE_SCAN_MAX_ENTRIES)
+    listings[shard] = found
+    if found is None:
+        return "unverified"
+    return "present" if identity in found else "absent"
+
+
+def _begin_presence_refresh() -> None:
+    """A fresh scan budget for a fresh refresh. Never carries a listing forward.
+
+    A listing is deliberately NOT reused across refreshes: the whole question is whether
+    a file is on the store NOW, and a cache would answer that with last refresh's truth.
+    """
+    _presence["refresh"] = int(_state["refreshes"])
+    _presence["listings"] = {}
+    _presence["budget"] = PRESENCE_SCAN_MAX_SHARDS_PER_REFRESH
+
+
 def _insert(identity, size, path, group_id=None) -> None:
-    """Add or refresh one entry, honouring the hard cap. Keyed by IDENTITY."""
+    """Add or refresh one entry, honouring the cap. Keyed by IDENTITY, ordered by TOUCH.
+
+    THE ORDER IS THE POINT (0.2.45). The queue is ordered by LAST TOUCH, so the
+    entry the
+    cap evicts is the one nobody wrote or read for the longest time. It used to be
+    `next(iter(entries))` of an INSERTION-ordered dict, which evicts the entry this rank
+    has restored most often - the exact inverse of the file-side LRU, which ranks by the
+    `st_mtime` that `disk_read.promote_recency` bumps on a read. A refresh of an
+    existing
+    identity is therefore a touch too: the journal just said it wrote that key again.
+    """
     entries = _state["entries"]
     existing = entries.get(identity)
     if existing is not None:
         existing["bytes"] = int(size)
         existing["journal"] = path
         existing["seen_ts"] = round(time.time(), 6)
+        # A RE-SPILL IS A WRITE, so it is a touch: without this the LRU would only ever
+        # move for readers, and a rank that only writes would have an insertion-ordered
+        # index wearing an LRU's name.
+        _touch(identity)
         return
-    while len(entries) >= MAX_INDEX_ENTRIES:
+    cap = entry_cap()["value"]
+    while len(entries) >= cap:
         oldest = next(iter(entries))
         dropped = entries.pop(oldest)
         _drop_identity_ranks(oldest)
-        _state["entries_dropped"] += 1
+        _state["entries_dropped"] = int(_state["entries_dropped"]) + 1
+        # WHAT THE DROP COST. `entries_dropped` alone could not tell "the file was
+        # reclaimed long ago" from "this span is on the RAID right now and the index has
+        # stopped offering it", and those are different incidents - one is bookkeeping,
+        # the other is capacity burned on a span the tier refuses to read.
+        verdict = _classify_drop(oldest)
+        if verdict == "present":
+            _state["entries_dropped_file_present"] = int(
+                _state["entries_dropped_file_present"]) + 1
+        elif verdict == "absent":
+            _state["entries_dropped_file_absent"] = int(
+                _state["entries_dropped_file_absent"]) + 1
+        else:
+            _state["entries_dropped_unverified"] = int(
+                _state["entries_dropped_unverified"]) + 1
         _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
                                       - int(dropped["bytes"]))
-        _state["last_reason"] = (f"the index is at its {MAX_INDEX_ENTRIES}-entry "
+        _state["last_reason"] = (f"the index is at its {cap}-entry "
                                  f"cap: {oldest} was dropped to admit a newer "
                                  "identity (a dropped entry is a missed restore)")
         if notice_once(
                 "index-entry-cap",
-                f"the disk index reached its {MAX_INDEX_ENTRIES}-identity cap and "
-                f"is DROPPING THE OLDEST entries to admit newer ones "
-                f"(entries_dropped: {int(_state['entries_dropped'])}). A converged "
-                "drain over a big store can live at this cap: every dropped "
-                "identity is one the offer path will answer `not_present` for "
-                "although the file is on disk - a missed restore, never a wrong "
-                "one, but NOT a caught-up index either. The section publishes "
-                "`entry_cap_hit: true` beside the count."):
+                f"the disk index reached its {cap}-identity cap and is DROPPING THE "
+                f"LEAST-RECENTLY-TOUCHED entries to admit newer ones "
+                f"(entries_dropped: {int(_state['entries_dropped'])}, of which "
+                f"{int(_state['entries_dropped_file_present'])} name a file that is "
+                "STILL ON THE STORE - a missed restore each). Raise "
+                f"{config.ENV_DISK_INDEX_ENTRIES} (now: "
+                f"{entry_cap()['source']}); a converged drain over a big store can "
+                "live at this cap. The section publishes `entry_cap_hit: true`, "
+                "`entries_dropped_file_present` and "
+                "`entries_dropped_unverified` beside the count, the last of those "
+                "being the drops the bounded presence scan could not check."):
             _state["entry_cap_hit"] = True
     entries[identity] = {"bytes": int(size), "journal": path,
                          "group": (int(group_id) if _is_plain_int(group_id)
@@ -1609,7 +1954,8 @@ def lookup(key) -> dict:
             return _fail(f"the index cannot look this up: {split['reason']}",
                          present=False, key16=None, group_id=None)
         key16, group = split["key16"], split["group_id"]
-        entry = _state["entries"].get(identity_of(key16, group))
+        identity = identity_of(key16, group)
+        entry = _state["entries"].get(identity)
         if entry is None:
             _state["misses"] += 1
             return _ok(present=False, key16=key16, group_id=group, bytes=0,
@@ -1617,6 +1963,17 @@ def lookup(key) -> dict:
                        reason="this boot's journal does not name a file for "
                               "this key and group")
         _state["hits"] += 1
+        # THE READ-SIDE TOUCH, for the caller that counts a hit. `lookup()` is
+        # the accessor
+        # that answers "may I restore this?" and moves the witness's ledger,
+        # so it is the
+        # one index entry point whose probe means "this identity is in use"; the
+        # non-ledger probes (`contains`, `entry_bytes`, `entry_for`, `membership`) stay
+        # side-effect-free on purpose, because their whole contract is that they do not
+        # move a counter - and an offer loop probes several groups per span,
+        # so promoting
+        # there would move the clock on identities that were never offered.
+        _touch(identity)
         return _ok(present=True, key16=key16, group_id=group,
                    bytes=int(entry["bytes"]),
                    rank=_rank_of(entry.get("journal")), reason=None)
@@ -1898,7 +2255,7 @@ def remove(key) -> dict:
 def forget_all(reason: str | None = None) -> dict:
     """Empty the index. The honest answer to 'I can no longer trust this'."""
     count = len(_state["entries"])
-    _state["entries"] = {}
+    _state["entries"] = OrderedDict()
     _state["rank_lines"] = {}
     _state["rank_records"] = 0
     _state["bytes_indexed"] = 0
@@ -1913,9 +2270,35 @@ def section() -> dict:
     # ONE read of the journal directory's filesystem + writability, reused by the
     # fields below and by `journal_fs`, so a payload cannot contradict itself.
     fs = journal_fs_state()
+    cap = entry_cap()
     return {
         "entries": int(len(_state["entries"])),
-        "entry_cap": MAX_INDEX_ENTRIES,
+        # THE CAP IN FORCE, plus where it came from: `default`, `env`, or `env_clamped`
+        # (with `entry_cap_reason`). An operator raising it needs to see that the raise
+        # landed, and a reader needs to know the number was not silently clamped.
+        "entry_cap": cap["value"],
+        "entry_cap_source": cap["source"],
+        "entry_cap_at_bytes": cap["bytes_at_cap"],
+        "entry_cap_reason": cap["reason"],
+        # THE LRU CLOCK (0.2.45): touches move an entry to the back of the
+        # eviction queue.
+        # A cap drop evicts the least-recently-TOUCHED entry, where a touch is
+        # a spill line
+        # that re-names an identity or a restore that produced bytes (the SAME
+        # event that
+        # bumps the file's `st_mtime`). `entries_touched: 0` with a non-zero
+        # `entries_dropped` would mean the clock never moved.
+        "entries_touched": int(_state["entries_touched"]),
+        "restores_noted": int(_state["restores_noted"]),
+        # WHAT THE DROPS COST, balancing `entries_dropped` exactly. See the
+        # counters block.
+        "entries_dropped_file_present": int(
+            _state["entries_dropped_file_present"]),
+        "entries_dropped_file_absent": int(
+            _state["entries_dropped_file_absent"]),
+        "entries_dropped_unverified": int(_state["entries_dropped_unverified"]),
+        "presence_scans": int(_state["presence_scans"]),
+        "presence_scan_skipped": int(_state["presence_scan_skipped"]),
         # THE PER-RANK VIEW `op=contains` answers from: how many (identity, rank) pairs
         # are held, and how many a cap refused to remember. A dropped pair is a span
         # that reads as fewer ranks than it has - never a false presence, always a
@@ -1986,6 +2369,29 @@ def section() -> dict:
         "last_reason": _state["last_reason"],
         "last_error": _state["last_error"],
         "units": {"entries": "identities", "entry_cap": "identities",
+                  "entry_cap_at_bytes": "bytes the map costs AT the cap (~342 B an "
+                                        "entry, measured; the dict only grows to what "
+                                        "the journals name)",
+                  "entry_cap_source": "default | env | env_clamped: who decided "
+                                      "the cap",
+                  "entries_touched": "touches that moved an entry to the back of the "
+                                     "eviction queue (the LRU clock: a write or a "
+                                     "restore)",
+                  "restores_noted": "restores this index was told produced bytes",
+                  "entries_dropped_file_present": "of the drops: the ones whose file "
+                                                  "is STILL on the store: capacity "
+                                                  "spent on spans the index will not "
+                                                  "offer",
+                  "entries_dropped_file_absent": "of the drops: the ones whose file "
+                                                 "was already reclaimed: bookkeeping, "
+                                                 "not a loss",
+                  "entries_dropped_unverified": "of the drops: the ones the bounded "
+                                                "presence scan did not check (no store "
+                                                "root, or the per-refresh shard budget "
+                                                "was spent)",
+                  "presence_scans": "shard directory listings this index performed to "
+                                    "answer the two above (bounded per refresh)",
+                  "presence_scan_skipped": "drops answered without a listing",
                   "rank_records": "(identity, rank) pairs: one parked span is one "
                                   "file PER RANK, so an identity is backed by as many "
                                   "records as it has ranks",
@@ -1994,7 +2400,10 @@ def section() -> dict:
                                           "has (never a false presence)",
                   "rank_cap_per_identity": "ranks remembered per identity",
                   "membership_checks": "answers `op=contains` has given here",
-                  "entries_dropped": "identities", "bytes_indexed": "bytes",
+                  "entries_dropped": "identities: the ones the entry cap evicted (a "
+                                     "missed restore); balanced by the three "
+                                     "entries_dropped_file_* / _unverified keys",
+                  "bytes_indexed": "bytes",
                   "journals_tracked": "files", "journal_writes": "lines",
                   "journal_lines": "lines", "journal_write_errors": "writes",
                   "journal_directory_attempts": "attempts",

@@ -429,14 +429,26 @@ def test_queue_depth_cap_is_unchanged_and_still_bounds_the_queue(monkeypatch,
     monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "4")
     gate = _Gated(block=True)
     monkeypatch.setattr(disk_read, "_read_file", gate)
-    paths = paths_for(tmp_path, disk_read.MAX_QUEUE_DEPTH + 4)
+    # THE ISSUE COUNT IS CAP + ONE JOB PER READER + A SURPLUS, AND THE SURPLUS IS NOT
+    # COSMETIC. `MAX_QUEUE_DEPTH` counts jobs QUEUED-OR-IN-FLIGHT, and a reader that has
+    # pulled a job out and parked on the gate keeps that job while freeing its queue
+    # slot. So the true capacity under N readers is CAP + N, and issuing exactly CAP + 4
+    # asked for a refusal on the boundary: on a run where the readers woke before the
+    # loop finished, all 260 were accepted - correctly, by the documented contract - and
+    # the assertion failed on a healthy engine. Asking for more than CAP + N makes the
+    # refusal a consequence of the cap rather than a race with thread startup.
+    readers = 4
+    paths = paths_for(tmp_path, disk_read.MAX_QUEUE_DEPTH + readers + 8)
     assert disk_read.begin_batch("deep", len(paths))["ok"] is True
     accepted, refused = issue("deep", paths)
     assert refused, "the queue let an unbounded pile in"
     assert {item["reason_kind"] for item in refused} == {"queue_full"}
     # What may sit between "issued" and "read" is the queue PLUS one job per reader,
     # and nothing else: the bound holds with four readers exactly as it did with one.
-    assert len(accepted) <= disk_read.MAX_QUEUE_DEPTH + 4
+    assert len(accepted) <= disk_read.MAX_QUEUE_DEPTH + readers
+    assert len(refused) >= 8, (
+        "the surplus past CAP + readers must ALL be refused: fewer means the bound "
+        "moved")
     assert disk_read.counters()["queue_depth_peak"] <= disk_read.MAX_QUEUE_DEPTH
     gate.hold.set()
     disk_read.cancel_batch("deep", "test teardown")

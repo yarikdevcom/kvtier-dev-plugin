@@ -633,7 +633,7 @@ def test_a_removal_under_a_known_peers_digest_is_counted_and_said(tier, channel,
     sibling_b = make_file(root, PEER_GEO, 123, when=now - 2.0, group=5)
     real = disk_spill._attribute_walk_bytes
 
-    def handing_peers_back(walk, peers):
+    def handing_peers_back(walk, peers, peers_known=True):
         """What a caller that COUNTS and OFFERS a known peer's bytes looks like.
 
         Both halves move together, because a peer file this rank neither counts nor
@@ -641,7 +641,7 @@ def test_a_removal_under_a_known_peers_digest_is_counted_and_said(tier, channel,
         share), and the point of this test is what the tier owes the reader when a
         sibling's file DOES get deleted.
         """
-        attribution = real(walk, peers)
+        attribution = real(walk, peers, peers_known)
         own_digest = disk_spill._state["geometry_digest"]
         peer_rows = [row for row in (walk.get("entries") or [])
                      if isinstance(row, dict)

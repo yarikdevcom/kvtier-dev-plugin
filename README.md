@@ -95,6 +95,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | the bounce-buffer pool's byte ceiling, PER PROCESS. **Unset = `disk_read.MAX_BUFFERS_BYTES` = 96 MiB**, today's value, which holds **8** units of 11,468,800 B (7 of the 12,902,400 B width). This is what actually bounds in-flight work: a buffer is taken at *issue* and only returned at the apply point, so **one offer needs the pool to hold the whole offer at once** - and a big-prompt offer is 10 units, so the default misses it by two. **128 MiB (134217728) is the smallest setting that holds a whole 10-unit offer on both widths.** HOST-RAM COST: the pool is per process and every engine rank is a process, so 128 MiB here is 512 MiB of resident bytes on a 4-rank boot. Clamped at 8 GiB and says so (`pool.clamped`). See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS` | **how many seconds one capacity-enforcement pass may spend (0.2.29). Unset = `disk_spill.CEILING_PASS_BUDGET_SECONDS` = 1.5 s.** The pass runs on the spill WRITER thread - the only thing draining the 256-job / 256 MiB spill queue - and before this release its worst case (100,000 directory entries read twice, 20,000 `stat`s, up to 4,096 unlinks) was bounded in files but not in TIME, so a full store could stall the queue and DROP spills at the moment the disk was fullest. When the budget expires the pass stops early and says so (`spill.ceiling_measurement.deadline_hit`, `plan_truncated`), and the next committed spill continues - a partial pass is this tier's normal shape, not an error. **`0` is refused** (a pass that does nothing reads as a configured ceiling that is not one) and a value that will not parse means the shipped default, reported in `env_problems`. See *The eviction clock is a touch clock, and nobody's neighbour is capacity*. |
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
+| `VLLM_E2_TIER_DISK_INDEX_ENTRIES` | **how many spill identities the in-memory disk index may hold (0.2.45). Unset = `disk_index.MAX_INDEX_ENTRIES` = 262,144** (about 90 MB at the measured 342 bytes per entry, and the dict only grows to the identities this rank actually indexed). Before this release the cap was a hard-coded constant, and the store outgrows it in normal operation - a 148 GiB ceiling store runs ~30,000 files per rank and the index maps each one. When the cap is reached the index now evicts **LRU-by-touch** (the identity that has not been used leaves first, not the one that was learned first) and every drop is counted by REASON: `entries_dropped_lru`, `entries_dropped_unverified`, `entries_dropped_unparsable` balance `entries_dropped`, and `entries_dropped_file_present` names the one that matters - the index forgetting a file that is still on disk. Not an on/off switch: it bounds a memory cost, so lowering it trades cache knowledge for RAM and never disables the tier. A value that will not parse, or is not above 0, means the shipped default and is reported in `env_problems`. See *Silence is not death* below. |
 | `VLLM_E2_TIER_MISS_LOG` | the miss ledger's OPTIONAL file mirror: a path to append one JSON line per tier lookup to. **Unset = no file, no `open()`, no I/O.** Env-only on purpose: an HTTP argument naming a path the engine appends to would be a write surface this plugin does not have anywhere else. Bounded by `MAX_MIRROR_BYTES` (32 MiB), where it STOPS and counts the stop (`mirror_stopped`) rather than filling a disk. |
 | `VLLM_E2_TIER_DISK_SHADOW` | **the shadow verifier (0.2.36), and it is OFF by default.** Unset (or `0`/`false`/`off`/`no`) = nothing reads a GPU block and `disk_shadow` reports `enabled: false`. `1`/`true`/`yes`/`on` = on a completed store, one block in 32 is read back off the DEVICE and compared against the bytes the spill path captured from the arena, and the disagreement is published in `rank-<rank>.json` under `disk_shadow`. It reads REAL KV bytes on the engine's step thread, so the default is off for the same reason `guard_mode` and `blockdump` opt in: a launcher must not be able to turn it on by accident, and a value that is neither an on word nor an off word is OFF *and* reported (`env_recognised: false`) - the direction a typo never overrides. The value is read ONCE at first use (a live boot's environment does not change; the `POST /disk {"op":"shadow"}` latch is the live lever, for the process that answers). It never writes a file, never changes a spill or a restore decision, and its copies are bounded to `MAX_BLOCKS_PER_STEP` per bind window. See *Does the GPU still hold what the arena spilled?*. |
 | `VLLM_E2_TIER_DISK_GPU_SHADOW_WRITES` | **the GPU-direct shadow writer (0.2.37), also OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no file is ever written by this module. `1`/`true`/`yes`/`on` = for a completed store the shadow verifier has just called `equal`, those GPU bytes are written a second time into a **separate** directory under the live store's own file name, and the two files are compared - the diff is the gate on the GPU -> NVMe route. It is never authoritative: the live store stays the only thing a restore loads, it never opens the store for writing, and a shadow root that *is* the store or is nested in it is REFUSED (`refused_root_conflict`), not merged. Everything it does runs on its own writer thread; the engine's step thread pays a `put_nowait`. The value is read once at first use; `POST /disk {"op":"gpu-shadow"}` latches only the answering process. See *Writing the block twice: the GPU-direct shadow*:. |
@@ -814,6 +815,16 @@ EngineCore-only. So a worker reports through a **file**: one per rank, into
 * **The fork's return values are untouched.** `bind_connector_metadata` counts the
   blocks this rank was handed; `get_finished` writes after the fork's own work, and
   both wrappers are contained, so a full disk cannot fail a step.
+* **It has a heartbeat (0.2.45).** The rank file is this rank's PROOF OF LIFE, and
+  `disk_restore` refuses to offer a disk restore on a file older than
+  `RANK_FILE_FRESH_SECONDS` (900 s). Writing it only from `get_finished` meant an IDLE
+  worker wrote nothing, its proof aged out, and the scheduler stopped serving from disk
+  for a worker that was perfectly alive - so the worker writer now runs its own bounded
+  daemon thread (`kvtier-worker-diag-heartbeat`, 60 s, floor
+  `HEARTBEAT_MIN_INTERVAL_SECONDS` 5 s) through the SAME write path a step uses. Started
+  at `install()`, not at the first step. Read `heartbeat_alive`,
+  `last_heartbeat_age_seconds` and `heartbeat_beats_in_window`; see
+  *An idle engine keeps its disk proof alive* below.
 * **The schema is the reader's contract**: `version` 1, a per-boot `epoch`, `ts`,
   `role: "worker"`, `rank` matching the file name (the reader calls a mismatch
   `malformed`), `arena.bytes_total`/`bytes_used`/`num_blocks` (plus
@@ -2635,6 +2646,95 @@ and a removal under a known peer's digest being counted, not buried), plus the r
 doctrine tests in `tests/test_disk_layout.py` and
 `tests/test_touch_promotion_and_peer_eviction.py`.
 
+## Silence is not death: three clocks that were reading the wrong thing (0.2.45)
+
+The operator's rule for this store is one sentence:
+
+> **LRU/quota is the only deleter; silence is not death.**
+
+Every file in the store obeys it - there is no TTL on a cached block, and the ceiling
+pass is the only thing that unlinks. Three OTHER clocks in the tier did not obey it, and
+all three cost real cache or real service on a quiet box. What they had in common: each
+one treated "I have not heard from X recently" as "X is gone". A rank that has not
+written recently is not a dead rank. An index entry nobody touched recently is not a
+file that left the disk. A worker that has taken no step recently is not a dead worker.
+
+**1. A quiet rank's bytes were the first casualty of a sibling's ceiling pass.** A rank
+that has not spilled for a while has no fresh digest in its peers' maps: the peer map
+aged its digest out at `PEER_DIGEST_FRESH_SECONDS` (120 s), the walk then found a file
+named by a digest nobody could confirm, classified it `ATTRIBUTION_DEAD` ("a config-change
+orphan"), and shed it in bucket 0 - ahead of the passing rank's OWN cold bytes. Measured
+on the unpatched tree: a quiet rank with a live worker had 3 of 3 of its files unlinked
+as dead bytes. A quiet rank is not a gone rank.
+
+The fix separates *liveness* from *geometry*, because the two questions were being
+answered by one lookup. Liveness now comes from the rank files (`rank-*.json`, which every
+live worker rewrites every 60 s) and not from the peer digest map, so a rank that is alive
+but quiet is LIVE and its current files are never `ATTRIBUTION_DEAD`. A foreign-GEOMETRY
+file stays sheddable - the `stale_geometry` path is untouched and still runs ahead of this
+rank's own cold bytes, because a file no engine on this box can read is genuinely dead
+capacity. `peers_known` is derived, fail-closed: an empty peer map claims nothing, so
+`attribute_name` refuses to call an identity dead on no evidence, while a rank that can
+see its own rank files CAN reclaim real orphans.
+
+*New, and deliberately separate so the two doctrines cannot be confused:*
+`stale_geometry_removed` counts files removed as unreadable-geometry orphans (a config
+change), `peer_files_removed_live` counts the unforgivable one - a live sibling's CURRENT
+bytes - and on the fixed tree the first moves and the second stays exactly zero.
+`identity_known` / `identity_available` / `liveness_source` in `disk.peer_eviction` name
+which evidence the pass actually had, so "why did it delete that?" is a reading.
+Tests: `tests/test_quiet_rank_bytes_are_not_dead_bytes.py`.
+
+**2. The disk index forgot bytes that were still on disk.** `disk_index` capped its
+identity map at a hard-coded count and evicted in INSERTION order, so a burst of restores
+could push out the identity of the file that was just restored (the expensive one to
+relearn) while a never-touched identity from the boot sweep stayed. The cap was also not
+configurable: the store grows past it in normal operation.
+
+Eviction is now LRU-by-**touch** (`OrderedDict.move_to_end`), a touch is recorded on the
+same event that bumps a file's `st_mtime` (`disk_read.promote_recency`), so the file clock
+and the index clock cannot drift apart, and the cap is
+`VLLM_E2_TIER_DISK_INDEX_ENTRIES` (default 262,144 - about 90 MB at the measured 342
+bytes per entry). A just-restored identity is the LAST to leave.
+
+*The counter that makes the loss honest:* `entries_dropped` is now balanced exactly by
+`entries_dropped_lru` (evicted by policy), `entries_dropped_unverified` (never checked
+against the directory) and `entries_dropped_unparsable`. Distinguishing them matters
+because only one of them means "we forgot a file that is still there":
+`entries_dropped_file_present` counts the index forgetting a live file, and
+`note_restored_path()` re-admits an identity a restore just proved exists. A drop is never
+guessed at - an entry the bounded presence scan did not check is `unverified`, not
+"absent". Tests: `tests/test_index_forgets_no_bytes_on_disk.py`.
+
+**3. An idle engine stopped serving from disk.** `disk_restore` may only offer a disk
+restore when a WORKER has attested that its restore layer is fitted (separate processes;
+offering without the proof means `start_load_kv` DMAs CPU slots nobody filled and the
+request is served from STALE KV). The attestation is the rank file and the reader refuses
+one older than `RANK_FILE_FRESH_SECONDS` (900 s). Both halves are correct. But the file
+was rewritten only by `get_finished` - an ENGINE STEP - so an idle worker's proof aged
+out and the tier closed its disk path on a healthy box, reopening only once a burst of
+steps arrived. Which is the worst possible moment: the first request after an idle spell
+is the one that wanted the disk.
+
+`worker_diag` now keeps its own proof alive from a bounded daemon thread
+(`kvtier-worker-diag-heartbeat`, `HEARTBEAT_INTERVAL_SECONDS` 60 s = fifteen beats inside
+the 900 s window, write floor 5 s), started at `install()` and NOT at the first step - the
+0.2.44 cold-start lesson, because an idle worker is precisely a worker whose step-driven
+starter never runs. The beat goes through the same `write_snapshot` a step uses, so a
+reader can never tell the two files apart. The handler is held as a WEAK reference (a
+diagnostic writer must not pin the CPU KV arena), and a beat with no handler still proves
+liveness, because the FACT the file carries is "this process is alive".
+
+What it does NOT do is weaken the gate: the window stays 900 s, so a worker that has
+genuinely gone stops being believed on time. A PROOF IS NOT DATA - nothing here keeps a
+cached byte alive, it keeps a live worker legible.
+
+*New counters:* `heartbeats`, `heartbeat_threads`, `heartbeat_respawns` (a thread that
+died and was re-armed by the next step), `heartbeat_floor_skips`, `heartbeat_errors`,
+plus `heartbeat_alive` / `last_heartbeat_age_seconds` / `heartbeat_beats_in_window` in the
+section, which answer "is this worker's proof being kept alive, and how tight is it?"
+without arithmetic. Tests: `tests/test_idle_engine_keeps_its_disk_proof_alive.py`.
+
 ## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
 
 The spill path captures a slot by reading the **arena** - the worker's
@@ -4361,6 +4461,37 @@ watchdog**, not systemd, so do not add `Restart=`. Until the restart the running
 engine still has the arena allocated - use the runtime disarm above to stop it
 scheduling right now.
 
+### The disk tier went off by itself on a quiet box (0.2.45)
+
+> **A rank file is a proof of life, and a proof of life needs a pulse.**
+
+If `gate().reason_kind` is `no_worker_proof` (or the disk path simply stopped serving
+after a quiet period) while the engine is healthy and idle, the rank files are stale, not
+absent. Since 0.2.45 each worker writer keeps its own file alive on a 60 s daemon thread,
+started at `install()` - so the question is whether that thread is running, which is a
+read:
+
+```bash
+# The worker's own answer, per rank: the file's stamp, and how many beats it has
+# written. A stamp older than 900 s with a live engine is the defect, not a fault.
+ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do
+  python3 -c "import json,sys,time; d=json.load(open(sys.argv[1])); c=d[\"counters\"]
+  print(sys.argv[1], int(time.time()-d[\"ts\"]), c.get(\"heartbeats\"),
+        c.get(\"heartbeat_errors\"), c.get(\"heartbeat_respawns\"))" "$f"
+done'
+```
+
+* `heartbeat_alive: false`, or `heartbeats` frozen while `applies_seen`/steps climb, means
+  the heartbeat is not running in that process - and `heartbeat_respawns` says whether a
+  step has re-armed it (the step-driven path re-arms a thread this process can see is gone).
+* `heartbeat_errors` climbing names a beat that raised (a filesystem, a contributor's
+  producer); the beat is contained, so the loop survives and counts it.
+* `heartbeat_beats_in_window` is the margin: the shipped 60 s inside 900 s is fifteen
+  beats, so an operator who raises the interval is one missed tick from closing the disk
+  path again, and this field is what makes that visible before it happens.
+* **Before 0.2.45 this symptom had no cause to find.** An idle worker simply wrote nothing
+  and the 900 s window elapsed. Nothing was broken; a heartbeat was missing.
+
 ### Confirm what state the engine is actually in
 
 `GET /plugins/kvtier/status` makes **no engine call** (it answers while the
@@ -4842,6 +4973,9 @@ The debugger verbs add six files:
 | `tests/test_trace_ring.py` | 36 | the ring's fixed capacity and wrap accounting, `read` never walking O(depth), the `gap_records` a slow poller gets, `clear` not resetting `seq`, arming installing and disarming removing the observers, a disarmed ring costing no allocation and no wrap, the step observer returning the fork's value untouched |
 | `tests/test_guard_mode.py` | 49 | every declined method returning the fork's documented no-op shape (and the one method that must re-raise), `BaseException` never swallowed, the metadata rebuild falling back to a re-raise if the fork renames its class, captures bounded with the full text only via the `captures` op, `guard_mode: true` in every payload, disarm restoring the originals by identity, tracing keeping the wrappers alive after a disarm, **no env var that can arm it** (the boot does, and the opt-out can only turn that off) |
 | `tests/test_worker_diag.py` | 43 | the file schema against the reader's contract (`version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters`), the rank name matching the file name, an unknown rank meaning no file at all, the cadence and the time floor, "a change writes now", the empty pool still writing zeros, atomic replace and the no-truncate rule, the size cap trimming prose before data, a full disk failing a step never, `bytes_used` as a proven floor |
+| `tests/test_quiet_rank_bytes_are_not_dead_bytes.py` | 12 | a rank that has not written for 300 s keeps its bytes while its worker is alive and publishing that digest (the defect, on a real filesystem); the peer map dropping a quiet rank's digest is not evidence of death; liveness from the RANK FILES, not the digest map; `stale_geometry` reclaim still runs and still runs ahead of this rank's own cold bytes; `stale_geometry_removed` and `peer_files_removed_live` separate the two doctrines; an empty peer map claims nothing, so no identity may be called dead on it; `identity_known`/`liveness_source` name the evidence a pass had |
+| `tests/test_index_forgets_no_bytes_on_disk.py` | 13 | eviction is LRU-by-TOUCH and not insertion order (a just-restored identity is the last to leave, and on the unpatched tree it was the first); a read that promotes a file touches the index on the throttled path too; `VLLM_E2_TIER_DISK_INDEX_ENTRIES` configures the cap and a bad value falls back and reports; `entries_dropped` balances its three reason counters exactly; `entries_dropped_file_present` counts the index forgetting a live file and never guesses at an unchecked one (`unverified`); `note_restored_path` re-admits an identity a restore proved |
+| `tests/test_idle_engine_keeps_its_disk_proof_alive.py` | 10 | install alone with ZERO engine steps produces and refreshes the rank file (the defect: only a step used to write it); `disk_restore.worker_proof` stays open across an idle spell and re-opens after a forced-stale file with no step in sight; the heartbeat starts at `install()` and never stacks a thread; it is a daemon with a findable name; the handler is held WEAKLY and a beat with no handler still writes; the write floor bounds forced beats; no `VLLM_E2_TIER_DIAG` means no thread and no file; the shipped interval fits the 900 s window with four beats to spare (pinned against the UNPATCHED default); the payload reports age and margin; a dead thread is respawned and counted |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
 

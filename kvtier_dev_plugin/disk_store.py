@@ -3540,6 +3540,20 @@ _PEER_EVICTION_FIELDS = (
     ("peer_files_removed", "peer_files_removed", 0),
     ("peer_files_removed_bytes", "peer_files_removed_bytes", 0),
     ("peer_files_removed_known_peer", "peer_files_removed_known_peer", 0),
+    # WHICH RULE PAID FOR A REMOVAL (0.2.45). `peer_files_removed` cannot tell a live
+    # sibling's bytes from the orphans a configuration change left behind, and those two
+    # read in opposite directions - one is the incident, the other is the reclaim path
+    # working. They are disjoint, so a reader can subtract.
+    ("stale_geometry_removed", "stale_geometry_removed", 0),
+    ("stale_geometry_removed_bytes", "stale_geometry_removed_bytes", 0),
+    ("stale_key_shape_removed", "stale_key_shape_removed", 0),
+    ("peer_files_removed_live", "peer_files_removed_live", 0),
+    ("peer_files_removed_live_bytes", "peer_files_removed_live_bytes", 0),
+    # THE IDENTITY VIEW: WHO THIS RANK COULD SEE when it decided.
+    ("identity_published_digests", "peer_identity_digests", 0),
+    ("identity_files_unnamed", "peer_identity_files_unnamed", 0),
+    ("identity_files_stale", "peer_identity_files_stale", 0),
+    ("identity_files_unreadable", "peer_identity_files_unreadable", 0),
     ("unattributable_entries_excluded", "unattributable_entries_excluded", 0),
     ("unattributable_entries_last_pass", "unattributable_entries_last_pass", 0),
     ("unattributable_bytes_last_pass", "unattributable_bytes_last_pass", 0),
@@ -3565,6 +3579,18 @@ def _peer_eviction_block(state) -> dict:
             raw, bool) else default
     block["plan_short"] = bool(source.get("ceiling_plan_short") or False)
     block["plan_short_bytes"] = int(source.get("ceiling_plan_short_bytes") or 0)
+    # THE THREE-STATE VERDICT, not just its consequences. `identity_known` is what
+    # licensed calling a foreign digest dead: with it false, the numbers above were
+    # produced by a rank that could NOT name every live rank, and a reader who does not
+    # know that will misread a withheld removal as a missing one.
+    # `liveness_source` names
+    # the witness that decided (`rank_files` / `write_activity`), so a box with no
+    # diagnostics directory is visible from the rank file alone.
+    block["identity_available"] = bool(source.get("peer_identity_available") or False)
+    block["identity_known"] = bool(source.get("peer_identity_known") or False)
+    source_name = source.get("peer_liveness_source")
+    block["liveness_source"] = (str(source_name)[:32]
+                                if isinstance(source_name, str) else None)
     return block
 
 

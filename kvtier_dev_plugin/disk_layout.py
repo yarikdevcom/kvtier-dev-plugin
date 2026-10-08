@@ -250,9 +250,11 @@ EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
 # THE SHED ORDER, as data (see `lru_eviction_plan`). LOWER SHEDS FIRST.
 #
 # 0 - bytes that are POSITIVELY nobody's: a digest this boot can never read AND that
-#     no live rank claims (a stale geometry, including an in-flight `.part`) or the
-#     pre-group key shape whose group is unattributable. Nobody can load them;
-#     deleting them costs nothing.
+#     no live rank CLAIMS with positive evidence (`attribute_name`'s `peers_known`: it
+#     is neither being written now by a sibling nor published as the current digest in
+#     a live rank's own rank file) - including an in-flight `.part`, or the pre-group
+#     key shape whose group is unattributable. Nobody can load them; deleting them
+#     costs nothing.
 # 1 - this boot's own committed files, oldest touch first.
 # 2 - a LIVE PEER RANK's files: readable, loadable data belonging to a sibling that
 #     shares this root. Reachable only when buckets 0 and 1 could not reach the
@@ -260,6 +262,17 @@ EVICTABLE_CLASSIFICATIONS = (NAME_STALE_GEOMETRY, NAME_STALE_KEY_SHAPE,
 #     a peer's file first meant each rank preferred its three peers' hottest spans
 #     over its own cold ones - a mutual-destruction loop, not an LRU.
 # 3 - anything this table does not name. It used to be 0, and 0 was the bug.
+#
+# WHAT BUCKET 0 STOPPED BEING (0.2.45). It used to swallow A SIBLING THAT WAS MERELY
+# QUIET: a rank that had not written for `PEER_DIGEST_FRESH_SECONDS` dropped out of the
+# learned peer map, and a digest outside a CONFIRMED map was "positively nobody's" - an
+# age rule read over somebody else's cached bytes, and the first thing every busy
+# sibling unlinked. The operator's rule removed that: "LRU/quota is the only deleter;
+# silence is not death". A quiet rank's bytes reach bucket 0 only on a positive witness
+# - either that its WORKER is gone (its rank file stopped being rewritten: a bound on a
+# PROCESS's liveness, never a lifetime over cached bytes), or that the digest is not the
+# current digest of ANY live rank at all, which is exactly what an arena-size or model
+# change leaves behind and what `stale_geometry` exists to reclaim.
 #
 # THE 0.2.34 REVISION, and why the old fail-safe direction was the wrong one. This
 # comment used to read "a classification absent from this table sheds FIRST: the
@@ -287,11 +300,15 @@ SHED_ORDER_UNKNOWN = 3
 # "could THIS BOOT read it?" and that is not the question an evictor needs. A closed
 # vocabulary, so a payload reader can enumerate it:
 #   own            - the digest is this boot's. This rank wrote it, or would write it.
-#   dead           - positively nobody's: an in-flight `.part` (never a committed
-#                    file, so never a restore), the pre-group key shape (ours by
-#                    lineage, unattributable by group, unloadable by any boot), or a
-#                    digest no live rank claims while this rank's peer map is
-#                    CONFIRMED (non-empty).
+#   dead           - positively nobody's, on EVIDENCE OF IDENTITY and never on silence:
+#                    an in-flight `.part` (never a committed file, so never a restore),
+#                    the pre-group key shape (ours by lineage, unattributable by group,
+#                    unloadable by any boot), or a digest that no live rank publishes as
+#                    its current digest and no live rank is writing - which is what an
+#                    arena-size or model change leaves behind, and the case the
+#                    `stale_geometry` classification exists to reclaim. Requires
+#                    `peers_known`: a rank that cannot see every live rank's identity
+#                    does not get to call a foreign digest nobody's.
 #   peer           - positively a known live sibling's. Shed last, never first.
 #   unattributable - a committed file under a digest that is not this boot's, seen
 #                    while NO peer digest is confirmed. It is either an old boot's
@@ -461,6 +478,23 @@ UNITS_BY_NAME = {
     "peer_files_removed_bytes": "bytes",
     "peer_files_removed_last_pass": "files",
     "peer_files_removed_known_peer": "files",
+    # WHICH RULE PAID FOR A REMOVAL (0.2.45): the configuration-change cleanup and the
+    # live-sibling incident are DIFFERENT numbers, because they read in opposite
+    # directions - one is the reclaim path working, the other is the bug.
+    "stale_geometry_removed": "files",
+    "stale_geometry_removed_bytes": "bytes",
+    "stale_geometry_removed_last_pass": "files",
+    "stale_key_shape_removed": "files",
+    "stale_key_shape_removed_bytes": "bytes",
+    "peer_files_removed_live": "files",
+    "peer_files_removed_live_bytes": "bytes",
+    # THE IDENTITY VIEW (0.2.45): the rank-file witness for "who is alive".
+    "rank_file_fresh_seconds": "seconds",
+    "identity_reads": "reads",
+    "identity_published_digests": "digests",
+    "identity_files_unnamed": "files",
+    "identity_files_stale": "files",
+    "identity_files_unreadable": "files",
     "passes_short": "passes",
     "plan_short_bytes": "bytes",
     "evict_threads_requested": "threads",
@@ -1517,25 +1551,71 @@ def classify_name(name, geometry_digest, peer_digests=(),
                filename=parsed["filename"], unlinkable=False)
 
 
+def resolve_peers_known(peer_digests, peers_known) -> bool:
+    """What the caller's `peer_digests` + `peers_known` pair ACTUALLY claims.
+
+    `peers_known` answers "does this list name EVERY live rank?", and the safe
+    reading of
+    a caller that passed NO flag is not the same for an empty list as for a full one:
+
+      * flag given (True/False) - the caller said; it is the only caller that can
+      know, so
+        it is believed. `disk_spill` always lands here, from `_peer_liveness()`.
+      * no flag, list NON-empty - the pre-0.2.45 contract: handing over a peer map HAS
+        always meant "these are the live ranks", so completeness is claimed and a digest
+        outside it is an orphan. This is what keeps the `stale_geometry` reclaim
+        path open
+        for every caller that has a map.
+      * no flag, list EMPTY - no information at all. Fail CLOSED: an empty list is the
+        shape a caller that FORGOT the argument has, and honouring it as "I am the only
+        live rank on this store" would let a careless caller delete every sibling's live
+        restore. A caller that has positively established an empty view ("the rank files
+        are readable and only I am on this box") says so with an explicit True.
+
+    So `peers_known=None` (the default everywhere) means "derive it", and a caller that
+    wants the permissive reading of an EMPTY map must ask for it by name.
+    """
+    if peers_known is not None:
+        return bool(peers_known)
+    return bool(peer_digests)
+
+
 def attribute_name(name, geometry_digest, peer_digests=(), *, classification=None,
-                   parsed=None) -> dict:
+                   parsed=None, peers_known=None) -> dict:
     """Can these bytes be POSITIVELY attributed to an owner? The evictor's question.
 
     `classify_name` answers "could this boot READ it?". An evictor needs a different
     question - "whose capacity is this, and am I ALLOWED to buy it with an unlink?" -
-    and the two come apart exactly once: a committed file under a digest that is not
-    this boot's, seen while NO peer digest is confirmed. `classify_name` must then
-    answer `stale_geometry` (it has no peer to name), and treating that as free
-    capacity is how four ranks delete each other's live restores. This function names
-    that case `unattributable` and every destructive caller refuses it.
+    and the two come apart for a committed file under a digest that is not this boot's.
+    `classify_name` must then answer `stale_geometry` (it has no peer to name), and
+    treating that as free capacity is how four ranks delete each other's live restores.
+    This function names the cases this rank may NOT delete and every destructive caller
+    refuses them.
 
-    THE GATE, in one sentence: a name is sheddable when it is POSITIVELY this boot's
-    (`own`), or POSITIVELY nobody's (`dead` - an in-flight `.part`, the pre-group key
-    shape, or a digest no live rank claims while the peer map is CONFIRMED). A name
-    that is neither, while `peer_digests` is empty, is `unattributable` and never
-    buys capacity. Once a peer map exists, a foreign digest outside it IS dead bytes
-    again - that is what a confirmed map means, and it keeps a store of old boots'
-    geometry sheddable instead of turning the ceiling into a comment.
+    THREE VERDICTS for a foreign committed digest, and the evidence each one needs:
+      * `peer` - the digest is in `peer_digests`: a live sibling is writing under it,
+        or publishes it as its current digest. Never this rank's to shed.
+      * `dead` - no live rank claims it AND `peers_known` is true. This is the case the
+        `stale_geometry` classification exists for: bytes orphaned by a configuration
+        change (an arena-size or model change moves the digest, so every pre-change file
+        becomes unservable-by-anybody and must stay reclaimable), or the leftovers of a
+        rank whose worker has been proved gone by a liveness witness. Disabling this
+        would fill the store with bytes that can never be served and never be reclaimed.
+      * `unattributable` - neither, because the caller cannot say who is alive
+        (`peers_known` false), whether its peer map is empty or only incomplete.
+        Withheld,
+        and the plan is allowed to come up SHORT: exceeding a ceiling is recoverable,
+        deleting a live sibling's prefix is not.
+
+    `peers_known` is the answer to "does this caller know who is alive?", and it is the
+    whole 0.2.45 change. It defaults to True so that a caller holding a peer map means
+    what it always meant ("these are the live ranks") and a caller holding none gets the
+    pre-0.2.30 reading; `disk_spill` is the one caller that has a real liveness view and
+    passes it explicitly. WHY IT MUST BE SEPARATE FROM AN EMPTY MAP: an empty map
+    used to
+    mean both "this box has no siblings" and "my sibling has been quiet for 120 s", and
+    reading the second as the first made a rank's live, restorable KV the cheapest
+    capacity on the box. Silence is not death.
 
     `classification` / `parsed` let a caller that already paid for the work hand it
     in: the attribution loop runs over every entry a ceiling walk statted, and a
@@ -1544,6 +1624,7 @@ def attribute_name(name, geometry_digest, peer_digests=(), *, classification=Non
     """
     peers = {str(digest).lower() for digest in (peer_digests or ())}
     unconfirmed = not peers
+    peers_known = resolve_peers_known(peer_digests, peers_known)
     info = parsed if isinstance(parsed, dict) else None
     classified = None
     if classification is None:
@@ -1573,15 +1654,46 @@ def attribute_name(name, geometry_digest, peer_digests=(), *, classification=Non
             attribution = ATTRIBUTION_DEAD
             reason = ("an in-flight .part is not a committed file, so it is "
                       "nobody's restore")
-        elif unconfirmed:
+        elif not peers_known:
+            # THE 0.2.45 CASE, and it covers BOTH shapes of blindness: a NON-empty map
+            # that may be missing a rank, and an EMPTY map, which under the old code was
+            # indistinguishable from "this box has no siblings".
+            #
+            # A live rank this caller cannot see may be exactly the rank that wrote this
+            # file, and "my witness cannot read it" is not evidence that it stopped
+            # existing. Withheld, because "not in my list" is not evidence of absence.
             attribution = ATTRIBUTION_UNATTRIBUTABLE
-            reason = ("its digest is not this boot's and no peer digest is "
-                      "confirmed, so it is either an old boot's dead bytes or a "
-                      "live sibling's restore, and the name cannot say which")
+            if unconfirmed:
+                reason = ("its digest is not this boot's, no peer digest is "
+                          "confirmed, AND this caller cannot name every live rank - so "
+                          "it is either an old boot's dead bytes or a live sibling's "
+                          "restore, and the name cannot say which")
+            else:
+                reason = ("its digest is not this boot's, and this rank cannot name "
+                          "every live rank's identity now (the peer map is "
+                          "incomplete), so a digest outside it may still be a live "
+                          "sibling's current one")
         else:
+            # Every live rank is NAMED and none of them owns this digest: not spilling
+            # under it, not publishing it in its own rank file. That is an orphan - the
+            # configuration-change case (an arena-size change moves `rank` or
+            # `total_bytes_per_block`, so every pre-change file becomes unservable by
+            # everybody) or the leftovers of a rank whose worker has been proved gone.
+            # Either way these bytes are positively nobody's, they are unservable by
+            # definition, and a tier that could not reclaim them would watch the store
+            # fill with data no boot can ever read. THIS IS THE RECLAIM PATH AND IT
+            # STAYS OPEN: `peers_known` is not a switch that disables `stale_geometry`.
+            #
+            # THE EMPTY-MAP CASE IS DELIBERATE (0.2.45). With the identity witness
+            # readable, an EMPTY peer map is a POSITIVE answer to "who owns this?":
+            # "nobody but me". It used to be read as a shrug because an empty map was
+            # also what a quiet sibling looked like - which is precisely the confusion
+            # this change removes. A single-rank box must be able to reclaim the bytes
+            # an arena-size change left behind, and `peers_known` is what licenses it.
             attribution = ATTRIBUTION_DEAD
-            reason = ("no live rank claims its digest, so this boot can never "
-                      "read it and no sibling can either")
+            reason = ("no live rank publishes or is writing its digest, so this boot "
+                      "can never read it and no sibling can either: bytes orphaned by "
+                      "a configuration change, or by a rank whose worker is gone")
     else:
         attribution = ATTRIBUTION_UNATTRIBUTABLE
         reason = ((classified or {}).get("reason")
@@ -1590,8 +1702,8 @@ def attribute_name(name, geometry_digest, peer_digests=(), *, classification=Non
     if not filename:
         filename = parse_path(name)["filename"]
     return _ok(units={}, attribution=attribution, classification=classification,
-               peers_unconfirmed=bool(unconfirmed), reason=reason,
-               filename=filename)
+               peers_unconfirmed=bool(unconfirmed), peers_known=peers_known,
+               reason=reason, filename=filename)
 
 
 # --- the sweep ---------------------------------------------------------------
@@ -1767,6 +1879,7 @@ def _empty_sweep_counts() -> dict:
 def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                       used_bytes=None, peer_digests=(),
                       target_fraction: float = 0.9,
+                      peers_known=None,
                       max_plan: int = MAX_EVICTION_PLAN) -> dict:
     """Which files to delete, oldest-touch-first, to get back under a byte ceiling.
 
@@ -1792,6 +1905,19 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     RANK's files. ``peer_digests`` is what moves a sibling's files out of the "pure
     capacity" bucket: the four ranks share one root, so an evictor that cannot name
     its siblings' digests sees their live data as foreign.
+
+    ``peers_known`` (0.2.45) is the caller's answer to "does ``peer_digests`` name every
+    live rank on this root?" (``None`` derives it - see `resolve_peers_known`). It is a
+    SEPARATE question from whether the map is empty, and conflating them is the
+    defect this
+    release removes: a rank whose sibling had not written for 120 s left a learned
+    map that
+    was non-empty but no longer complete, and a digest outside a "confirmed" map was
+    called
+    ``dead`` and shed first. Now a foreign committed digest is ``dead`` - reclaimable
+    capacity, which is what a configuration change leaves behind and what MUST stay
+    reclaimable - only when the caller can say it sees every live rank's identity;
+    otherwise it is ``unattributable`` and withheld.
 
     THE FAIL-CLOSED GATE (0.2.34). An EMPTY ``peer_digests`` now means "I cannot tell
     my peers' live restores from dead capacity", and an entry that cannot be
@@ -1836,6 +1962,10 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     if not plan_cap["ok"]:
         return _fail(str(plan_cap["reason"]))
     limit = plan_cap["value"]
+    # RESOLVE THE LIVENESS CLAIM ONCE, before anything reads it, so the plan's
+    # payload can never report a different answer than the gate applied
+    # (`resolve_peers_known`).
+    peers_known = resolve_peers_known(peer_digests, peers_known)
 
     usable: list[dict] = []
     skipped = 0
@@ -1854,7 +1984,8 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
             continue
         name = item.get("filename") or os.path.basename(path)
         attributed = attribute_name(name, geometry_digest, peer_digests,
-                                    parsed=parse_path(name))
+                                    parsed=parse_path(name),
+                                    peers_known=peers_known)
         classification = attributed["classification"] or NAME_REFUSED
         if classification not in EVICTABLE_CLASSIFICATIONS:
             skipped += 1
@@ -1894,6 +2025,7 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                   excluded_unattributable=excluded,
                   excluded_unattributable_bytes=excluded_bytes,
                   peers_unconfirmed=not bool(peer_digests),
+                  peers_known=bool(peers_known),
                   short=False, short_by_bytes=0,
                   reason=("the store is under its target, so nothing is "
                           "evictable yet"))
@@ -1957,8 +2089,8 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
         reason = (
             f"nothing is sheddable: over the {target}-byte target by "
             f"{short_by} byte(s) with {excluded} file(s) ({excluded_bytes} "
-            "byte(s)) withheld as UNATTRIBUTABLE because no peer digest is "
-            "confirmed")
+            "byte(s)) withheld as UNATTRIBUTABLE because this rank cannot name their "
+            "owner (no peer digest confirmed, or the live-peer view is incomplete)")
     elif truncated:
         reason = f"the plan cap {limit} was reached before the target was met"
     return _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
@@ -1976,6 +2108,7 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                excluded_unattributable=excluded,
                excluded_unattributable_bytes=excluded_bytes,
                peers_unconfirmed=not bool(peer_digests),
+               peers_known=bool(peers_known),
                short=short, short_by_bytes=short_by, reason=reason)
 
 
@@ -2167,7 +2300,7 @@ def _remove_quietly(path) -> None:
 
 def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
                         geometry_digest=None, peer_digests=(),
-                        for_capacity: bool = False,
+                        for_capacity: bool = False, peers_known=None,
                         max_unlinks: int = MAX_UNLINK_PLAN) -> dict:
     """Unlink the plan, re-validating EVERY entry. Destructive; dry-run by default.
 
@@ -2219,7 +2352,7 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
     bytes_freed = 0
     for path in pending:
         verdict = _validate_unlink(path, root, geometry_digest, peer_digests,
-                                   for_capacity)
+                                   for_capacity, peers_known)
         if not verdict["ok"]:
             counts["refused"] += 1
             actions.append({"path": str(path), "action": "refused",
@@ -2258,7 +2391,7 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
 
 
 def _validate_unlink(path, root, geometry_digest, peer_digests,
-                     for_capacity) -> dict:
+                     for_capacity, peers_known=None) -> dict:
     """Prove one path is a regular, non-link, ours, in-directory, deletable file."""
     if not isinstance(path, (str, os.PathLike)):
         return _fail(f"the path is not a filesystem path: {type(path).__name__}")
@@ -2301,10 +2434,11 @@ def _validate_unlink(path, root, geometry_digest, peer_digests,
             # gated: the sweep path's allowed set is `UNLINKABLE_CLASSIFICATIONS`,
             # whose doctrine is a deliberate operator request to reclaim dead bytes.
             gate = attribute_name(base, geometry_digest, peer_digests,
-                                  classification=classification, parsed=parsed)
+                                  classification=classification, parsed=parsed,
+                                  peers_known=peers_known)
             if gate["attribution"] == ATTRIBUTION_UNATTRIBUTABLE:
-                return _fail(f"{base} cannot be attributed to an owner while no "
-                             f"peer digest is confirmed: {gate['reason']}. An "
+                return _fail(f"{base} cannot be attributed to an owner: "
+                             f"{gate['reason']}. An "
                              "unattributable name never buys capacity - exceed the "
                              "ceiling instead of deleting a sibling's live restore")
     target = os.path.join(root, base)
