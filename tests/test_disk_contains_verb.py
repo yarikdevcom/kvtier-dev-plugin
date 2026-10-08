@@ -312,11 +312,22 @@ def test_one_key_rule_for_the_route_and_the_verb(fresh_index):
 # --- 4. the two views cannot drift ------------------------------------------
 
 def test_a_removal_line_drops_the_entry_and_the_ranks_together(fresh_index):
-    """One rank reporting the file unlinked drops the identity for the OFFER path today.
+    """What a peer's removal line may and may not do (0.2.46).
 
-    The per-rank view goes with it, deliberately: a table still showing four ranks next
-    to an entry the offer path cannot see would be a truer-LOOKING lie, and the verb
-    would promise a restore the scheduler will never offer.
+    WHAT CHANGED, AND WHAT DID NOT. This test used to pin a removal line dropping EVERY
+    rank's claim beside the entry, reasoning that a per-rank table still naming three
+    ranks next to an entry the offer path could not see "would be a truer-LOOKING lie".
+    That put the cart before the horse: those three ranks held READABLE FILES, and the
+    thing that was lying was the OFFER answer, not the table. One rank unlinking its own
+    slice cannot withdraw three other ranks' files - refusing them was the false-absent
+    condition measured at ~442 identities per rank on the box.
+
+    THE INVARIANT THIS TEST EXISTS FOR IS UNTOUCHED AND STILL ASSERTED: the verb and the
+    offer path cannot disagree. `present` IS the offer answer, so a span one rank cannot
+    read still answers `present: false` and `contains()` still answers False. What
+    arrives
+    with it now is the rank the span is waiting for, and the three ranks that do hold
+    files, instead of a table claiming nobody held anything.
     """
     spill()
     directory = config.diagnostics_dir()
@@ -334,15 +345,45 @@ def test_a_removal_line_drops_the_entry_and_the_ranks_together(fresh_index):
     assert refreshed["ok"], refreshed
     assert refreshed["removals"] == 1
     answer = membership()
-    assert answer["present"] is False
-    assert answer["ranks"] == []
-    assert answer["ranks_present"] == 0
+    assert answer["present"] is False, "the offer path will not see this span"
+    for field in ("offerable", "ranks_missing", "ranks_expected"):
+        assert field in answer, (
+            f"`{field}` is not published, so an answer of `present: false` cannot say "
+            "WHICH rank the span is waiting for - the difference between a rank's "
+            "ceiling pass and a prefix nobody ever spilled")
+    assert answer["offerable"] is False, answer
+    assert answer["ranks_present"] == 3, (
+        "three ranks hold readable files and the per-rank view must say so: a removal "
+        f"line retires the claim of the rank that wrote it ({answer['ranks']})")
+    assert answer["ranks_missing"] == [RANKS[0]], answer
+    assert answer["verdict"] == disk_index.VERDICT_PARTIAL_RANKS, answer
     assert disk_index.contains(KEY) is False, "both views must agree about the offer"
+    try:
+        three_only = disk_index.contains(KEY, RANKS[1:])
+    except TypeError as exc:
+        raise AssertionError(
+            "the offer predicate takes no rank set, so it cannot answer for the three "
+            f"ranks that still hold their files ({exc})") from exc
+    assert three_only is True, (
+        "asked about the three ranks that hold the files, the predicate must say yes")
 
 
 def test_a_truncated_journal_forgets_that_rank_and_only_that_rank(fresh_index):
     """The entry survives when another rank still backs it; the truncating rank's claim
-    goes, so the rank count drops rather than lying."""
+    goes, so the rank count drops rather than lying.
+
+    AND SINCE 0.2.46 THE SPAN IS NO LONGER OFFERABLE, which is the safe half of the same
+    rule rather than a weakening of it. A journal this drain can no longer read is a
+    rank
+    whose files it cannot PROVE, and a restore reads one file per rank - promising the
+    span on three peers' claims is exactly the false present that reaches the fourth
+    rank
+    as `file_missing`. The entry stays (the other ranks' files are real bytes the
+    capacity
+    view must keep pricing), the rank count drops to three (the truth), and
+    `ranks_missing`
+    names the rank whose journal went.
+    """
     paths = spill()
     victim = paths[0]
     with open(victim, "w", encoding="utf-8") as handle:
@@ -350,9 +391,14 @@ def test_a_truncated_journal_forgets_that_rank_and_only_that_rank(fresh_index):
     refreshed = disk_index.refresh(force=True)
     assert refreshed["ok"], refreshed
     answer = membership()
-    assert disk_index.contains(KEY) is True
+    assert disk_index.contains(KEY) is False, (
+        "a rank whose journal cannot be read cannot be proved to hold its file, and a "
+        "restore needs every rank's file")
+    assert answer["present"] is False and answer["offerable"] is False, answer
+    assert answer["bytes"] > 0, "the entry survives: the peers' files are real bytes"
     assert answer["ranks_present"] == 3
     assert RANKS[0] not in [row["rank"] for row in answer["ranks"]]
+    assert answer["ranks_missing"] == [RANKS[0]], answer
 
 
 def test_the_entry_cap_drops_the_rank_rows_with_the_entry(fresh_index, monkeypatch):

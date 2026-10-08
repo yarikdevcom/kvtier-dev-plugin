@@ -672,6 +672,36 @@ def four_ranks(tmp_path, monkeypatch):
         disk_restore._proof_cache.update({"mono": None, "result": None})
 
     fill(str(root), blocks=4)
+    # FOUR RANKS PROVEN, FOUR JOURNALS REQUIRED (0.2.46). `write()` below attests four
+    # serving ranks through the real rank files, and the worker proof therefore names
+    # four
+    #  serving ranks through the real rank files, and the worker proof therefore names
+    # ranks that will each have to READ their own file for a span. A parked span is one
+    # file per rank, so the per-rank presence intersection needs a journal from each of
+    # them - and a rank with no journal is a rank that spilled nothing, whose files do
+    # not
+    # exist, and an offer to it is the `file_missing` hole this release exists to stop.
+    # So the fixture mirrors the spilled identities into the other ranks' journals,
+    # which
+    #  So the fixture mirrors the spilled identities into the other ranks' journals,
+    # is exactly what a four-rank boot leaves behind: the same identities, one journal
+    # per
+    # rank, each rank's own slice named with its own geometry digest.
+    first = (diag / f"{disk_restore.disk_index.JOURNAL_PREFIX}PP0_TP0"
+             f"{disk_restore.disk_index.JOURNAL_SUFFIX}")
+    lines = first.read_text(encoding="utf-8")
+    for other in RANKS[1:]:
+        (diag / f"{disk_restore.disk_index.JOURNAL_PREFIX}{other}"
+         f"{disk_restore.disk_index.JOURNAL_SUFFIX}").write_text(lines,
+                                                                 encoding="utf-8")
+    # Drain them NOW. `fill()` already refreshed, and an ordinary refresh inside the
+    # age floor is skipped by design - so without this the four-rank world would exist
+    # on
+    # disk and not in the index, and the offer path would honestly refuse until the
+    # floor
+    # elapsed. A real boot has every rank's journal from its first refresh; this is the
+    # fixture's way of describing that boot.
+    disk_restore.disk_index.refresh(force=True)
     return write
 
 

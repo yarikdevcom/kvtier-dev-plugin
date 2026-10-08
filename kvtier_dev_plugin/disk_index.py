@@ -144,6 +144,7 @@ path.
 
 from __future__ import annotations
 
+import heapq
 import logging
 import os
 import time
@@ -280,6 +281,32 @@ GROUP_PREFIX = "g"                  # `<key16>:g<group>` is an index key
 MAX_JOURNAL_SIZE_BYTES = 1 << 40    # BYTES one line may claim (a slot is 11.5 MB)
 SEQ_TAIL_READ_BYTES = 4096          # BYTES of the journal tail read to seed a seq
 
+# PER-RANK PRESENCE (0.2.46), and the defect that earned it. A parked span is not one
+# file, it is ONE FILE PER RANK (`kvslot-<key16>-g<group>-<geodigest12>.bin`, every rank
+# naming it with its OWN geometry digest), and a restore reads them all. So "is this
+# span on disk?" is a per-rank SET, never a bool, and a removal line means "THE RANK
+# THAT WROTE THIS LINE unlinked its own file" - nothing more. HEAD's removal handler
+# retired the whole identity (`_drop_identity_ranks`) and the offer path read a single
+# global table, which lied in both directions at once: one rank's ceiling pass denied
+# every peer its still-readable files (measured on the box 2026-10-26 as ~442 identities
+# per rank, about 19.5 GB of KV no rank was allowed to read), and a peer's next `+`
+# line resurrected the identity that MY rank had just deleted - the false present that
+# reaches a worker as `file_missing` and a hole in the middle of a claimed run. Making
+# presence per-rank needed no journal format change: the rank is in the FILE NAME, and
+# the drain already knew which rank wrote a line. The removal handler was not listening.
+MAX_RANKS_EXPECTED = 64             # RANKS one presence answer is intersected over
+MAX_RANK_NAME_CHARS = 64            # CHARACTERS one rank label may carry (a verb's)
+
+# THE SAMPLED AUDIT (0.2.46). The condition this change fixes is rank-shaped and a
+# box has 262,144 identities in the table, so the live measurement is a bounded SAMPLE
+# taken every few refreshes, never a census: an exact classification per refresh would
+# share the offer path's process and its request budget. Every key it publishes is
+# named `sampled_*` for exactly that reason - it is a rate over a sample, not a count
+# of the store.
+AUDIT_SAMPLE_IDENTITIES = 64        # IDENTITIES one audit pass classifies
+AUDIT_EVERY_N_REFRESHES = 4         # REFRESHES between two audit passes
+MAX_IDENTITIES_PER_CALL = 512       # IDENTITIES one `op=identities` page may carry
+
 # THE ANSWER `membership()` gives, a closed vocabulary. The distinction that matters
 # is between "I looked and it is not there" and "I have never looked" - on
 # 2026-10-05 `entries: 0` was read as "my span is not on disk" for an afternoon when
@@ -291,11 +318,18 @@ VERDICT_NEVER_REFRESHED = "index_never_refreshed"
 VERDICT_NO_JOURNAL_DIR = "index_has_no_journal_directory"
 VERDICT_INDEX_EMPTY = "index_empty_no_spill_lines"
 VERDICT_KEY_REJECTED = "key_rejected"
+# WHAT A 3-OF-4 SPAN ANSWERS (0.2.46). `present: false` is still the OFFER answer - a
+# span one rank cannot read is not a span this boot can restore - but it arrives WITH
+# the rank it is waiting for. Before this token existed, "three ranks hold readable
+# files and one deleted its slice" and "nobody ever spilled this" printed the same
+# three words, and the first is a rank's ceiling pass while the second is a
+# configuration problem. They are different investigations and the name says so.
+VERDICT_PARTIAL_RANKS = "partial_ranks"
 VERDICT_CHECK_FAILED = "membership_check_failed"
 MEMBERSHIP_VERDICTS = (VERDICT_PRESENT, VERDICT_NOT_PRESENT, VERDICT_ENTRY_DROPPED,
                        VERDICT_NEVER_REFRESHED, VERDICT_NO_JOURNAL_DIR,
                        VERDICT_INDEX_EMPTY, VERDICT_KEY_REJECTED,
-                       VERDICT_CHECK_FAILED)
+                       VERDICT_PARTIAL_RANKS, VERDICT_CHECK_FAILED)
 """Every answer `membership()` may give. FIVE of them mean "I cannot answer", not
 "it is not there", and answer `present: null` for exactly that reason: a key that
 cannot name an identity, a journal directory this process was never pointed at, an
@@ -319,6 +353,46 @@ _state: dict = {
     "rank_lines": {},
     "rank_records": 0,                # (identity, rank) PAIRS held
     "rank_records_dropped": 0,        # pairs refused by a cap
+    # PER-RANK PRESENCE (0.2.46): the counters of the two lies this table used to tell,
+    # counted at apply time so reading them costs no scan and no `stat`.
+    #   claims_removed - a `-` line that retired the CLAIMING rank's own claim: the
+    #     whole of what a removal line has always meant, and the only one of these four
+    #     that HEAD also counted (as a whole identity).
+    #   claims_kept_past_peer_removal - (identity, rank) PAIRS that survived another
+    #     rank's removal line. THE UNIT IS THE PAIR because that is the unit the box
+    #     measured: one removal line used to withdraw several ranks' files, and this is
+    #     the ~442-per-rank false-absent, now counted instead of served.
+    #   rank_claims_unmatched - a `-` for a claim that rank did not hold (a replayed
+    #     line, an eviction never journalled as a spill). It retires nothing and must
+    #     move no byte, which is the double-debit a global entry table made easy.
+    #   inserts_incomplete_span - a `+` line whose identity is NOT held by every rank
+    #     that has to read. Ordinary during a boot drain and across divergent ceiling
+    #     passes; what matters is that this used to be the OFFER answer too, and a run
+    #     was promised across it.
+    "claims_removed": 0,
+    "claims_kept_past_peer_removal": 0,
+    "rank_claims_unmatched": 0,
+    "inserts_incomplete_span": 0,
+    # WHOSE PRESENCE AN ANSWER IS INTERSECTED OVER, and who said so. Learned from the
+    # journal FILE NAMES the drain already lists - they ARE the rank set, and they exist
+    # before any request does - and monotonic within a boot: losing a rank from the set
+    # would RELAX the intersection, which is the one direction that is not safe. The
+    # offer path overrides it with the ranks the worker proof names, because that is who
+    # will actually read; this is the fallback and the published comparison.
+    "ranks_expected": [],
+    "ranks_expected_source": None,
+    # THE SAMPLED AUDIT, so the condition has a live number that is not an operator
+    # running a verb over 262,144 identities. Bounded by AUDIT_SAMPLE_IDENTITIES per
+    # pass and AUDIT_EVERY_N_REFRESHES between passes, and it does NO I/O at all: it
+    # classifies the tables this process already holds.
+    "last_audit_at_refresh": None,
+    "sampled_runs": 0,
+    "sampled_identities": 0,
+    "sampled_partial_ranks": 0,
+    "sampled_offerable": 0,
+    "sampled_claims_without_entry": 0,
+    "sampled_refreshes_since": 0,
+    "sampled_last": None,
     "membership_checks": 0,           # `op=contains` answers given here
     "cursors": {},                    # journal path -> byte offset
     "seq": {},                        # journal path -> last applied seq
@@ -444,6 +518,13 @@ def reset_state_for_tests() -> None:
         "last_refresh_mono": None, "bytes_indexed": 0,
         "journal_fs": None, "journal_on_tmpfs": None,
         "journal_tmpfs_warnings": 0, "journal_fs_directory": None,
+        "claims_removed": 0, "claims_kept_past_peer_removal": 0,
+        "rank_claims_unmatched": 0, "inserts_incomplete_span": 0,
+        "ranks_expected": [], "ranks_expected_source": None,
+        "last_audit_at_refresh": None, "sampled_runs": 0,
+        "sampled_identities": 0, "sampled_partial_ranks": 0,
+        "sampled_offerable": 0, "sampled_claims_without_entry": 0,
+        "sampled_refreshes_since": 0, "sampled_last": None,
     })
     _presence["refresh"] = 0
     _presence["listings"] = {}
@@ -1200,6 +1281,10 @@ def refresh(*, force: bool = False) -> dict:
         # not pay for listings another refresh would have needed.
         _begin_presence_refresh()
         names = _journal_names(directory)
+        # WHOSE PRESENCE AN ANSWER IS INTERSECTED OVER (0.2.46): the journal files
+        # themselves name the ranks, and they exist before any request does. The set
+        # only grows within a boot - see `_observe_journal_ranks`.
+        _observe_journal_ranks(names)
         if not names:
             out["reason"] = ("no spill journal file exists in the diagnostics "
                              "directory: no rank has spilled anything yet")
@@ -1267,6 +1352,15 @@ def refresh(*, force: bool = False) -> dict:
         out["entries"] = int(len(_state["entries"]))
         out["applied"] = out["lines"] > 0
         out["elapsed_seconds"] = round(time.monotonic() - started, 6)
+        # THE SAMPLED AUDIT, on its cadence rather than every pass: a bounded
+        # classification of the tables this refresh just built, no I/O, so the
+        # condition has a live number that never competes with the offer path for a
+        # request's time. `sampled_*` throughout, because it is a rate over a sample.
+        _state["sampled_refreshes_since"] = int(_state["sampled_refreshes_since"]) + 1
+        if _state["sampled_refreshes_since"] >= AUDIT_EVERY_N_REFRESHES:
+            _state["sampled_refreshes_since"] = 0
+            _state["last_audit_at_refresh"] = int(_state["refreshes"])
+            audit_now()
         if out["journals"]:
             out["reason"] = None
         return out
@@ -1472,26 +1566,31 @@ def _apply_journal(path, budget, line_budget) -> dict:
 
 
 def _forget_rank(path) -> None:
-    """Drop every index entry that came from this journal."""
-    entries = _state["entries"]
-    doomed = [key for key, entry in entries.items()
-              if entry.get("journal") == path]
-    for key in doomed:
-        entries.pop(key, None)
-    _state["bytes_indexed"] = max(0, sum(int(entry["bytes"])
-                                         for entry in entries.values()))
-    # The PER-RANK view loses exactly that rank's claims - and an identity whose last
-    # remaining claim came from the truncated journal goes with it, so the two views
-    # cannot disagree about whether a rank backs an entry.
+    """Drop the claims THIS journal backs, and only the entries nothing else backs.
+
+    PER RANK, AND ONLY SINCE 0.2.46. This used to pop every entry whose last writer was
+    this journal, and when presence was a single global table that looked like the safe
+    direction. It was not: a truncated journal means THIS RANK can no longer prove its
+    files, while the peers' claims - real bytes on the store, priced in
+    `bytes_indexed` - are untouched. So the rank's rows go, and an entry goes only when
+    the LAST rank claim goes with them, which is the same rule the removal line now
+    follows in `_drop_rank_claim`.
+    """
     rank_lines = _state["rank_lines"]
+    entries = _state["entries"]
     for identity in list(rank_lines):
         rows = rank_lines[identity]
         for name in [name for name, row in rows.items()
                      if row.get("journal") == path]:
             rows.pop(name, None)
             _state["rank_records"] = max(0, int(_state["rank_records"]) - 1)
-        if not rows:
-            rank_lines.pop(identity, None)
+        if rows:
+            continue
+        rank_lines.pop(identity, None)
+        # NOTHING backs this identity any more, so the entry that priced it goes too.
+        entries.pop(identity, None)
+    _state["bytes_indexed"] = max(0, sum(int(entry["bytes"])
+                                         for entry in entries.values()))
 
 
 def _rank_label(path) -> str:
@@ -1552,6 +1651,259 @@ def rank_claims(identity) -> dict:
             _state["rank_lines"].get(identity, {}).items()}
 
 
+# --- the rank set an answer is intersected over (0.2.46) ---------------------
+
+def _expected_from_names(names) -> list:
+    """The rank labels a set of journal file names describes. Bounded, sorted.
+
+    THE RANK IS IN THE FILE NAME (`disk-spill-journal-PP0_TP0.jsonl`), which is why
+    making presence per-rank needed no change to the journal format: the drain already
+    knows which rank wrote every line, and the removal handler was not listening.
+    """
+    found = {_rank_label(name) for name in names}
+    found.discard(UNNAMED_RANK)      # a journal with no rank in its name names nobody
+    out = sorted(found)
+    if len(out) > MAX_RANKS_EXPECTED:
+        if notice_once(
+                "ranks-expected-cap",
+                f"{len(out)} journal rank labels exist and the expected-rank set "
+                f"names only {MAX_RANKS_EXPECTED}: a journal is never deleted, so a "
+                "box whose topology was renamed keeps names from the old one, and "
+                "intersecting over ranks that no longer exist withholds every span. "
+                "The set is published as `ranks_expected`, and the offer path prefers "
+                "the ranks the worker proof names - move the dead journals aside."):
+            _note(f"the expected-rank set is at its {MAX_RANKS_EXPECTED}-rank cap")
+        out = out[:MAX_RANKS_EXPECTED]
+    return out
+
+
+def _observe_journal_ranks(names) -> None:
+    """Record which ranks the journals seen this refresh belong to.
+
+    MONOTONIC ON PURPOSE: the set only ever grows within a boot. An unreadable
+    directory, or a journal that momentarily vanishes, must not RELAX the intersection,
+    because a relaxed intersection is the false present this change exists to remove -
+    losing a rank from the set is the one way to make the index promise a span a rank
+    cannot read. Only a restart, or the offer path naming the armed ranks directly,
+    decides who has to read.
+    """
+    found = _expected_from_names(names)
+    if not found:
+        return
+    merged = sorted(set(_state["ranks_expected"]) | set(found))[:MAX_RANKS_EXPECTED]
+    changed = merged != list(_state["ranks_expected"])
+    _state["ranks_expected"] = merged
+    _state["ranks_expected_source"] = "journal files"
+    if changed:
+        _note(f"the index now intersects presence over {len(merged)} rank(s) "
+              f"named by the journals: {','.join(merged)[:96]}")
+
+
+def expected_ranks() -> list:
+    """The rank labels this index intersects a presence answer over. A copy."""
+    return list(_state["ranks_expected"])
+
+
+def expected_rank_source():
+    """WHO said the expected-rank set: "journal files", or None before a first drain."""
+    return _state["ranks_expected_source"]
+
+
+def _expected_ranks(ranks=None) -> tuple:
+    """The set to intersect over for ONE answer: the caller's, else the index's.
+
+    A caller that names ranks gets EXACTLY those ranks - no union, no silent widening.
+    That is what lets the offer path ask about the ranks the boot has armed (who will
+    actually read) so a dead rank's leftover journal cannot veto the living ones, while
+    an armed rank that has spilled nothing vetoes everything.
+    """
+    if ranks is None:
+        return tuple(_state["ranks_expected"])
+    if isinstance(ranks, (str, bytes)):
+        return (str(ranks),)[:MAX_RANKS_EXPECTED]
+    try:
+        names = sorted({str(name) for name in ranks if str(name)})
+    except TypeError:
+        return ()
+    return tuple(names[:MAX_RANKS_EXPECTED])
+
+
+def _missing_ranks(identity, expected) -> list:
+    """Which of `expected` ranks hold no claim to this identity, in given order."""
+    if not expected:
+        return []
+    rows = _state["rank_lines"].get(identity)
+    if not rows:
+        return list(expected)
+    return [name for name in expected if name not in rows]
+
+
+def presence(identity, ranks=None) -> dict:
+    """The whole presence verdict for one identity, per rank. No counters, no I/O.
+
+    WHY `offerable` IS NOT `present`. A parked span is one file per rank and a restore
+    reads every one of them, so the offer predicate is an INTERSECTION over the ranks
+    that have to read: three ranks holding a block and one rank that deleted its slice
+    is not a span this boot can restore, and promising it is the `file_missing` /
+    `hole_in_middle` the box served. `ranks_missing` is the answer's other half: the
+    same `false` that reads "never spilled" and the one that reads "PP1_TP1 evicted
+    its slice" are different incidents, and only one of them is a capacity problem.
+    """
+    expected = _expected_ranks(ranks)
+    rows = _state["rank_lines"].get(identity) or {}
+    missing = _missing_ranks(identity, expected)
+    entry = _state["entries"].get(identity)
+    # With no rank set named and none learned from the journals there is nothing to
+    # intersect, so the answer degrades to the entry table's - and the published
+    # `ranks_expected: []` beside it is what says that happened.
+    offerable = (bool(rows) and not missing) if expected else (entry is not None)
+    return {"identity": identity,
+            "present": bool(offerable),
+            "ranks_expected": list(expected),
+            "ranks_expected_source": _state["ranks_expected_source"],
+            "ranks_present": sorted(rows),
+            "ranks_missing": list(missing),
+            "offerable": bool(offerable),
+            "entry": entry is not None,
+            "bytes": int(entry["bytes"]) if entry else 0}
+
+
+# WHAT A SAMPLED AUDIT CALLS ONE IDENTITY. A closed vocabulary, and `malformed` is
+# deliberately absent: this reads the index's OWN tables, not a file from elsewhere.
+AUDIT_CLASSES = ("offerable", "partial_ranks", "absent", "claims_without_entry")
+
+
+def audit_now() -> dict:
+    """A bounded, cheap classification of a SAMPLE of the tables. Runs no I/O.
+
+    WHY SAMPLED, AND WHY THE KEYS ARE NAMED FOR IT. The condition this measures (some
+    rank holds an identity and some rank that has to read does not) is rank-shaped, and
+    a box lives at hundreds of thousands of identities: classifying all of them on every
+    refresh is a second job sharing the offer path's process. So one pass looks at at
+    most AUDIT_SAMPLE_IDENTITIES identities every AUDIT_EVERY_N_REFRESHES refreshes, and
+    every key is named `sampled_*` so no reader can take a rate for a census.
+
+    It reads tables this process already holds - no store walk, no journal read, no
+    stat - so it costs a dict walk on the refresh path that already did the work.
+    """
+    expected = tuple(_state["ranks_expected"])
+    entries = _state["entries"]
+    rank_lines = _state["rank_lines"]
+    # THE LEAST-RECENTLY-TOUCHED FIRST, which is where a cap-evicted or divergent
+    # region shows up first: the entries nobody has written or read for the longest
+    # time are where two ranks' journals disagree, not the hot prefix.
+    names = list(entries.keys())[:AUDIT_SAMPLE_IDENTITIES]
+    if len(rank_lines) > len(names):
+        names += [identity for identity in list(rank_lines)[:AUDIT_SAMPLE_IDENTITIES]
+                  if identity not in entries][:AUDIT_SAMPLE_IDENTITIES]
+    names = names[:AUDIT_SAMPLE_IDENTITIES]
+    offered = partial = orphan = 0
+    for identity in names:
+        rows = rank_lines.get(identity) or {}
+        if not rows:
+            continue                       # nothing any rank claims: not a case
+        if identity not in entries:
+            orphan += 1                    # a claim with no entry: the cap, not a peer
+            continue
+        if expected and _missing_ranks(identity, expected):
+            partial += 1
+        else:
+            offered += 1
+    _state["sampled_runs"] = int(_state["sampled_runs"]) + 1
+    _state["sampled_identities"] = int(_state["sampled_identities"]) + len(names)
+    _state["sampled_partial_ranks"] = int(_state["sampled_partial_ranks"]) + partial
+    _state["sampled_offerable"] = int(_state["sampled_offerable"]) + offered
+    _state["sampled_claims_without_entry"] = (
+        int(_state["sampled_claims_without_entry"]) + orphan)
+    out = {"sampled": True,
+           "sampled_identities": len(names),
+           "sampled_offerable": offered,
+           "sampled_partial_ranks": partial,
+           "sampled_claims_without_entry": orphan,
+           "classes": AUDIT_CLASSES,
+           "of_identities": int(len(entries)),
+           "every_n_refreshes": AUDIT_EVERY_N_REFRESHES,
+           "ranks_expected": list(expected),
+           "units": {
+               "sampled_identities": "identities THIS pass looked at: a rate over a "
+                                     "bounded sample, never a census of the index",
+               "sampled_partial_ranks": "of those: some rank claims the identity and "
+                                        "some rank that has to read does not - "
+                                        "withheld, correctly, and the number to watch "
+                                        "when the ranks are expected to agree",
+               "sampled_offerable": "of those: every rank that has to read claims it, "
+                                    "so the offer path may promise it",
+               "sampled_claims_without_entry": "of those: a rank's journal claims it "
+                                               "and no entry backs it (the entry cap, "
+                                               "never a peer)"}}
+    _state["sampled_last"] = out
+    return out
+
+
+def scan_identities(after=None, limit=None, rank=None, state=None) -> dict:
+    """A bounded, paged, DIGEST-ONLY enumeration of the per-rank claims.
+
+    WHY A VERB AND NOT A LOG LINE. The claim this change rests on - a rank holds a
+    readable file the index will not attribute to it, or the index believes a rank whose
+    file is gone - is checkable against the store, and an operator checks it by diffing
+    this enumeration against `op=ls`. So it names identities and the ranks that hold
+    them and NOTHING else: no paths, no sizes as a walk, no directory listing. The
+    digest each rank named its file with is `disk_layout`'s geometry digest for that
+    rank, which is what pairs a row with an `op=ls` line.
+
+    BOUNDED THREE WAYS: at most `limit` identities, one heap walk over the identity
+    table (no sort of 262,144 keys), and a cursor so the caller pages instead of
+    asking for everything.
+    """
+    wanted = int(limit) if limit is not None else AUDIT_SAMPLE_IDENTITIES
+    wanted = max(1, min(wanted, MAX_IDENTITIES_PER_CALL))
+    only_rank = str(rank) if rank not in (None, "") else None
+    want = str(state).strip().lower() if state not in (None, "") else "all"
+    if want not in ("all", "offerable", "partial"):
+        return _fail("`which` must be one of all, offerable, partial", identities=[])
+    expected = tuple(_state["ranks_expected"])
+    after_text = str(after) if after is not None else None
+    rows = []
+    nxt = None
+    table = _state["rank_lines"]
+    try:
+        # A heap of the smallest `wanted + 1` identities past the cursor: O(N log
+        # limit) over the table, where sorting 262,144 keys would be a stall on the
+        # endpoint this is polled from.
+        candidates = heapq.nsmallest(
+            wanted + 1, (identity for identity in table
+                         if after_text is None or str(identity) > after_text))
+    except TypeError:
+        return _fail("the identity table cannot be ordered", identities=[])
+    for identity in candidates:
+        if len(rows) >= wanted:
+            nxt = str(identity)
+            break
+        rows.append({"identity": str(identity),
+                     "ranks": sorted(table.get(identity) or {}),
+                     "ranks_missing": _missing_ranks(identity, expected),
+                     "offerable": bool(presence(identity)["offerable"])})
+    if only_rank is not None:
+        rows = [row for row in rows if only_rank in row["ranks"]]
+    if want == "offerable":
+        rows = [row for row in rows if row["offerable"]]
+    elif want == "partial":
+        rows = [row for row in rows if not row["offerable"] and row["ranks"]]
+    truncated = nxt is not None or len(candidates) > wanted
+    return _ok(identities=rows, count=len(rows), limit=wanted,
+               truncated=bool(truncated), next=nxt,
+               ranks_expected=list(expected),
+               ranks_expected_source=_state["ranks_expected_source"],
+               units={"identities": "identity -> the RANKS whose journal claims it; "
+                                    "digests only, never a path: the digest each rank "
+                                    "named its file with is what pairs a row with "
+                                    "`op=ls`",
+                      "next": "the identity to pass as `after` for the next page; "
+                              "null when the walk reached the end",
+                      "truncated": "more identities exist past this page: a census is "
+                                   "this verb paged to the end, never one big call"})
+
+
 def _apply_line(text, path):
     """Apply one journal line: `<seq> <+|-> <key16> <bytes> <group>`.
 
@@ -1603,21 +1955,70 @@ def _apply_line(text, path):
     identity = identity_of(key16, group)
     if op == REMOVE_LINE:
         _state["removals"] += 1
-        gone = _state["entries"].pop(identity, None)
-        # The per-rank view goes with the entry, deliberately WITHOUT the rank's
-        # identity being the deciding fact: one rank reporting the file unlinked drops
-        # the identity for the offer path today, and a per-rank table that still
-        # claimed all four would tell a truer-looking lie than the answer the offer
-        # path is actually going to give.
-        _drop_identity_ranks(identity)
-        if gone is not None:
-            _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
-                                          - int(gone["bytes"]))
+        # PER RANK, AND ONLY PER RANK (0.2.46). The rank this line came from is the rank
+        # that unlinked a file - its OWN file, named with its OWN geometry digest. Until
+        # now the line retired the whole per-rank table and the global entry with it, so
+        # one rank's ceiling pass withdrew a span from the three ranks still holding
+        # readable files: the ~442 identities per rank measured on the box, some
+        # 19.5 GB of KV no rank was allowed to read. A removal now retires the
+        # removing rank's
+        # claim and NOTHING else; the entry, which is the bytes/cap/LRU view, survives
+        # while any rank backs it, and the OFFER answer became an intersection that
+        # names the rank which actually removed something.
+        _drop_rank_claim(identity, _rank_label(path))
         return REMOVE_LINE
     _state["spills"] += 1
     _insert(identity, size, path, group)
     _record_rank(identity, path, size, seq)
+    # THE MIRROR OF THE SAME BUG, counted here: a spill makes the ENTRY exist, and under
+    # a global presence that was the whole answer - so a peer re-spilling an identity my
+    # rank had deleted made the span offerable, and the worker was handed a read for a
+    # file it had unlinked (`file_missing`, `hole_in_middle`). This counts every spill
+    # that did NOT complete the span across every rank that has to read: ordinary during
+    # a boot drain or a divergent ceiling pass, and it used to be the offer answer too.
+    # The number is here so the rate is visible, and `sampled_partial_ranks` says
+    # whether any of it is still being withheld.
+    if _missing_ranks(identity, tuple(_state["ranks_expected"])):
+        _state["inserts_incomplete_span"] = (int(_state["inserts_incomplete_span"]) + 1)
     return SPILL_LINE
+
+
+def _drop_rank_claim(identity, rank) -> bool:
+    """Retire ONE RANK's claim to one identity. Returns whether a claim went.
+
+    The entry follows only when the LAST claim goes: `entries` is the table that prices
+    an identity and bounds the map, and while any rank still holds a file the identity
+    is real bytes on the store. Debiting `bytes_indexed` any earlier would double-count
+    against the entry's single credit in `_insert`, and a `bytes_indexed` that drifts is
+    a capacity view no operator can price against the ceiling.
+    """
+    rank_lines = _state["rank_lines"]
+    rows = rank_lines.get(identity)
+    row = rows.pop(rank, None) if rows is not None else None
+    if row is None:
+        # A `-` for a claim this rank does not hold: a replayed line, or an eviction the
+        # rank never journalled as a spill. It retires nothing, so NOTHING here moves -
+        # above all not the byte accounting, which a global entry popped twice.
+        _state["rank_claims_unmatched"] = int(_state["rank_claims_unmatched"]) + 1
+        return False
+    _state["rank_records"] = max(0, int(_state["rank_records"]) - 1)
+    _state["claims_removed"] = int(_state["claims_removed"]) + 1
+    kept = len(rows)
+    if not rows:
+        rank_lines.pop(identity, None)
+    entries = _state["entries"]
+    entry = entries.get(identity)
+    if entry is not None and not kept:
+        entries.pop(identity, None)
+        _state["bytes_indexed"] = max(0, int(_state["bytes_indexed"])
+                                      - int(entry["bytes"]))
+    if kept:
+        # THE NUMBER THIS FIX IS MEASURED BY: a peer's removal that used to take this
+        # rank's file away from the index, and no longer does. The unit is the PAIR,
+        # because that is the unit the box's ~442 was counted in.
+        _state["claims_kept_past_peer_removal"] = (
+            int(_state["claims_kept_past_peer_removal"]) + kept)
+    return True
 
 
 def _stop(path, reason, kind):
@@ -2063,26 +2464,44 @@ def entry_for(key16, group_id) -> dict:
                 "reason": f"reading the entry raised {type(exc).__name__}"}
 
 
-def contains(key) -> bool:
-    """The bare membership test the offer loop uses, without a counter move.
+def contains(key, ranks=None) -> bool:
+    """The offer predicate: does EVERY RANK THAT HAS TO READ hold this identity?
 
-    `lookup()` counts hits and misses for the witness; the offer loop probes the
-    SAME chain for several groups and must not inflate those counters, so it asks
-    this instead. It still resolves the identity through `split_block_key` - an
-    ungrouped key is not present, and answering "present" to one would hand the
-    offer loop exactly the ambiguity the identity exists to remove. Cheaper than
-    `lookup()` by the counters and the dict build, not by the parsing.
+    `lookup()` counts hits and misses for the witness; the offer loop probes the SAME
+    chain for several groups and must not inflate those counters, so it asks this
+    instead. It still resolves the identity through `split_block_key` - an ungrouped key
+    is not present, and answering "present" to one would hand the offer loop exactly the
+    ambiguity the identity exists to remove. Cheaper than `lookup()` by the counters and
+    the dict build, not by the parsing.
+
+    SINCE 0.2.46 THIS IS AN INTERSECTION, AND THAT IS THE WHOLE FIX. A parked span is
+    one file per rank and a restore reads all of them, so a single rank's absence is
+    enough to answer False: asked about `ranks` (or, when the caller names none, about
+    the ranks its own journals name), the index answers for THOSE ranks and nobody else.
+    A peer's `+` line can no longer make a span offerable for a rank that deleted its
+    slice - the false present that reached a worker as `file_missing` - and a peer's `-`
+    line can no longer deny the ranks that kept their files.
     """
     try:
         split = disk_layout.split_block_key(key)
         if not split["ok"]:
             return False
-        return identity_of(split["key16"], split["group_id"]) in _state["entries"]
+        identity = identity_of(split["key16"], split["group_id"])
+        expected = _expected_ranks(ranks)
+        rows = _state["rank_lines"].get(identity)
+        if not expected:
+            # Nobody has named a rank set: the entry table is all there is to answer
+            # with. Say so where the answer is read - the published
+            # `ranks_expected: []` is this branch.
+            return identity in _state["entries"]
+        if not rows:
+            return False
+        return not _missing_ranks(identity, expected)
     except Exception:  # noqa: BLE001 - a membership test cannot be fatal
         return False
 
 
-def membership(key) -> dict:
+def membership(key, ranks=None) -> dict:
     """The OPERATOR's answer to "is this span in the disk index?", per RANK.
 
     WHY THIS EXISTS WHEN `lookup()` AND `contains()` EXISTED. Both of those answer the
@@ -2147,7 +2566,15 @@ def membership(key) -> dict:
                 "entry_cap_hit": bool(_state["entry_cap_hit"])}
         blank = {"key16": None, "group_id": None, "identity": None, "shard": None,
                  "bytes": 0, "bytes_all_ranks": 0, "journal": None, "rank": None,
-                 "ranks": [], "ranks_present": 0, "index": view}
+                 "ranks": [], "ranks_present": 0, "ranks_missing": [],
+                 # WHO THIS ANSWER IS INTERSECTED OVER (0.2.46), beside the answer in
+                 # every branch: an intersection is only readable if the reader can see
+                 # the sets it joined. `journal files` means the index learned the rank
+                 # set from the journals it drains; the offer path asks with the ranks
+                 # the worker proof names, and passes them in.
+                 "ranks_expected": list(_expected_ranks(ranks)),
+                 "ranks_expected_source": _state["ranks_expected_source"],
+                 "offerable": False, "index": view}
         split = disk_layout.split_block_key(key)
         if not split["ok"]:
             return {**blank, "ok": False, "present": None,
@@ -2182,9 +2609,36 @@ def membership(key) -> dict:
                  "seen_ts": row["seen_ts"]}
                 for name, row in sorted(claims.items())]
         total = sum(int(row["bytes"]) for row in rows)
+        # THE INTERSECTION, spelled out beside the answer (0.2.46). `present` IS the
+        # offer answer, so a span some rank cannot read answers `false` here and the
+        # two views can never disagree; `offerable` is the same verdict by name, and
+        # `ranks_missing` is the part that ends an investigation instead of starting
+        # one - "three ranks hold it and PP1_TP1 deleted its slice" and "nobody ever
+        # spilled this" are different incidents that used to print the same three words.
+        expected = _expected_ranks(ranks)
+        missing = _missing_ranks(identity, expected)
+        offerable = (bool(rows) and not missing) if expected else (entry is not None)
         found = {**blank, **located, "ok": True, "ranks": rows,
-                 "ranks_present": len(rows), "bytes_all_ranks": total}
-        if entry is not None:
+                 "ranks_present": len(rows), "bytes_all_ranks": total,
+                 "ranks_missing": list(missing), "offerable": bool(offerable)}
+        if rows and expected and missing:
+            return {**found, "present": False, "verdict": VERDICT_PARTIAL_RANKS,
+                    # THE ENTRY STILL PRICES THESE FILES. A partial span is not an
+                    # absent one: the peers' slices are real bytes on the store, the
+                    # capacity view still counts them, and a reader comparing this
+                    # answer with `op=ls` needs the size to do it.
+                    "bytes": int(entry["bytes"]) if entry else 0,
+                    "journal": str(entry.get("journal") or "") if entry else "",
+                    "rank": _rank_of(entry.get("journal")) if entry else None,
+                    "reason": (f"{len(rows)} of {len(expected)} rank(s) that have to "
+                               f"read claim this identity; {', '.join(missing)} holds "
+                               "no file for it, so a restore would read a slice that "
+                               "is not there: the span is withheld until that rank "
+                               "spills it again"),
+                    "answer": (f"not offered: missing for "
+                               f"{', '.join(missing)} of "
+                               f"{', '.join(expected)}")}
+        if entry is not None and offerable:
             return {**found, "present": True, "verdict": VERDICT_PRESENT,
                     "bytes": int(entry["bytes"]),
                     "journal": str(entry.get("journal") or ""),
@@ -2223,7 +2677,8 @@ def membership(key) -> dict:
         snapshot._error(exc, "disk_index membership")
         return _fail(f"the membership check raised {type(exc).__name__}",
                      present=None, verdict=VERDICT_CHECK_FAILED, key16=None,
-                     group_id=None, ranks=[], ranks_present=0)
+                     group_id=None, ranks=[], ranks_present=0, ranks_missing=[],
+                     offerable=False)
 
 
 def remove(key) -> dict:
@@ -2306,6 +2761,25 @@ def section() -> dict:
         "rank_records": int(_state["rank_records"]),
         "rank_records_dropped": int(_state["rank_records_dropped"]),
         "rank_cap_per_identity": MAX_RANKS_PER_IDENTITY,
+        # PER-RANK PRESENCE (0.2.46): WHO the answer is intersected over, and the two
+        # lies this table used to tell, counted at apply time. `ranks_expected_source`
+        # is part of the number - "journal files" is the index's own knowledge, and the
+        # offer path prefers the ranks the worker proof names.
+        "ranks_expected": list(_state["ranks_expected"]),
+        "ranks_expected_source": _state["ranks_expected_source"],
+        "claims_removed": int(_state["claims_removed"]),
+        "claims_kept_past_peer_removal": int(_state["claims_kept_past_peer_removal"]),
+        "rank_claims_unmatched": int(_state["rank_claims_unmatched"]),
+        "inserts_incomplete_span": int(_state["inserts_incomplete_span"]),
+        # THE SAMPLED AUDIT: a rate over at most AUDIT_SAMPLE_IDENTITIES identities per
+        # pass, never a census of the store. Named `sampled_*` so a reader cannot take
+        # one for a total.
+        "sampled_runs": int(_state["sampled_runs"]),
+        "sampled_identities": int(_state["sampled_identities"]),
+        "sampled_partial_ranks": int(_state["sampled_partial_ranks"]),
+        "sampled_offerable": int(_state["sampled_offerable"]),
+        "sampled_claims_without_entry": int(_state["sampled_claims_without_entry"]),
+        "sampled_last": _state["sampled_last"],
         "membership_checks": int(_state["membership_checks"]),
         "entries_dropped": int(_state["entries_dropped"]),
         # THE ENTRY CAP, AS ITS OWN TRUTH: once true, this index answers
@@ -2399,6 +2873,42 @@ def section() -> dict:
                                           "may read as fewer ranks than it "
                                           "has (never a false presence)",
                   "rank_cap_per_identity": "ranks remembered per identity",
+                  "ranks_expected": "rank labels a presence answer is intersected "
+                                    "over: the ranks that would have to READ a span, "
+                                    "learned from the journal file names this drain "
+                                    "reads (the offer path asks with the ranks the "
+                                    "worker proof names instead)",
+                  "ranks_expected_source": "journal files | None: who said so",
+                  "claims_removed": "removal lines that retired the claiming rank's "
+                                    "own claim: what a `-` line has always meant",
+                  "claims_kept_past_peer_removal": "(identity, rank) pairs that "
+                                                   "survived another rank's removal "
+                                                   "line: the withheld-identity "
+                                                   "condition this fix exists for, "
+                                                   "counted instead of served",
+                  "rank_claims_unmatched": "removal lines for a claim that rank did "
+                                           "not hold: they retire nothing and move no "
+                                           "byte",
+                  "inserts_incomplete_span": "spill lines whose identity is not held "
+                                             "by every rank that has to read: ordinary "
+                                             "in a drain, and the answer that used to "
+                                             "be the offer answer",
+                  "sampled_runs": "audit passes since boot (at most a bounded sample "
+                                  "of identities each; no I/O, no store walk)",
+                  "sampled_identities": "identities the audit has classified IN TOTAL: "
+                                        "a rate over a sample, NOT a count of the "
+                                        "index",
+                  "sampled_partial_ranks": "of those: some rank claims the identity "
+                                           "and some rank that has to read does not - "
+                                           "withheld, correctly, and the number to "
+                                           "watch when the ranks are expected to agree",
+                  "sampled_offerable": "of those: every rank that has to read "
+                                       "claims it",
+                  "sampled_claims_without_entry": "of those: a rank's journal "
+                                                  "claims it and no entry backs it "
+                                                  "(the entry cap, never a peer)",
+                  "sampled_last": "the last audit pass's own numbers, with its sample "
+                                  "size and the rank set it intersected over",
                   "membership_checks": "answers `op=contains` has given here",
                   "entries_dropped": "identities: the ones the entry cap evicted (a "
                                      "missed restore); balanced by the three "

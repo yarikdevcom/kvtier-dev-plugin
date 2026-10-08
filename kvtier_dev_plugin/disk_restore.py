@@ -3947,7 +3947,7 @@ def _group_contract(manager, group: int) -> dict:
 
 
 def _group_block_key(resolved: dict, lengths: dict, index: int, group: int,
-                     helpers: dict) -> tuple:
+                     helpers: dict, ranks: tuple = ()) -> tuple:
     """One (group, block) -> the identity a spilled file for it is named under.
 
     Four answers, because "no file" and "no hash" and "the hash is the wrong shape"
@@ -3964,6 +3964,12 @@ def _group_block_key(resolved: dict, lengths: dict, index: int, group: int,
                            to SEE, so it is a named refusal rather than a quiet run
                            end - the same distinction `disk_read` draws between a
                            missing file and a malformed one.
+
+    `ranks` (0.2.46) is WHO HAS TO READ, and it changes the answer for one group's one
+    block: a parked span is one file PER RANK, so a block whose file some rank deleted
+    is not a block this offer can name - even though three peers still hold theirs. A
+    miss stays a `miss` (a run boundary, never an error), but it is now a miss for the
+    RIGHT reason, and `_stop_detail` can name the rank the store is waiting for.
     """
     if index >= int(lengths.get(group) or 0):
         return "miss", None
@@ -3985,14 +3991,90 @@ def _group_block_key(resolved: dict, lengths: dict, index: int, group: int,
         return "refuse", _fail(f"make_block_hash_with_group_id raised "
                                f"{type(exc).__name__}",
                                reason_kind="no_key_helpers")
-    if not disk_index.contains(key_hex):
+    if not disk_index.contains(key_hex, ranks):
         return "miss", None
     return "hit", key_hex
 
 
+# HOW LONG a stop detail may run in a refusal sentence: it names rank labels, and a
+# rank set on a big box is long, so the sentence stays the readable part of a refusal.
+MAX_STOP_DETAIL_CHARS = 160
+
+
+def _required_ranks() -> tuple:
+    """WHO HAS TO READ the span this offer would promise. Empty means "nobody said".
+
+    The worker proof is the only live answer: it names the ranks whose files ARMED this
+    boot, which is exactly the set that will execute the load - and it beats the index's
+    journal-derived set, because a journal from a rank that is not armed (a dead rank,
+    last boot's topology) must not veto the living ones, while an armed rank that has
+    spilled nothing must veto everything. Two ways that read fails, and neither may turn
+    into a wider intersection:
+
+      * no proof, or a proof that names no ranks: the index falls back to the ranks its
+        own journals name (inside `disk_index`, published as
+        `ranks_expected_source: "journal files"`);
+      * a TRUNCATED name list - `ranks_armed` larger than the list the proof carries,
+        as `worker_proof` caps its names at 8. A truncated list is not a set, so it is
+        refused here and the index's own knowledge answers instead. Refusing to widen is
+        the safe direction: the answer stays an intersection, over the ranks the
+        journals can prove.
+    """
+    try:
+        proof = worker_proof()
+    except Exception:  # noqa: BLE001 - a proof we cannot read is no proof
+        return ()
+    if not proof.get("ok"):
+        return ()
+    names = [str(name) for name in (proof.get("ranks") or []) if str(name)]
+    armed = int(proof.get("ranks_armed") or 0)
+    if not names or armed != len(names):
+        return ()
+    return tuple(sorted(names)[:disk_index.MAX_RANKS_EXPECTED])
+
+
+def _stop_detail(resolved: dict, index: int, positional: list, helpers: dict,
+                 ranks: tuple) -> str | None:
+    """WHY THE WALK STOPPED, when the answer is "a rank has no file", not "no file".
+
+    Worth exactly ONE presence verdict - at the block that stopped the walk, on the stop
+    path only, never per block - because `no_disk_run` reads as "the tier holds nothing"
+    and sends an operator to the capacity ceiling, when the fact may be that three ranks
+    hold the block and one deleted its own slice. That difference IS the per-rank
+    presence story, and it belongs in the refusal rather than in a README.
+    """
+    if not ranks:
+        return None
+    for group in positional:
+        try:
+            digest = resolved[group][index]
+        except Exception:  # noqa: BLE001, S112 - a hole in the view names nothing
+            continue
+        if not isinstance(digest, bytes):
+            continue
+        try:
+            key_hex = bytes(helpers["pack"](digest, group)).hex()
+            split = disk_layout.split_block_key(key_hex)
+        except Exception:  # noqa: BLE001, S112 - an unbuildable name is no name
+            continue
+        if not split["ok"]:
+            continue
+        verdict = disk_index.presence(
+            disk_index.identity_of(split["key16"], split["group_id"]), ranks)
+        if verdict["ranks_present"] and verdict["ranks_missing"]:
+            return (f"block {index} of group {group} is held by "
+                    f"{len(verdict['ranks_present'])} of {len(ranks)} rank(s) that "
+                    f"have to read and is missing for "
+                    f"{','.join(verdict['ranks_missing'])[:MAX_STOP_DETAIL_CHARS]}")
+        if verdict["ranks_missing"]:
+            return (f"block {index} of group {group} is held by NO rank: nobody "
+                    f"spilled it, or every rank that did has evicted it")
+    return None
+
+
 def _disk_run(request, start_block: int, groups: list, block_size: int,
               hash_block_size: int, helpers: dict, contracts: dict | None = None,
-              max_blocks: int | None = None) -> dict:
+              max_blocks: int | None = None, ranks: tuple | None = None) -> dict:
     """The contiguous span of scheduler blocks the SSD tier can supply.
 
     THIS FUNCTION IS WHERE THE CORRECTNESS OF A CLAIM LIVES. A run is a promise that
@@ -4024,7 +4106,19 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
     scan stays inside it so a clamped offer can never be handed a run whose boundary
     it cannot pay for. `anchors` publishes every length that WOULD have worked, which
     is what `_cut_run` uses when a later clamp shortens the offer further.
+
+    WHO HAS TO READ is resolved ONCE for the whole walk (`_required_ranks`), not per
+    block: the walk asks `disk_index.contains(key, ranks)` and so truncates at the first
+    block ANY of those ranks cannot supply. An empty set is not "no ranks", it is
+    "nobody named them", and the index then answers from the ranks its own journals
+    name - published either way as `ranks_expected`, because an intersection without
+    the set it joined is not a readable answer.
     """
+    required = _required_ranks() if ranks is None else tuple(
+        str(name) for name in ranks if str(name))
+    ranks_expected = list(required) or list(disk_index.expected_ranks())
+    ranks_expected_source = ("worker proof" if required
+                             else disk_index.expected_rank_source())
     block_hashes = getattr(request, "block_hashes", None)
     if block_hashes is None:
         return _fail("the request carries no block_hashes",
@@ -4068,13 +4162,14 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
     # --- 1. the positional run: one file per block, per group ------------------
     pos_keys: list = []
     walk_capped = False
+    stop_index = None
     while len(pos_keys) < limit:
         index = start_block + len(pos_keys)
         block_keys: list = []
         complete = True
         for group in positional:
             state, key_hex = _group_block_key(resolved, lengths, index, group,
-                                              helpers)
+                                              helpers, required)
             if state == "refuse":
                 return key_hex
             if state != "hit":
@@ -4082,6 +4177,10 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
                 break
             block_keys.append((group, key_hex))
         if not complete:
+            # WHERE the walk stopped, so the refusal can name WHICH rank has nothing
+            # here. The stop path only: one presence verdict per offer, never one per
+            # block - and a walk that ran to its cap has no stop to explain.
+            stop_index = index
             break
         pos_keys.append(block_keys)
     else:
@@ -4100,7 +4199,7 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
         whole = True
         for group in boundary:
             state, key_hex = _group_block_key(resolved, lengths, index, group,
-                                              helpers)
+                                              helpers, required)
             if state == "refuse":
                 return key_hex
             if state != "hit":
@@ -4121,7 +4220,13 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
                    positional_groups=positional, boundary_groups=boundary,
                    positional_run=len(pos_keys), anchors={},
                    clamped_to_anchor=False, walk_capped=walk_capped,
-                   no_anchor=bool(boundary) and len(pos_keys) > 0)
+                   no_anchor=bool(boundary) and len(pos_keys) > 0,
+                   stop_index=stop_index,
+                   stop_detail=(_stop_detail(resolved, stop_index, positional,
+                                             helpers, required)
+                                if stop_index is not None else None),
+                   ranks_expected=ranks_expected,
+                   ranks_expected_source=ranks_expected_source)
     # THE TWO VIEWS, and the difference is a bug that was actually shipped once in this
     # change: `keys` is the run AS OFFERED (the last span carrying the boundary-state
     # pairs too), while `positional_keys` is the walk before that merge. A clamp that
@@ -4138,7 +4243,16 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
                positional_run=len(pos_keys), anchors=anchors,
                clamped_to_anchor=bool(boundary) and blocks != len(pos_keys),
                walk_capped=walk_capped,
-               no_anchor=False)
+               no_anchor=False,
+               # THE HOLE THE RUN STOPPED AT, when it stopped at one: the difference
+               # between "the tier is empty" and "PP1_TP1 evicted its slice of this
+               # block". The first sends an operator to the capacity ceiling.
+               stop_index=stop_index,
+               stop_detail=(_stop_detail(resolved, stop_index, positional,
+                                         helpers, required)
+                            if stop_index is not None else None),
+               ranks_expected=ranks_expected,
+               ranks_expected_source=ranks_expected_source)
 
 
 def _cut_run(run: dict, length: int) -> dict:
@@ -4767,10 +4881,16 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                     f"{boundary_groups}, so the one block those groups need for a "
                     "claim does not exist")
             return ram_result
+        # WHICH RANK THE STORE IS WAITING FOR, when the walk knows. Without this the
+        # sentence reads "the tier holds nothing" and the operator goes to the capacity
+        # ceiling; with it, "three of four ranks hold block 0 and PP1_TP1 does not" is a
+        # rank's ceiling pass, which is a different incident.
         _refuse("no_disk_run", f"the SSD tier holds no contiguous span starting at "
                                f"block {start_block} for all of groups "
                                f"{groups['groups']}"
-                               + _index_blindness()["sentence"])
+                               + _index_blindness()["sentence"]
+                               + (f"; {run['stop_detail']}"
+                                  if run.get("stop_detail") else ""))
         return ram_result
     # The SPAN half of the loop fuse: this exact span already failed for somebody.
     span = _suppressed_span(run)
@@ -5199,6 +5319,15 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
         "groups_required": required["rows"][:16],
         "groups_unfilled": required["unfilled_group_ids"][:16],
         "loads": required["loads"][:16],
+        # WHO HAD TO READ this offer, and where its walk stopped. A span is one file per
+        # rank, so an offer's structure is only described by the rank set the presence
+        # answers were intersected over - and if the run was shorter than the prefix the
+        # positional groups hold, the named rank is the reason.
+        "ranks_expected": list(run.get("ranks_expected") or [])[:16],
+        "ranks_expected_source": run.get("ranks_expected_source"),
+        "run_stop_index": run.get("stop_index"),
+        "run_stop_detail": (_clip(str(run["stop_detail"]), 220)
+                            if run.get("stop_detail") else None),
     }
     _note(f"offered {disk_tokens} disk tokens for {request_id[:48]} in {blocks} "
           f"span(s) across {len(groups['groups'])} group(s) "
@@ -9247,6 +9376,31 @@ def scheduler_section() -> dict:
                   "unread_journals": dict(index.get("unread_journals") or {}),
                   "bytes_read": int(index.get("bytes_read") or 0),
                   "entry_cap_hit": bool(index.get("entry_cap_hit")),
+                  # PER-RANK PRESENCE (0.2.46), passed through from the index: a span
+                  # is one file PER RANK, so an offer is an intersection over the ranks
+                  # that have to read. `ranks_expected_source` says who named them: the
+                  # worker proof on the offer path, the journal file names otherwise.
+                  # `claims_kept_past_peer_removal` is the counter this change exists to
+                  # move: (identity, rank) pairs a peer's removal line used to withdraw.
+                  "ranks_expected": list(index.get("ranks_expected") or []),
+                  "ranks_expected_source": index.get("ranks_expected_source"),
+                  "claims_removed": int(index.get("claims_removed") or 0),
+                  "claims_kept_past_peer_removal": int(
+                      index.get("claims_kept_past_peer_removal") or 0),
+                  "rank_claims_unmatched": int(
+                      index.get("rank_claims_unmatched") or 0),
+                  "inserts_incomplete_span": int(
+                      index.get("inserts_incomplete_span") or 0),
+                  # THE SAMPLED AUDIT, named as sampled because it is a rate over at
+                  # most a bounded sample of identities per pass, never a census.
+                  "sampled_runs": int(index.get("sampled_runs") or 0),
+                  "sampled_identities": int(index.get("sampled_identities") or 0),
+                  "sampled_partial_ranks": int(
+                      index.get("sampled_partial_ranks") or 0),
+                  "sampled_offerable": int(index.get("sampled_offerable") or 0),
+                  "sampled_claims_without_entry": int(
+                      index.get("sampled_claims_without_entry") or 0),
+                  "sampled_last": index.get("sampled_last"),
                   "blind": blindness["blind"],
                   "blindness": blindness["sentence"] or None,
                   "last_reason": index.get("last_reason")},
@@ -9275,6 +9429,42 @@ def scheduler_section() -> dict:
             "refused": "refusals, one counter per reason",
             "last_refusal": "refusals",
             "index.entries": "identities known to be on disk",
+            "index.ranks_expected": "rank labels a presence answer is intersected "
+                                    "over: the ranks that would have to READ a span. "
+                                    "The offer path asks with the ranks the worker "
+                                    "proof arms; this is the index's own knowledge, "
+                                    "learned from the journal file names it drains",
+            "index.ranks_expected_source": "journal files | worker proof | None: who "
+                                           "said so",
+            "index.claims_removed": "removal lines that retired the claiming rank's "
+                                    "own claim: what a `-` line has always meant",
+            "index.claims_kept_past_peer_removal": "(identity, rank) pairs that "
+                                                   "survived another rank's removal "
+                                                   "line: the withheld-identity "
+                                                   "condition (measured on the box at "
+                                                   "~442 identities per rank), counted "
+                                                   "instead of served",
+            "index.rank_claims_unmatched": "removal lines for a claim that rank did "
+                                           "not hold: they retire nothing and move no "
+                                           "byte",
+            "index.inserts_incomplete_span": "spill lines whose identity is not held "
+                                             "by every rank that has to read: ordinary "
+                                             "in a drain, and the answer that used to "
+                                             "be the offer answer",
+            "index.sampled_runs": "audit passes since boot (a bounded sample of "
+                                  "identities each, no I/O, no store walk)",
+            "index.sampled_identities": "identities the audit has classified IN TOTAL: "
+                                        "a rate over a sample, NOT a count of the "
+                                        "index",
+            "index.sampled_partial_ranks": "of those: some rank claims the identity "
+                                           "and some rank that has to read does not - "
+                                           "withheld, correctly, and the number to "
+                                           "watch when the ranks are expected to agree",
+            "index.sampled_offerable": "of those: every rank that has to read "
+                                       "claims it",
+            "index.sampled_claims_without_entry": "of those: a rank's journal claims "
+                                                  "it and no entry backs it (the entry "
+                                                  "cap, never a peer)",
             "index.bytes_indexed": "bytes",
             "index.journals_tracked": "journal files",
             "index.refreshes": "journal replays",

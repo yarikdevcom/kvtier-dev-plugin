@@ -321,6 +321,15 @@ def test_one_deep_journal_cannot_starve_another_rank(fresh_index, monkeypatch):
     shrunk so the deep rank cannot finish, the shallow rank STILL finishes in the
     same passes - the share divides the budget, it is not whatever the previous
     rank left over.
+
+    SINCE 0.2.46 THE OFFER ANSWER FOLLOWS THE DRAIN PER RANK, which sharpens what this
+    test can assert. The shallow rank's identity is READ in the same pass (the entry
+    exists, the fair share did its job), but it is not OFFERABLE while the deep rank's
+    cursor sits short of it: presence is an intersection over the ranks that have to
+    read, and a rank whose journal has not been drained that far cannot be proved to
+    hold the file. The fair share is what makes that intersection honest, and the last
+    assertion is the pair of them working: once the deep journal converges, the span
+    becomes offerable.
     """
     monkeypatch.setattr(disk_index, "BOOT_DRAIN_MAX_BYTES", 128 * 1024)
     deep = journal_named(fresh_index, "PP0_TP0")
@@ -329,12 +338,22 @@ def test_one_deep_journal_cannot_starve_another_rank(fresh_index, monkeypatch):
     seed_journal(shallow, 300)
     out = disk_index.refresh(force=True)
     assert out["journals"] == 2
-    assert present(299) is True, (
-        "the shallow rank's newest identity is read in the same pass a deep rank is "
+    assert disk_index.entry_for(key_for(299), GROUP)["present"] is True, (
+        "the shallow rank's newest identity is READ in the same pass a deep rank is "
         "being drained - the share protects it")
+    assert present(299) is False, (
+        "read is not offerable: the deep rank's cursor has not reached this identity, "
+        "so its own file for it is unproven, and a restore reads one file per rank")
     unread = disk_index.counters()["unread_journals"]
     assert os.path.basename(shallow) not in unread, "the shallow journal is at EOF"
     assert os.path.basename(deep) in unread, "the deep journal is honestly draining"
+    for _ in range(40):
+        if disk_index.refresh(force=True)["converged"]:
+            break
+    assert disk_index.counters()["converged"] is True, "the drain finishes"
+    assert present(299) is True, (
+        "the fair share plus the intersection: once BOTH ranks' journals have been "
+        "drained to this identity, it is offerable")
 
 
 # --- 6. silence is the bug ----------------------------------------------------

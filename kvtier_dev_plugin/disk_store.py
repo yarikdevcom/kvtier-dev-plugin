@@ -295,13 +295,15 @@ DISK_FILL_RANK_CAP = 16                 # rank entries in ONE `disk_fill` block
 
 MAX_LS_FILES = 200                  # ENTRIES in an `ls` response
 MAX_LS_LIMIT_DEFAULT = 50
+MAX_IDENTITIES_LIMIT = 200          # IDENTITIES in an `identities` page
+MAX_RANK_NAME_CHARS = 32            # CHARS of a rank label in a verb argument
 MAX_FILENAME_DISPLAY = 200          # CHARS of a path shown in a response
 MAX_RESPONSE_BYTES = 256 * 1024     # BYTES: any verb payload's hard ceiling
 MAX_STRING_CHARS = 160
 
-DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "offers",
-             "authority", "failures", "shadow", "gpu-shadow", "restore-verify",
-             "gpu-write")
+DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "identities",
+             "offers", "authority", "failures", "shadow", "gpu-shadow",
+             "restore-verify", "gpu-write")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
                      "gpu-shadow", "restore-verify", "gpu-write")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
@@ -3315,8 +3317,62 @@ def _op_gpu_write(body: dict) -> dict:
             "gpu_write": disk_gpu_write.status()}
 
 
+def _op_identities(body: dict) -> dict:
+    """The OTHER SIDE OF THE DIFF: what the index believes, per rank, digests only.
+
+    WHY A `contains` AND AN `ls` WERE NOT ENOUGH. The one question the whole box
+    investigation turned on was "which identities does the index believe, per RANK, and
+    which files are actually on the store?" - and neither verb could answer it alone.
+    `contains` names ONE identity and never enumerates; `ls` names files and knows
+    nothing about ranks. Diffing them by hand needs a list, and a list of 262,144
+    identities in one payload is not a diagnostic, it is an outage. So this is bounded
+    (a page of at most `MAX_IDENTITIES_LIMIT`), paged (pass `after` to continue),
+    filterable (`rank`, and `state` = all | offerable | partial) and DIGEST-ONLY: rows
+    carry a key16, a group, a shard and the rank labels, never a path. The digest each
+    rank named its own file with is not in the journal (the line is
+    `<seq> <+|-> <key16> <bytes> <group>`), so this verb deliberately does not name
+    files - pairing it with `op=ls` is the operator's join, and the README says so.
+
+    It walks no store, moves no counter and reads no file: the index is per-process
+    memory and this endpoint is polled, so the same rule that keeps `contains` from
+    scanning a shard keeps this from turning a dashboard into an I/O storm.
+    """
+    limit = _bounded_int(body.get("limit"), MAX_LS_LIMIT_DEFAULT,
+                         MAX_IDENTITIES_LIMIT)
+    after = body.get("after")
+    if after not in (None, ""):
+        after = str(after)[:64]
+        if not all(char.isalnum() or char in ":g_" for char in after):
+            return {"ok": False, "op": "identities", "read_only": True,
+                    "reason": "the `after` cursor must be an identity from the "
+                              "previous page (a key16, a colon, and a group field)"}
+    else:
+        after = None
+    rank = body.get("rank")
+    rank = None if rank in (None, "") else str(rank)[:MAX_RANK_NAME_CHARS]
+    which = str(body.get("which") or body.get("state") or "all").strip().lower()
+    if which not in ("all", "offerable", "partial"):
+        return {"ok": False, "op": "identities", "read_only": True,
+                "reason": 'which must be "all", "offerable" or "partial"',
+                "which": ["all", "offerable", "partial"]}
+    page = disk_index.scan_identities(after=after, limit=limit, rank=rank,
+                                      state=which)
+    page["read_only"] = True
+    page["limit"] = int(page["limit"])
+    page["next_step"] = (
+        "pair this with {\"op\":\"ls\",\"shard\":\"<shard>\"}: the store names every "
+        "file kvslot-<key16>-g<group>-<geodigest12>.bin, one per rank, and the "
+        "geodigest is the rank's own. An identity this verb reports WITHOUT a rank, "
+        "for which `ls` nevertheless shows that rank's digest, is a withheld file; "
+        "one it reports WITH a rank the store no longer holds is a false present. "
+        "Page with `after` until `truncated` is false to make it a census.")
+    page["sampled"] = False
+    return page
+
+
 _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "spill-one": _op_spill_one, "ls": _op_ls, "contains": _op_contains,
+             "identities": _op_identities,
              "offers": _op_offers, "authority": _op_authority,
              "failures": _op_failures, "shadow": _op_shadow,
              "gpu-shadow": _op_gpu_shadow,

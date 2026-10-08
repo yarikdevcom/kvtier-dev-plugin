@@ -409,11 +409,26 @@ ARG_SPECS: dict[str, dict] = {
     # and `fingerprint` 32 so the 12-hex digest check stays the layout's too.
     config.ROUTE_DISK: {"op": {"kind": "enum",
                                "values": ("status", "arm", "disarm", "spill-one",
-                                          "ls", "contains", "offers", "authority",
-                                          "failures", "shadow", "gpu-shadow",
-                                          "restore-verify", "gpu-write")},
+                                          "ls", "contains", "identities", "offers",
+                                          "authority", "failures", "shadow",
+                                          "gpu-shadow", "restore-verify",
+                                          "gpu-write")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
+                        # `op=identities` (0.2.46): the paged, digest-only enumeration
+                        # of what the index believes PER RANK, so it can be diffed
+                        # against `op=ls`. `after` is the cursor the previous page
+                        # returned, bounded at the width of an identity
+                        # (`key16:g<n>`) rather than the generic string width because a
+                        # longer cursor is a caller that has not read the verb. `rank`
+                        # filters to one rank's claims and `which` narrows the page to
+                        # `offerable` or `partial` identities; both are bounded at the
+                        # width of a rank label, and the SHAPES stay the engine's rules
+                        # (`_op_identities` refuses a cursor with characters an identity
+                        # cannot contain, and a `which` outside its three values).
+                        "after": {"kind": "str", "max_chars": 64},
+                        "rank": {"kind": "str", "max_chars": 32},
+                        "which": {"kind": "str", "max_chars": 16},
                         "fingerprint": {"kind": "str", "max_chars": 32},
                         "seconds": {"kind": "int", "min": 1, "max": 7200},
                         "limit": {"kind": "int", "min": 1, "max": 200},
@@ -1343,8 +1358,11 @@ async def route_disk(request: Request):
 async def route_disk_post(request: Request):
     """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
-    `{op: status|arm|disarm|spill-one|ls|contains|offers|authority|failures, slot?,
-    key?, fingerprint?, seconds?, limit?, shard?, enabled?}`. KV slots evicted from
+    `{op: status|arm|disarm|spill-one|ls|contains|offers|authority|failures,
+    identities, slot?, key?, fingerprint?, seconds?, limit?, shard?, after?, rank?,
+    which?, enabled?}` - `op=identities` (0.2.46) is the paged, digest-only enumeration
+    of what the index believes PER RANK (`after` is its cursor, `rank` and `which` the
+    filters), the other half of the diff against `op=ls`. KV slots evicted from
     the RAM tier are spilled to
     `<root>/<shard>/kvslot-<key16>-g<group>-<geodigest12>.bin` on the engine's own
     disk, so the RAM tier can shrink - the group id is part of the identity, since

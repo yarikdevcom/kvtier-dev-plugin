@@ -226,7 +226,7 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `identities` (the paged, digest-only per-rank view of the index, 0.2.46 - the other half of the diff against `ls`), `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -1043,9 +1043,15 @@ distinction is the most valuable field on the verb: on 2026-10-05 `entries: 0` w
 "my span is not on disk" for a whole afternoon when the fact was that nothing had been
 replayed into that process yet. A present answer carries the entry's `bytes`, the journal
 file it came from, and one row per rank (`rank`, `bytes`, `journal`, `seq`) - which is how
-you tell a complete span from a partial one. What it cannot say is each rank's geometry
-digest: the journal line is `<seq> <+|-> <key16> <bytes> <group>` and names no digest, so
-naming the actual files is `op=ls` with a `shard`, and the answer says so.
+you tell a complete span from a partial one. Since 0.2.46 an identity that SOME ranks hold
+and others do not is its own verdict, `partial_ranks`: `present: false` and `offerable:
+false` because a restore reads one file per rank, with `ranks_missing` naming which, and
+the surviving entry's `bytes`/`journal`/`rank` rows beside it - "three ranks hold this and
+PP1_TP1 does not" is a different fact from "nothing holds this", and the offer path's
+predicate is now the intersection over the ranks that have to read. What it cannot say is
+each rank's geometry digest: the journal line is `<seq> <+|-> <key16> <bytes> <group>` and
+names no digest, so naming the actual files is `op=ls` with a `shard` - or the index's own
+claim list, `op=identities` - and the answer says so.
 
 **No fsync, on purpose.** The spill writes are buffered: `write_committed_file`
 keeps the `.part` + `O_CREAT|O_EXCL` + `os.replace` commit ordering (so *a committed
@@ -2734,6 +2740,132 @@ died and was re-armed by the next step), `heartbeat_floor_skips`, `heartbeat_err
 plus `heartbeat_alive` / `last_heartbeat_age_seconds` / `heartbeat_beats_in_window` in the
 section, which answer "is this worker's proof being kept alive, and how tight is it?"
 without arithmetic. Tests: `tests/test_idle_engine_keeps_its_disk_proof_alive.py`.
+
+## Presence is per rank: a peer's journal cannot decide what my rank may read (0.2.46)
+
+**The store keeps one file per rank; the index answered as if it kept one.** A parked span is
+`kvslot-<key16>-g<group>-<geodigest12>.bin`, written by EVERY armed rank under its own geometry
+digest, and a restore reads all of them. The index kept `rank_lines` per identity, but the
+answer the offer path asked was `disk_index.contains()`, which read ONE global entry table - and
+a journal REMOVE line called `_drop_identity_ranks(identity)`, retiring every rank's claim
+instead of the claim of the rank whose journal the line arrived in. Two failure directions, both
+live on the box:
+
+| shape | mechanism | what the operator saw |
+|---|---|---|
+| **false present** | rank A's `- <key16>` unlinks its slice; rank B's next `+` for the same identity resurrects the global entry; `contains()` says present | a read offered for a file rank A deleted: `failed={'file_missing': 5}`, `hole_in_middle` |
+| **false absent** | rank A's `- <key16>` dropped the entry AND every peer's claim; the peers' later `+` lines then read as "a removal of something nobody holds", so their claims went unmatched | spans whose files were all on disk, refused as `span is not fully indexed` |
+
+**Measured read-only on the box first, by replaying the journals' own per-rank lines** (the rank
+was never missing information - it is in the FILE NAME of the journal that carries the line):
+**1,768 removal-retired (identity, rank) claims across 446 unique identities**, `disk_used =
+146,643,927,040` of a 298 GiB store. So "~442 identities per rank" and "~1,768 claims" are ONE
+population counted at two units: the identity count is 446, and 1,768 is 446 x ~3.96 ranks. No
+identity was found resurrected by a peer while its own file was absent from the store, so the
+loss that box was taking was one-directional - withheld cache, not a failed read.
+
+**The rule now.** A REMOVE line retires the claim of the rank whose journal it appeared in
+(`_drop_rank_claim`) and nothing else; the entry follows only when the LAST claim goes, and
+`bytes_indexed` is debited once against the entry's own size. The offer predicate is an
+INTERSECTION: `disk_index.contains(key, ranks)` is true only when every rank in `ranks` holds a
+claim AND the entry exists. Truncation at a hole needed no new walk logic - `_disk_run`'s
+positional scan already stops at the first miss, and the miss is now the HOLE instead of the end
+of the span, so a span with one rank's slice missing keeps offering its long prefix instead of
+losing the prefix and the run.
+
+**Who the intersection runs over, and where that set came from.** The offer path asks with the
+ranks the worker proof ARMS (`worker_proof()["ranks"]` -> `_disk_run(ranks=...)`), because those
+are the ranks that will execute the load: a dead rank's leftover journal cannot veto the living
+ones, and an armed rank that has spilled nothing vetoes everything. A proof whose rank list came
+back TRUNCATED is not proof of a rank set, so that case falls back. With no caller-named set the
+index uses the ranks its own journal FILE NAMES declare (`kvslot-index-<RANK>.journal`), a set
+that grows monotonically within a boot - forgetting a rank would RELAX the intersection, and
+relaxing it is the direction that hands out missing files. The set and its provenance are both
+published (`ranks_expected`, `ranks_expected_source` = `"worker proof"` | `"journal files"`) in
+`disk_index.section()`, `counters()`, `restore.index` and the `no_disk_run` refusal: "we expected
+4 and 3 showed up" is a different diagnosis from "we expected 3".
+
+**`op=contains` gained the verdict for the in-between case.** An identity some ranks hold and
+others do not answers `verdict: "partial_ranks"` with `present: false`, `offerable: false`,
+`ranks_missing: ["PP1_TP1"]`, `ranks_present: 3` and the surviving entry's `bytes` / `journal` /
+`rank` rows beside it - "three ranks hold this and PP1_TP1 does not" is a different fact from
+"nothing holds this", and only the first has a fix. The refusal says the same thing in the run's
+own data: `no_disk_run` carries `stop_index` and `stop_detail`, e.g. `block 3 of group 5 is held
+by 3 of 4 rank(s) that have to read and is missing for PP1_TP1`, appended to the sentence the
+operator reads. Computing it costs ONE `presence()` call, at the stop index, on a path that has
+already decided not to serve.
+
+**Counters - every one counted at apply time, none from a scan.**
+
+| counter | unit | a non-zero value means |
+|---|---|---|
+| `index.claims_removed` | (identity, rank) claims | a REMOVE line retired a claim that existed: the honest count of the events the old code applied globally |
+| `index.claims_kept_past_peer_removal` | (identity, rank) claims | a PEER's REMOVE line arrived for a claim this rank still holds, and the claim SURVIVED. This is the false-absent rate, measured; on a 4-rank box it runs ~3.96 per withheld identity |
+| `index.rank_claims_unmatched` | journal lines | a REMOVE for an (identity, rank) nobody holds: it retires nothing, moves no byte, debits nothing |
+| `index.inserts_incomplete_span` | journal lines | a `+` that landed an identity not every expected rank holds - an offerable=false span in the making |
+
+**The audit is a sample and says so.** `sampled_runs`, `sampled_identities`,
+`sampled_partial_ranks`, `sampled_offerable`, `sampled_claims_without_entry` and `sampled_last`
+come from `disk_index.audit_now()`: at most `AUDIT_SAMPLE_IDENTITIES` (64) identities per pass,
+once every `AUDIT_EVERY_N_REFRESHES` (4) refreshes, doing NO I/O - no `stat`, no listing, no
+journal read, a dict walk only. Its payload carries `sampled: true` with the sample size; a
+`scan_identities` payload carries `sampled: false`. Nothing in this counts every identity: a
+census of 262,144 of them on a serving path is the thing this module exists to avoid.
+
+**`op=identities` is the enumeration half of the diff.** Bounded (default 50, hard cap
+`MAX_IDENTITIES_LIMIT` = 200 identities per page), paged (`after` is the cursor the last page
+returned), filtered (`rank`, and `which` = `all` | `offerable` | `partial`) and DIGEST-ONLY: a row
+is `{identity, ranks, ranks_missing, offerable}` - an identity (`<key16>:g<group>`), the rank
+labels whose journal claims it, which of the expected ranks do not, and whether the offer path
+may promise it. Never a path, never a size walk: the digest each rank named its file with is the
+layout's geometry digest for that rank, and the journal line (`<seq> <+|-> <key16> <bytes>
+<group>`) cannot know it, so pairing a row with an `op=ls` line is the operator's join. The verb
+walks no store, moves no counter and reads no file, and it is not in `MUTATING_DISK_OPS`.
+
+```bash
+B=http://127.0.0.1:8000/plugins/kvtier/disk; H='Authorization: Bearer <token>'
+# 1. what the index intersects over, and what the last sampled pass saw
+curl -s -H "$H" "$B?op=status" | jq '.restore.index | {ranks_expected, ranks_expected_source,
+    claims_removed, claims_kept_past_peer_removal, rank_claims_unmatched, inserts_incomplete_span,
+    sampled_last}'
+# 2. the index's per-rank claims: 200 identities, digests only, no paths
+curl -s -H "$H" -X POST -d '{"op":"identities","limit":200}' $B | jq '.identities[0]'
+# 3. keep paging until `truncated` is false - that is the census, not this page
+curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"after":"<next from page 2>"}' $B
+# 4. only the withheld spans; only one rank's claims
+curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"which":"partial"}' $B
+curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"rank":"PP1_TP1"}' $B
+# 5. the STORE's side of the same question, by shard: real FILE NAMES, one per rank
+curl -s -H "$H" -X POST -d '{"op":"ls","shard":"a3f0","limit":50}' $B
+```
+
+Both directions of the `identities`-vs-`ls` diff mean something, and the verb's `next_step`
+says which is which: an identity reported WITHOUT a rank for which `ls` shows that rank's digest
+is a WITHHELD file (the false absent, and the ~19.5 GiB of parked KV behind it); an identity
+reported WITH a rank whose file `ls` no longer shows is a FALSE PRESENT, the one that reaches a
+worker as `file_missing`. On a box that is behaving, the second list is empty and the first
+matches `claims_kept_past_peer_removal` growing at the rate the ceiling pass reclaims.
+
+**Three existing tests changed, each narrowed to what is actually true.**
+`test_a_removal_line_drops_the_entry_and_the_ranks_together` asserted the entry died with the
+first removal while its own docstring said "the per-rank view goes on carrying the rank that
+wrote it" - it now asserts the entry survives with three ranks, `contains()` still refuses the
+GLOBAL question, and `ranks_missing` names the one rank. `test_a_truncated_journal_forgets_that_rank_and_only_that_rank`
+asserted the same all-ranks-died shape and that `membership` reports no bytes; the entry's bytes
+are real (the other ranks' files are on disk), so it now asserts the surviving three, the named
+missing rank and `bytes > 0`. `test_one_deep_journal_cannot_starve_another_rank` asserted that an
+identity a lagging rank has not reached is NOT read at all; it is read - and the new semantics
+say what the old test meant, that it is not OFFERABLE until the lagging rank's own journal proves
+its file, which is the same protection with the correct subject.
+`test_disk_restore_scope.py`'s four-rank fixture changed too: it armed four ranks and spilled
+from one journal, which is a rank set that does not exist outside a test; the fixture now mirrors
+the spill into all four journals so the span is genuinely complete and the geometry/eligibility
+rules that test exists to check are what it checks.
+
+**What it does NOT do.** No journal format change (the rank was already in the filename), no
+`stat` per entry on the serving path (the live numbers are sampled, and named `sampled_*`), no
+new `worker_diag` contribution (the cap of 6 is untouched), and `contains()`/`membership()` only
+gained fields. Tests: `tests/test_disk_rank_presence.py`.
 
 ## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
 
