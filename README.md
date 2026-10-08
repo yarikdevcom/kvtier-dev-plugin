@@ -3156,7 +3156,7 @@ Its `equal` verdict is also the *admission rule* for the next step of the route 
 those GPU bytes to a second tree and diffing the two files - see *Writing the block twice:
 the GPU-direct shadow* below.
 
-## Writing the block twice: the GPU-direct shadow (`disk_gpu_shadow.py`, 0.2.37)
+## Writing the block twice: the GPU-direct shadow (`disk_gpu_shadow.py`, 0.2.37; whose bytes a differ is, 0.2.48)
 
 Entry 27 of the plan established that the host-RAM arena cannot simply be deleted: it is
 the spill trigger, the byte source, the restore landing pad and the only GPU<->host
@@ -3199,18 +3199,110 @@ diff -rq /home/user/kv-tier/disk /home/user/kv-tier/gpu-shadow | grep -v '^Only 
 
 **When everything agrees it prints nothing.** `Only in ...` lines are expected and mean
 nothing is wrong: the shadow tree holds only the sampled subset (one store in 32, capped
-per bind window), so the live store always has files it does not. What must never appear
-is a line of the form
-`Files /home/user/kv-tier/disk/3f/kvslot-....bin and /home/user/kv-tier/gpu-shadow/3f/kvslot-....bin differ`
-- one of those is a fault in the GPU-direct write path (or a live file that changed after
-the spill), and the module raises the same alarm in the worker log when it sees one. The
-counters cross-check the same claim without reading files:
+per bind window), so the live store always has files it does not.
+
+**A `differ` line is not one fact, it is three (0.2.48).** Until 0.2.48 this page said
+that a line of the form `Files .../disk/3f/kvslot-....bin and .../gpu-shadow/3f/kvslot-....bin
+differ` "is a fault in the GPU-direct write path". That was wrong, and it has cost two
+investigations on a live box. A name outlives the completion that created it: **neither
+tree ever overwrites an existing name** (`disk_layout.write_committed_file` declines a
+duplicate with `duplicate=True, write_bytes=0`, and the spill path writes the live file
+through that same function), so each side of a pair keeps the bytes of whichever
+execution of the write path first created that name on that side - and fp8 KV
+recomputation is not bit-reproducible, so two executions of the same key legitimately
+give different bytes. The comparator does not guess. It asks one question
+(`disk_gpu_shadow._attribute_pair`): **is the live file older than the instant before
+this shadow's own spill was requested?** If it is, the store could not have written it,
+and the pair was never going to agree.
+
+| outcome | counter | log | what it means | what you do |
+|---|---|---|---|---|
+| `cross_execution` | `pairs_cross_execution` | **one INFO per episode** | the live half predates this store, so it is an earlier spill's (or an earlier boot's) bytes under a name that outlived them | nothing. This is expected on every boot, and it is not an alarm |
+| `same_execution` | `pairs_fault` | **one ERROR per episode** | both sides came from THIS store, so the GPU-direct write path disagrees with the spill it claims to mirror - or the live file changed after the spill. The line adds two honesty notes when they apply: the offset is past the verifier's 256 KB window (bytes no witness read), or the live half is newer than our shadow file (which is also what a LATER store's file looks like if this store's spill never reached the disk - check `pairs_failed`) | **this is the one.** Read `last_difference`, then the two files |
+| `unattributed` | `pairs_unattributed` | **one WARNING per episode** | the module could not order the two sides (no store instant on the plan, a clock that moved, a file that vanished mid-decision) | read `classification_reason`; it is deliberately neither of the above |
+
+`pairs_differing` stays the umbrella, and the three always sum to it: nine differs are
+accounted for by their three buckets, and the buckets are what tells you whether nine
+deserve attention. The split is deliberately asymmetric - ambiguity goes to
+`unattributed`, never to the benign bucket, so the tolerance can make the module timid
+but can never make it call a fault benign.
+
+**The grep that tells the three apart.** They are one word in one line each, and each
+kind logs once per episode, so this is the whole reading:
+
+```bash
+grep -a 'disk_gpu_shadow] a shadow file' /tmp/vllm-serve.log \
+  | grep -oE 'same_execution|cross_execution|unattributed' | sort | uniq -c
+# and the only line that should ever be non-empty:
+grep -a 'differ (.*): same_execution' /tmp/vllm-serve.log
+```
+
+**The read-only sequence that shows the new fields after a deploy.** Every command here
+is a read; none of them touches the engine. The box's login shell is zsh, so a bare glob
+aborts the whole command line ("no matches found") - `find` with explicit paths, and the
+JSON is read through a heredoc (`<<'PY'` quotes it against both shells) rather than a
+nested `python3 -c` with escaped quotes:
+
+```bash
+# which rank files exist, newest last:
+ssh llm 'find /tmp/kv-tier-diagnostics -maxdepth 1 -name "rank-*.json" -printf "%T@ %p\n" | sort -n'
+
+# one rank's shadow section: the three buckets, the reference, the last differ:
+ssh llm 'python3 -' <<'PY'
+import json, glob, os
+f = max(glob.glob("/tmp/kv-tier-diagnostics/rank-*.json"), key=os.path.getmtime)
+s = json.load(open(f)).get("disk_gpu_shadow")
+print(f)
+keys = ("pairs_checked", "pairs_identical", "pairs_differing",
+        "pairs_cross_execution", "pairs_fault", "pairs_unattributed",
+        "pairs_size_disagree")
+print({k: s.get(k, "ABSENT") for k in keys})     # ABSENT = this boot predates 0.2.48
+print("reference:", s.get("differ_reference", "ABSENT"))
+print("last differ:", json.dumps(s.get("last_difference"), indent=1))
+PY
+
+# the same verdict in the engine's own log (each worker writes its own lines, prefixed
+# by `(Worker_PPn_TPm_EPk pid=...)`, and each kind is one line per episode):
+ssh llm 'grep -a "disk_gpu_shadow] a shadow file" /tmp/vllm-serve.log | tail -6'
+
+# and the evidence itself, while retention still allows it (the cap is 64 files /
+# 512 MiB, and a differing pair is usually pruned within minutes - which is exactly why
+# the byte sample is published in `last_difference` instead of left to be re-read):
+ssh llm 'find /home/user/kv-tier/gpu-shadow -type f -printf "%T@ %s %p\n" | sort -n | tail -8'
+```
+
+`last_difference` is the record of the most recent differ, and it has the same keys in
+every state (benign, fault, unattributed, and the state where the byte sample could not
+be read): `classification`, `classification_reason`, `first_difference`,
+`scanned_bytes`, `shadow_bytes`, `live_bytes`, `size_disagree`, both mtimes, the
+`reference_seconds`/`reference_source` the decision used, `live_predates_this_process_start`,
+and the sample: `sample_offset`, `sample_bytes`, `sample_available`,
+`differing_bytes_in_sample`, `max_byte_delta`, `sample_reason`. The sample is
+`DIFF_SAMPLE_BYTES` (1 KiB) read from BOTH sides starting at the first differing byte -
+bounded by construction, and nulls rather than zeros when it could not be read, because
+`differing_bytes_in_sample: 0` would read as "the sample agrees".
+
+**`differ_reference`, and why it is not `VLLM_E2_TIER_DIAG_EPOCH`.** The section also
+publishes when THIS process started (`pid`, `process_start_seconds`, `source`). The
+epoch variable is the obvious-looking existing thing and it is the wrong tool: it is an
+opaque identifier, not a time, so it cannot order an mtime; when set it is deliberately
+the same in every process of the boot, the API server included, so it says nothing about
+when this worker started; and when unset it degrades to `snapshot.epoch()`, four random
+hex bytes with no time content. This module reports a differ in a worker, so the start
+time worth having is the one read from `/proc/self` in that same worker (the fallback, if
+`/proc` is unreadable, is the wall clock at first use HERE, and the `source` string says
+so because it is only an upper bound). It is published to DESCRIBE the evidence -
+"a previous boot wrote the live half" is worth saying - and it is not what decides:
+see the box evidence below.
 
 | counter | what it means | what you do |
 |---|---|---|
 | `written`, `bytes_written` | shadow files committed | nothing; this is the number growing |
 | `pairs_checked` / `pairs_identical` | files compared against the live store's file of the same name, and byte-identical | nothing; `identical == checked` is the gate |
-| `pairs_differing` | a same-named pair disagrees | **this is the one** - look at `last_difference.first_difference` and `differing_names` |
+| `pairs_differing` | a same-named pair disagrees, **of any kind** | read the three buckets below; the umbrella alone no longer says anything about danger |
+| `pairs_cross_execution` | its live half predates this store (0.2.48) | nothing; expected wherever a key is re-spilled, and expected again after every reboot |
+| `pairs_fault` | both sides came from this store (0.2.48) | **this is the one** - `last_difference.first_difference`, `differing_bytes_in_sample`, `max_byte_delta`, `differing_names` |
+| `pairs_unattributed` | the two sides could not be ordered (0.2.48) | read `classification_reason`; it is neither benign nor a fault, and it is not silent |
 | `pairs_size_disagree` | the same-named pair has different lengths | a truncated or half-written shadow file |
 | `pairs_unpaired_expired` | the live partner never appeared | the spill refused, was evicted, or the name is not the same file |
 | `pairs_shadow_missing` | the SHADOW file went away before its pair was compared (retention shed it, or the directory was cleared) | raise `MAX_SHADOW_FILES`/`MAX_SHADOW_BYTES` if you want every pair decided; it is never counted against the store |
@@ -3220,16 +3312,48 @@ counters cross-check the same claim without reading files:
 | `refused_write_failed` / `refused_*` | the directory refused the write, the queue is full, the name disagreed | look at `reasons` |
 | `retention_removed`, `walk_truncated` | the cap (`MAX_SHADOW_FILES`/`MAX_SHADOW_BYTES`) shed evidence, or the walk hit its bound | normal; the files are evidence, not data |
 
-**What the diff proves, said exactly.** Only blocks the verifier called `equal` are
-written, and the bytes written are the bytes that vouching read - so the two files agree
-by construction *at capture time*, and the diff is not re-answering "do the GPU and the
-arena hold the same bytes?" (the verifier answers that per block, live, in its own
-counters). What the diff does prove is everything this module ADDS: that
-`disk_layout.build_slot_path` under a different root produces the same relative name the
-store wrote (the identity a restore looks up - the module checks the two naming sites
-agree and writes nothing if they ever differ), that what landed is a whole slot and not
-half of one, that the `.part`/`os.replace` discipline held under real traffic, and that
-across a store turnover the GPU-direct tree and the arena tree are the same files.
+**What the box showed on 2026-10-09, and why the boot boundary is the wrong reference.**
+Eight same-named pairs differed. All eight had BOTH sides written after the box's last
+boot (`uptime -s` 2026-10-08 23:20:12), so ordering files against "when did this process
+start?" would have reported eight faults:
+
+```
+ef/kvslot-ef88716efb746ada-g5-...   shadow 00:44:20.875   live 00:05:27.231  (+2333 s)
+50/kvslot-50ed223d55f5384a-g1-...   shadow 00:43:59.074   live 00:43:58.942  (+ 132 ms)
+```
+
+The second pair is the one that settles it: 132 ms is the timing signature of an
+identical pair on that box (they sat at 0.25-1.02 s), both files are this-boot, and the
+bytes still disagree - because the live name had already been created by an earlier
+spill of the same key. Its bytes, measured before retention took the shadow file, were
+4,673,131 of 11,468,800 differing with deltas dominated by +/-1 code and a long tail
+(the shape of independently recomputed fp8, not of a shifted or truncated block). The
+store instant is what separates that pair from a real fault; the boot reference only
+describes it.
+
+**Runbook: after every reboot, expect `cross_execution` differs.** A reboot starts a new
+execution while both trees keep their names, so the first boot that re-spills a hot
+prefix will find live files older than its own stores and log INFO once. That is the
+trees working, not KV corruption: the line you must never see is
+`differ (...): same_execution`, and `pairs_fault` is the number to watch.
+
+
+**What a SAME-EXECUTION diff proves, said exactly.** Only blocks the verifier called
+`equal` are written, and the bytes written are the bytes that vouching read - so when the
+live half is the file this store wrote, the two files agree by construction *at capture
+time* - over the window the witness read, which is the first
+`disk_shadow.MAX_DIFF_SCAN_BYTES` (256 KB) of the slot, not its whole 11.4 MB. So the
+diff is not re-answering "do the GPU and the arena hold the same bytes?" (the verifier
+answers that per block, live, in its own counters, for as far as it scans), and a
+same-execution difference beyond that window is reported as what it is: bytes no witness
+compared. What a same-execution diff does prove is everything this module ADDS: that `disk_layout.build_slot_path`
+under a different root produces the same relative name the store wrote (the identity a
+restore looks up - the module checks the two naming sites agree and writes nothing if
+they ever differ), that what landed is a whole slot and not half of one, and that the
+`.part`/`os.replace` discipline held under real traffic. What it does NOT prove, and
+what 0.2.48 stopped claiming, is that two trees stay byte-for-byte the same file across
+a store turnover: a name that survives a turnover keeps the bytes of the execution that
+created it on each side, and those two executions may legitimately disagree.
 
 **It inherits the ordering rule instead of re-implementing it.** The bytes come from
 `disk_shadow._read_gpu_slot` - the ONE device->host seam in the package - which sums the
@@ -3261,6 +3385,20 @@ growing or waiting, retention stays inside its own directory, a pair whose shado
 retention removed is counted as ours going away and never as the store's absence, the
 shadow file is the `sorted(name)` concatenation and not the insertion-order one, and the
 published key set does not change shape.
+
+`tests/test_disk_gpu_shadow_attribution.py` (19 tests, 0.2.48) is the spec of the
+*differ*: a pair whose live half predates this store is `pairs_cross_execution` logged
+once at INFO and never at ERROR, a pair whose two sides came from this store and differ
+by ONE BYTE is still one ERROR and `pairs_fault` (and still compares the whole slot, so
+the fault claim is worth making), a pair that cannot be ordered is `pairs_unattributed`
+at WARNING and is neither benign nor a fault, the sample counts the differing bytes and
+the largest delta in a window we craft (with the largest delta deliberately not first, so
+it cannot be an artifact of ordering) and never reads more than `DIFF_SAMPLE_BYTES` per
+side - counted, with a wrapper around the real file objects - a sample read that raises
+says "sample unavailable" with null numbers instead of a `0` that reads as agreement,
+the three buckets always sum to `pairs_differing`, the difference record has the same key
+set in the benign, fault, unattributed and sample-unavailable states, and the boot
+reference is this process's own start even when `VLLM_E2_TIER_DIAG_EPOCH` is set.
 
 ## Do the RESTORED bytes match the file? (`disk_restore_verify.py`, 0.2.39-0.2.42)
 
@@ -5079,7 +5217,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2564 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2583 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -5094,7 +5232,13 @@ without the feature, that a writer which raises or a root that cannot be written
 counter and not a crash, that retention removes its own file and not a same-named file in
 the store, that the shadow file is the `sorted(name)` concatenation and not the
 insertion-order one, and that a fat published section sheds its illustrations rather than
-its numbers. The restore-side verifier is `tests/test_disk_restore_verify.py`: that
+its numbers. The attribution of a differ is `tests/test_disk_gpu_shadow_attribution.py`:
+that a live half predating this store is `cross_execution` at INFO and never an ERROR,
+that a one-byte same-execution difference is still one ERROR and `pairs_fault` with the
+whole slot compared, that an unordered pair is `pairs_unattributed` at WARNING, that the
+byte sample is correct and bounded, that a failed sample is "unavailable" and never
+"identical", and that the published shape does not change between those states. The
+restore-side verifier is `tests/test_disk_restore_verify.py`: that
 the default opens no file and reads no device (proved with both readers instrumented
 to raise), that a flipped byte inside `W_g` is a stable mismatch while a difference
 confined to the tail is `equal`, that a destination one slot off FAILS rather than

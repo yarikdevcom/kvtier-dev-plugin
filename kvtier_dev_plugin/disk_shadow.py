@@ -639,9 +639,17 @@ def snapshot(handler, event, slot: int, key=None) -> dict | None:
             # way. Nothing else in this module reads `gpu`, and no byte is copied a
             # second time - it is the reason the GPU-direct writer needs no device read
             # and no copy seam of its own.
+            #
+            # `store_wall_ns` exists for `disk_gpu_shadow`'s attribution (0.2.48). Its
+            # POSITION IN THIS FUNCTION IS THE WHOLE POINT: it is stamped here, before
+            # `disk_store` calls `request_spill`, so it is a bound that holds even when
+            # the spill's writer thread commits its file before this step gets as far as
+            # `consider()`. A timestamp taken later could not prove that a live file was
+            # not written by this store, and the mistake it would cause is the dangerous
+            # direction: a real fault labelled benign.
             return {"handler": handler, "event": event, "slot": int(slot),
                     "key": key, "gpu_block": int(gpu_block), "blob": None,
-                    "gpu": None}
+                    "gpu": None, "store_wall_ns": time.time_ns()}
     except Exception as exc:  # noqa: BLE001 - never into the engine's step path
         with _lock:
             _count("errors")

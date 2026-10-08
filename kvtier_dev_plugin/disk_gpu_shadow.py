@@ -27,18 +27,61 @@ under us is never written, because it never got an `equal`), and no code path he
 hand a device address to `ctypes.string_at`. That is the whole reason this module is
 downstream of the verifier instead of beside it.
 
-WHAT THE FILE DIFF THEREFORE PROVES, SAID EXACTLY. It does not re-answer "do the GPU
-and the arena agree?" - the verifier answers that per block, live, in its own
-counters. Given only `equal` blocks are written, the two files' bytes agree by
-construction AT CAPTURE TIME, so a diff that disagrees is a fault in the thing this
-module adds: the FILE PATH. Specifically it proves (a) naming parity - that
+WHAT THE FILE DIFF PROVES, AND WHOSE BYTES THEY ARE (0.2.48). It does not re-answer
+"do the GPU and the arena agree?" - the verifier answers that per block, live, in its
+own counters. What it CAN prove depends on a fact the 0.2.37 text of this file did not
+state: A NAME OUTLIVES THE COMPLETION THAT CREATED IT. Neither tree ever overwrites an
+existing name (`disk_layout.write_committed_file` declines a duplicate with
+`duplicate=True, write_bytes=0`, and the spill path writes the live file through that
+same function), so each side of a pair holds the bytes of whichever EXECUTION OF THE
+WRITE PATH first created that name on that side - and fp8 KV recomputation is not
+bit-reproducible. A pair whose two sides came from two different completions of the
+same name is therefore EXPECTED to differ, and that is the common case: eight
+same-named pairs differed on the live box on 2026-10-09, every one of them with BOTH
+sides written after the box's last boot, one of them 132 ms apart from its partner -
+the timing signature an identical pair has. So the module asks the one question that
+decides correctly (`_attribute_pair`): WAS THE LIVE HALF WRITTEN BY THE STORE THIS
+SHADOW DESCRIBES, or did that name already exist? Only the second kind is benign, and
+only the first is a fault.
+
+WHAT THE DIFF PROVES IN THE FAULT CASE, SAID EXACTLY. Given only `equal` blocks are
+written, a pair that really did come from one completion has bytes that agree by
+construction AT CAPTURE TIME - over the window the witness actually looked at, which is
+the FIRST `disk_shadow.MAX_DIFF_SCAN_BYTES` (256 KB) of the slot and not its whole 11.4
+MB: the verifier's scan is bounded, so "equal" means "equal for every byte it read". A
+same-execution difference PAST that window is therefore still a real disagreement - the
+GPU's bytes against the arena's, in a region no witness read - but it is not one the
+verdict covered, and the ERROR line says so rather than letting a reader assume the
+block was compared whole. Inside the window, a diff that disagrees is a fault in the
+thing this module adds: the FILE PATH.
+
+THE ONE WAY THE REFERENCE ITSELF CAN BE STALE, AND IT IS SAID OUT LOUD. A live file at
+or after `store_wall_ns` is this store's file UNLESS this store's spill never reached
+the disk: then the pair sat pending, a LATER store wrote the live name, and the ERROR is
+our old shadow against a foreign completion. That is still an ERROR and still
+`pairs_fault` (a spill that silently failed is a fault), but the line names both
+readings and points at `pairs_failed`, because the counters cannot tell the two apart
+and only the mtime order can. Specifically it proves (a) naming parity - that
 `disk_layout.build_slot_path` under a different root produces the same relative name
 the live store wrote, which is the identity a restore looks up; (b) width - that what
 landed is a whole slot and not half of one; (c) write discipline - `.part`, verified
 size, `os.replace`, no truncation, no interleave; and (d) that across a store
 turnover the GPU-direct tree and the arena tree stay byte-for-byte the same files. A
-pair that differs, or a shadow file with no live partner, is that kind of fault, and
-the counters name which.
+SAME-EXECUTION pair that differs, or a shadow file with no live partner, is that kind
+of fault, and the counters name which. `pairs_differing` stays the umbrella over
+every byte-differing pair (so an existing dashboard keeps its meaning);
+`pairs_cross_execution`, `pairs_fault` and `pairs_unattributed` say which kind each
+one was, and they always sum to it.
+
+AND WHAT THE DIFFERENCE LOOKS LIKE, CAPTURED WHILE IT STILL EXISTS. A differing pair is
+pruned by this module's own retention within minutes, so "how bad was it?" is a
+question that cannot be asked after the fact - an operator who polls the box after the
+alarm finds only identical files, which is exactly what happened on 2026-10-09. At the
+moment of a differ the module reads `DIFF_SAMPLE_BYTES` of BOTH sides starting at the
+first differing byte (two seeks, two bounded reads, never a slot, never a walk) and
+publishes `differing_bytes_in_sample` and `max_byte_delta` beside the offset it already
+published. A sample that could not be read is `sample_available: false` with NULL
+numbers, never a `0` that reads as "the sample agreed".
 
 THE ORDER RULE IS INHERITED, NOT RE-IMPLEMENTED. A slot's bytes are the sum over the
 region tensors in `sorted(name)` order - never dict-insertion order, which is what the
@@ -172,14 +215,49 @@ MAX_REASON_CHARS = 120
 # at, not a list that eats the section's byte budget.
 MAX_NAME_SAMPLES = 6
 #
+# THE DIFFER'S OWN SAMPLE, in bytes per side. Why it exists: the evidence is pruned
+# within minutes, so the byte offset is the only description a differ keeps past its
+# retention - unless the module writes down what the bytes DO at the moment it sees
+# them. 1 KiB per side, read from the first differing byte, is two seeks and two
+# bounded reads on the writer thread: enough to tell "one code at one position" (a bit
+# flip) from "almost every byte differs by up to 255" (two independent fp8
+# recomputations of the same key, which is what the 2026-10-09 sample showed), and far
+# too small to be a read of a slot. The WINDOW STARTS AT THE FIRST DIFFERENCE rather
+# than at byte 0 because the
+# offsets seen in production were 0, 2 and 30720: a fixed prefix would have sampled a
+# purely identical region of a real differ and reported nothing.
+DIFF_SAMPLE_BYTES = 1024
+#
+# THE ATTRIBUTION'S TOLERANCE, in nanoseconds. The kernel stamps an inode from the
+# COARSE real clock, which lags the fine clock the module reads by up to one timer tick
+# (1-4 ms), so a live file written AFTER our store can be stamped slightly BEFORE it.
+# 20 ms is five to twenty times that lag. It is deliberately asymmetric: widening the
+# band can only move a pair out of the benign bucket and into `pairs_unattributed` or
+# the fault, never the other way round, so the tolerance can make this module timid but
+# never can make it call a fault benign.
+MTIME_GRANULARITY_MARGIN_NS = 20_000_000
+#
 # THE SECTION'S OWN BYTE BUDGET, tighter than the seam's on purpose, for the reason
 # `disk_shadow` documents at length: `worker_diag.MAX_CONTRIBUTION_BYTES` REFUSES an
 # over-cap section instead of truncating it, so a fat payload deletes the whole section
 # on the boot someone is reading the file about. This module sheds its illustrations in
 # a declared order and says what it shed in `trimmed`.
-MAX_SECTION_BYTES = 3072
+#
+# 3072 -> 3400 in 0.2.48, deliberately and for a countable reason: three new counters
+# (~80 B), the `differ_reference` view (~120 B) and a difference record that grew from
+# six keys to nineteen. The number is the SIBLING's - `disk_gpu_write`, the other module
+# that reports bytes - it stays below the 4096 B seam that refuses a section outright,
+# and `disk_restore_verify` runs at 3920, so this is the middle of the range this
+# package already ships rather than a new concession. The alternative was to let the
+# worst-case section reach its LAST trim step at the old budget, which would have meant
+# a fat boot losing every reason row it has: a worse trade than 328 bytes of rank file.
+MAX_SECTION_BYTES = 3400
 TRIM_REASON_CHARS = 48
 TRIM_NAME_SAMPLES = 2
+# THE DIFFER'S OWN PROSE, trimmed to this when the section is tight. `classification`
+# stays whole (it is one word, and it is the answer); what is clipped is WHY and HOW WE
+# KNOW - sentences a reader can reconstruct from the numbers the record also carries.
+TRIM_REFERENCE_CHARS = 32
 
 # THE STABLE KEY SET. `section()` builds every one of these on every call, in every
 # state, and the degraded view is built by the same code as the healthy one - that is
@@ -217,6 +295,15 @@ _COUNTER_KEYS = (
     "pairs_checked",
     "pairs_identical",
     "pairs_differing",
+    # THE THREE KINDS OF DIFFER, and they always sum to `pairs_differing`:
+    # `pairs_cross_execution` = the live half predates this shadow's own store, so the
+    # store kept an earlier execution's bytes under that name (expected, INFO once);
+    # `pairs_fault` = both sides came from this store, so a differ IS the write-path
+    # fault this module was built to catch (ERROR once); `pairs_unattributed` = the
+    # module could not order the two sides, which is neither of those and is reported.
+    "pairs_cross_execution",
+    "pairs_fault",
+    "pairs_unattributed",
     "pairs_size_disagree",
     "pairs_unpaired_expired",
     "pairs_shadow_missing",
@@ -266,10 +353,21 @@ _state: dict = {
     "last_retention_mono": None,
     "last_difference": None,
     "differing_names": [],
+    # When THIS process started, resolved once in THIS process (see
+    # `_resolve_process_start`). None until first asked.
+    "reference": None,
     "counters": {key: 0 for key in _COUNTER_KEYS},
 }
 _lock = threading.Lock()
 _pass_lock = threading.Lock()
+
+# THE ONE FILE-READ SEAM THIS MODULE HAS. Not indirection for its own sake: "the sample
+# read is bounded" is a claim about HOW MANY BYTES LEAVE THE DISK, and a claim about a
+# byte count has to be testable by counting bytes. Every sample read goes through this
+# name, so a test can wrap it in a file object that counts what it is asked for and
+# measure the shipped code rather than a re-implementation of it. Everything else in
+# this module keeps using the builtin.
+_OPEN = open
 
 
 # --- THE BOOKKEEPING PRIMITIVES (the `disk_shadow` idioms, deliberately the
@@ -508,6 +606,69 @@ def root_state() -> dict:
                                "live store's own scheme under the shadow root"}
 
 
+# --- THE REFERENCE POINT: WHEN DID *THIS* PROCESS START -----------------------
+def _resolve_process_start() -> dict:
+    """When this process started, in wall-clock seconds, resolved ONCE, here.
+
+    WHY NOT `VLLM_E2_TIER_DIAG_EPOCH`, which is the obvious-looking existing thing:
+    it is an opaque identifier and not a time, so it cannot order an `st_mtime`; when
+    the operator sets it it is deliberately the SAME value in every process of the boot
+    including the API server, so it carries no information about when this worker
+    started; and when it is unset it degrades to `snapshot.epoch()`, four random hex
+    bytes generated at first use (config.py:923-942, snapshot.py:81-88), which has no
+    time content at all. This module reports a differ in a WORKER, so the only start
+    time worth having is the one belonging to the process that observed the pair - the
+    same class of mistake 0.2.47 removed from the snapshot's `worker_diag` block, where
+    a value captured in the API-server process was published as if it described a
+    worker.
+
+    WHY THIS IS THE RIGHT SHAPE OF ANSWER, AND WHY IT IS NOT THE DECIDER. The boot
+    boundary answers "was this file written before or after we started?" and that is
+    COARSER than the question the differ actually needs: on the live box every differing
+    pair had both sides written after the last boot, so a boot boundary would have
+    called all of them faults. What decides is `_attribute_pair`, which compares each
+    side against THIS shadow's own store instant. The boot reference is published and
+    logged because it describes the evidence ("a previous boot wrote the live half" is
+    worth saying out loud), not because it decides anything.
+
+    THE FALLBACK IS LABELLED, not smoothed over. `/proc` is unreadable in a container
+    without a mount or under some sandboxes; then the best available value is the wall
+    clock at first use HERE, which is an UPPER bound on our start - so a file written
+    during our own boot can look older than it is. The source string says that, because
+    a reference whose weakness is hidden is worse than one that admits it.
+    """
+    cached = _state.get("reference")
+    if cached is not None:
+        return dict(cached)
+    pid = os.getpid()
+    started = None
+    source = None
+    try:
+        with _OPEN("/proc/self/stat", "r", encoding="utf-8") as handle:
+            stat_line = handle.read()
+        with _OPEN("/proc/uptime", "r", encoding="utf-8") as handle:
+            uptime_line = handle.read()
+        # Field 22 of /proc/<pid>/stat is the start time in clock ticks since boot, but
+        # field 2 (`comm`) is parenthesised and may contain a space, so the split starts
+        # after the LAST `)` rather than at the beginning. Uptime gives the boot's
+        # offset from now, which turns a tick count into a wall-clock second.
+        fields = stat_line[stat_line.rindex(")") + 2:].split()
+        start_ticks = int(fields[19])
+        uptime_seconds = float(uptime_line.split()[0])
+        ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+        started = round(time.time() - uptime_seconds
+                        + start_ticks / ticks_per_second, 3)
+        source = ("this process's own start (/proc/self/stat + /proc/uptime)")
+    except (OSError, ValueError, IndexError, KeyError):
+        started = round(time.time(), 3)
+        source = ("this process's first use, no /proc: an UPPER bound on our start, so "
+                  "a file written during our own boot can look older than it is")
+    resolved = {"pid": int(pid), "process_start_seconds": started, "source": source}
+    with _lock:
+        _state["reference"] = resolved
+    return dict(resolved)
+
+
 # --- THE HAND-OFF: CALLED FROM THE STEP THREAD, DOES NOTHING ------------------
 def consider(plan, verdict) -> dict:
     """Offer a compared block for a shadow write. Cheap, bounded, never raises.
@@ -559,6 +720,16 @@ def consider(plan, verdict) -> dict:
                         "written until it is")
                 return {"written": False, "reason_kind": "no_bytes"}
             data = bytes(blob)
+            # THE INSTANT THIS STORE HAPPENED, taken by `disk_shadow.snapshot` BEFORE
+            # `disk_spill.request_spill` was called - which is what makes it a bound a
+            # differ can be judged against. A timestamp taken here, in `consider`, would
+            # have been later than the spill's own file write whenever the spill's
+            # writer thread won the race, and the error it produced would have been
+            # the bad direction: a same-execution fault labelled benign. A plan that
+            # carries no instant is not guessed at: the pair becomes
+            # `pairs_unattributed`.
+            store_wall_ns = (plan or {}).get("store_wall_ns") \
+                if isinstance(plan, dict) else None
             root = _resolve_root()
             if not root["root"]:
                 _count("refused_not_configured")
@@ -585,6 +756,7 @@ def consider(plan, verdict) -> dict:
         job = {"key": key, "blob": data, "bytes": width,
                "slot": (plan or {}).get("slot"),
                "gpu_block": (plan or {}).get("gpu_block"),
+               "store_wall_ns": store_wall_ns,
                "queued_ts": time.monotonic()}
         if not _put(job):
             return {"written": False, "reason_kind": "queue_full"}
@@ -805,7 +977,7 @@ def _handle_job(job) -> None:
         _reason("committed_size_mismatch",
                 f"{named['name']}: the committed shadow file is {size} B, not "
                 f"{len(blob)} B")
-    _append_pending(named)
+    _append_pending(named, job.get("store_wall_ns"))
 
 
 def _file_size(path) -> int | None:
@@ -815,11 +987,120 @@ def _file_size(path) -> int | None:
         return None
 
 
-def _append_pending(named: dict) -> None:
-    """Queue the pair for comparison, on the writer thread, shedding the oldest."""
+def _file_mtime_ns(path) -> int | None:
+    """One file's `st_mtime_ns`, or None. Never raises, never a verdict.
+
+    Nanoseconds, deliberately: the attribution compares this against a store instant
+    captured with `time.time_ns()`, and the kernel's coarse inode clock is already good
+    to a millisecond or four - comparing at second resolution would put the interesting
+    cases (a live file written 132 ms before its shadow, which is what the live box
+    showed) straight into the ambiguous band.
+    """
+    try:
+        return int(os.stat(path).st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _read_window(path, offset, limit: int) -> dict:
+    """At most `limit` bytes of one file, from `offset`. Never reads more, never raises.
+
+    THE ONLY READ THE SAMPLE MAKES, through `_OPEN`, so the bound is one number in one
+    place and a test can count it. A seek past the end of a file reads nothing, which is
+    an ordinary answer and not an error.
+    """
+    want = int(limit)
+    if want <= 0:
+        return {"ok": False, "data": b"", "bytes_read": 0,
+                "reason": "the window is empty"}
+    try:
+        with _OPEN(path, "rb") as handle:
+            handle.seek(int(offset))
+            data = handle.read(want)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "data": b"", "bytes_read": 0,
+                "reason": f"{type(exc).__name__}"}
+    return {"ok": True, "data": data, "bytes_read": len(data), "reason": None}
+
+
+def _sample_difference(left, right, offset, limit: int | None = None) -> dict:
+    """What the two sides actually do over `DIFF_SAMPLE_BYTES` from `offset`.
+
+    WHY THIS EXISTS. A differ is evidence with a retention cap: on 2026-10-09 an
+    operator polled the live box eight times after the alarm and every pair still on
+    disk was identical, so "how bad was the difference?" was permanently unanswerable.
+    The offset alone does not answer it either - one code at one position and every
+    quantized element disagreeing both have "first differing byte at 0". So at the
+    moment of the differ, while both files are certainly still here, the module reads a
+    bounded window of each and publishes how many bytes in it disagree and how far apart
+    the two sides get at their worst.
+
+    THE BOUND IS THE POINT: `min(limit, the shorter side's remaining bytes)` per side,
+    two seeks, two reads, no walk, no slot, and no lock held across any of it (the
+    caller takes `_lock` only to store the result). A read that fails is
+    `sample_available: false` with NULL numbers - never `0`, because a `0` here reads as
+    "the sample agrees", and that is the sentence that closes an investigation.
+    """
+    cap = int(DIFF_SAMPLE_BYTES if limit is None else limit)
+    out = {"sample_available": False, "sample_offset": None, "sample_bytes": 0,
+           "differing_bytes_in_sample": None, "max_byte_delta": None,
+           "reason": None}
+    start = max(0, int(offset or 0))
+    size_left, size_right = _file_size(left), _file_size(right)
+    if size_left is None or size_right is None:
+        out["reason"] = ("a side could not be measured before the sample was read "
+                         "(it vanished, or the root refused the stat)")
+        return out
+    window = min(cap, min(size_left, size_right) - start)
+    if window <= 0:
+        out["reason"] = (f"the first difference is at {start}, at or past the end of "
+                         f"the shorter side ({min(size_left, size_right)} B), so there "
+                         "is no window that both sides have")
+        return out
+    read_left = _read_window(left, start, window)
+    read_right = _read_window(right, start, window)
+    if not read_left["ok"] or not read_right["ok"]:
+        out["reason"] = ("a sample read failed "
+                         f"({read_left['reason'] or read_right['reason']})")
+        return out
+    length = min(len(read_left["data"]), len(read_right["data"]))
+    if length <= 0:
+        out["reason"] = "both windows came back empty"
+        return out
+    left_bytes = read_left["data"][:length]
+    right_bytes = read_right["data"][:length]
+    differing = 0
+    biggest = 0
+    for position in range(length):
+        first, second = left_bytes[position], right_bytes[position]
+        if first != second:
+            differing += 1
+            gap = first - second if first > second else second - first
+            if gap > biggest:
+                biggest = gap
+    out["sample_available"] = True
+    out["sample_offset"] = start
+    out["sample_bytes"] = int(length)
+    out["differing_bytes_in_sample"] = int(differing)
+    out["max_byte_delta"] = int(biggest)
+    return out
+
+
+def _append_pending(named: dict, store_wall_ns=None) -> None:
+    """Queue the pair for comparison, on the writer thread, shedding the oldest.
+
+    `store_wall_ns` rides along with the pair because it is the ONLY thing that can
+    answer, minutes later on a different thread, who wrote the live half: it is the
+    instant before this store's spill was requested, stamped by `disk_shadow.snapshot`
+    on the step thread. `None` is carried honestly as `None` and decided as
+    unattributed, never replaced by "now".
+    """
     with _lock:
         entry = {"name": named["name"], "shadow_path": named["shadow_path"],
                  "live_path": named["live_path"], "width": int(named["width"]),
+                 "store_wall_ns": (int(store_wall_ns)
+                                   if isinstance(store_wall_ns, (int, float))
+                                   and int(store_wall_ns) > 0 else None),
                  "since": time.monotonic()}
         pending = _state["pending"]
         pending.append(entry)
@@ -957,8 +1238,222 @@ def _compare_files(left: str, right: str, limit: int) -> dict:
             "shadow_bytes": size_left, "live_bytes": size_right}
 
 
+# THE THREE KINDS OF DIFFER, and the counter and the log level each one earns. Kept as
+# two tables rather than branches so the invariant "every differ lands in exactly one
+# bucket" is a fact about a dict, testable against `_COUNTER_KEYS`.
+_KIND_COUNTER = {"cross_execution": "pairs_cross_execution",
+                 "same_execution": "pairs_fault",
+                 "unattributed": "pairs_unattributed"}
+_KIND_LEVEL = {"cross_execution": "info", "same_execution": "error",
+               "unattributed": "warning"}
+
+
+def _attribute_pair(entry, live_mtime_ns) -> dict:
+    """Who wrote the live half: the store this shadow describes, or an earlier one.
+
+    THE QUESTION, SAID EXACTLY. Neither tree ever overwrites a name, so a live file
+    older than the instant BEFORE THIS STORE'S SPILL WAS REQUESTED cannot be the file
+    this store wrote: it is an earlier execution of the write path - an earlier store in
+    this boot, or a previous boot - sitting under a name that outlived it. Two
+    independent fp8 recomputations of one key are not bit-identical, so that pair was
+    never going to agree, and 0.2.47 logged it as a corruption fault. A live file that
+    is NOT older than that instant is this store's own file, and a differ there is
+    exactly the fault this module was written to catch.
+
+    WHY NOT THE BOOT BOUNDARY, which is what a reference for this looks like at first
+    glance. Every differing pair measured on the live box on 2026-10-09 had BOTH sides
+    written after the box's last boot, and one of them was 132 ms from its partner -
+    ordering files against "when did this process start" would have labelled all of them
+    faults. The store instant is the same KIND of fact (a wall-clock bound taken in this
+    process, before the spill was queued) and it is the one that discriminates. The boot
+    reference is still published in `differ_reference` because it DESCRIBES the
+    evidence; it does not decide it.
+
+    THE THREE ANSWERS ARE NOT SYMMETRIC, AND THE ASYMMETRY IS DELIBERATE. Anything
+    ambiguous goes to `unattributed`, never to `cross_execution`: a tolerance can only
+    move a pair OUT of the benign bucket, so this function can be made timid but can
+    never be talked into calling a fault benign.
+    """
+    store_ns = entry.get("store_wall_ns")
+    if not isinstance(store_ns, (int, float)) or int(store_ns) <= 0:
+        return {"classification": "unattributed",
+                "reason": "the plan carried no store instant, so nothing orders the "
+                          "two sides"}
+    if live_mtime_ns is None:
+        return {"classification": "unattributed",
+                "reason": "the live file's mtime could not be read (it went away "
+                          "between the comparison and the attribution)"}
+    now_ns = time.time_ns()
+    if now_ns < int(store_ns):
+        return {"classification": "unattributed",
+                "reason": "the wall clock now reads earlier than the instant this "
+                          "store was stamped, so it moved backwards and an mtime "
+                          "ordering proves nothing"}
+    if int(live_mtime_ns) > now_ns + MTIME_GRANULARITY_MARGIN_NS:
+        return {"classification": "unattributed",
+                "reason": "the live file's mtime is in the future, which means the "
+                          "clock moved after that file was written"}
+    if int(live_mtime_ns) >= int(store_ns):
+        return {"classification": "same_execution",
+                "reason": "the live file is not older than the instant before this "
+                          "store's spill was requested, so it is the file this store "
+                          "wrote"}
+    if int(live_mtime_ns) > int(store_ns) - MTIME_GRANULARITY_MARGIN_NS:
+        return {"classification": "unattributed",
+                "reason": f"the live file's mtime sits within "
+                          f"{MTIME_GRANULARITY_MARGIN_NS // 1_000_000} ms below the "
+                          "store instant, where the kernel's coarse inode timestamp "
+                          "and a genuinely older file cannot be told apart"}
+    return {"classification": "cross_execution",
+            "reason": "the live file predates this store by more than the inode "
+                      "timestamp's granularity, and neither tree ever overwrites an "
+                      "existing name, so it holds an earlier execution's bytes"}
+
+
+def _difference_record(entry, result, attribution, sample, reference,
+                       shadow_mtime_ns, live_mtime_ns) -> dict:
+    """`last_difference`, built by the ONLY code that builds it, with every key always.
+
+    The section's stable-shape rule applies to this nested record too, because the
+    reader is a person or an agent diffing two rank files: a key that appeared only in
+    the fault branch would read as "the format changed" in the one branch that matters,
+    and a sample that could not be read must not remove the keys it could not fill - it
+    nulls them and says why in `sample_reason`.
+    """
+    def as_seconds(value):
+        return None if value is None else round(int(value) / 1_000_000_000, 3)
+
+    store_ns = entry.get("store_wall_ns")
+    predates = _predates_this_process(live_mtime_ns, reference)
+    return {"name": entry["name"],
+            "first_difference": result["first_difference"],
+            "scanned_bytes": result["scanned_bytes"],
+            "shadow_bytes": result["shadow_bytes"],
+            "live_bytes": result["live_bytes"],
+            "size_disagree": bool(result["size_disagree"]),
+            "classification": attribution["classification"],
+            "classification_reason": _clip_text(attribution["reason"],
+                                                MAX_REASON_CHARS),
+            "reference_seconds": as_seconds(store_ns),
+            "reference_source": _clip_text(reference["source"], MAX_REASON_CHARS),
+            "shadow_mtime_seconds": as_seconds(shadow_mtime_ns),
+            "live_mtime_seconds": as_seconds(live_mtime_ns),
+            "live_predates_this_process_start": predates,
+            "sample_offset": sample["sample_offset"],
+            "sample_bytes": sample["sample_bytes"],
+            "sample_available": bool(sample["sample_available"]),
+            "differing_bytes_in_sample": sample["differing_bytes_in_sample"],
+            "max_byte_delta": sample["max_byte_delta"],
+            "sample_reason": sample["reason"]}
+
+
+def _difference_line(entry, result, attribution, sample, reference,
+                     shadow_mtime_ns, live_mtime_ns) -> str:
+    """The ONE line a differ earns, worded by which kind of differ it was.
+
+    Both mtimes and the reference used are in every variant, because the whole point of
+    the classification is that it is an inference from those three numbers - a reader
+    who cannot see them cannot audit the verdict, and "trust me, it is benign" is what
+    the 0.2.47 message was.
+    """
+    kind = attribution["classification"]
+    def seconds(value):
+        return "?" if value is None else f"{round(int(value) / 1_000_000_000, 3)} s"
+    store_ns = entry.get("store_wall_ns")
+    head = (f"[disk_gpu_shadow] a shadow file and the live store's file with the SAME "
+            f"NAME differ ({entry['name']}): {kind}. First differing byte at "
+            f"{result['first_difference']} of {result['scanned_bytes']} B scanned "
+            f"({result['shadow_bytes']} B vs {result['live_bytes']} B, "
+            f"sizes {'disagree' if result['size_disagree'] else 'agree'}). "
+            f"mtime: shadow {seconds(shadow_mtime_ns)}, live "
+            f"{seconds(live_mtime_ns)}; reference {seconds(store_ns)} = the wall "
+            f"instant before this store's spill was requested, in this process "
+            f"(pid {reference['pid']}; this process started at "
+            f"{reference['process_start_seconds']} s by "
+            f"{reference['source']}). ")
+    if sample["sample_available"]:
+        head += (f"Sample of {sample['sample_bytes']} B from the first difference: "
+                 f"{sample['differing_bytes_in_sample']} bytes differ, max delta "
+                 f"{sample['max_byte_delta']}. ")
+    else:
+        head += f"No byte sample ({sample['reason']}). "
+    if kind == "cross_execution":
+        return head + (attribution["reason"] + " - "
+                       + ("the live half also predates this process's start, so a "
+                          "previous boot wrote it" if
+                          _predates_this_process(live_mtime_ns, reference)
+                          is True else
+                          "the live half is from an earlier store of this same boot")
+                       + ". Expected wherever a key is re-spilled, and NOT a fault "
+                       "(counted as pairs_cross_execution; one line per episode)")
+    if kind == "same_execution":
+        body = (attribution["reason"] + " - that is a fault in the GPU-direct write "
+                "path or a live file that changed after the spill, and this module "
+                "compares every byte of both sides to be able to say so ")
+        window = _verifier_window_bytes()
+        first = result["first_difference"]
+        if window and isinstance(first, int) and first >= window:
+            body += (f"(note: the verifier's `equal` covers the first {window} B of "
+                     f"the slot, so this difference is in a region no witness read - "
+                     f"the GPU's bytes against the arena's, a real disagreement and "
+                     f"not a covered one) ")
+        if live_mtime_ns is not None and shadow_mtime_ns is not None \
+                and int(live_mtime_ns) > int(shadow_mtime_ns):
+            # THE ONE WAY THIS REFERENCE CAN BE STALE. `store_wall_ns` came from THIS
+            # store, so a live file newer than it is this store's file - unless this
+            # store's spill never reached the disk. Then the pair sat pending, a LATER
+            # store created the live name (neither tree overwrites, so nothing else
+            # would ever notice), and the comparison is our old shadow against a file
+            # from a different completion. That is still an ERROR and still a fault
+            # counter - a spill that silently failed is a fault - but the reader has to
+            # be able to tell the two apart, and the mtimes are the only thing that can.
+            body += ("(note: the live half is NEWER than this shadow file, so it is "
+                     "either this spill's own file committed after our writer wrote - "
+                     "normal, they are different threads - or this store's spill never "
+                     "reached the disk and the live name belongs to a LATER store. "
+                     "`pairs_failed` and `last_reason` say whether a write failed "
+                     "here; if they do not, this is the fault it claims to be) ")
+        return head + body + "(counted as pairs_fault; one line per episode)"
+    return head + (attribution["reason"] + " - reported as its own outcome "
+                   "(counted as pairs_unattributed): neither benign nor a fault, so "
+                   "neither the INFO line above nor the ERROR below can be substituted "
+                   "for it")
+
+
+def _predates_this_process(live_mtime_ns, reference) -> bool | None:
+    """Did the live half exist before this process started? None if it cannot be said.
+
+    One implementation, used by the record AND by the log line, so the two can never
+    disagree about which boot wrote the other side.
+    """
+    started = reference.get("process_start_seconds")
+    if live_mtime_ns is None or started is None:
+        return None
+    return bool(int(live_mtime_ns) < int(float(started) * 1_000_000_000))
+
+
+def _verifier_window_bytes() -> int:
+    """How far `disk_shadow`'s `equal` verdict actually looks; 0 if it cannot be said.
+
+    A local import and a `getattr`, not because the sibling might be missing - it is
+    not - but because what this feeds is the context sentence of a log line: a module
+    that renamed one constant must never be able to break a differ's report.
+    """
+    try:
+        from . import disk_shadow  # noqa: PLC0415 - a sentence, not a dependency
+        return int(getattr(disk_shadow, "MAX_DIFF_SCAN_BYTES", 0) or 0)
+    except Exception:  # noqa: BLE001 - context only, never a reason to lose the line
+        return 0
+
+
 def _compare_pair(entry: dict) -> str:
-    """Decide one pair, report that the live file has not appeared, or drop it."""
+    """Decide one pair, report that the live file has not appeared, or drop it.
+
+    The counting that a pair ALWAYS earns (checked, identical, differing, size) happens
+    under `_lock`; everything a DIFFER needs after that - two stats, two bounded sample
+    reads, one `/proc` read on the first differ - happens OUTSIDE it, because a writer
+    thread that holds a lock across NVMe reads makes its own queue wait on a disk.
+    """
     result = _compare_files(entry["shadow_path"], entry["live_path"],
                             entry["width"])
     with _lock:
@@ -978,26 +1473,48 @@ def _compare_pair(entry: dict) -> str:
         _count("pairs_checked")
         if result["identical"]:
             _count("pairs_identical")
-        else:
-            _count("pairs_differing")
-            if result["size_disagree"]:
-                _count("pairs_size_disagree")
-            _state["last_difference"] = {
-                "name": entry["name"], "first_difference": result["first_difference"],
-                "scanned_bytes": result["scanned_bytes"],
-                "shadow_bytes": result["shadow_bytes"],
-                "live_bytes": result["live_bytes"],
-                "size_disagree": bool(result["size_disagree"])}
-            if entry["name"] not in _state["differing_names"]:
-                _state["differing_names"].append(entry["name"])
-                del _state["differing_names"][MAX_NAME_SAMPLES:]
-            _note_once("differing",
-                       f"[disk_gpu_shadow] a shadow file and the live store's file "
-                       f"with the SAME NAME differ ({entry['name']}, first differing "
-                       f"byte at {result['first_difference']}) - that is a fault in "
-                       "the GPU-direct write path or a live file that changed after "
-                       "the spill, not a layout question", level="error")
-        return "decided"
+            return "decided"
+        _count("pairs_differing")
+        if result["size_disagree"]:
+            _count("pairs_size_disagree")
+    # THE DIFFER. Attribution and sampling are I/O, so they run outside the lock, and
+    # the comparison that produced `result` has ALREADY read both sides in full up to
+    # the first difference - no branch of this function compares fewer bytes than any
+    # other, which is what makes "it is a fault" worth saying.
+    live_mtime_ns = _file_mtime_ns(entry["live_path"])
+    shadow_mtime_ns = _file_mtime_ns(entry["shadow_path"])
+    attribution = _attribute_pair(entry, live_mtime_ns)
+    kind = attribution["classification"]
+    sample = _sample_difference(entry["shadow_path"], entry["live_path"],
+                                result["first_difference"])
+    reference = _resolve_process_start()
+    if not sample["sample_available"]:
+        _note_once("differ-sample-unavailable",
+                   f"[disk_gpu_shadow] the byte sample of a differing pair could not "
+                   f"be read ({entry['name']}, offset "
+                   f"{result['first_difference']}): {sample['reason']} - the verdict "
+                   "and the counters are unaffected, but "
+                   "`differing_bytes_in_sample` and `max_byte_delta` are null in that "
+                   "record rather than zero, which would read as an agreement",
+                   "warning")
+    with _lock:
+        _count(_KIND_COUNTER[kind])
+        _state["last_difference"] = _difference_record(
+            entry, result, attribution, sample, reference,
+            shadow_mtime_ns, live_mtime_ns)
+        if kind != "cross_execution" and entry["name"] \
+                not in _state["differing_names"]:
+            # THE ACTIONABLE NAMES ONLY. The list is capped at `MAX_NAME_SAMPLES` and it
+            # is the "go look at this file" list, so a benign differ - which is the
+            # common case, and needs no looking - would push out the one name an
+            # operator does. The counters still count every kind.
+            _state["differing_names"].append(entry["name"])
+            del _state["differing_names"][MAX_NAME_SAMPLES:]
+    _note_once(f"differ-{kind}",
+               _difference_line(entry, result, attribution, sample, reference,
+                                shadow_mtime_ns, live_mtime_ns),
+               level=_KIND_LEVEL[kind])
+    return "decided"
 
 
 # --- RETENTION: THIS DIRECTORY ONLY -------------------------------------------
@@ -1172,19 +1689,29 @@ def _fit(out: dict) -> dict:
 
       1. the reason TEXT to 48 chars (the tag at the front survives, and the tag is the
          part that names the category);
-      2. the differing-name SAMPLES to two (the `pairs_differing` counter survives -
+      2. the differ's PROSE (why it was classified that way, and what reference the
+         classification used) to 32 chars - the `classification` word itself is never
+         touched, only its explanation;
+      3. the differing-name SAMPLES to two (the `pairs_differing` counter survives -
          the sample is the illustration, the number is the fact);
-      3. the reason list itself, emptied.
+      4. the reason list itself, emptied.
 
-    `last_difference` is never a trim target and never gains a key: like
-    `disk_shadow.last_mismatch` it carries only numbers, and a trim step that shed it
-    would make a trimmed section a different SHAPE from an untrimmed one.
+    `last_difference` is never a trim target as a whole and its KEYS never change: like
+    `disk_shadow.last_mismatch` it carries numbers, and a trim step that shed a key from
+    it would make a trimmed section a different SHAPE from an untrimmed one. It gained
+    keys in 0.2.48 (the classification and the sample), and it gained them in the one
+    function that builds it, which is what keeps that promise checkable; only its two
+    sentences are clipped, and only when the budget asks.
     """
     trimmed = out["trimmed"] = []
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return out
     out["reasons"] = [str(line)[:TRIM_REASON_CHARS] for line in out["reasons"]]
     trimmed.append(f"reason_chars:{TRIM_REASON_CHARS}")
+    if _dump_size(out) <= MAX_SECTION_BYTES:
+        return _counted_trim(out)
+    _clip_differ_prose(out)
+    trimmed.append(f"differ_prose:{TRIM_REFERENCE_CHARS}")
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return _counted_trim(out)
     names = list(out["differing_names"])[:TRIM_NAME_SAMPLES]
@@ -1206,6 +1733,40 @@ def _fit(out: dict) -> dict:
                    "rank writer will refuse it, so `disk_gpu_shadow` will be absent "
                    "from diagnostics-rank.json", level="error")
     return out
+
+
+def _clip_text(value, limit: int) -> str:
+    """Clip one sentence to `limit` chars, saying so. Empty and None pass through."""
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit - 3)] + "..."
+
+
+def _clip_differ_prose(out: dict) -> None:
+    """Clip the differ's two sentences, and the reference's own source string.
+
+    Only prose: `classification`, `first_difference`, the sample's two figures and every
+    counter survive a trim whole, and NO key is removed, so a reader of a trimmed
+    section can still tell a benign differ from a fault and still cannot mistake it for
+    a format change. The dicts edited here are always copies (`section()` deep-copies
+    the record and `_resolve_process_start` hands out a copy), so a trim can never edit
+    the module's own stored state.
+    """
+    reference = out.get("differ_reference")
+    if isinstance(reference, dict) and "source" in reference:
+        reference["source"] = _clip_text(reference.get("source"),
+                                         TRIM_REFERENCE_CHARS)
+    record = out.get("last_difference")
+    if isinstance(record, dict):
+        for key in ("classification_reason", "reference_source"):
+            # ONLY a key that is already there: a trim that ADDED a key would make the
+            # trimmed section a different shape from the untrimmed one, which is the one
+            # thing this function is not allowed to do.
+            if key in record:
+                record[key] = _clip_text(record[key], TRIM_REFERENCE_CHARS)
 
 
 def _counted_trim(out: dict) -> dict:
@@ -1257,6 +1818,9 @@ def section() -> dict:
     out["env_recognised"] = enable["env_recognised"]
     out["latch"] = enable["latch"]
     out["root"] = root_state()
+    # WHEN THIS PROCESS STARTED, published because the differ records quote it. Resolved
+    # once per process and never re-read, so the step thread pays it at most twice.
+    out["differ_reference"] = _resolve_process_start()
     out["limits"] = {"max_queue_jobs": int(MAX_QUEUE_JOBS),
                      "max_queued_bytes": int(MAX_QUEUED_BYTES),
                      "max_pairs_per_pass": int(MAX_PAIRS_PER_PASS),
@@ -1268,9 +1832,10 @@ def section() -> dict:
     out["section"] = MODULE
     out["writer"] = OWNER_TAG
     out["note"] = ("never authoritative: these files are a second copy of a block the "
-                   "shadow verifier already called `equal`, written under a root that "
-                   "is not the live store, so the live store stays the only thing a "
-                   "restore loads; a differing pair is a fault in this write path")
+                   "shadow verifier called `equal`, written under a root that is not "
+                   "the live store; a differing pair is a fault only when its two "
+                   "sides came from one store - read `classification`, whose three "
+                   "counters sum to `pairs_differing")
     return _fit(out)
 
 
@@ -1414,6 +1979,7 @@ def _fresh_state() -> dict:
         "measured_age_seconds": None,
         "last_pass_mono": None, "last_retention_mono": None,
         "last_difference": None, "differing_names": [],
+        "reference": None,
         "counters": {key: 0 for key in _COUNTER_KEYS},
     }
 
