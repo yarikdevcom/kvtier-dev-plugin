@@ -31,7 +31,7 @@ SCHEMA (version 1; the reader's `KV_TIER_SNAPSHOT_VERSION`)
 -----------------------------------------------------------
     {"version": 1, "epoch": "<8 hex>", "ts": 1790000000.123,
      "role": "worker", "rank": "PP0_TP0",
-     "plugin_version": "0.2.50", "plugin_version_reason": null,
+     "plugin_version": "0.2.51", "plugin_version_reason": null,
      "plugin_version_scope": "<which process this value describes>",
      "arena": {"bytes_total": int, "bytes_used": int, "num_blocks": int,
                "block_bytes_by_group": [int, ...] | null},
@@ -138,14 +138,28 @@ Which fields the reader REQUIRES, and what this writer can honestly supply:
       "last_beat_duration_seconds": float|null, "errors": int,
       "fatal_beats": int, "stalled_beats": int, "jammed_beats": int,
       "floor_skips": int, "respawns": int, "writer_pid": int,
+      "cadence_clock": "boottime"|"monotonic", "ticks": int,
+      "beats_from_clock": int, "beats_from_step": int,
+      "beats_after_resume": int, "refusals": int, "resumes": int,
       "last_error": str|null}
 
  HOW TO READ IT: `beating` in a file whose `ts` is old means the writer stopped AFTER
  writing (the process died, or its supervisor did); `alive_not_beating` means the
- thread is alive and NOT writing - a blocked contributor, and `state_reason` plus
- `last_beat_duration_seconds`/`stalled_beats` say so while the file is still fresh;
- `never_started` names what refused it; `not_applicable` says this process is not a
- worker rank-file writer. `writer_pid` distinguishes two writers of one file name.
+ thread is alive and NOT writing - after 0.2.51 a TRANSIENT at startup, and otherwise a
+ blocked contributor (`state_reason` plus `last_beat_duration_seconds`/`stalled_beats`
+ say so while the file is still fresh) or a beat that refused to write for a reason now
+ named by `refusals` and by `state_reason`; `never_started` names what refused it;
+ `not_applicable` says this process is not a worker rank-file writer. `writer_pid`
+ distinguishes two writers of one file name.
+
+ IS THE IDLE PATH ALIVE? Read `beats_from_clock`. It counts the beats the supervisor
+ issued because ITS OWN CLOCK EXPIRED with no help from the engine, which is the only
+ measurement that can answer the question - `beats` totals all causes and
+ `beats_from_step` counts the beats a busy engine would have written anyway. On a box
+ that suspends, also read `resumes` and `cadence_clock`: `resumes` is how many times
+ this process detected that the box slept under it (BOOTTIME gaining seconds that
+ CLOCK_MONOTONIC did not) and `cadence_clock` names the clock every age in this block is
+ kept on, because the gate ages this file on a WALL clock (`disk_restore.py:3410`).
  A reader that does not know this key ignores it, exactly as it ignores `gpu_census`.
 
 BUDGET (the whole reason this is allowed on a per-step path)
@@ -339,8 +353,24 @@ _state: dict = {
     "heartbeat_respawns": 0,
     "heartbeat_floor_skips": 0,
     "heartbeat_errors": 0,
-    "heartbeat_last_mono": None,
+    # 0.2.51: this stamp is on the CADENCE clock, not `monotonic`, so its age agrees
+    # with the wall-clock age the gate computes instead of disagreeing by the suspended
+    # seconds. It used to be called `heartbeat_last_mono` and it was a lie by name.
+    "heartbeat_last_beat_time": None,
     "heartbeat_thread_alive": False,
+    # THE 0.2.51 ADDITIONS: WHO ASKED FOR EACH BEAT, and what refused it. The 0.2.47
+    # block could say a beat had not happened; it could not say the supervisor had not
+    # ASKED, which is why an idle worker with no beats and a box that was merely
+    # suspended were the same reading. `heartbeat_ticks` counts the supervisor's own
+    # wakeups, the three `heartbeat_beats_*` keys name the CAUSE of each beat it issued,
+    # and `heartbeat_refusals` counts a beat that reached the tick and declined to write
+    # for a reason that previously vanished without a trace.
+    "heartbeat_ticks": 0,
+    "heartbeat_beats_clock": 0,
+    "heartbeat_beats_step": 0,
+    "heartbeat_beats_after_resume": 0,
+    "heartbeat_refusals": 0,
+    "heartbeat_resumes": 0,
     # THE 0.2.47 ADDITIONS: the beat's own health, not just its count.
     # `heartbeat_writes` is the one number that separates a thread that BEATS from a
     # thread that is merely alive; `heartbeat_inflight` is what a supervisor tick would
@@ -397,8 +427,12 @@ def reset_state_for_tests() -> None:
                    "last_path": None, "bytes_written": 0, "fallbacks": 0,
                    "heartbeats": 0, "heartbeat_threads": 0,
                    "heartbeat_respawns": 0, "heartbeat_floor_skips": 0,
-                   "heartbeat_errors": 0, "heartbeat_last_mono": None,
+                   "heartbeat_errors": 0, "heartbeat_last_beat_time": None,
                    "heartbeat_thread_alive": False, "handler_ref": None,
+                   "heartbeat_ticks": 0, "heartbeat_beats_clock": 0,
+                   "heartbeat_beats_step": 0,
+                   "heartbeat_beats_after_resume": 0,
+                   "heartbeat_refusals": 0, "heartbeat_resumes": 0,
                    "heartbeat_writes": 0, "heartbeat_inflight": 0,
                    "heartbeat_stalled": 0, "heartbeat_jammed": 0,
                    "heartbeat_fatal": 0, "heartbeat_last_duration_seconds": None,
@@ -673,9 +707,22 @@ def section() -> dict:
         "heartbeat_respawns": int(_state["heartbeat_respawns"]),
         "heartbeat_floor_skips": int(_state["heartbeat_floor_skips"]),
         "heartbeat_errors": int(_state["heartbeat_errors"]),
+        # THE 0.2.51 CAUSE KEYS, in the snapshot surface too: `/status` is answered by
+        # the API server about its own process, so for a WORKER these stay zeros - but a
+        # test or a same-process reader asks this payload, and it should be able to ask
+        # the same question there that the rank file answers per rank.
+        "heartbeat_ticks": int(_state["heartbeat_ticks"]),
+        "heartbeat_beats_clock": int(_state["heartbeat_beats_clock"]),
+        "heartbeat_beats_step": int(_state["heartbeat_beats_step"]),
+        "heartbeat_beats_after_resume": int(
+            _state["heartbeat_beats_after_resume"]),
+        "heartbeat_refusals": int(_state["heartbeat_refusals"]),
+        "heartbeat_resumes": int(_state["heartbeat_resumes"]),
+        "heartbeat_cadence_clock": HEARTBEAT_CADENCE_CLOCK,
         "last_heartbeat_age_seconds": (
-            round(time.monotonic() - float(_state["heartbeat_last_mono"]), 3)
-            if isinstance(_state["heartbeat_last_mono"], (int, float)) else None),
+            round(_cadence_now() - float(_state["heartbeat_last_beat_time"]), 3)
+            if isinstance(_state["heartbeat_last_beat_time"],
+                          (int, float)) else None),
         "heartbeat_window_seconds": _heartbeat_window_seconds(),
         "heartbeat_beats_in_window": int(_heartbeat_window_seconds() // max(
             0.001, float(HEARTBEAT_INTERVAL_SECONDS))),
@@ -1138,7 +1185,13 @@ HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_DEFAULT
 # floor - a separate knob rather than a borrowed one, because "how often may a
 # background thread touch this directory" and "how often may a step" are different
 # questions an operator may want to answer differently.
-HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+# THE SHIPPED VALUE, pinned beside the live one for the same reason
+# `HEARTBEAT_INTERVAL_DEFAULT` exists: a suite that shortens the floor to make a beat
+# observable otherwise cannot tell a beat that was refused by the floor from one the
+# floor was never in a position to refuse - and "the post-wake beat was refused by a
+# floor kept on the clock the suspend skipped" is the defect 0.2.51 removes.
+HEARTBEAT_MIN_INTERVAL_DEFAULT = 5.0
+HEARTBEAT_MIN_INTERVAL_SECONDS = HEARTBEAT_MIN_INTERVAL_DEFAULT
 HEARTBEAT_THREAD_NAME = "kvtier-worker-diag-heartbeat"
 # THE MARGIN THIS DESIGN IS ALLOWED TO LOSE. 60 s inside a 900 s window is fifteen
 # beats, so four consecutive dropped ticks (a long GIL hold, a slow device, a
@@ -1167,6 +1220,76 @@ HEARTBEAT_BEAT_BUDGET_SECONDS = 20.0
 HEARTBEAT_MAX_INFLIGHT_BEATS = 3
 HEARTBEAT_BEAT_THREAD_NAME = "kvtier-worker-diag-beat"
 
+# THE CLOCK THE CADENCE IS KEPT ON (0.2.51), and why it is not `time.monotonic()`.
+# Until 0.2.51 the supervisor's whole clock was `stop.wait(interval)`, and CPython
+# implements `Event.wait(timeout)` on CLOCK_MONOTONIC. On Linux CLOCK_MONOTONIC DOES NOT
+# ADVANCE WHILE THE BOX IS SUSPENDED - CLOCK_BOOTTIME does. This box suspends
+# (`systemctl suspend` from the proxy on its idle timeout; `suspend_stats/success` is
+# non-zero on the live host and the measured gap between the two clocks was 19,612 s on
+# 2026-10-09), so a beat deadline set before a sleep is still unpaid when the box wakes,
+# and the wait resumes with its remaining seconds counted from the WAKE. That alone
+# delays one beat by up to one interval, which is cheap - but the reader does not use
+# that clock: `disk_restore._read_rank_file` computes `age = time.time() - ts`
+# (`disk_restore.py:3410`), a WALL clock, which charges the whole sleep to the stamp.
+# So across a suspend the file says `last_beat_age_seconds: 3.0` while the gate
+# reads the same file as 15 minutes stale, and the gate is the only reader that
+# matters: the first request after a wake is refused a disk restore
+# (`no_worker_proof`) and recomputes a long prompt - precisely the request the tier
+# exists to serve.
+# Keeping the cadence on CLOCK_BOOTTIME makes the two clocks agree about the thing they
+# are both measuring (has this worker proven recently?) and turns the resume into a
+# detectable EVENT instead of a silent pause: BOOTTIME gains the suspended seconds that
+# MONOTONIC did not, which is what `_suspended_between` below reads.
+# `HEARTBEAT_RESUME_POLL_SECONDS` is what makes the wait still a bounded wait and not a
+# spin: the thread sleeps at most this long per poll, so the deadline is honoured to
+# within 5 s and a resume is noticed - and beaten for - within 5 s of the wake. A thread
+# parked on `stop.wait()` costs nothing while the box sleeps, because it is frozen too.
+HEARTBEAT_RESUME_POLL_SECONDS = 5.0
+# HOW MUCH MORE the cadence clock may gain on the monotonic clock before the gap is
+# called a suspend rather than measurement noise. Two clocks read microseconds apart in
+# one sample; two seconds is a thousand times that and far less than any real sleep.
+HEARTBEAT_SUSPEND_EVIDENCE_SECONDS = 2.0
+
+try:  # CLOCK_BOOTTIME is Linux; a host without it keeps the old clock and says so.
+    time.clock_gettime(time.CLOCK_BOOTTIME)
+    HEARTBEAT_CADENCE_CLOCK = "boottime"
+except (OSError, AttributeError, ValueError):  # pragma: no cover - not this platform
+    HEARTBEAT_CADENCE_CLOCK = "monotonic"
+
+
+def _cadence_now() -> float:
+    """Now, on the clock the beat is kept on. See `HEARTBEAT_CADENCE_CLOCK`."""
+    if HEARTBEAT_CADENCE_CLOCK == "boottime":
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.monotonic()
+
+
+def _clock_pair() -> tuple:
+    """(cadence now, monotonic now). A suspend is the DIFFERENCE of these two moving."""
+    return (_cadence_now(), time.monotonic())
+
+
+def _suspended_between(previous, current) -> float | None:
+    """Seconds this process was suspended between two `_clock_pair()` samples.
+
+    None means "nothing to see". This is not a guess from a big number: a suspend is the
+    ONLY ordinary event that makes BOOTTIME advance while MONOTONIC does not, because
+    both are kernel counters started at boot and only one of them counts the suspended
+    seconds. An NTP step cannot produce it (neither clock is stepped), and neither can a
+    long GIL hold, which stops BOTH.
+
+    On a host with no CLOCK_BOOTTIME the two readings are the same clock, so the answer
+    is always None and the resume path degrades to the plain deadline - which is the
+    0.2.50 behaviour, and `cadence_clock` in the rank file names it.
+    """
+    try:
+        cadence_gain = float(current[0]) - float(previous[0])
+        monotonic_gain = float(current[1]) - float(previous[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    gap = cadence_gain - monotonic_gain
+    return gap if gap > float(HEARTBEAT_SUSPEND_EVIDENCE_SECONDS) else None
+
 # THE FOUR ANSWERS THE RANK FILE GIVES ABOUT ITS OWN PROCESS, and the key set it gives
 # them in. Every state answers with EVERY key (`_heartbeat_state_shell` builds the shape
 # and the real reading overwrites it), because a reader that has to guess which fields a
@@ -1181,9 +1304,22 @@ HEARTBEAT_FILE_KEYS = ("state", "state_reason", "alive", "started", "beats",
                        "window_seconds", "beats_in_window",
                        "last_beat_age_seconds", "last_beat_duration_seconds",
                        "errors", "fatal_beats", "stalled_beats", "jammed_beats",
-                       "floor_skips", "respawns", "writer_pid", "last_error")
+                       "floor_skips", "respawns", "writer_pid",
+                       "cadence_clock", "ticks", "beats_from_clock",
+                       "beats_from_step", "beats_after_resume", "refusals",
+                       "resumes", "last_error")
 
-_heartbeat: dict = {"thread": None, "stop": None, "closed": False}
+# WHICH COUNTER EACH BEAT CAUSE ADDS. An unknown cause lands on `clock` rather than
+# raising: a miscounted cause must never cost a worker its proof.
+_BEAT_CAUSE_KEYS = {"clock": "heartbeat_beats_clock",
+                    "step": "heartbeat_beats_step",
+                    "resume": "heartbeat_beats_after_resume"}
+
+# `wake` is how a step asks for a beat EARLY without ever running one; `due` is the
+# supervisor's own next deadline on the cadence clock, published so a step can tell
+# "the supervisor is on schedule" (one float compare) from "it is late" (set `wake`).
+_heartbeat: dict = {"thread": None, "stop": None, "closed": False,
+                    "wake": None, "due": None}
 _heartbeat_lock = threading.Lock()
 _handler_lock = threading.Lock()
 # THE ONE LOCK THE HEARTBEAT MADE NECESSARY. Every counter update the heartbeat thread
@@ -1257,6 +1393,27 @@ def _heartbeat_window_seconds() -> float:
         return 0.0
 
 
+def _note_beat_refusal(reason: str) -> None:
+    """A beat that declined to write must be COUNTED and NAMED (0.2.51).
+
+    THE HOLE THAT MADE 2026-10-09 UNDECIDABLE. `heartbeat_once()` has three ways to
+    return without writing, and only the floor counted anything: "no diagnostics
+    directory" and "no usable rank" returned a reason into a dict that the beat thread
+    then THREW AWAY, touching no counter and no `heartbeat_last_beat_reason`. So a rank
+    file in `alive_not_beating` read identically whether the supervisor had never
+    ticked,
+    had ticked and been refused by the rank derivation, or had ticked and been refused
+    by
+    the floor - and the operator's question on 2026-10-09 ("is the idle path alive at
+    all?") could not be answered from the artifact, only argued from the source.
+    A refusal is a fact about the idle path; it goes in the file.
+    """
+    with _state_lock:
+        _state["heartbeat_refusals"] = int(_state["heartbeat_refusals"]) + 1
+        _state["heartbeat_last_beat_reason"] = _clip(
+            reason, MAX_STRING_CHARS)
+
+
 def heartbeat_once() -> dict:
     """One beat: rewrite the rank file if the floor allows it.
 
@@ -1271,37 +1428,90 @@ def heartbeat_once() -> dict:
     directory = config.diagnostics_dir()
     if directory is None:
         out["reason"] = f"{config.ENV_DIAG_DIR} is not set"
+        _note_beat_refusal(out["reason"])
         return out
     rank, rank_source = rank_id()
     if rank is None:
         out["reason"] = f"no usable rank: {rank_source}"
+        _note_beat_refusal(out["reason"])
         return out
-    last = _state["heartbeat_last_mono"]
+    last = _state["heartbeat_last_beat_time"]
     floor = max(0.0, float(HEARTBEAT_MIN_INTERVAL_SECONDS))
-    if isinstance(last, (int, float)) and (time.monotonic() - float(last)) < floor:
+    # THE FLOOR IS ON THE CADENCE CLOCK TOO (0.2.51), and that is not cosmetic: a floor
+    # measured on CLOCK_MONOTONIC does not expire across a suspend, so the one beat that
+    # a sleeping box most needs - the first one after it wakes - would be refused as
+    # "too soon after the last write", by a last write that happened before the sleep.
+    # The floor exists to rate-limit writes to a directory the scheduler also reads, and
+    # a directory untouched for the whole of a sleep has not been rate-limited at all.
+    if isinstance(last, (int, float)) and (_cadence_now() - float(last)) < floor:
         with _state_lock:
             _state["heartbeat_floor_skips"] = int(_state["heartbeat_floor_skips"]) + 1
+            # NAMED as well as counted (0.2.51): a `floor_skips` with no reason
+            # beside it leaves `state_reason` on its generic fallback text.
+            _state["heartbeat_last_beat_reason"] = (
+                f"floor {floor}s not elapsed since the last beat")
         out["reason"] = f"floor {floor}s not elapsed since the last beat"
         return out
     handler = _resolve_handler()
     out["handler"] = handler is not None
-    report = write_snapshot(handler, rank, rank_source)
+    # COUNT THE BEAT BEFORE WRITING IT (0.2.51), and give it back if the write fails.
+    # A rank file cannot report a counter it has not yet incremented, so the FIRST
+    # beat's own file used to read `state: alive_not_beating` with `beats: 0` - a window
+    # as long as the interval (60 s shipped) in which a perfectly healthy worker's rank
+    # file says the idle path is dead, beside a `beating` that only appears one beat
+    # later. That is exactly the reading that was argued over on 2026-10-09, and
+    # `state_reason`'s "no beat has written the file yet" made it look like a mechanism
+    # rather than an ordering. The number still means "beats that wrote": it is rolled
+    # back on a write that did not write.
+    #
+    # THE STAMP MOVES WITH THE COUNT, INSIDE THE SAME LOCKED BLOCK. A reader must never
+    # see a beat counted with no age beside it (`heartbeats: 1` and
+    # `last_beat_age_seconds: null`), which is the window that incrementing here and
+    # stamping after the write would open for as long as one write takes. The stamp is
+    # the START of the beat, so an age read from it is never younger than the truth -
+    # the safe direction for the one number a freshness gate is judged by.
+    began = _cadence_now()
     with _state_lock:
-        _state["heartbeat_last_mono"] = time.monotonic()
-        if report.get("written"):
-            _state["heartbeats"] = int(_state["heartbeats"]) + 1
-            # THE NUMBER THE RANK FILE REPORTS AS `beating`: a tick that ACTUALLY WROTE.
-            # `heartbeats` alone cannot say that (a refused tick never reaches it),
-            # and a
-            # beat that ticked but was refused (a floor, a rank that vanished, a write
-            # error) must never be misreported to the operator as a live proof.
-            _state["heartbeat_writes"] = int(_state["heartbeat_writes"]) + 1
-            _state["heartbeat_last_beat_reason"] = None
-            out["written"] = True
-        else:
-            out["reason"] = str(report.get("reason"))[:MAX_STRING_CHARS]
-            _state["heartbeat_last_beat_reason"] = out["reason"]
+        _state["heartbeats"] = int(_state["heartbeats"]) + 1
+        _state["heartbeat_writes"] = int(_state["heartbeat_writes"]) + 1
+        _state["heartbeat_last_beat_time"] = began
+    try:
+        report = write_snapshot(handler, rank, rank_source)
+    except BaseException:
+        _uncount_beat()
+        raise
+    written = bool(report.get("written"))
+    reason = None if written else str(report.get("reason"))[:MAX_STRING_CHARS]
+    with _state_lock:
+        if not written:
+            # THE NUMBER THE RANK FILE REPORTS AS `beating` is a tick that ACTUALLY
+            # WROTE, so a beat that ticked but was refused (a floor, a rank that
+            # vanished, a write error) is given back rather than misreported to the
+            # operator as a live proof.
+            _state["heartbeats"] = max(0, int(_state["heartbeats"]) - 1)
+            _state["heartbeat_writes"] = max(0,
+                                             int(_state["heartbeat_writes"]) - 1)
+        _state["heartbeat_last_beat_reason"] = reason
+    if not written:
+        out["reason"] = reason
+        # OUTSIDE the lock: `_note_beat_refusal` takes it, and `_state_lock` is not
+        # reentrant - nesting the two here would wedge the beat thread.
+        _note_beat_refusal(reason or "the write refused without a reason")
+        return out
+    out["written"] = True
     return out
+
+
+def _uncount_beat() -> None:
+    """Take back a beat that never reached its write. See the note in
+    `heartbeat_once`."""
+    try:
+        with _state_lock:
+            _state["heartbeats"] = max(0, int(_state["heartbeats"]) - 1)
+            _state["heartbeat_writes"] = max(0,
+                                             int(_state["heartbeat_writes"]) - 1)
+    except Exception as exc:  # noqa: BLE001 - a rollback is never worth a fault
+        snapshot._error(exc, "worker diag beat rollback")
 
 
 def _contained_heartbeat() -> dict:
@@ -1367,17 +1577,27 @@ def _run_beat_guarded() -> None:
                 _state["heartbeat_stalled"] = int(_state["heartbeat_stalled"]) + 1
 
 
-def _issue_beat() -> dict:
+def _issue_beat(cause: str = "clock") -> dict:
     """Hand one beat to its own thread. Never waits for it. Never raises.
 
     THE TICK DOES NOT WRITE ANY MORE, IT DELEGATES - the whole of the 0.2.47 change, and
     the reason a wedged contributor can no longer stop the proof: the supervisor's clock
-    is its own `stop.wait()`, so a beat parked on someone else's lock holds up nothing
+    is its own bounded wait, so a beat parked on someone else's lock holds up nothing
     except itself. `HEARTBEAT_MAX_INFLIGHT_BEATS` is what keeps that from becoming a
     thread leak: past the bound the supervisor says `jammed`, stops launching, and the
     rank file carries the word instead of a silence.
+
+    `cause` is 0.2.51 and answers the question the 0.2.47 block could not: WHY this beat
+    was issued. `"clock"` means the supervisor's own deadline expired with the engine
+    taking no steps - THE IDLE PATH, and the only cause that can prove it is alive;
+    `"step"`
+    means an engine step found the supervisor behind its deadline and woke it;
+    `"resume"`
+    means the box came back from a suspend and the stamp is stale on arrival. A refusal
+    at this point (closed, or at the in-flight bound) is counted by its own key, so a
+    counted cause is a beat that was actually launched.
     """
-    out = {"launched": False, "reason": None}
+    out = {"launched": False, "reason": None, "cause": cause}
     with _heartbeat_lock:
         if _heartbeat["closed"]:
             out["reason"] = "the heartbeat is stopped in this process"
@@ -1390,6 +1610,10 @@ def _issue_beat() -> dict:
                              "another")
             return out
         _state["heartbeat_inflight"] = inflight + 1
+        _state[_BEAT_CAUSE_KEYS.get(cause,
+                                    "heartbeat_beats_clock")] = int(
+            _state.get(_BEAT_CAUSE_KEYS.get(cause, "heartbeat_beats_clock"),
+                       0)) + 1
     try:
         threading.Thread(target=_run_beat_guarded,
                          name=HEARTBEAT_BEAT_THREAD_NAME, daemon=True).start()
@@ -1408,7 +1632,7 @@ def _issue_beat() -> dict:
 
 
 def _heartbeat_loop(stop) -> None:
-    """The supervisor's tick: wait, then ISSUE one beat, until asked to stop.
+    """The supervisor's tick: wait on its OWN clock, then ISSUE one beat, until stopped.
 
     `stop.wait()` FIRST, never after: a loop that writes before its first wait has
     written a file during `install()`, which is the step-driven path's job and would
@@ -1418,13 +1642,93 @@ def _heartbeat_loop(stop) -> None:
     makes that cheap rather than merely rare.
 
     Since 0.2.47 the tick delegates (`_issue_beat`) and is wrapped against
-    `BaseException`. The loop is the only clock an idle worker has, so the rule for it
-    is absolute: NOTHING a beat can do may end it, and nothing a beat can do may delay
-    it. Both halves are tested, because both were false here.
+    `BaseException`. Since 0.2.51 the deadline it waits on is kept on the CADENCE clock
+    and polled in bounded slices, and that is the whole of the idle-worker fix, because
+    the thing that actually silenced an idle worker was neither a step coupling nor a
+    dead thread: it was the box suspending. `stop.wait()` is a CLOCK_MONOTONIC wait and
+    CLOCK_MONOTONIC stands still while the box sleeps, so a deadline set before a sleep
+    was still unpaid on wake while the reader - which ages this file on a WALL clock,
+    `disk_restore.py:3410` - had already charged the entire sleep to the stamp. So:
+
+      * the deadline is `BOOTTIME + interval`, which the sleep cannot freeze;
+      * the wait is capped at `HEARTBEAT_RESUME_POLL_SECONDS`, so the deadline is met to
+        within one short poll AND a resume is noticed within 5 s of the wake;
+      * a detected resume beats at once rather than waiting for the deadline, because a
+        box that has slept for longer than the freshness window arrives with a stale
+        stamp whatever the deadline says, and the first request after a wake is the one
+        that wants the disk.
+
+    The rule for this loop stays absolute: NOTHING a beat can do may end it, and nothing
+    a beat can do may delay it. Both halves are tested, because both were false here.
     """
-    while not stop.wait(max(0.001, float(HEARTBEAT_INTERVAL_SECONDS))):
+    interval = max(0.001, float(HEARTBEAT_INTERVAL_SECONDS))
+    deadline = _cadence_now() + interval
+    _heartbeat["due"] = deadline
+    pair = _clock_pair()
+    while True:
+        remaining = deadline - _cadence_now()
+        if remaining < 0.001:
+            remaining = 0.001
+        # A REAL BOUNDED WAIT, on `stop`, with a timeout: this thread sleeps between
+        # polls, it never spins, and it leaves promptly when asked. The cap is only what
+        # bounds how late a deadline can be and how long a wake can go unnoticed. The
+        # floor on the cap is deliberate: `HEARTBEAT_RESUME_POLL_SECONDS` is an operator
+        # knob, and a 0 in it must not turn the only clock an idle worker has into a
+        # spin loop.
+        poll = max(0.001, float(HEARTBEAT_RESUME_POLL_SECONDS))
+        if stop.wait(min(remaining, poll)):
+            return
+        now = _cadence_now()
+        slept_for = _suspended_between(pair, (now, time.monotonic()))
+        pair = _clock_pair()
+        wake = _heartbeat.get("wake")
+        if slept_for is not None:
+            cause = "resume"
+        elif wake is not None and wake.is_set():
+            cause = "step"
+        elif now >= deadline:
+            cause = "clock"
+        else:
+            continue          # a short poll expired; nothing is due yet
+        if wake is not None:
+            wake.clear()
+        # THE INTERVAL IS RE-READ EVERY TICK, as it was before 0.2.51: it is a module
+        # knob, and a supervisor that latched it at start would ignore a change made
+        # while it ran.
+        interval = max(0.001, float(HEARTBEAT_INTERVAL_SECONDS))
+        deadline = now + interval
+        _heartbeat["due"] = deadline
+        with _state_lock:
+            _state["heartbeat_ticks"] = int(_state["heartbeat_ticks"]) + 1
+        if slept_for is not None:
+            with _state_lock:
+                _state["heartbeat_resumes"] = int(
+                    _state["heartbeat_resumes"]) + 1
+                seen = int(_state["heartbeat_resumes"])
+            # One line per resume, never one per poll: the `asleep_notice_once` rule
+            # this repo already holds everywhere else. This is the line that turns "the
+            # gate was shut after the wake" into a timestamp.
+            #
+            # THE NOTE IS AS DANGEROUS AS THE BEAT, so it is guarded exactly like it. A
+            # note that raises here ended the loop on its way past the counter it had
+            # just incremented: `resumes` said one, the log said nothing, and the idle
+            # path was dead with `heartbeat_fatal` still 0 and the thread simply gone.
+            # That is the one outcome this loop's rule forbids, and 0.2.51's own resume
+            # note found the hole while it was being written - a log line is formatting
+            # plus whatever its arguments read, which is exactly as fallible as a write.
+            try:
+                _note_once(f"heartbeat-resume:{seen}",
+                           f"[WORKERDIAG] this process woke from a "
+                           f"{slept_for:.1f}s suspend (#{seen}); beating at once, not "
+                           f"at the {interval}s deadline, because the rank file's "
+                           "wall-clock age already includes the whole sleep | "
+                           + _heartbeat_clock_attribution())
+            except KeyboardInterrupt:  # pragma: no cover - not that thread
+                raise
+            except BaseException as exc:  # noqa: BLE001 - a note is never worth a death
+                snapshot._error(exc, "worker diag resume note")
         try:
-            _issue_beat()
+            _issue_beat(cause)
         except KeyboardInterrupt:  # pragma: no cover - not that thread
             raise
         except BaseException as exc:  # noqa: BLE001 - the clock outlives everything
@@ -1478,6 +1782,7 @@ def start_heartbeat() -> dict:
             return report
         try:
             stop = threading.Event()
+            wake = threading.Event()
             new = threading.Thread(target=_heartbeat_loop, args=(stop,),
                                    name=HEARTBEAT_THREAD_NAME, daemon=True)
             new.start()
@@ -1495,6 +1800,7 @@ def start_heartbeat() -> dict:
         # failure this module exists to remove, so it is a named line rather than a
         # field.
         _heartbeat["stop"] = stop
+        _heartbeat["wake"] = wake
         _heartbeat["thread"] = new
         reopened = bool(_heartbeat["closed"])
         _heartbeat["closed"] = False
@@ -1552,6 +1858,60 @@ def note_heartbeat_refusal(reason) -> None:
                "worker that is perfectly alive")
 
 
+def heartbeat_is_overdue() -> bool:
+    """Is the supervisor's OWN deadline already past? One float compare, no lock.
+
+    This is the only thing an engine step is asked to work out about the heartbeat
+    (0.2.51), and it is deliberately a compare rather than a decision: the step path
+    runs
+    on the engine's hot path and this module's standing rule is that no lock is taken
+    there. A `None` deadline means no supervisor is running here, which is not overdue,
+    it is absent - and `heartbeat_status(force=True)` already re-arms that case.
+    """
+    due = _heartbeat.get("due")
+    if due is None:
+        return False
+    try:
+        return _cadence_now() >= float(due)
+    except (TypeError, ValueError):
+        return False
+
+
+def wake_heartbeat() -> dict:
+    """Ask the supervisor for a beat NOW, from any thread. Never blocks, never raises.
+
+    A STEP MAY WAKE A BEAT; A STEP NEVER RUNS ONE. That distinction is the 0.2.47 lesson
+    kept intact: `heartbeat_once()` is six other modules' producers plus an fsync'd
+    atomic replace, and running it inline on the thread that serves the engine is how a
+    slow contributor wedges a caller. So the step sets an `Event` and returns; the beat
+    still runs on its own short-lived thread, launched by the supervisor.
+
+    Callers should ask only when `heartbeat_is_overdue()` says so, which is what keeps
+    this off the hot path in normal running: a supervisor on schedule is never woken.
+    The value is in the moments that matter - a box that just resumed has a stamp that
+    is
+    stale the instant it wakes, and the first engine step after the wake can now pay for
+    a beat immediately instead of waiting out the supervisor's next poll.
+    """
+    out = {"woken": False, "reason": None}
+    try:
+        with _heartbeat_lock:
+            if _heartbeat["closed"]:
+                out["reason"] = "the heartbeat is stopped in this process"
+                return out
+            wake = _heartbeat["wake"]
+        if wake is None:
+            out["reason"] = "no beat supervisor is running in this process"
+            return out
+        wake.set()
+        out["woken"] = True
+        return out
+    except Exception as exc:  # noqa: BLE001 - waking a beat is never a fault
+        snapshot._error(exc, "worker diag heartbeat wake")
+        out["reason"] = f"waking raised {type(exc).__name__}"
+        return out
+
+
 def stop_heartbeat() -> dict:
     """Ask the thread to stop. Teardown, and the only way a test gets a quiet directory.
 
@@ -1572,6 +1932,12 @@ def stop_heartbeat() -> dict:
         thread = _heartbeat["thread"]
         _heartbeat["stop"] = None
         _heartbeat["thread"] = None
+        # THE WAKE CHANNEL AND THE DEADLINE GO WITH THE THREAD (0.2.51). Leaving a stale
+        # deadline behind would have every engine step in a stopped process setting an
+        # Event nobody waits on, forever, and `heartbeat_is_overdue()` would keep saying
+        # "overdue" about a supervisor that is simply gone.
+        _heartbeat["wake"] = None
+        _heartbeat["due"] = None
         _heartbeat["closed"] = True
     if stop is not None:
         with contextlib.suppress(Exception):
@@ -1615,6 +1981,15 @@ def _heartbeat_state_shell(state: str, reason) -> dict:
             "jammed_beats": 0,
             "floor_skips": 0,
             "respawns": 0,
+            # THE 0.2.51 KEYS, in the shell too: a state that omits one is a reader that
+            # reads nothing, which is the contract the key-set test enforces.
+            "cadence_clock": HEARTBEAT_CADENCE_CLOCK,
+            "ticks": 0,
+            "beats_from_clock": 0,
+            "beats_from_step": 0,
+            "beats_after_resume": 0,
+            "refusals": 0,
+            "resumes": 0,
             "writer_pid": int(os.getpid()),
             "last_error": _clip(_state.get("last_error"), MAX_STRING_CHARS)}
 
@@ -1666,13 +2041,25 @@ def heartbeat_state() -> dict:
         out["jammed_beats"] = int(_state["heartbeat_jammed"])
         out["floor_skips"] = int(_state["heartbeat_floor_skips"])
         out["respawns"] = int(_state["heartbeat_respawns"])
+        # WHICH CLOCK THE CADENCE IS KEPT ON, so a reader can tell this file's ages from
+        # the gate's. The gate ages this document on a wall clock
+        # (`disk_restore.py:3410`); on a box that suspends, an age kept on
+        # CLOCK_MONOTONIC and an age kept on the wall differ by exactly the suspended
+        # seconds, and only one of them is the number the gate will act on.
+        out["cadence_clock"] = HEARTBEAT_CADENCE_CLOCK
+        out["ticks"] = int(_state["heartbeat_ticks"])
+        out["beats_from_clock"] = int(_state["heartbeat_beats_clock"])
+        out["beats_from_step"] = int(_state["heartbeat_beats_step"])
+        out["beats_after_resume"] = int(_state["heartbeat_beats_after_resume"])
+        out["refusals"] = int(_state["heartbeat_refusals"])
+        out["resumes"] = int(_state["heartbeat_resumes"])
         duration = _state["heartbeat_last_duration_seconds"]
         out["last_beat_duration_seconds"] = (round(float(duration), 3)
                                              if isinstance(duration,
                                                          (int, float)) else None)
-        last = _state["heartbeat_last_mono"]
+        last = _state["heartbeat_last_beat_time"]
         out["last_beat_age_seconds"] = (
-            round(time.monotonic() - float(last), 3)
+            round(_cadence_now() - float(last), 3)
             if isinstance(last, (int, float)) else None)
         if not _state["installed"]:
             out["state"] = "not_applicable"
@@ -1728,8 +2115,8 @@ def heartbeat_status(*, force: bool = False) -> dict:
         if alive:
             with _state_lock:
                 _state["heartbeat_respawns"] = int(_state["heartbeat_respawns"]) + 1
-    last = _state["heartbeat_last_mono"]
-    age = (round(time.monotonic() - float(last), 3)
+    last = _state["heartbeat_last_beat_time"]
+    age = (round(_cadence_now() - float(last), 3)
            if isinstance(last, (int, float)) else None)
     window = _heartbeat_window_seconds()
     return {"started": _heartbeat["thread"] is not None or alive,
@@ -1740,7 +2127,72 @@ def heartbeat_status(*, force: bool = False) -> dict:
                                 if window else None),
             "last_heartbeat_age_seconds": age,
             "heartbeats": int(_state["heartbeats"]),
+            "ticks": int(_state["heartbeat_ticks"]),
+            "beats_from_clock": int(_state["heartbeat_beats_clock"]),
+            "beats_from_step": int(_state["heartbeat_beats_step"]),
+            "beats_after_resume": int(_state["heartbeat_beats_after_resume"]),
+            "cadence_clock": HEARTBEAT_CADENCE_CLOCK,
             "errors": int(_state["heartbeat_errors"])}
+
+
+def _heartbeat_clock_attribution() -> str:
+    """THE ACCOUNTING THAT REPLACED THAT ARGUMENT, where the counters live.
+
+    The 2026-10-09 investigation spent its time on the wrong question ("is the
+    beat thread alive?") because the counters it had could not answer the right
+    one. They were "did a step happen", "is a thread alive", "is there a
+    timestamp" - three proxy questions. The distinction that settled it was
+    whether a beat came from the supervisor's own clock or from an engine step,
+    and the code could not say: the step path was a backstop, and a beat's cause
+    was never attributed.
+
+    So a beat now carries its cause, and the causes are MUTUALLY EXCLUSIVE rather
+    than overlapping: a step can WAKE a beat (the beat already owed lands
+    sooner) but it never RUNS one on the stepping thread, so
+    `heartbeat_beats_step` counts only beats the supervisor issued because a step
+    had found it behind its deadline. Read together they are a PARTITION of the
+    ticks by what woke them: clock + step + resume = the ticks, always.
+    `heartbeat_writes` is deliberately NOT in that identity - a beat can be
+    attributed and then refused by the write floor, which is why the floor skip is
+    a counter of its own and the gap `ticks - heartbeat_writes` is readable.
+
+    What each one can prove:
+
+    * `heartbeat_beats_clock > 0` - the idle path is alive. That is the answer to
+      the question that was asked, and it needs nothing from the engine.
+    * `heartbeat_beats_step > 0` with `heartbeat_beats_clock == 0` - the
+      supervisor exists and writes, but its own clock is not arriving. That is
+      the signature of a cadence clock a suspend froze, and of nothing else; the
+      shipped cadence clock is CLOCK_BOOTTIME precisely so this pairing means a
+      real anomaly and not the normal behaviour of a box that sleeps.
+    * `heartbeat_beats_after_resume > 0` - the box came back and the beat fired
+      without being asked, which is the event the disk-restore gate opens on.
+    * all three zero with `heartbeat_started` and `heartbeat_alive` both true -
+      the beat is being refused before it writes, and `heartbeat_floor_skips` /
+      `heartbeat_last_beat_reason` name what refused it.
+
+    Before 0.2.47 the engine path inlined a beat on the CALLING thread when it
+    found the supervisor behind its deadline, so a busy engine produced
+    `heartbeat_beats_step` counts and the pairing above was indistinguishable
+    from "the engine is busy". If this function is extended again, the property
+    worth keeping is the mutual exclusion: one counter per cause, and never a
+    beat attributed to two of them.
+    """
+    interval = float(HEARTBEAT_INTERVAL_SECONDS)
+    window = _heartbeat_window_seconds()
+    # `started` and `alive` are read the way the rank block reads them: from the thread
+    # handle, not from a `_state` key - there is no `heartbeat_started` in `_state`, and
+    # inventing a second source for the same fact is how the two would drift.
+    thread = _heartbeat.get("thread")
+    started = thread is not None
+    alive = bool(thread is not None and thread.is_alive())
+    with _state_lock:
+        clock = int(_state["heartbeat_beats_clock"])
+        step = int(_state["heartbeat_beats_step"])
+        resume = int(_state["heartbeat_beats_after_resume"])
+    return (f"cadence={HEARTBEAT_CADENCE_CLOCK} interval={interval:.1f}s "
+            f"window={window:.1f}s clock={clock} step={step} resume={resume} "
+            f"started={int(started)} alive={int(alive)}")
 
 
 # --- the counters (the only per-step work) ----------------------------------
@@ -1795,6 +2247,17 @@ def _make_get_finished(original):
         # it can never replace it either: the disk may be gone, the step returns.
         try:
             _maybe_write(self)
+            # THE STEP MAY WAKE A BEAT, AND NEVER RUNS ONE (0.2.51). Cadence belongs to
+            # the supervisor's own clock; a step's only right is to ask for a beat
+            # EARLY,
+            # and only when that clock says the supervisor is already behind its
+            # deadline
+            # - which is exactly the moment a resumed box needs it and the moment a
+            # starved supervisor needs it. The check is a float compare and the wake is
+            # an `Event.set()`; the beat still runs on its own thread, because a step
+            # that executed a beat inline is the 0.2.47 defect.
+            if heartbeat_is_overdue():
+                wake_heartbeat()
             # THE SELF-HEALING BEAT (0.2.45). A heartbeat thread that died leaves the
             # worker proving again only while steps arrive - the correct fallback (a
             # busy worker needs no heartbeat), except that nothing would ever re-arm it

@@ -932,7 +932,13 @@ EngineCore-only. So a worker reports through a **file**: one per rank, into
   step. Since 0.2.47 each beat runs in its own bounded thread (budget
   `HEARTBEAT_BEAT_BUDGET_SECONDS` 20 s, at most `HEARTBEAT_MAX_INFLIGHT_BEATS` 3 of them)
   and catches `BaseException`, so one contributor blocked on a lock cannot stop the proof
-  and one raising `SystemExit` cannot end it. **Read the state in the rank file -
+  and one raising `SystemExit` cannot end it. Since 0.2.51 the beat's DEADLINE and its
+  write floor are both kept on `CLOCK_BOOTTIME` and the wait is polled in slices of
+  `HEARTBEAT_RESUME_POLL_SECONDS` (5 s), because `CLOCK_MONOTONIC` - the clock CPython's
+  `Event.wait()` waits on - does not advance while the box is suspended, and this box
+  suspends: see *Silence is not death, part three*. An engine step may
+  `wake_heartbeat()` when the supervisor is found behind its own deadline, and never runs
+  a beat inline. **Read the state in the rank file -
   `writer.heartbeat.state`** (`beating`, `alive_not_beating`, `started_not_alive`,
   `never_started`, `not_applicable`): `heartbeat_alive` in `snapshot` describes the
   process that BUILT the snapshot - the EngineCore, reached over the utility hop, with
@@ -2847,7 +2853,9 @@ is the one that wanted the disk.
 
 `worker_diag` now keeps its own proof alive from a bounded daemon thread
 (`kvtier-worker-diag-heartbeat`, `HEARTBEAT_INTERVAL_SECONDS` 60 s = fifteen beats inside
-the 900 s window, write floor 5 s), started at `install()` and NOT at the first step - the
+the 900 s window, write floor 5 s; since 0.2.51 that interval and that floor are both kept
+on `CLOCK_BOOTTIME`, which a suspend cannot freeze - see *Silence is not death, part
+three*), started at `install()` and NOT at the first step - the
 0.2.44 cold-start lesson, because an idle worker is precisely a worker whose step-driven
 starter never runs. The beat goes through the same `write_snapshot` a step uses, so a
 reader can never tell the two files apart. The handler is held as a WEAK reference (a
@@ -3099,10 +3107,29 @@ answer and a FIXED key set in all five states:
 | `never_started` | the start was refused, with the reason that refused it |
 | `not_applicable` | no worker writer in this process, so there is no proof to keep alive |
 
-Beside it: `beat_writes` / `beat_seconds_since` / `beat_budget_exceeded` / `beat_errors` /
-`beat_inflight` / `beat_stalled` / `beat_jammed`, the window the reader will apply
-(`window_seconds`) and how many beats fit inside it (`beats_in_window`), and the writer's
-own `writer_pid`, so a reader can ask whether that process still exists.
+Beside it, under the names the FILE uses (the ones below are the contract; a runbook key
+that does not exist prints `None` and reads as a fault): `beats` / `beat_writes` /
+`inflight_beats` / `last_beat_age_seconds` / `last_beat_duration_seconds` / `errors` /
+`fatal_beats` / `stalled_beats` / `jammed_beats` / `floor_skips` / `respawns`, the window
+the reader will apply (`window_seconds`) and how many beats fit inside it
+(`beats_in_window`), and the writer's own `writer_pid`, so a reader can ask whether that
+process still exists.
+
+From 0.2.51 the same block also answers *where the beat's time comes from* and *who woke
+it*: `cadence_clock` (the short name of the clock the deadline is kept on - `boottime`,
+or `monotonic` on a host without it), `ticks` (wake-ups that led to a beat), and
+`beats_from_clock` / `beats_from_step` / `beats_after_resume` - a partition of the ticks,
+so `beats_from_clock + beats_from_step + beats_after_resume == ticks` holds while this
+build is the writer. `beat_writes` is NOT part of that identity: an attributed beat can
+still be refused by the write floor, so `beat_writes <= ticks`, and the gap between them
+is how many beats were decided and then not written. `refusals` counts the times the beat had something to write and
+could not (no directory, no rank), and `resumes` the resumes the cadence clock has
+noticed. Every one of these is `0` rather than absent when nothing has happened, and the
+key SET is identical in every state - including the shell of a file written before this
+build - so a runbook question cannot fail because of a state. The age beside them
+(`last_beat_age_seconds`) is measured on `cadence_clock`, while `worker_proof()` ages the
+FILE by the wall clock, because a file's `mtime` is stamped in wall-clock seconds whether
+or not the writer's clock believed the suspend.
 
 **The refusal now has a timestamp.** `worker_proof()` logs **one line per transition**
 (never per poll - the `notice_once` rule this repo already holds for the sleep-notice and
@@ -3138,8 +3165,8 @@ ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do
   python3 -c "import json,sys,time
   d=json.load(open(sys.argv[1])); h=(d.get(\"writer\",{}).get(\"heartbeat\") or {})
   print(sys.argv[1].rsplit(\"/\",1)[-1], int(time.time()-d[\"ts\"]), h.get(\"state\"),
-        \"writes=\"+str(h.get(\"beat_writes\")), \"stalled=\"+str(h.get(\"beat_stalled\")),
-        \"jammed=\"+str(h.get(\"beat_jammed\")), \"pid=\"+str(h.get(\"writer_pid\")),
+        \"writes=\"+str(h.get(\"beat_writes\")), \"stalled=\"+str(h.get(\"stalled_beats\")),
+        \"jammed=\"+str(h.get(\"jammed_beats\")), \"pid=\"+str(h.get(\"writer_pid\")),
         \"reason=\"+str(h.get(\"state_reason\")))" "$f"
 done'
 
@@ -3159,8 +3186,17 @@ ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' -H "$H" \
   (`installed`, `worker_fitted`, `not_configured_reason`) or on the GATE line - not in the
   heartbeat.
 * `state: "alive_not_beating"` is the state that used to be invisible: a live thread that
-  is not writing. `beat_budget_exceeded: true` means the beat is still waiting on a lock;
-  `gate_open: false` means a `stop_heartbeat()` nobody followed with a start.
+  is not writing. Read what refuses it, all of it in the same block: `stalled_beats`
+  climbing with `last_beat_duration_seconds` over 20 s is a beat parked on someone else's
+  lock; `inflight_beats` at 3 with `jammed_beats` climbing is the supervisor having
+  stopped launching; `floor_skips` climbing is the write floor refusing beats; and since
+  0.2.51, `refusals` climbing with `state_reason` naming the cause is a beat that reached
+  its write and declined it (no diagnostics directory, or a rank this process cannot
+  derive) - the two refusals that used to vanish without a counter.
+  **Since 0.2.51 this state is a TRANSIENT AT STARTUP, not an outage state**: the first
+  beat now counts itself before it writes, so a healthy worker's file says `beating` from
+  its very first beat; if a file says `alive_not_beating` more than one interval after
+  the boot, one of the four counters above is moving.
 * `state: "never_started"` plus `state_reason` is the boot-time answer this repo could not
   get before: the reason `install()` used to swallow, now in the file and, when the
   diagnostics directory is the cause, in the engine log once at WARNING.
@@ -3188,6 +3224,129 @@ one.
 Tests: `tests/test_idle_worker_proof_stays_alive_and_legible.py` (24 tests, driven from
 `engine_side.register()` plus the handshake hook exactly as a worker does, with zero engine
 steps, and the READER's clock moved so a test can wait fifteen minutes).
+
+## Silence is not death, part three: the clock the beat waits on (0.2.51)
+
+**The report this answers.** After a boot, all four rank files read `beats: 0`,
+`beat_writes: 0`, `floor_skips: 0`, `last_beat_age_seconds: null`,
+`state: "alive_not_beating"` about seven minutes into a quiet engine, and one request
+later they read `beats: 1`. The theory offered was *"beats are issued only while the
+engine is taking steps"*. **That theory is refuted, and the mechanism is the box's
+suspend.** The supervisor has had its own clock since 0.2.45 (`_heartbeat_loop` waits,
+then issues one beat); no engine step has ever issued a beat. The live rank files said so
+while the engine stepped roughly once a second:
+
+```
+beats       17 -> 18 in 60.0 s      one beat per interval, not per step
+floor_skips  0                      no step ever tried to beat through the 5 s floor
+```
+
+**Where the silence came from.** Three clocks are involved and they do not agree across a
+suspend. `threading.Event.wait(timeout)` - what the beat loop waited on - is
+`CLOCK_MONOTONIC`, which on Linux **does not advance while the system is suspended**.
+The gate that consumes this file ages it on a **wall clock** (`disk_restore.py:3410`,
+`age = time.time() - ts`), which charges the entire sleep to the stamp. Measured on the
+GPU box on 2026-10-09: `CLOCK_BOOTTIME - CLOCK_MONOTONIC = 19,612 s` with
+`suspend_stats/success = 2` - the box had been asleep for five and a half hours of its
+seven-hour-old engine's life. So the deadline a beat was waiting on was still unpaid when
+the box woke, the beat that had to follow the wake was refused by a write floor measured
+on the clock the sleep had just skipped, and the file reported
+`last_beat_age_seconds: 3.0` next to a gate reading it as many minutes stale. The first
+request after a wake - the one that wants a disk restore more than any other - is the one
+the gate closes on, with `no_worker_proof`.
+
+**What the beat cadence is now.** Still one bounded wait on a `threading.Event` in a
+thread, and still never inline on a caller's thread. Three changes:
+
+| | 0.2.50 | 0.2.51 |
+|---|---|---|
+| the deadline | `monotonic + interval` (frozen by a suspend) | `BOOTTIME + interval` (cannot be frozen) |
+| the wait | one `Event.wait(interval)` | the same wait, polled in slices of `HEARTBEAT_RESUME_POLL_SECONDS` (5 s) |
+| a resume | invisible | detected from BOOTTIME gaining what MONOTONIC did not, and **beaten for at once** |
+| the write floor | `monotonic` (did not expire across a sleep) | the cadence clock, so a directory untouched for a whole sleep is not "too recently written" |
+| a step's role | nothing | may `wake_heartbeat()` when the supervisor is behind its deadline; never runs a beat |
+
+**What is NOT claimed.** A box that has slept longer than `RANK_FILE_FRESH_SECONDS`
+wakes with a stamp that is stale on arrival, and nothing can un-age it: the gate is closed
+at the wake by design, because during the sleep the worker was frozen and proved nothing.
+What 0.2.51 changes is how long it stays closed with nobody at fault - up to one interval
+plus the floor (about 65 s shipped) down to about one poll (5 s), and to less still when
+the first engine step after the wake finds the supervisor behind its deadline. The first
+request that lands inside that window is still refused a restore and recomputes. A
+follow-up, deliberately not attempted here because it is not contained: teach
+`worker_proof()` that a stamp older than the window but younger than the box's own
+suspend interval is "asleep, not dead", which needs a source of suspend truth the reader
+can trust.
+
+**The keys 0.2.51 added** (to `writer.heartbeat`, in EVERY state, and to
+`heartbeat_status()`): `cadence_clock` (`"boottime"` on the box, `"monotonic"` where the
+kernel has no BOOTTIME - it names the clock every age in the block is kept on), `ticks`
+(the supervisor's own wakeups), `beats_from_clock`, `beats_from_step`,
+`beats_after_resume`, `refusals` (a beat that reached its write and declined it, now
+named in `state_reason`), `resumes`.
+
+> **Is the idle path alive? Read `beats_from_clock`.** It counts only the beats the
+> supervisor issued because its OWN CLOCK EXPIRED. `beats` totals every cause and
+> `beats_from_step` counts beats a busy engine would have written anyway, so neither
+> answers the question; `beats_from_clock` rising while `counters.steps` is frozen is the
+> idle path, measured.
+
+**After you deploy and restart, confirm it with these three reads** (all read-only, none
+touches the engine):
+
+```bash
+# 1. THE CLOCK, and the idle path, per rank. Run this after the engine has been idle for
+#    more than one interval (60 s) with no traffic through the proxy.
+#    `find`, not a glob: the box's login shell is zsh and a glob with no match aborts the
+#    whole command line, which is the worst possible failure for a diagnostic.
+ssh llm 'find /tmp/kv-tier-diagnostics -maxdepth 1 -name "rank-*.json" -type f \
+    | sort | while read -r f; do
+  python3 -c "import json,sys,time
+d=json.load(open(sys.argv[1])); w=d.get(\"writer\",{}); h=(w.get(\"heartbeat\") or {})
+print(sys.argv[1].rsplit(\"/\",1)[-1], h.get(\"state\"),
+      \"from_clock=\"+str(h.get(\"beats_from_clock\")),
+      \"ticks=\"+str(h.get(\"ticks\")),
+      \"cadence=\"+str(h.get(\"cadence_clock\")), \"resumes=\"+str(h.get(\"resumes\")),
+      \"age=\"+str(h.get(\"last_beat_age_seconds\")),
+      \"refusals=\"+str(h.get(\"refusals\")),
+      \"reason=\"+str(h.get(\"state_reason\")))" "$f"
+done'
+#    WANT: state=beating, cadence=boottime, and from_clock RISING on every rank while no
+#    request is in flight. `from_clock` frozen at 0 with ticks moving means the beats are
+#    being refused - `refusals` and `reason` now say by what.
+
+# 2. THE CLOCKS THEMSELVES, to see what the beat is being kept on:
+ssh llm 'python3 -c "import time; m=time.clock_gettime(time.CLOCK_MONOTONIC); b=time.clock_gettime(time.CLOCK_BOOTTIME); print(\"mono %.0f boot %.0f suspended %.0f s\"%(m,b,b-m))"'
+
+# 3. THE RESUME, named once in the engine log, and the gate around it:
+ssh llm "grep -a 'WORKERDIAG] this process woke from a' /tmp/vllm-serve.log | tail -4"
+ssh llm "grep -a 'DISK\\[proof\\] GATE' /tmp/vllm-serve.log | tail -8"
+#    WANT: one line per resume naming the sleep length, followed by GATE OPEN within a
+#    few seconds and with no request in between.
+```
+
+**One reading that is a trap, and is now closed.** A rank file cannot report a counter it
+has not yet incremented, so until 0.2.51 the FIRST beat's own file read
+`state: "alive_not_beating"` with `beats: 0` - a window as long as the interval (60 s
+shipped) during which a perfectly healthy worker's rank file said the idle path was dead.
+That is the reading the report above was made from. The beat now counts itself before it
+writes and gives the count back if the write fails, so `beating` is true from the first
+beat.
+
+**The rule "nothing a beat can do may end this loop" applies to log lines.** Writing the
+resume note found the hole: the note sat outside the loop's `try`, so a note that raised
+ended the supervisor on its way past the counter it had just incremented. What that
+leaves is the worst artifact in this file - `resumes` moved, so the state says the resume
+was seen; the log is empty, so nothing says it; `fatal_beats` is 0, so the counter for a
+killed loop reports nothing; and the thread is gone. A note is formatting plus whatever
+its arguments read, which is exactly as fallible as a write, so it is guarded like one
+and the failure is reported through `snapshot._error` instead of swallowed.
+
+Tests: `tests/test_heartbeat_beats_on_a_clock_the_suspend_cannot_freeze.py` (14 tests:
+the cold start with a DERIVED rank, the gate reopening after a suspend with nothing
+arriving, the quiet period longer than the freshness window, the step that wakes a beat
+off the stepping thread, the refusals that used to vanish, the partition of the ticks,
+and a raising log line that must cost a line and nothing else).
 
 ## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
 
@@ -5196,7 +5355,7 @@ ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do
   d=json.load(open(sys.argv[1])); h=(d.get(\"writer\",{}).get(\"heartbeat\") or {})
   print(sys.argv[1].rsplit(\"/\",1)[-1], int(time.time()-d[\"ts\"]), h.get(\"state\"),
         \"beat_writes=\"+str(h.get(\"beat_writes\")),
-        \"stalled=\"+str(h.get(\"beat_stalled\")), \"jammed=\"+str(h.get(\"beat_jammed\")),
+        \"stalled=\"+str(h.get(\"stalled_beats\")), \"jammed=\"+str(h.get(\"jammed_beats\")),
         \"respawns=\"+str(h.get(\"respawns\")),
         \"written_by_beat=\"+str((d.get(\"writer\") or {}).get(\"steps_since_write\", 0) > 0))" "$f"
 done'
