@@ -112,6 +112,9 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 | `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH` | **THE RUN-END ANCHOR PATCH (0.2.64), ON by default, and the SECOND runtime-patch target.** Unset (or `1`/`true`/`yes`/`on`) = the boot wraps `MambaManager.reachable_block_mask` (`single_type_kv_cache_manager.py:1610-1669`, a pure classmethod) so a cached range's LAST block is marked reachable: `if mask and not mask[-1]: mask[-1] = True`. That one mark is what carries an align-mode group's boundary state into the hash → offer → spill pipeline at the end of a run, which is the difference between a run that can be anchored from NVMe and the `no_boundary_anchor` refusal the spill-side counters measured at a 20.0% orphan rate. `0`/`false`/`off`/`no` = **`env-refused`**: nothing is fitted, no half-patch state exists, and the mask answers exactly as the fork's own body does. The grammar is `KVTIER_DISK_BOOT_ENABLE`'s (default ON, and a value in neither vocabulary stays ON and reports `recognised: false`). Like the #56810 backport it is **fingerprint-pinned**: the live body's `inspect.getsource()` SHA-256 is pinned from the live-tree reconstruction (`vllm-live-repro@live`, file md5 `52a3c5ad…`, identical on `built` and in `vllm-dev`), and a stale fingerprint is a REFUSAL naming both hashes and the pin's source, never a guess. **This target is spill-side only**: it can add data to the store and has no door to an arm, a serving posture or a request path – pinned twice, behaviourally and against this package's own AST, beside the AST-pinned serve-switch tests. The boot line carries the verdict as one token so an installed boot and a silently-absent one cannot be confused: `MAMBA_ANCHOR[patched|refused|disabled|env-refused]` (`disabled` = this process is not the scheduler, which is normal in a worker). Counters: `mamba_anchor.anchor_offers_total` (the marks the patch made, in the snapshot's `disk_store` section), `disk_store.anchor_spills_completed` (the anchor files the ranks stored, in the cross-rank rollup) and `disk_restore.restore_anchor_hits_total` (run ends found anchorable on a patched boot). The three are the two ends of one pipe and are deliberately NOT a per-block causal chain: a spill hand-off carries `(slot, block-hash)` pairs and no token position, so the per-block join from the mask to a file does not exist in-process. See *The run-end anchor patch (`mamba_anchor.py`, 0.2.64)*. |
+| `VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS` | **how many seconds the boot's journal drain may take (0.2.65). Unset, or anything that is not a finite number above 0, = `disk_index.BOOT_DRAIN_DEADLINE_SECONDS` = 45 s.** THE HARD CEILING ON A STARTUP COST, and the reason it is a deadline and not a byte count: a journal that grows without bound must never be able to stall a boot. Sized against the box's own measurement (the drain reads ~2.2 MB/s of journal, so 45 s permits ~99 MB of reading - ~57 MB of journal at the measured 1.73x line-cap amplification, ~2.3x the ~25 MB the incident boot had to read). Tonight's ~25 MB converges in ~11-12 modelled seconds, which is what the boot pays and a request no longer does. `0` is REFUSED, not honoured: a deadline of 0 drains nothing and reads as "configured". The value in force is `restore.index.drain_limits.boot_deadline_seconds` with its origin in `boot_deadline_source` (`default` / `env` / `env_ignored`), and a refused value reports its complaint in `problems` instead of defaulting silently. See *Who pays for the drain (`disk_index.py`, 0.2.65)*. |
+| `VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES` | **how many bytes the boot's journal drain may read in total (0.2.65). Unset, or anything that is not an integer above 0, = `disk_index.BOOT_DRAIN_MAX_BYTES` = 64 MiB.** The 32 MiB it replaces could not have covered the incident boot even with an infinite deadline: a bounded pass reads a whole `MAX_READ_PER_REFRESH`-sized window but applies only the lines its line cap fits, and the cursor advances past APPLIED lines only, so the tail of every window is read again by the next pass - measured in this repo at **1.73x** on the incident's shape (28.0 MB read for 16.2 MB of journal, 4 ranks x 110k lines). 64 MiB covers 25 MB x 1.73 = ~43 MB with ~1.5x headroom. Past either bound the boot stops, `boot_drain.stopped_at` says WHICH bound, and the remainder keeps draining on the request path exactly as before. Grammar only (`config.disk_index_drain_env`); the policy is `disk_index.drain_limits()`. |
+| `VLLM_E2_TIER_DISK_INDEX_REFRESH_BYTES` | **the STEADY-STATE cap: bytes one refresh after the boot drain may read across all journals (0.2.65). Unset, or anything that is not an integer above 0, = `disk_index.MAX_READ_PER_REFRESH` = 512 KiB - the number every release before this one used, UNCHANGED by 0.2.65 on purpose.** The offer path's work bound is what stops a burst of requests becoming a burst of reads; widening it is a decision an operator makes after the boot drain has proved itself, not a side effect of this release. It is the trickle's rate: `boot_drain.lag_bytes / this` is the number of refreshes a boot that stopped early still owes. Published as `restore.index.drain_limits.read_bytes_per_refresh` with `read_bytes_source`. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
@@ -2503,6 +2506,11 @@ boot: ~4.71 MB read (each byte once, plus at most one line-capped window re-read
 the first `get_num_new_matched_tokens` after engine start. Either bound ending the
 drain early is normal: the index stays `converged: false`, says so everywhere, and
 finishes through ordinary refreshes.
+
+*(0.2.65: both of those numbers moved - 32 MiB to 64 MiB, 5 s to 45 s - because on the
+night they were shipped this the boot still stopped with 2.3 MB unread, and the drain is
+now issued at connector creation instead of waiting for the first offer. See* Who pays
+for the drain (`disk_index.py`, 0.2.65)*.)*
 
 **A partial index can no longer read as a caught-up one.** `disk_index.section()`,
 `counters()`, the `restore.index` payload and `op:contains`'s own view now publish
@@ -5295,7 +5303,7 @@ nothing. Both halves are now handled at the one moment the class exists:
 * **One line says all of it.** `pr56810.boot.line`, also written to the engine log
   at WARNING so it survives without curling anything:
 
-  `BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=ARMED tier=ARMED faults=0 journal_dir=tmpfs arena=OK disk_boot=ARMED guard_over=... not_covered=... restore=YES restore_gate=closed restore_ranks=0 captures=...`
+  `BOOT[auto] backport=YES guard=YES ram_tier=ARMED disk_tier=ARMED tier=ARMED faults=0 journal_dir=tmpfs arena=OK disk_boot=ARMED MAMBA_ANCHOR[patched] JOURNAL_DRAIN[converged] guard_over=... not_covered=... restore=YES restore_gate=closed restore_ranks=0 captures=...`
 
   `tier=` is the **RAM/host tier** and stays exactly as it was - the restart verifier
   greps it as a PASS criterion - while `ram_tier=` repeats that verdict under an
@@ -5629,6 +5637,76 @@ Three different "offs", which are easy to confuse: `store_hook`'s policy veto is
 a per-block SKIP inside a live tier; `guard_mode` turns an exception into a
 decline (development only, masks bugs); the kill switch stops the connector
 scheduling ANY store or load. Only the last one is a kill switch.
+
+## Who pays for the drain (`disk_index.py`, 0.2.65)
+
+**THE MEASUREMENT.** A boot at 23:00:43; a request at 23:02 that recomputed **129,285
+tokens** because the restore tier answered `blind: true` and could not say whether the
+span was on the NVMe tier; a journal replay that finished around **23:12**. The journals
+were four files of ~155k lines each, ~25 MB in total.
+
+**IT WAS NOT A DEADLOCK, AND SAYING SO IS THE POINT.** `disk_restore._refresh_index()`
+runs on the offer path at `disk_restore.py` and it runs *before* blindness is consulted
+(blindness is refusal text appended afterwards, in the `no_disk_run` sentence), so the
+drain advanced regardless of the `blind` flag. A self-sustaining blind window would have
+been a far worse bug and there was none. What there was is a **budget** and a drain that
+is *traffic-driven*: the boot spent its 5-second deadline with 2.3 MB of journal unread,
+and the rest was read at `MAX_READ_PER_REFRESH` (512 KiB) per arriving request behind a
+1 s floor. About six seconds of reading was charged to eleven minutes of traffic, and
+the first 90 seconds of that boot paid the largest share of it.
+
+**THE FIX IS A MOMENT, NOT A SECOND DRAIN.** `boot_from_connector` runs from the
+connector-creation hook, and the connector is built by `KVConnectorFactory.create_connector`
+at `vllm/v1/core/sched/scheduler.py:164` - inside `Scheduler.__init__`, which
+`EngineCore.__init__` (`core.py:260`) constructs before `run_busy_loop()` is ever entered
+(`core.py:1452`). Nothing can be served from that moment, so the drain's seconds are paid
+by STARTUP instead of by a user's request. `_boot_journal_drain` runs as the boot's last
+step, reaches `disk_index` and nothing else, cannot arm, cannot offer, cannot pick a
+posture, and never joins `boot.refusals` - a slow index costs a recompute, and a boot
+that failed to read a journal is still a boot. An inert boot
+(`VLLM_E2_TIER_DEV_BOOT_INERT`) drains nothing: inert means inert.
+
+**THE TWO NUMBERS, AND WHY THOSE.** See the env table for
+`VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS` (45 s, the hard ceiling on the startup cost) and
+`VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES` (64 MiB). The bytes number is the interesting one:
+a bounded pass reads a whole window and applies only the lines its **line cap** fits,
+and the cursor advances past APPLIED lines only - so the tail of every window is read
+again next pass. Measured in this repo on the incident's shape (4 ranks x 110k lines,
+16.2 MB): **28.0 MB read = 1.73x amplification**. 25 MB of journal therefore costs ~43 MB
+of reading, which is why the 32 MiB budget could not have finished it even with an
+infinite deadline. At the box's measured ~2.2 MB/s the incident journal converges in
+~11-12 modelled seconds of boot; the deadline's job is to make the *worst* case 45 s and
+no worse, whatever the journal's size.
+
+**WHAT IS NEW IN THE PAYLOAD, AND HOW TO PROVE IT WORKED.**
+`GET /plugins/kvtier/disk` → `restore.index.boot_drain`:
+`{ran, attempted, trigger, stopped_at, bytes_read, lines, entries_at_end,
+elapsed_seconds, converged, lag_bytes, lag_journals, passes, deadline_seconds,
+max_bytes, error}` - beside the `converged` / `lag_bytes` / `blind` fields it explains,
+with its own `units` - and `restore.index.drain_limits` for the three bounds in force
+with each one's origin (`default` / `env` / `env_ignored`) and any refused value's
+complaint. After a good boot read `{"ran": true, "stopped_at": "converged",
+"lag_bytes": 0, "converged": true, "trigger": "connector creation"}` and
+`restore.index.blind: false`. The BOOT line carries the one-glance verdict as
+`JOURNAL_DRAIN[converged|deadline|budget|no_progress|empty|no_dir|inert|error|not_run]`
+- bracketed and with no `=`, for the two reasons `MAMBA_ANCHOR[...]` gives: a closed
+vocabulary, and invisible to the llm-api restart verifier's
+`grep -oE "tier=[A-Za-z_]+" | tail -1`.
+
+**WHAT DID NOT CHANGE.** The steady-state cap (`MAX_READ_PER_REFRESH`, 512 KiB), the
+line cap (8,192), the 1 s refresh floor, the offer path's work bound, and the rule that
+whatever a boot leaves keeps draining one bounded pass at a time. `drain_journal_at_boot()`
+carries `mamba_anchor.install()`'s fail-open contract - any `Exception` is counted
+(`boot_drain.error`), logged once, and leaves today's behaviour; `BaseException` still
+propagates.
+
+**Tests:** `tests/test_boot_journal_drain.py` (12). The deep fixture is 4 journals of
+110k well-formed lines (~16 MB, 440k lines) driven by a clock that advances by
+`bytes read / 2.2 MB/s`, because a wall-clock deadline measured in *this host's* time
+(this host reads the same journal ~4.5x faster than the box's array) would be measuring
+the machine it ran on. Its headline test asserts its own fixture is deeper than the
+retired 5.0 s budget and shallower than the shipped 45 s, so the test cannot drift into
+passing either way.
 
 ## The run-end anchor patch (`mamba_anchor.py`, 0.2.64)
 
@@ -6228,7 +6306,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2709 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2867 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -6496,6 +6574,7 @@ The debugger verbs add six files:
 | `tests/test_idle_worker_proof_stays_alive_and_legible.py` | 24 | THE 0.2.47 SUITE, driven from `engine_side.register()` plus the handshake hook exactly as a worker walks them (the plugin-load install must DECLINE there, the handshake must land it), with zero engine steps and the READER's clock moved so a test can wait fifteen minutes: the gate stays open across two idle spells nearly the length of the window and still closes on a beat that stopped, on a future-stamped file, and on a file whose `disk_restore` section is gone; a contributor wedged for three budgets cannot stop the rank file moving; a beat raising `SystemExit` cannot kill the supervisor; a `SystemExit` contributor costs its own section only; the in-flight bound says `jammed` instead of leaking threads; `writer.heartbeat` in all five states with one key set inside its byte budget; `GATE AT BOOT` / `GATE CLOSED` / `GATE OPEN again` once per flip, naming the reason, the per-file counts and the freshest file's age AND wall clock, and distinguishing `stale=` from `sectionless=`; the refusal that never started is said once at WARNING; the shipped cadence is pinned against the UNPATCHED default |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
+| `tests/test_boot_journal_drain.py` | 12 | THE 0.2.65 FIX: a journal of the incident's shape (4 ranks x 110k real `<seq> <+\|-> <key16> <bytes> <group>` lines, ~16 MB, built once per module, digest-pinned as READ-ONLY) drained on a clock that advances by `bytes read / 2.2 MB/s`, the box's measured throughput - a wall-clock deadline timed in this host's time (it reads the same journal ~4.5x faster) measures the host, not the box. The headline test asserts its OWN fixture is deeper than the retired 5.0 s boot budget and shallower than the shipped 45 s, then requires `converged: true` with `lag_bytes: 0` and an `elapsed_seconds` ABOVE the retired bound (the same drain the old deadline stopped blind); the deadline and the byte budget each stop a deeper journal, are REPORTED as `stopped_at: deadline` / `byte_budget` with the bound in force, do not raise, and leave the rest draining one bounded pass per refresh on the request path; an unparseable env value leaves each default standing with `*_source: env_ignored` and quotes the variable and its raw value back in `problems`, while a well-formed one lands and is the number the next refresh honours; UNSET is today's numbers, the steady-state cap still 512 KiB and the line cap still 8,192; the record and its limits reach `restore.index` beside `converged`/`blind` and carry their own `units`; no arm, no posture, no switch moves - behaviourally AND as an AST fact about `disk_index.py` and about the boot's own `_boot_journal_drain`; a drain that raises is counted, logged once, recorded as `error` and leaves `boot_drained: false`, while `KeyboardInterrupt` propagates; and the fork's own `create_connector` (the `scheduler.py:164` shape, fake factory in `sys.modules`) returns a connector whose index is ALREADY drained - with the drain's state captured DURING construction proving the fork's constructor ran first - the BOOT line carrying `JOURNAL_DRAIN[converged]` without disturbing the restart verifier's `tier=` last-match; an inert boot reads no journal byte at all |
 | `tests/test_mamba_anchor_patch.py` | 28 | THE 0.2.64 TARGET SPEC, on the fork's own unpatched `reachable_block_mask` text in `fixtures_mamba.py`: the mask marks a run end only under the patch, a dense `None` and an EMPTY mask pass through UNTOUCHED, a mask already ending True is not recounted (the anti-vacuity control that keeps the counter measuring the patch and not the retention interval), a call's other arguments and return identity survive; a mutated body REFUSES with both hashes named and the unpatched answer intact (the shipped fingerprint is re-derived from the fixture in the test, so editing the pin cannot fix a red test); a `staticmethod`, a subclass hiding the classmethod, an unknown class and an already-foreign-patched class all refuse and leave `mamba_patch_installed` False while the test's own class stays exactly the object it was; the wrapper's OWN body is `except BaseException: raise` (AST-pinned, like the connector's kill-switch wrappers), and a raising original costs the counter; the env flag reads `KVTIER_DISK_BOOT_ENABLE`'s grammar from `config.py` and `env-refused` is counted as enabled + a reason in the payload; the boot token is bracketed so the restart verifier's `tier=` grep cannot match it; the counter doors each fail independently (the spill counter reaches the cross-rank rollup via `RANK_ROLLUP_FIELDS` alone; the restore counter moves for an anchored run and NOT for a run with no anchor, same walk, same boot); and nothing about serving posture changed - behaviourally AND as an AST fact about this module's own source, with the restore layer's only reach into the patch pinned to the one read-only liveness call |
 
 The store-policy hook (`tests/test_store_hook.py`, 55 of them) runs against a

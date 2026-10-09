@@ -88,17 +88,33 @@ The rule now is a DRAIN. A refresh reads from each journal's cursor FORWARD, app
 whole lines in the file's own order, and RETURNS WITH THE CURSOR SHORT OF EOF when
 its budget binds; the next refresh continues where this one stopped. The first
 refresh of a process runs several such passes under its own larger budget
-(`BOOT_DRAIN_MAX_BYTES`, `BOOT_DRAIN_DEADLINE_SECONDS`) so a cold boot converges
-before the first offer instead of dozens of one-second refreshes later; every later
-refresh is ONE bounded pass, exactly the old caps. A partial-but-advancing index is
-strictly better than partial-and-frozen: the drain cannot lose history, converges in
-a number of passes a reader can compute (`unread_bytes / share`), and every
-intermediate state is publishable. While any cursor is short of its journal's end the
-index says so (`converged: false`, `lag_bytes`, `unread_journals` naming each
-journal and its unread bytes), and a `not_present` out of a partial index is a
-statement about the READER, never about the store. The one legitimate use of
-`_forget_rank` that remains is an externally TRUNCATED journal, where the bytes the
-entries were learned from no longer exist.
+(`BOOT_DRAIN_MAX_BYTES`, `BOOT_DRAIN_DEADLINE_SECONDS`, both overridable since 0.2.65)
+so a cold boot converges before the first offer instead of dozens of one-second
+refreshes later; every later refresh is ONE bounded pass, exactly the old caps. A
+partial-but-advancing index is strictly better than partial-and-frozen: the drain
+cannot lose history, converges in a number of passes a reader can compute
+(`unread_bytes / share`), and every intermediate state is publishable. While any cursor
+is short of its journal's end the index says so (`converged: false`, `lag_bytes`,
+`unread_journals` naming each journal and its unread bytes), and a `not_present` out of
+a partial index is a statement about the READER, never about the store. The one
+legitimate use of `_forget_rank` that remains is an externally TRUNCATED journal, where
+the bytes the entries were learned from no longer exist.
+
+A DRAIN THAT ONLY ADVANCES WHEN A REQUEST ARRIVES IS STILL ON THE REQUEST PATH
+------------------------------------------------------------------------------
+Advancing was never the problem; WHO PAYS was. On the night this was measured the box
+came up at 23:00:43, a request at 23:02 recomputed 129,285 tokens because the index
+answered `blind: true`, and the replay finished around 23:12. There was no deadlock -
+`_refresh_index()` runs on
+the offer path BEFORE blindness is consulted, so the drain advanced regardless - but the
+boot's 5-second deadline expired with 2.3 MB of a ~25 MB journal unread and the rest was
+read at 512 KiB per ARRIVING request behind a 1 s floor. Since 0.2.65 the first refresh
+is issued at connector creation (`drain_journal_at_boot()`, called by
+`backport.boot_from_connector` inside `Scheduler.__init__`) under bounds sized to finish
+a journal of that size, so the seconds are paid by STARTUP, where no request exists yet
+to be slowed. `boot_drain` (recorded here, published in the `/disk` payload's
+`restore.index.boot_drain`) says what was read, how long it took and which bound stopped
+it; `JOURNAL_DRAIN[...]` says the same on the BOOT line.
 
 THE INDEX MAY ONLY EVER BE STALE IN THE SAFE DIRECTION
 ------------------------------------------------------
@@ -202,6 +218,12 @@ ENTRY_BYTES_MEASURED = 342
 MAX_JOURNAL_BYTES = 32 * 1024 * 1024  # BYTES one rank's journal may reach
 MAX_JOURNAL_FILES = 64              # journal FILES one refresh will open
 MAX_LINES_PER_REFRESH = 8_192       # LINES applied per refresh (bounded work)
+# THE STEADY-STATE READ CAP - the bytes ONE refresh after the boot drain may pull out
+# of all the journals together. It is a DEFAULT now and `VLLM_E2_TIER_DISK_INDEX_
+# REFRESH_BYTES` may raise or lower it (0.2.65), but the shipped number is UNCHANGED by
+# that release on purpose: the offer path's work bound is what keeps a burst of requests
+# from turning into a burst of reads, and tonight's problem was never a refresh that was
+# too small - it was a boot that stopped and nobody paying for the rest.
 MAX_READ_PER_REFRESH = 512 * 1024   # BYTES read across all journals per refresh
 # THE FLOOR ON ONE JOURNAL'S SHARE of a refresh's budget. Below this a window is
 # smaller than one rank's newest spill burst; the TOTAL cap (`MAX_READ_PER_REFRESH`)
@@ -211,13 +233,66 @@ MIN_JOURNAL_WINDOW_BYTES = 4 * 1024  # BYTES: the smallest share one journal get
 # cold boot with deep journals converges BEFORE the first offer instead of one share
 # per second afterwards. The bounds are total bytes READ and wall time for that first
 # refresh only - every later refresh is one pass under `MAX_READ_PER_REFRESH` /
-# `MAX_LINES_PER_REFRESH` exactly as before. 32 MiB covers four 32 MiB-cap'd journals
-# at 512 KiB passes only partially; what matters is that neither bound can stall a
-# boot: on the observed shape (4 journals, 4.7 MB, 132k records) the drain reads
-# every byte in ONE refresh in well under a second, and a box that exceeds either
-# bound simply keeps `converged: false` and finishes through ordinary refreshes.
-BOOT_DRAIN_MAX_BYTES = 32 * 1024 * 1024   # BYTES the first refresh may read in total
-BOOT_DRAIN_DEADLINE_SECONDS = 5.0         # SECONDS the first refresh may take
+# `MAX_LINES_PER_REFRESH` exactly as before, and both bounds are env-overridable
+# (`VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES`, `VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS`) with
+# the grammar in `config.disk_index_drain_env()` and the resolution in `drain_limits()`.
+#
+# WHY THESE TWO NUMBERS, MEASURED (0.2.65). The box rebooted at 23:00:43 and a request
+# at 23:02 recomputed 129,285 tokens because the index was still `blind: true`; the
+# replay finished around 23:12. The journals were four files of ~155k lines each,
+# ~25 MB in total, and the boot's 5-second deadline expired with 2.3 MB of them unread.
+# Everything after that was paid by the request path at 512 KiB a refresh and a 1 s
+# floor - about ELEVEN MINUTES of traffic-driven reading to do what six seconds of boot
+# reading could have done. The two bounds are sized against that measurement:
+#
+#   BYTES, 64 MiB. A pass reads a `MAX_READ_PER_REFRESH`-sized window per journal but
+#   applies only the first `share_lines` lines of it, and the cursor advances solely
+#   past APPLIED lines - so the tail of every window is read again by the next pass.
+#   Measured in this repo on exactly tonight's shape (4 ranks, 440k lines, 16.2 MB):
+#   28.0 MB of reads for 16.2 MB of journal, an amplification of 1.73x. Tonight's 25 MB
+#   therefore costs ~43 MB of READING, which the 32 MiB budget could not have covered
+#   even with an infinite deadline. 64 MiB covers it with ~1.5x headroom for a journal
+#   that has grown by half since.
+#
+#   SECONDS, 45. The boot drain read 22.7 MB in the 5 s it was allowed (~4.5 MB/s), and
+#   the operator's conservative figure for the array is ~2.2 MB/s; sized on the
+#   conservative number, the 64 MiB byte budget is ~29 s of reading, so the deadline is
+#   the CEILING and the budget is what normally binds - which is the order that makes
+#   the payload's `stopped_at` mean something. At 2.2 MB/s 45 s permits ~99 MB of reads
+#   (~57 MB of journal at 1.73x, ~2.3x tonight's). WHAT THIS BUYS: boot gets slower by
+#   the drain's `elapsed_seconds` - ~11-12 s for tonight's journal, and never more than
+#   the deadline, because the loop checks it between passes and stops. That cost moves
+#   seconds from the FIRST REQUEST onto STARTUP, where `boot_from_connector` runs
+#   inside `Scheduler.__init__` and no request exists yet to be slowed.
+#
+# Neither bound may ever stall a boot, and neither does: a journal that grows past both
+# simply keeps `converged: false`, reports which bound stopped it, and finishes through
+# ordinary refreshes exactly as it does today.
+BOOT_DRAIN_MAX_BYTES = 64 * 1024 * 1024   # BYTES the first refresh may read in total
+BOOT_DRAIN_DEADLINE_SECONDS = 45.0        # SECONDS the first refresh may take
+# THE VOCABULARY of `boot_drain.stopped_at`, the one field that answers "did the boot
+# finish reading its journals, and if not, which bound said no?". A CLOSED vocabulary so
+# `boot_drain_token()` can render it and a reader cannot invent a sixth answer.
+DRAIN_STOPS = ("not_run", "inert", "no_directory", "no_journals", "converged",
+               "deadline", "byte_budget", "no_progress", "error")
+# `stopped_at` -> the BOOT LINE's bracketed token. Named apart, because the payload word
+# and the greppable word are read by different people: `JOURNAL_DRAIN[converged]` has to
+# fit in a line an operator scans at 3 a.m., and `no_directory` does not.
+DRAIN_STOP_TOKENS = {"converged": "converged", "deadline": "deadline",
+                     "byte_budget": "budget", "no_progress": "no_progress",
+                     "no_journals": "empty", "no_directory": "no_dir",
+                     "inert": "inert", "error": "error", "not_run": "not_run"}
+# The trigger recorded when the BOOT runs the drain, so the payload can say who paid for
+# it. `connector creation` is the claim of 0.2.65 and it is checked by tests.
+DRAIN_TRIGGER_BOOT = "connector creation"
+DRAIN_TRIGGER_OTHER = "first refresh (not the boot hook)"
+# THE FLOOR a per-refresh / per-boot BYTE knob may be given. 1024 is far below anything
+# useful and above zero, which the grammar refuses: a budget of 0 reads nothing,
+# drains nothing, and reads as "configured" to a reader of `boot_drain.stopped_at`.
+# Between 1 and this the value is CLAMPED with a reason in `drain_limits()` (this
+# module's doctrine for an operator-supplied bound), because a window smaller than one
+# rank's spill burst drains nothing useful while claiming to be configured.
+DRAIN_BYTES_FLOOR = 1024
 # HOW MANY journals the per-journal unread map names in a payload before the rest are
 # folded into `unread_journals_omitted`. The bytes are always summed; only names cap.
 MAX_LAG_NAMED_JOURNALS = 8
@@ -344,6 +419,109 @@ DROP_REASONS = ("malformed_line", "bad_op", "bad_key", "bad_size", "bad_seq",
                 "bad_group", "journal_shrank", "journal_capped", "line_cap",
                 "read_cap", "stopped")
 
+# THE UNITS OF THE BOOT DRAIN'S OWN RECORD, published INSIDE the record (the idiom
+# `disk_store`'s ceiling block and `disk_index`'s journal-fs block already use) rather
+# than bolted onto the enclosing section: `bytes_read` three levels up means "what this
+# process has read", and inside `boot_drain` it means "what the BOOT read" - one unit
+# table cannot say both, and this repo's rule is that a number without its unit is a
+# number a dashboard draws the wrong axis for.
+BOOT_DRAIN_UNITS = {
+    "ran": "did a drain loop actually execute (a journal directory with files in it "
+           "was reached): true | false",
+    "attempted": "boot-eligible refreshes that reached the drain, so a first refresh "
+                 "that found no journal directory yet is visible instead of being a "
+                 "silent no-op (unit: refreshes)",
+    "trigger": "connector creation | first refresh (not the boot hook) | None: who "
+               "paid for the drain",
+    "stopped_at": "converged | deadline | byte_budget | no_progress | no_journals | "
+                  "no_directory | inert | error | not_run: WHY the boot's drain ended",
+    "bytes_read": "RAW bytes the boot drain read out of the journals (unit: bytes). "
+                  "Exceeds the journals' own size because a line-capped window has its "
+                  "tail re-read by the next pass - measured at 1.73x for four ranks of "
+                  "110k lines",
+    "lines": "journal lines the boot drain applied (unit: lines)",
+    "entries_at_end": "identities in the index when the drain stopped (unit: "
+                      "identities) - the number that makes `converged: true` mean a "
+                      "populated index and not merely moved cursors",
+    "elapsed_seconds": "wall time the boot drain took (unit: seconds), bounded by "
+                       "`deadline_seconds`: this is the startup cost the release buys",
+    "converged": "every journal cursor at end-of-file when the drain stopped: true | "
+                 "false",
+    "lag_bytes": "unread journal bytes the boot drain LEFT (unit: bytes) - what the "
+                 "request path still has to read at one bounded pass a refresh",
+    "lag_journals": "of those bytes: how many journals they sit in (unit: journals)",
+    "passes": "bounded passes the boot drain made (unit: passes), each at most "
+              "`drain_limits.read_bytes_per_refresh` bytes",
+    "deadline_seconds": "the wall-clock bound that drain ran under (unit: seconds), "
+                        "resolved from the env or the shipped default",
+    "max_bytes": "the byte budget that drain ran under (unit: bytes), resolved from "
+                 "the env or the shipped default",
+    "error": "the exception TYPE of a contained drain failure, else null: a counted "
+             "failure that left the boot on today's behaviour (unit: none)",
+    "note": "what the record means in one sentence, for a reader who finds it without "
+            "the release notes",
+}
+
+DRAIN_LIMITS_UNITS = {
+    "boot_deadline_seconds": "the SECONDS one boot drain may take, IN FORCE (unit: "
+                             "seconds)",
+    "boot_bytes": "the BYTES one boot drain may read in total, IN FORCE (unit: bytes)",
+    "read_bytes_per_refresh": "the BYTES one refresh after the boot drain may "
+                              "read across all journals (unit: bytes) - the trickle a "
+                              "boot leaves behind is finishable from `lag_bytes` and "
+                              "this number",
+    "default_boot_deadline_seconds": "the shipped deadline, for comparison (unit: "
+                                     "seconds)",
+    "default_boot_bytes": "the shipped byte budget, for comparison (unit: bytes)",
+    "default_read_bytes_per_refresh": "the shipped per-refresh cap, for comparison "
+                                      "(unit: bytes)",
+}
+
+
+def _fresh_boot_drain_record() -> dict:
+    """THE BOOT DRAIN'S RECORD, as one stable key set.
+
+    Defined before `_state` because BOTH state builders call it: a payload whose keys
+    depend on which reset ran last is a payload a dashboard misreads. The record
+    describes the LAST boot-eligible drain this process attempted (the first refresh of
+    the process, whoever ran it), not a cumulative total - `bytes_read` is what THAT
+    drain read, and the cumulative figure remains `bytes_read` at the top level.
+
+      ran            a drain loop actually executed (a directory WITH journals existed)
+      attempted      boot-eligible refreshes that reached the drain, so a boot that
+                     found no journal directory yet is visible as attempts > 0 and not
+                     as a silent no-op
+      trigger        who ran it: `connector creation` (0.2.65's boot hook - the claim
+                     this release makes) or `first refresh (not the boot hook)`
+      stopped_at     which bound ended it, from `DRAIN_STOPS`
+      bytes_read     RAW bytes the boot drain read (>= the journal's own size: a
+                     line-capped window is partly re-read by the next pass, measured at
+                     1.73x for tonight's shape)
+      lines          journal lines it applied
+      entries_at_end what the index held when it stopped: the one number that says
+                     "converged" means something and not merely "the cursors moved"
+      elapsed_seconds   wall time it took, under the deadline it was given
+      converged      every cursor at its journal's end
+      lag_bytes / lag_journals  what it left for the request path
+      deadline_seconds / max_bytes  the bounds IN FORCE for that drain (resolved env or
+                     shipped default), so a reader never has to guess which number the
+                     verdict was produced against
+      passes         bounded passes it made
+      error          the exception TYPE of a contained failure, else None
+    """
+    return {"ran": False, "attempted": 0, "trigger": None,
+            "stopped_at": "not_run", "bytes_read": 0, "lines": 0,
+            "entries_at_end": 0, "elapsed_seconds": 0.0, "converged": False,
+            "lag_bytes": 0, "lag_journals": 0, "passes": 0,
+            "deadline_seconds": float(BOOT_DRAIN_DEADLINE_SECONDS),
+            "max_bytes": int(BOOT_DRAIN_MAX_BYTES), "error": None,
+            "note": ("the FIRST refresh of this process: the drain that was supposed "
+                     "to finish before the engine served. Read `stopped_at` first: "
+                     "`converged` means the index could answer presence questions from "
+                     "the first request, anything else means the request path is still "
+                     "reading journals at 512 KiB a refresh")}
+
+
 _state: dict = {
     "entries": OrderedDict(),       # identity -> entry dict, ORDERED BY LAST TOUCH
     # identity -> {rank -> {bytes, journal, seq, seen_ts}}. `entries` is what the OFFER
@@ -408,6 +586,10 @@ _state: dict = {
     "boot_drained": False,
     "converged": False,
     "bytes_read": 0,
+    # THE BOOT DRAIN'S RECORD (0.2.65): what the first refresh read, how long it took,
+    # and WHICH bound stopped it. The field that answers "did tonight's boot fix
+    # itself?" without a second reboot to compare against.
+    "boot_drain": _fresh_boot_drain_record(),
     "unread_journals": {},
     "entries_dropped": 0,
     # WHICH DROPS COST A FILE (0.2.45). `entries_dropped` says the cap evicted an entry;
@@ -499,6 +681,7 @@ def reset_state_for_tests() -> None:
         "cursors": {}, "seq": {}, "stopped": {},
         "applied": 0, "spills": 0, "removals": 0, "misses": 0, "hits": 0,
         "boot_drained": False, "converged": False, "bytes_read": 0,
+        "boot_drain": _fresh_boot_drain_record(),
         "unread_journals": {},
         "entries_dropped": 0, "entry_cap_hit": False,
         "entries_dropped_file_present": 0, "entries_dropped_file_absent": 0,
@@ -543,6 +726,10 @@ def counters() -> dict:
     out["entries"] = int(len(_state["entries"]))
     out["rank_lines"] = int(len(_state["rank_lines"]))
     out["unread_journals"] = _unread_view()
+    # A COPY, not the live record: `dict(_state)` is shallow, and `boot_drain` is the
+    # one nested dict in here. A payload that hands out the live record lets a reader
+    # write the drain's verdict, which is exactly the state this release publishes.
+    out["boot_drain"] = boot_drain_view()
     return out
 
 
@@ -580,6 +767,173 @@ def index_lag() -> dict:
             "entries_dropped": int(_state["entries_dropped"]),
             "journals_stopped": sorted(str(os.path.basename(str(p)))
                                        for p in _state["stopped"])}
+
+
+# --- THE DRAIN'S BOUNDS, AND THE BOOT THAT RUNS IT (0.2.65) ------------------
+
+def drain_limits() -> dict:
+    """THE THREE BOUNDS IN FORCE, resolved against the environment, with their origin.
+
+    The `staging_rows_verdict()` discipline: the shipped default, the boot environment,
+    and nothing else. No runtime route - a bound the boot is being measured against must
+    not move under a reader of the payload - and no cache either: the environment is
+    read on call, so the number a reader gets is the number the NEXT refresh will use.
+    A value the grammar refused is reported with its complaint in `problems` and the
+    default stands, with that knob's `*_source` reading `env_ignored`; "unset" and
+    "ignored" are different facts and both are published.
+
+    The module constants are read here rather than captured, so a test (or a later
+    release) that moves `BOOT_DRAIN_DEADLINE_SECONDS` moves the bound in force.
+    """
+    out = {"boot_deadline_seconds": float(BOOT_DRAIN_DEADLINE_SECONDS),
+           "boot_bytes": int(BOOT_DRAIN_MAX_BYTES),
+           "read_bytes_per_refresh": int(MAX_READ_PER_REFRESH),
+           "units": dict(DRAIN_LIMITS_UNITS),
+           "default_boot_deadline_seconds": float(BOOT_DRAIN_DEADLINE_SECONDS),
+           "default_boot_bytes": int(BOOT_DRAIN_MAX_BYTES),
+           "default_read_bytes_per_refresh": int(MAX_READ_PER_REFRESH),
+           "boot_deadline_source": "default", "boot_bytes_source": "default",
+           "read_bytes_source": "default",
+           "env_vars": {"boot_deadline_seconds": config.ENV_DISK_BOOT_DRAIN_SECONDS,
+                        "boot_bytes": config.ENV_DISK_BOOT_DRAIN_BYTES,
+                        "read_bytes_per_refresh":
+                            config.ENV_DISK_INDEX_REFRESH_BYTES},
+           "raw_values": {}, "problems": [],
+           "note": ("the boot drain's bounds and the steady-state per-refresh read "
+                    "cap. `stopped_at` in `boot_drain` names which of the first two "
+                    "bound the last boot; `read_bytes_per_refresh` is what one refresh "
+                    "after the "
+                    "boot may read, so the trickle a boot leaves behind is a number a "
+                    "reader can compute a finish time from")}
+    try:
+        env = config.disk_index_drain_env()
+    except Exception as exc:  # noqa: BLE001 - a bound read is never worth a fault
+        snapshot._error(exc, "disk_index drain limits")
+        return out
+    out["problems"] = [str(problem) for problem in (env.get("problems") or [])]
+    for key, source_key, name, value, caster in (
+            ("boot_deadline_seconds", "boot_deadline_source",
+             config.ENV_DISK_BOOT_DRAIN_SECONDS, env.get("deadline_seconds"), float),
+            ("boot_bytes", "boot_bytes_source", config.ENV_DISK_BOOT_DRAIN_BYTES,
+             env.get("boot_bytes"), int),
+            ("read_bytes_per_refresh", "read_bytes_source",
+             config.ENV_DISK_INDEX_REFRESH_BYTES, env.get("refresh_bytes"), int)):
+        raw = os.environ.get(name)
+        if raw:
+            out["raw_values"][name] = raw
+        if value is None:
+            if any(name in problem for problem in out["problems"]):
+                out[source_key] = "env_ignored"
+            continue
+        wanted = caster(value)
+        if key != "boot_deadline_seconds" and wanted < DRAIN_BYTES_FLOOR:
+            # CLAMPED WITH A REASON, never trusted - this module's own doctrine for a
+            # operator-supplied bound. A byte budget below one journal's useful window
+            # drains nothing and reads as "configured" to a reader of `stopped_at`, so
+            # the floor is honoured and the clamp is published rather than the number
+            # being quietly replaced.
+            out[source_key] = "env_clamped"
+            out[key] = int(DRAIN_BYTES_FLOOR)
+            out["problems"].append(
+                f"{name}={raw!r} is below the {DRAIN_BYTES_FLOOR}-byte floor and was "
+                "clamped to it (a window smaller than one rank's spill burst drains "
+                "nothing useful and would read as configured)")
+            continue
+        out[key] = wanted
+        out[source_key] = "env"
+    return out
+
+
+def boot_drain_view() -> dict:
+    """A COPY of the boot drain's record, with its units. Never the live dict."""
+    try:
+        record = _state["boot_drain"]
+        out = dict(record)
+        out["units"] = dict(BOOT_DRAIN_UNITS)
+        out["stopped_at"] = (record.get("stopped_at") if record.get("stopped_at")
+                             in DRAIN_STOPS else "not_run")
+        return out
+    except Exception as exc:  # noqa: BLE001 - a view is never worth a fault
+        snapshot._error(exc, "disk_index boot drain view")
+        return _fresh_boot_drain_record()
+
+
+def boot_drain_token(record=None) -> str:
+    """The BOOT line's token: `JOURNAL_DRAIN[converged|deadline|budget|...]`.
+
+    Bracketed, not `key=value`, for the two reasons `mamba_anchor.boot_token()` gives:
+    the verdict is a CLOSED vocabulary rather than a field, and the restart verifier in
+    the llm-api repo pulls the tier verdict with `grep -oE "tier=[A-Za-z_]+" | tail -1`
+    - a token with no `=` can never become a candidate `tier=` match by accident, and
+    the boot line's "every field name appears exactly once" rule is about `=`-shaped
+    fields.
+    Its job is the one-glance question "did this boot read its journals before it served
+    - and if not, which bound said no?", because a silent absence is exactly what cost
+    an afternoon to notice.
+    """
+    source = boot_drain_view() if record is None else record
+    stopped = source.get("stopped_at") if isinstance(source, dict) else None
+    if stopped not in DRAIN_STOPS:
+        stopped = "not_run"
+    return f"JOURNAL_DRAIN[{DRAIN_STOP_TOKENS.get(stopped, 'not_run')}]"
+
+
+def drain_journal_at_boot() -> dict:
+    """Drain the journals NOW, at connector creation, under the boot bounds.
+
+    WHY THIS EXISTS, IN ONE NUMBER. The box's own measurement: a boot at 23:00:43, a
+    request at 23:02 that recomputed 129,285 tokens because `blind: true` meant the
+    index could not say what was on disk, and a journal replay that finished at 23:12.
+    Nothing was deadlocked - `disk_restore._refresh_index()` runs on the offer path and
+    advances the drain regardless of the blind flag - the boot simply stopped at its
+    deadline and the REST was paid per arriving request. This function moves that work
+    to the one moment where it costs nobody's request: the connector-creation hook,
+    inside `Scheduler.__init__`, before the first step.
+
+    THE CONTRACT IS `mamba_anchor.install()`'s and the backport installs', and for the
+    same reason: it must never raise into a boot. `refresh()` already contains every
+    exception it can reach, so the `except Exception` here is for the containment layer
+    itself failing; the failure is COUNTED (`error`), LOGGED ONCE (the
+    `notice_once` idiom, because the boot may re-enter this for a second connector),
+    and left as today's behaviour: the request path drains exactly as it did before
+    this release. `BaseException` (`KeyboardInterrupt`, `SystemExit`, a fork's own
+    cancel) propagates unchanged - a plugin must not swallow a shutdown.
+
+    IDEMPOTENT BY FACT, NOT BY LOCK: `refresh()`'s boot phase runs once per process
+    (`boot_drained`), so a second connector creation costs one bounded pass and cannot
+    re-run a 45-second drain. The record keeps the FIRST one and says which trigger made
+    it, so the payload cannot claim a boot drain that a request actually paid for.
+    """
+    record = _state["boot_drain"]
+    if record["ran"]:
+        # Already drained in this process. Report it; do not restart a bounded drain
+        # because a MultiConnector built a second tier connector.
+        return boot_drain_view()
+    record["trigger"] = DRAIN_TRIGGER_BOOT
+    try:
+        out = refresh(force=True)
+        record = _state["boot_drain"]
+        if not out.get("ok", True):
+            record["error"] = str(out.get("reason")
+                                  or "refresh reported a failure")[:160]
+            record["stopped_at"] = "error"
+            notice_once("boot-drain-failed",
+                        f"kvtier-dev-plugin: the BOOT journal drain reported a failure "
+                        f"({record['error']}) - the journal keeps draining on the "
+                        "request path, exactly as before 0.2.65")
+        return boot_drain_view()
+    except Exception as exc:  # noqa: BLE001 - a boot must never be lost to a drain
+        record = _state["boot_drain"]
+        record["error"] = f"{type(exc).__name__}"[:160]
+        record["stopped_at"] = "error"
+        snapshot._error(exc, "disk_index boot journal drain")
+        notice_once(f"boot-drain-error:{type(exc).__name__}",
+                    f"kvtier-dev-plugin: the BOOT journal drain raised "
+                    f"{type(exc).__name__} and was contained - the index stays on "
+                    "today's path (the first offer pays for the drain), which is the "
+                    "behaviour this release was written to avoid, not a fault that "
+                    "should stop a boot")
+        return boot_drain_view()
 
 
 # --- small helpers ------------------------------------------------------------
@@ -1212,6 +1566,24 @@ def journal_append(op, key, size_bytes=None, group_id=None) -> dict:
 
 # --- the reader: replay every rank's journal into the index -----------------
 
+def _note_boot_drain_attempt(stopped: str, limits: dict) -> None:
+    """A boot-eligible refresh that reached NO journal still says why it stopped.
+
+    Only while the boot drain has not run: once a process has drained, the record is
+    history and a later empty listing must not overwrite the boot's verdict. Neither
+    early return marks `boot_drained`, so a journal directory that appears later still
+    gets its full boot drain - and `attempted` is the field that shows this happened
+    more than once instead of leaving a `not_run` record unexplained.
+    """
+    if _state["boot_drained"] or _state["boot_drain"]["ran"]:
+        return
+    _state["boot_drain"].update({
+        "attempted": int(_state["boot_drain"]["attempted"]) + 1,
+        "stopped_at": stopped,
+        "deadline_seconds": float(limits["boot_deadline_seconds"]),
+        "max_bytes": int(limits["boot_bytes"])})
+
+
 def refresh(*, force: bool = False) -> dict:
     """Apply every rank's new journal lines. Cheap, bounded, never raises.
 
@@ -1226,13 +1598,18 @@ def refresh(*, force: bool = False) -> dict:
     `lag_bytes: 0` forever after (the `entries: 146` over 132,099 records incident).
 
     THE BOOT DRAIN. The FIRST refresh of this process repeats the bounded pass until
-    every journal's cursor reaches end-of-file, bounded TOTAL by
-    `BOOT_DRAIN_MAX_BYTES` bytes read and `BOOT_DRAIN_DEADLINE_SECONDS` of wall time;
-    either bound ending the loop is normal (logged, `converged: false`) and ordinary
-    refreshes finish the job. It runs wherever the first refresh runs - the
-    scheduler's offer path (`disk_restore._refresh_index`) - so a cold boot pays it
-    inside the FIRST offer attempt rather than spreading it over a minute of
-    one-second refreshes.
+    every journal's cursor reaches end-of-file, bounded TOTAL by the byte budget and the
+    wall time `drain_limits()` resolves (the shipped `BOOT_DRAIN_MAX_BYTES` /
+    `BOOT_DRAIN_DEADLINE_SECONDS`, or `VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES` /
+    `..._SECONDS`). Either bound ending the loop is normal (logged once, recorded in
+    `boot_drain.stopped_at`, `converged: false`) and ordinary refreshes finish the job.
+    Since 0.2.65 that first refresh is meant to be `drain_journal_at_boot()`, called by
+    the connector-creation hook inside `Scheduler.__init__`; when it is not (a process
+    whose first refresh came from the offer path) the record's `trigger` says so, since
+    "the boot drained it" and "a request paid for it" are different facts. Either way
+    the
+    drain runs wherever the first refresh runs, so a cold boot pays it once at startup
+    rather than spreading it over a minute of one-second refreshes.
 
     WORK BOUND (the invariant the offer path depends on): any refresh after the
     first reads at most `MAX_READ_PER_REFRESH` bytes and applies at most
@@ -1242,6 +1619,7 @@ def refresh(*, force: bool = False) -> dict:
     floor so a burst of requests does not turn into a burst of stats.
     """
     started = time.monotonic()
+    limits = drain_limits()
     out = {"ok": True, "reason": None, "journals": 0, "lines": 0, "spills": 0,
            "removals": 0, "dropped": 0, "entries": int(len(_state["entries"])),
            "applied": False, "lag_bytes": 0, "lag_journals": 0,
@@ -1255,6 +1633,7 @@ def refresh(*, force: bool = False) -> dict:
                              f"neither is {config.ENV_DIAG_DIR}: no spill journal "
                              "can be read, so the disk index stays empty")
             _note(out["reason"])
+            _note_boot_drain_attempt("no_directory", limits)
             return out
         now = time.monotonic()
         last = _state["last_refresh_mono"]
@@ -1293,24 +1672,30 @@ def refresh(*, force: bool = False) -> dict:
             # had no journal to drain.
             _state["converged"] = True
             out["converged"] = True
+            _note_boot_drain_attempt("no_journals", limits)
             return out
         boot = not _state["boot_drained"]
         _state["boot_drained"] = True
-        deadline = started + BOOT_DRAIN_DEADLINE_SECONDS if boot else None
+        deadline = started + limits["boot_deadline_seconds"] if boot else None
         unread: dict = {}
         last_lag = None
+        passes = 0
+        stopped = "converged"
         while True:
-            pass_budget = MAX_READ_PER_REFRESH
+            pass_budget = limits["read_bytes_per_refresh"]
             if boot:
-                left = BOOT_DRAIN_MAX_BYTES - out["bytes_read"]
+                left = limits["boot_bytes"] - out["bytes_read"]
                 if left <= 0:
-                    _note(f"the boot drain stopped at its {BOOT_DRAIN_MAX_BYTES}-"
+                    stopped = "byte_budget"
+                    _note(f"the boot drain stopped at its "
+                          f"{limits['boot_bytes']}-"
                           "byte budget with unread journal bytes left; ordinary "
                           "refreshes will finish the drain (converged: false "
                           "until they do)")
                     break
                 pass_budget = min(pass_budget, left)
             res = _refresh_pass(directory, names, pass_budget, unread)
+            passes += 1
             out["journals"] += res["journals"]
             out["lines"] += res["applied"]
             out["spills"] += res["spills"]
@@ -1331,11 +1716,13 @@ def refresh(*, force: bool = False) -> dict:
                 # finished, or a read that failed): re-reading the same bytes in a
                 # tight loop would spin the boot deadline away for the same view.
                 # The next refresh - one floor interval away - tries again.
+                stopped = "no_progress"
                 break
             last_lag = int(res["lag_bytes"])
             if time.monotonic() >= deadline:
+                stopped = "deadline"
                 _note(f"the boot drain stopped at its "
-                      f"{BOOT_DRAIN_DEADLINE_SECONDS}s deadline with "
+                      f"{limits['boot_deadline_seconds']}s deadline with "
                       f"{res['lag_bytes']} unread journal bytes over "
                       f"{res['lag_journals']} journal(s); ordinary refreshes will "
                       "finish the drain (converged: false until they do)")
@@ -1343,6 +1730,43 @@ def refresh(*, force: bool = False) -> dict:
         _state["lag_bytes"] = int(out["lag_bytes"])
         _state["lag_journals"] = int(out["lag_journals"])
         _state["bytes_read"] = int(_state["bytes_read"]) + out["bytes_read"]
+        if boot:
+            # THE BOOT DRAIN'S RECORD, written where the drain actually ran - which is
+            # NOT necessarily `drain_journal_at_boot()`: a process whose first refresh
+            # came from the offer path still gets an honest record, with the trigger the
+            # boot hook did not set. `stopped_at` is the answer to "did the boot finish,
+            # and if not, which bound said no", and it is computed here rather than
+            # inferred from `converged`, because the two bound-exhaustion stops used to
+            # be a log line only - which is exactly how tonight's boot read as "a bit
+            # behind" instead of "the deadline expired with 2.3 MB unread".
+            _state["boot_drain"].update({
+                "ran": True,
+                "attempted": int(_state["boot_drain"]["attempted"]) + 1,
+                "trigger": (_state["boot_drain"]["trigger"]
+                            or DRAIN_TRIGGER_OTHER),
+                "stopped_at": stopped,
+                "bytes_read": int(out["bytes_read"]),
+                "lines": int(out["lines"]),
+                "entries_at_end": int(len(_state["entries"])),
+                "elapsed_seconds": float(round(time.monotonic() - started, 6)),
+                "converged": bool(out["lag_bytes"] <= 0),
+                "lag_bytes": int(out["lag_bytes"]),
+                "lag_journals": int(out["lag_journals"]),
+                "passes": int(passes),
+                "deadline_seconds": float(limits["boot_deadline_seconds"]),
+                "max_bytes": int(limits["boot_bytes"]),
+                "error": None})
+            notice_once(f"boot-drain-{stopped}",
+                        f"kvtier-dev-plugin: the BOOT journal drain read "
+                        f"{out['bytes_read']} byte(s) over {passes} pass(es) and "
+                        f"stopped at its bound: {stopped} "
+                        f"({out['lag_bytes']} unread byte(s) over "
+                        f"{out['lag_journals']} journal(s), "
+                        f"{len(_state['entries'])} entries) - bounds "
+                        f"{limits['boot_deadline_seconds']}s / "
+                        f"{limits['boot_bytes']} bytes"
+                        + ("; the rest keeps draining on the request path" if stopped
+                           != "converged" else ""))
         _state["unread_journals"] = dict(
             sorted(unread.items(), key=lambda row: -row[1])
             [:MAX_LAG_NAMED_JOURNALS])
@@ -1386,14 +1810,19 @@ def _refresh_pass(directory, names, byte_budget, unread_out) -> dict:
     cannot starve the others. A span needs EVERY rank to have journalled it, so a
     uniformly-behind drain is honest where a partially-caught-up index would turn
     "the file is gone for rank 3" into an offered load that fails.
+
+    The share is divided out of the RESOLVED per-refresh cap (`drain_limits()`), not the
+    constant, so `VLLM_E2_TIER_DISK_INDEX_REFRESH_BYTES` moves the share and the total
+    together - a knob that halved the total but left the shares alone would let one
+    refresh read past its own bound.
     """
     res = {"journals": 0, "applied": 0, "spills": 0, "removals": 0, "dropped": 0,
            "lag_bytes": 0, "lag_journals": 0, "bytes_skipped": 0,
            "lines_skipped": 0, "jumps": 0, "read": 0}
     budget = int(byte_budget)
     lines = MAX_LINES_PER_REFRESH
-    share_bytes = max(MIN_JOURNAL_WINDOW_BYTES,
-                      MAX_READ_PER_REFRESH // max(1, len(names)))
+    read_cap = int(drain_limits()["read_bytes_per_refresh"])
+    share_bytes = max(MIN_JOURNAL_WINDOW_BYTES, read_cap // max(1, len(names)))
     share_lines = max(1, MAX_LINES_PER_REFRESH // max(1, len(names)))
     for name in names:
         path = os.path.join(directory, name)
@@ -2827,6 +3256,14 @@ def section() -> dict:
         "boot_drained": bool(_state["boot_drained"]),
         "unread_journals": _unread_view(),
         "bytes_read": int(_state["bytes_read"]),
+        # THE BOOT'S OWN DRAIN, and the bounds it ran under (0.2.65). `bytes_read` above
+        # is this process's cumulative reading; this record is the FIRST refresh's,
+        # which is the one question tonight's measurement asks ("did the boot finish
+        # before the first request, and if not, which bound stopped it?"). Beside it
+        # the bounds IN FORCE with their origin, so a reader never has to know the
+        # release notes to interpret `stopped_at`.
+        "boot_drain": boot_drain_view(),
+        "drain_limits": drain_limits(),
         "applied_lines": int(_state["applied"]),
         "spills_seen": int(_state["spills"]),
         "removals_seen": int(_state["removals"]),

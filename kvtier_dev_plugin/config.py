@@ -353,6 +353,28 @@ ENV_DISK_INDEX_ENTRIES = "VLLM_E2_TIER_DISK_INDEX_ENTRIES"
 # `journal_dir=tmpfs` when it lands on a filesystem that dies at reboot.
 ENV_DISK_JOURNAL_DIR = "VLLM_E2_TIER_DISK_JOURNAL_DIR"
 
+# HOW LONG AND HOW DEEP THE BOOT SPENDS READING THAT JOURNAL (0.2.65) ----------
+# Three numbers, one problem. The index learns what is on the NVMe tier by replaying
+# the journals, and until 0.2.65 all three of these were compiled in: the boot drain's
+# wall-clock deadline and byte budget, and the steady-state bytes one refresh may read.
+# On the night this was measured the boot's 5 s deadline expired with 2.3 MB of a
+# ~25 MB journal unread, and the remainder was read by the REQUEST path at 512 KiB a
+# refresh and a 1 s floor -
+# so a request at 23:02 recomputed 129,285 tokens through an index that was still
+# `blind: true`, and the replay finished around 23:12. Six seconds of boot reading was
+# worth eleven minutes of traffic-driven reading, and neither number could be changed
+# without a release. Grammar lives here, policy lives in `disk_index.drain_limits()`;
+# a value the grammar refuses leaves the shipped default standing and reports its
+# complaint (`drain_limits`' `problems`), because a typo in a systemd drop-in must cost
+# a knob and never a boot.
+ENV_DISK_BOOT_DRAIN_SECONDS = "VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS"
+ENV_DISK_BOOT_DRAIN_BYTES = "VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES"
+# The STEADY-STATE cap, not the boot's: the bytes one refresh after the boot drain may
+# read across all journals together. Ship-for-ship unchanged at 512 KiB; this exists so
+# an operator can widen the trickle without a release once the boot drain has proved
+# itself, and so the payload can name the number the offer path is actually bounded by.
+ENV_DISK_INDEX_REFRESH_BYTES = "VLLM_E2_TIER_DISK_INDEX_REFRESH_BYTES"
+
 # THE RESTORE SETTLE WAIT (`disk_restore.py`) ---------------------------------
 # THE ALLOWANCE on how long one apply point (`start_load_kv`) may wait for its disk
 # reads, in MILLISECONDS. **Default 5,000 = give the read up to five seconds**
@@ -1287,6 +1309,52 @@ def disk_index_env() -> dict:
             wanted = None
         entries = wanted
     return {"entries": entries, "problems": problems}
+
+
+def disk_index_drain_env() -> dict:
+    """The journal drain's three bounds, parsed and NOT interpreted.
+
+    The `ceiling_env` / `disk_index_env` split for the third time: the grammar lives
+    here and the policy that spends the numbers (`disk_index.BOOT_DRAIN_MAX_BYTES`,
+    `disk_index.BOOT_DRAIN_DEADLINE_SECONDS`, `disk_index.MAX_READ_PER_REFRESH`, and the
+    resolution in `disk_index.drain_limits`) lives with the drain. Every key is None
+    when the operator said nothing, which the consumer answers with its shipped
+    default - so a typo in a drop-in gives a boot that drains the shipped amount, never
+    a boot with no deadline and never one with no budget.
+
+    `0` and negatives are REFUSED, as `ceiling_env` refuses a 0 budget. A deadline or a
+    budget of 0 drains nothing at all, which reads as "configured" to anyone looking at
+    `boot_drain.stopped_at` while guaranteeing the blind index this release exists to
+    remove. The ceiling on a byte budget is policy: it is a boot-cost decision, and the
+    module that owns the deadline clamps and reports nothing here because the deadline,
+    not the bytes, is the hard ceiling on startup time.
+    """
+    problems: list = []
+
+    def positive_number(name: str, unit: str, whole: bool):
+        """One variable, one value, one complaint. None means 'said nothing'."""
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw) if whole else float(raw)
+        except ValueError:
+            problems.append(f"{name}={raw!r} is not a {unit} and was ignored (the "
+                            "shipped default stands)")
+            return None
+        if value != value or value <= 0:
+            problems.append(f"{name}={raw!r} is not a finite {unit} above 0 and was "
+                            "ignored (0 would drain nothing and read as configured)")
+            return None
+        return value
+
+    return {"deadline_seconds": positive_number(ENV_DISK_BOOT_DRAIN_SECONDS,
+                                                "number of seconds", False),
+            "boot_bytes": positive_number(ENV_DISK_BOOT_DRAIN_BYTES,
+                                          "integer number of bytes", True),
+            "refresh_bytes": positive_number(ENV_DISK_INDEX_REFRESH_BYTES,
+                                             "integer number of bytes", True),
+            "problems": problems}
 
 
 def settle_env() -> dict:

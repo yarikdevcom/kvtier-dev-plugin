@@ -1962,6 +1962,12 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             # prohibition it must never cross, which is that this is computed FRESH and
             # never restored from a previous boot's arm file.
             "disk_boot": None,
+            # THE SPILL JOURNAL DRAIN (0.2.65): what the boot read out of the
+            # journals, how long it took and which bound stopped it - the answer to
+            # "will the first request find a converged index, or recompute?". `None`
+            # means this boot never reached the step (a boot note for a process with no
+            # tier to boot).
+            "journal_drain": None,
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -2070,6 +2076,23 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             boot["refusals"].append("disk_boot: {}".format(
                 (disk_verdict.get("reason") or "the boot default was not honoured")[
                     :MAX_BOOT_ITEM_CHARS]))
+
+        # THE SPILL JOURNAL, READ HERE RATHER THAN BY THE FIRST REQUEST. The index
+        # learns what is on the NVMe tier by replaying the journals, and until now that
+        # replay began on the OFFER path: the boot's bounded drain stopped, and the rest
+        # was paid per arriving request at 512 KiB a refresh. Measured on the box: a
+        # boot at 23:00:43, a request at 23:02 recomputing 129,285 tokens behind `blind:
+        # true`, and a replay that finished at 23:12. This is the one moment in the boot
+        # where those seconds cost NOTHING - `create_connector` is called from
+        # `Scheduler.__init__` (`scheduler.py:164`), so the drain runs before the first
+        # step, before the first `bind_gpu_block_pool` and long before any request; and
+        # the connector existing is the only precondition the reader has (it needs the
+        # spill tier's journal directory from the environment, not the manager).
+        # Contained by `disk_index.drain_journal_at_boot()`'s own contract: a drain that
+        # raises leaves the boot exactly as un-drained as it was, counted and logged
+        # once. It is never a REFUSAL and never joins `refusals`: a slow index costs a
+        # recompute, and a boot that could not read a journal is still a boot.
+        boot["journal_drain"] = _boot_journal_drain(boot)
 
         _state["boots"] += 1
         _state["boot"] = boot
@@ -2336,6 +2359,13 @@ def boot_line(boot: dict) -> str:
     # line, and the reason a bare absence is not acceptable: a target that installs
     # nothing has to SAY so.
     parts.append(mamba_anchor.boot_token())
+    # THE SPILL JOURNAL'S VERDICT, in the same bracketed-token shape and for the same
+    # reason as `MAMBA_ANCHOR[...]` (see `disk_index.boot_drain_token`): a closed
+    # vocabulary, no `=`, so the restart verifier's `grep -oE "tier=[A-Za-z_]+" |
+    # tail -1` can never land on it. `JOURNAL_DRAIN[converged]` is the answer to "will
+    # the first request find the NVMe tier, or recompute it?" - the question tonight's
+    # 129,285-token recompute asked and the boot log could not answer.
+    parts.append(_journal_drain_token(boot))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2428,6 +2458,50 @@ def _is_tier_connector(connector) -> bool:
     return False
 
 
+def _boot_journal_drain(boot: dict) -> dict:
+    """READ THE SPILL JOURNAL NOW (0.2.65). The boot's journal step; never raises.
+
+    WHY HERE. The connector exists, which is all the journal reader needs (its directory
+    is the spill tier's, resolved from the environment, not the manager), and the caller
+    is `KVConnectorFactory.create_connector` - inside `Scheduler.__init__`, so nothing
+    is being served yet. Everything the drain builds is in-process memory, and it
+    reaches `disk_index` and NOTHING else: it cannot arm, cannot offer, cannot pick a
+    serve posture and cannot refuse a spill. The AST of this function is pinned against
+    exactly that claim by `tests/test_boot_journal_drain.py`.
+
+    INERT MEANS INERT. `VLLM_E2_TIER_DEV_BOOT_INERT` is the operator's "install and stop
+    there", and the drain costs boot seconds, so an inert boot reads no journal byte and
+    says so (`stopped_at: "inert"`) rather than quietly doing work the opt-out refused.
+    """
+    del boot  # this step needs no other boot verdict: it reads no boot state
+    from . import disk_index  # noqa: PLC0415 - sibling layer, lazy by idiom
+    if boot_mode()[0] == BOOT_MODE_INERT:
+        record = disk_index.boot_drain_view()
+        record["stopped_at"] = "inert"
+        record["note"] = (f"{config.ENV_BOOT_INERT} is set: this boot read no journal "
+                          "byte. The first offer pays for the drain, as it did before "
+                          "0.2.65")
+        return record
+    return disk_index.drain_journal_at_boot()
+
+
+def _journal_drain_token(boot: dict) -> str:
+    """The BOOT line's `JOURNAL_DRAIN[...]` token, from this boot's own record.
+
+    Read from the BOOT DICT rather than module state (the `arena=` / `disk_boot=`
+    discipline, not `MAMBA_ANCHOR`'s): the line must describe the boot that produced it,
+    and a boot that never reached the step renders `JOURNAL_DRAIN[not_run]` instead of
+    whatever a previous boot left in the index.
+    """
+    try:
+        from . import disk_index  # noqa: PLC0415 - sibling layer, lazy by idiom
+        return disk_index.boot_drain_token(boot.get("journal_drain")
+                                           if isinstance(boot, dict) else None)
+    except Exception as exc:  # noqa: BLE001 - a token is never worth a lost line
+        snapshot._error(exc, "backport journal drain token")
+        return "JOURNAL_DRAIN[not_run]"
+
+
 def boot_note(reason: str) -> dict:
     """The BOOT line for a process that has NO tier to boot. Same format.
 
@@ -2443,7 +2517,7 @@ def boot_note(reason: str) -> dict:
             "refusals": [reason], "not_covered": [], "nested": [],
             "live_check": None, "manager": None, "install_reason": None,
             "restore": None, "arena": None, "disk_boot": None,
-            "line": None}
+            "journal_drain": None, "line": None}
     boot["line"] = boot_line(boot)
     _state["boot_line"] = boot["line"]
     logger.warning("kvtier-dev-plugin: %s", boot["line"])

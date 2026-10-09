@@ -377,9 +377,40 @@ SPAN_SHAPE_COUNTERS = ("spill_spans_classified", "spill_spans_complete",
 MAMBA_CACHE_MODE_ALIGN = "align"
 
 # WHERE the split was read from, published beside the numbers so a reader can tell
-# "the geometry says X" from "the plugin guessed".
+# "the geometry says X" from "the plugin guessed". The base string is the source that
+# has always worked; `resolve_mamba_cache_mode` APPENDS the source it actually used,
+# because a per-group claim read from an engine-wide flag has to be readable as one.
 SPAN_SHAPE_BASIS = ("kv_cache_groups[i].kv_cache_spec."
                     "{prefix_cacheable,mamba_cache_mode}")
+
+# THE THREE PLACES a group's mode can be true of, in the order they are tried, each
+# optional. They are published inside `basis`/`reason` rather than kept private, so
+# "how do you know this group is a state group?" is answerable from the payload.
+MODE_FROM_SPEC = "spec"
+MODE_FROM_SUB_SPECS = "sub-specs"
+MODE_FROM_CACHE_CONFIG = "engine-wide cache_config"
+MODE_FROM_AMBIGUOUS = "sub-specs disagree"
+
+# A class name is EVIDENCE about a spec the same way the fork reads one
+# (`gpu_census._is_circular_buffer`'s MRO-by-class-name, `kvconfig.py:241-255`): it
+# says WHICH group, never WHETHER align mode is on. Only a real
+# `mamba_cache_mode == "align"` may classify a group, and the name marker below is
+# consulted solely to decide which group an ENGINE-WIDE "align" may be attributed to.
+STATE_CLASS_MARKERS = ("Mamba",)
+
+# BOUNDS on the evidence strings. `worker_diag.MAX_CONTRIBUTION_BYTES` refuses (here:
+# trims) an over-long rank section, so a reason that named thirty groups and forty
+# classes would cost every counter beside it. These are the reason strings' ceiling,
+# and `test_the_disk_section_still_fits_the_contribution_cap` holds the line; the class
+# cap is TWO because the live pair - the container and the sub-spec class inside it - is
+# the fact worth naming, and a wider list pushes the engine-wide verdict past the clip.
+MODE_EVIDENCE_CLASSES = 2
+MODE_CLASS_CHARS = 40
+MODE_MRO_CLASSES = 8
+MODE_SUB_SPECS_SCANNED = 64
+SPAN_SHAPE_REASON_CHARS = 400
+SPAN_SHAPE_BASIS_CHARS = 140
+SPAN_SHAPE_ID_CHARS = 32
 
 # The last readable answer, and the config object it was read out of. A holder rather
 # than two module globals because this module has already been crashed twice by a
@@ -1295,22 +1326,254 @@ def observe_bind(handler, metadata) -> dict:
         return _fail(f"the bind observation raised {type(exc).__name__}")
 
 
+def _class_name(spec) -> str:
+    """A spec's class name, bounded. Never raises: `type()` cannot, the slice cannot."""
+    return type(spec).__name__[:MODE_CLASS_CHARS]
+
+
+def _class_chain(spec) -> list:
+    """The class names on a spec's own MRO, bounded, or [] if the reflection fails.
+
+    The fork's own precedent for identifying a spec by its class rather than by an
+    import (`gpu_census._is_circular_buffer`, `kvconfig.py:241-255`): a plugin that
+    imports vllm types onto the step thread is a plugin that can fail a step. The names
+    come from each class's OWN `__name__` - a spec is an instance, so its MRO entries
+    are classes and `type(cls).__name__` would answer "type" for every one of them.
+    """
+    try:
+        names = []
+        for cls in type(spec).__mro__:
+            name = getattr(cls, "__name__", None)
+            if isinstance(name, str) and name:
+                names.append(name[:MODE_CLASS_CHARS])
+        return names[:MODE_MRO_CLASSES]
+    except Exception:  # noqa: BLE001 - a name we cannot read is not a fault
+        return []
+
+
+def _sub_specs(spec) -> tuple:
+    """(the per-layer specs a container aggregates, the accessor that yielded them).
+
+    A WORKER's group entry is the AGGREGATED spec the fork projects to it: where the
+    EngineCore's scheduler holds a representative per-layer spec, `kv_cache_utils.py:
+    1075-1077` says the worker's config carries "an aggregated
+    UniformTypeKVCacheSpecs", and `_project_kv_cache_groups_to_worker`
+    (`kv_cache_utils.py:2606-2614`) rebuilds each group's spec as exactly that. The
+    container declares no `mamba_cache_mode` of its own - `MambaSpec` does, at
+    `kv_cache_interface.py:998` - and it publishes its layers in `kv_cache_specs` with
+    a `first_spec` shortcut (`kv_cache_interface.py:1191`, `:1200-1205`). BOTH
+    spellings are tried: depending on exactly one is how a panel goes dark again.
+
+    The scan is bounded at `MODE_SUB_SPECS_SCANNED`: the population is one entry per
+    LAYER, and a witness on the step thread must be able to price itself.
+    """
+    try:
+        direct = getattr(spec, "kv_cache_specs", None)
+        if isinstance(direct, dict) and direct:
+            values = [item for item in list(direct.values())[:MODE_SUB_SPECS_SCANNED]
+                      if item is not None]
+            if values:
+                return values, "kv_cache_specs"
+        elif isinstance(direct, (list, tuple)) and direct:
+            values = [item for item in list(direct)[:MODE_SUB_SPECS_SCANNED]
+                      if item is not None]
+            if values:
+                return values, "kv_cache_specs"
+        first = getattr(spec, "first_spec", None)
+        if first is not None:
+            return [first], "first_spec"
+    except Exception:  # noqa: BLE001 - an unreadable container says "nothing found"
+        return [], None
+    return [], None
+
+
+def _cache_config_mode(vllm_config) -> tuple:
+    """(the engine-wide `mamba_cache_mode`, or None, and why it is None).
+
+    The worker keeps the config it was built with (`worker.py:40`), and the fork fills
+    EVERY MambaSpec's mode from this same field (`abstract.py:78`), so on this fork the
+    two sources agree by construction. It is ENGINE-WIDE all the same: it can say the
+    engine runs align-mode state groups, never which group is one.
+    """
+    try:
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is None:
+            return None, "no vllm_config.cache_config in this process"
+        mode = getattr(cache_config, "mamba_cache_mode", None)
+        if mode is None:
+            return None, "cache_config.mamba_cache_mode is absent"
+        if not isinstance(mode, str):
+            return None, (f"cache_config.mamba_cache_mode is "
+                          f"{type(mode).__name__}, not a str")
+        return mode, None
+    except Exception as exc:  # noqa: BLE001 - a config that refuses is a fact
+        return None, f"reading cache_config raised {type(exc).__name__}"
+
+
+def resolve_mamba_cache_mode(spec, vllm_config=None) -> dict:
+    """One group's `mamba_cache_mode`, read wherever it is actually kept.
+
+    WHY THIS EXISTS, AND WHY IT IS ONE FUNCTION. `span_shape_state()` here and
+    `disk_restore_verify._boundary_groups()` both asked the GROUP's spec, and on the
+    live worker both got None for all six groups - so the whole 0.2.63 span-completeness
+    panel and the verifier's align half reported zeros that were structurally incapable
+    of moving. Fixing one and not the other would leave the same predicate written twice
+    and read twice; this is the only place in the package that asks.
+
+    THREE SOURCES, each optional, tried in this order:
+      1. the group's OWN spec field, which is the fork's answer and always wins; a
+         `MambaSpec` declares it (`kv_cache_interface.py:998`) and an attention spec
+         declares no such field at all, which is the fork's way of saying positional;
+      2. the CONTAINER's per-layer sub-specs (`_sub_specs`), which is where the mode
+         lives on a worker whose group entry aggregates seven layers into one spec;
+      3. the ENGINE-WIDE `cache_config.mamba_cache_mode`, used only for a group whose
+         spec class (or MRO, or sub-spec class) NAMES a state spec, because an
+         engine-wide flag can say WHETHER but not WHICH. Every result from this source
+         is labelled in `detail` so no reader can mistake it for per-group evidence.
+
+    A group whose sub-specs DISAGREE is `ambiguous`, and a walk that cannot read the
+    spec at all is `error`: neither is silently positional, because a guessed
+    denominator would move the one ratio this feeds in whichever direction the guess
+    pointed. `Exception` is contained into those two verdicts; `BaseException` is not
+    caught and reaches the engine - the line `tests/test_containment.py` draws.
+
+    Returns `{mode, source, spec_class, sub_spec_classes, detail, ambiguous, error}`,
+    where `mode` is the fork's string (or the spec's own non-str value, which the
+    caller reports by type) and `detail` is one line naming what was looked at.
+    """
+    out: dict = {"mode": None, "source": None, "spec_class": _class_name(spec),
+                 "sub_spec_classes": [], "detail": "", "ambiguous": False,
+                 "error": None}
+    try:
+        declared = getattr(spec, "mamba_cache_mode", None)
+        if declared is not None:
+            out.update(mode=declared, source=MODE_FROM_SPEC,
+                       detail=(f"{out['spec_class']} declares mamba_cache_mode="
+                               f"{declared!r}"))
+            return out
+        subs, accessor = _sub_specs(spec)
+        classes: list = []
+        modes: list = []
+        for sub in subs:
+            name = _class_name(sub)
+            if name not in classes:
+                classes.append(name)
+            value = getattr(sub, "mamba_cache_mode", None)
+            if isinstance(value, str) and value not in modes:
+                modes.append(value)
+        out["sub_spec_classes"] = classes
+        engine, engine_note = _cache_config_mode(vllm_config)
+        where = (f"{out['spec_class']} via {accessor} ({', '.join(classes)})"
+                 if accessor else f"{out['spec_class']}, no sub-spec accessor")
+        if len(modes) > 1:
+            out.update(ambiguous=True, source=MODE_FROM_AMBIGUOUS,
+                       detail=(f"{len(subs)} sub-specs of {where} disagree about "
+                               f"mamba_cache_mode: {modes}"))
+            return out
+        if modes:
+            out.update(mode=modes[0], source=MODE_FROM_SUB_SPECS,
+                       detail=(f"{where} declare mamba_cache_mode={modes[0]!r}"))
+            return out
+        names = _class_chain(spec) + classes
+        state_named = any(marker in name for name in names
+                          for marker in STATE_CLASS_MARKERS)
+        if engine is not None and state_named:
+            out.update(mode=engine, source=MODE_FROM_CACHE_CONFIG,
+                       detail=(f"ENGINE-WIDE cache_config.mamba_cache_mode="
+                               f"{engine!r} attributed to {out['spec_class']} by its "
+                               "class name, not a per-group field"))
+            return out
+        out["detail"] = (
+            f"no mode found: {where} declared none"
+            + (f"; engine-wide cache_config.mamba_cache_mode={engine!r} but no class "
+               "names a state spec" if engine is not None else
+               f"; engine-wide cache_config unreadable ({engine_note})"))
+        return out
+    except Exception as exc:  # noqa: BLE001 - a reason, never a step fault
+        out["error"] = type(exc).__name__
+        out["detail"] = (f"reading {out['spec_class']}.{MODE_FROM_SUB_SPECS} raised "
+                         f"{type(exc).__name__}")
+        return out
+
+
+def _span_evidence(vllm_config, resolutions) -> str:
+    """One bounded line naming WHAT THE WALK SAW, for a reason that has to explain it.
+
+    This is the self-diagnostic half of the change: tonight the worker's spec shape had
+    to be INFERRED from `page_size_bytes` ratios because nothing published it. The
+    class names and the source that answered are the facts a reader needs to know
+    whether the resolution is reading the real thing or a simulation of it.
+    """
+    classes: list = []
+    for entry in resolutions:
+        for name in ([entry.get("spec_class")]
+                     + list(entry.get("sub_spec_classes") or ())):
+            if name and name not in classes:
+                classes.append(name)
+    engine, engine_note = _cache_config_mode(vllm_config)
+    verdict = (repr(engine) if engine is not None
+               else f"unreadable ({engine_note})")
+    return (f"spec classes {', '.join(classes[:MODE_EVIDENCE_CLASSES]) or 'none'}; "
+            f"modes answered for {len(resolutions)} group(s); engine-wide "
+            f"cache_config.mamba_cache_mode={verdict}")
+
+
+def _span_reason(text: str, vllm_config, resolutions) -> str:
+    """A refusal, and the evidence that explains it, in one line."""
+    return f"{text}; evidence: {_span_evidence(vllm_config, resolutions)}"
+
+
+def _span_ids(ids) -> str:
+    """Group ids as a bounded label, for a basis that stays rank-file sized."""
+    return ",".join(str(int(value)) for value in list(ids)[:8])[
+        :SPAN_SHAPE_ID_CHARS]
+
+
+def _span_basis(resolved: dict, from_sub_specs: list,
+                from_cache_config: list) -> str:
+    """WHERE the split was read from, spelled out of the evidence rather than asserted.
+
+    The base names the fields; each suffix names the source actually used and the class
+    names it read, so a reader of a rank file can tell a per-group `mamba_cache_mode`
+    from a container's sub-specs from an ENGINE-WIDE flag attributed by class name -
+    the three claims have different strengths and the basis is where that shows.
+    """
+    basis = SPAN_SHAPE_BASIS
+    if from_sub_specs:
+        shapes = []
+        for index in from_sub_specs:
+            entry = resolved[index]
+            layers = (entry["sub_spec_classes"] or ["?"])[0]
+            label = f"{entry['spec_class']}>{layers}"
+            if label not in shapes:
+                shapes.append(label)
+        basis += (f"; align {_span_ids(from_sub_specs)} from sub-specs: "
+                  f"{', '.join(shapes)}")
+    if from_cache_config:
+        basis += (f"; align {_span_ids(from_cache_config)} from engine-wide "
+                  "cache_config.mamba_cache_mode (not per-group evidence)")
+    return basis
+
+
 def span_shape_state(handler) -> dict:
     """Which prefix-cacheable groups must be in a run, and which supply its anchor.
 
     READ FROM THE FORK'S OWN GROUP TABLE, the same object `_group_fields` reads for the
     fingerprint (`handler.kv_cache_config.kv_cache_groups`, kept by `worker.py:41`):
     `kv_cache_spec.prefix_cacheable` says whether a restore asks for the group at all
-    (group 4, the parked QSA ring, says no), and `kv_cache_spec.mamba_cache_mode ==
-    "align"` says it is a boundary-state group (`MambaSpec` declares the field,
-    `kv_cache_interface.py:998`; an attention spec does not declare it at all, which is
-    the fork's way of saying "positional"). That is `disk_restore._group_contract`'s
-    rule, applied to the spec because a worker has no manager to ask.
+    (group 4, the parked QSA ring, says no), and a `mamba_cache_mode` of `"align"` says
+    it is a boundary-state group. The mode is read by `resolve_mamba_cache_mode`, NOT by
+    a direct `getattr` here, because on a worker the group's spec is the AGGREGATED
+    container the fork projects to it and the mode lives on its sub-specs - which is how
+    the whole 0.2.63 panel reported zeros that could never move (see that helper's
+    docstring, and `tests/test_span_shape_spec_resolution.py`).
 
     EVERY failure is an answer with a reason, never an exception and never a default:
     a geometry whose shape cannot be read classifies NOTHING. A guessed denominator
     would be worse than no number - it would move the one ratio this exists to report,
-    in whichever direction the guess happened to point.
+    in whichever direction the guess happened to point. Every reason carries the
+    evidence the walk saw (spec classes, which source answered, the engine-wide mode),
+    because a panel that reads zero has to be able to say why from the rank file.
     """
     base = {"ok": False, "basis": None, "align_group_ids": [],
             "positional_group_ids": [], "prefix_cacheable_group_ids": [],
@@ -1328,6 +1591,10 @@ def span_shape_state(handler) -> dict:
     align: list = []
     positional: list = []
     cacheable: list = []
+    resolved: dict = {}          # group index -> the resolution, for the strings below
+    from_sub_specs: list = []    # align groups whose mode came from a container
+    from_cache_config: list = []  # align groups CLAIMED from the engine-wide flag
+    vllm_config = getattr(handler, "vllm_config", None)
     for index, group in enumerate(listed):
         spec = getattr(group, "kv_cache_spec", None)
         if spec is None:
@@ -1340,29 +1607,65 @@ def span_shape_state(handler) -> dict:
         if not cacheable_attr:
             continue
         cacheable.append(index)
-        mode = getattr(spec, "mamba_cache_mode", None)
+        entry = resolve_mamba_cache_mode(spec, vllm_config)
+        resolved[index] = entry
+        if entry["error"]:
+            return {**base, "prefix_cacheable_group_ids": cacheable,
+                    "reason": _span_reason(
+                        f"group {index} kv_cache_spec.{entry['spec_class']} could not "
+                        f"be read: {entry['error']}, so its block shape is unknown",
+                        vllm_config, list(resolved.values()))}
+        if entry["ambiguous"]:
+            return {**base, "prefix_cacheable_group_ids": cacheable,
+                    "reason": _span_reason(
+                        f"group {index}'s sub-specs disagree about the mode, so which "
+                        f"group a run must find its anchor in is unknown: "
+                        f"{entry['detail']}", vllm_config, list(resolved.values()))}
+        mode = entry["mode"]
         if mode is None:
-            positional.append(index)      # an attention spec declares no mode
+            # Neither the spec, nor its layers, nor the config said "align": this is
+            # not a state group HERE. An attention spec declares no mode at all, and
+            # that is the fork's own way of saying positional.
+            positional.append(index)
             continue
         if not isinstance(mode, str):
             return {**base, "reason": f"group {index} kv_cache_spec."
                                       "mamba_cache_mode is "
                                       f"{type(mode).__name__}, not a str"}
-        (align if mode == MAMBA_CACHE_MODE_ALIGN else positional).append(index)
+        if mode == MAMBA_CACHE_MODE_ALIGN:
+            align.append(index)
+            # THE BASIS RECORDS HOW EACH ALIGN GROUP WAS EARNED - and only for the
+            # groups that were classified align. A group that resolved to "none" via
+            # the container or the config is positional, and naming it in an "align
+            # from ..." clause would be a wrong claim in the one field a reader trusts
+            # to tell the strengths of the evidence apart.
+            if entry["source"] == MODE_FROM_SUB_SPECS:
+                from_sub_specs.append(index)
+            elif entry["source"] == MODE_FROM_CACHE_CONFIG:
+                from_cache_config.append(index)
+        else:
+            positional.append(index)
     if not cacheable:
         return {**base, "reason": "no prefix-cacheable group exists, so there is no "
                                   "span here for a restore to want"}
     if not align:
+        # THE REASON A PANEL IS DARK, and the text a rank file carries. Kept short on
+        # purpose: `span_shape_publication` clips the whole line, and the EVIDENCE at
+        # its end (the spec classes, the engine-wide mode) is the part that pays for
+        # the field - a long explanation that pushed the evidence past the clip would
+        # have made this change's own diagnostic unreadable.
         return {**base, "prefix_cacheable_group_ids": cacheable,
-                "reason": "no prefix-cacheable group reports mamba_cache_mode == "
-                          "'align', so the group a run must find its boundary-state "
-                          "anchor in is unknown and every span would be counted in "
-                          "one direction or the other"}
+                "reason": _span_reason(
+                    "no prefix-cacheable group resolved mamba_cache_mode == 'align', "
+                    "so the group a run must find its boundary-state anchor in is "
+                    "unknown", vllm_config, list(resolved.values()))}
     if not positional:
         return {**base, "prefix_cacheable_group_ids": cacheable,
                 "reason": "no prefix-cacheable group is positional, so no span could "
                           "ever be part of a contiguous run"}
-    return {"ok": True, "basis": SPAN_SHAPE_BASIS, "align_group_ids": align,
+    return {"ok": True, "basis": _span_basis(resolved, from_sub_specs,
+                                             from_cache_config),
+            "align_group_ids": align,
             "positional_group_ids": positional,
             "prefix_cacheable_group_ids": cacheable, "reason": None}
 
@@ -1507,6 +1810,35 @@ def span_shape_view() -> dict:
                      "`spill_incomplete_state` spans can never anchor a run end and "
                      "`spill_incomplete_attention` spans can never be walked over, so "
                      "their bytes are written and never served")}
+
+
+def span_shape_publication() -> dict:
+    """THE THREE RANK-FILE KEYS about the span geometry, clipped to their ceilings.
+
+    WHY THREE KEYS AND NOT JUST THE COUNTERS: `span_shape_view()` belongs to
+    `hook_section()`, which runs in the ENGINE process, where the worker's shape cache
+    is empty - so the reason that explains a dark panel could never travel in the one
+    payload that carried it. The rank file is the door that CAN carry it:
+
+      * `span_shape_reason` - WHY this rank's span counters are zero, in its own words;
+      * `span_shape_basis` - WHERE the geometry was read from, naming the spec classes
+        it saw, so the next boot reports the worker's real shape instead of an operator
+        inferring it from `page_size_bytes` ratios;
+      * `span_shape_pairs_ignored` - pairs the classifier could not read, which is the
+        other explanation for a tally of nothing.
+
+    The clips are load-bearing: `worker_diag` caps ONE rank section at
+    `MAX_CONTRIBUTION_BYTES`, so a reason long enough to overflow it would cost every
+    counter beside it - the dark panel again, with more words.
+    """
+    cached = _span_shape_cache["shapes"] or {}
+    reason = cached.get("reason")
+    basis = cached.get("basis")
+    return {"span_shape_reason": (_clip(reason, SPAN_SHAPE_REASON_CHARS - 3)
+                                  if isinstance(reason, str) else None),
+            "span_shape_basis": (_clip(basis, SPAN_SHAPE_BASIS_CHARS - 3)
+                                 if isinstance(basis, str) else None),
+            "span_shape_pairs_ignored": int(_state["span_shape_pairs_ignored"])}
 
 
 def completed_snapshot(handler):
@@ -2323,6 +2655,13 @@ RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
                       # rather than as a per-block cause and its effect.
                       ("anchor_spills_completed",
                        ("disk", "anchor_spills_completed"), "anchor files"),
+                      # THE PAIRS THE CLASSIFIER COULD NOT READ (no group suffix, not a
+                      # key, a group the table does not have). Counted since 0.2.63 and
+                      # published in `span_shapes` only, which is the engine process's
+                      # view of ITS OWN empty cache - so a fleet feeding the classifier
+                      # garbage looked identical to a fleet with clean pairs.
+                      ("span_shape_pairs_ignored",
+                       ("disk", "span_shape_pairs_ignored"), "pairs"),
                       ("recency_promotions",
                        ("disk_restore", "readers", "recency_promotions"), "reads"),
                       ("recency_promotions_throttled",
@@ -2390,6 +2729,17 @@ RANK_ROLLUP_MEANINGS = {
                                   "positional file, so no contiguous run can include "
                                   "them at all - the mirror of the orphan above, and "
                                   "equally unservable",
+    "span_shape_pairs_ignored": "(slot, key) pairs this rank's classifier could not "
+                                "read - no group suffix on the key, a key that is not "
+                                "a string, or a group the group table does not list - "
+                                "and therefore IGNORED, never a span of their own. A "
+                                "zero-span tally beside a non-zero count here is a "
+                                "CLASSIFIER BEING FED SOMETHING ELSE, not an idle "
+                                "tier; a zero beside a `span_shape_reason` is a "
+                                "geometry this build could not read. Added because the "
+                                "count lived in `_state` and in the engine's own view "
+                                "and in NO cross-rank door, so the one process that "
+                                "saw it was the one nobody polled",
     "anchor_spills_completed": "boundary-state ANCHOR files this rank's hand-offs "
                               "wrote: one per align-mode pair, which is the block a "
                               "run end is priced with (`_disk_run` asks that group for "
@@ -2559,6 +2909,19 @@ def _rank_file_rollup_row(path, name: str) -> tuple:
     row["estimated_bytes"] = _rank_rollup_int(section.get("estimated_bytes"))
     basis = section.get("ceiling_measurement_basis")
     row["walk_basis"] = _clip(basis, 48) if isinstance(basis, str) else None
+    # WHY A RANK'S SPAN PANEL IS ZERO, READ OUT OF THAT RANK'S OWN FILE. Modelled on
+    # `share_basis` above: a STRING field, so it is published per rank and never summed
+    # - and, like every other field here, it has to be NAMED to exist. A rank-file key
+    # that this reader does not name is silently never rolled up: no error, no gap, no
+    # `fields_rejected` entry, just a view in which the fact was never available. That
+    # is exactly how the span-completeness panel stayed invisible for a day, so the
+    # reason and the basis travel with the counters they explain.
+    span_reason = section.get("span_shape_reason")
+    row["span_shape_reason"] = (_clip(span_reason, SPAN_SHAPE_REASON_CHARS)
+                                if isinstance(span_reason, str) else None)
+    span_basis = section.get("span_shape_basis")
+    row["span_shape_basis"] = (_clip(span_basis, SPAN_SHAPE_BASIS_CHARS)
+                               if isinstance(span_basis, str) else None)
     row["fields_rejected"] = rejected
     if rejected:
         row["fields_rejected_note"] = _clip(
@@ -4063,6 +4426,13 @@ def worker_report() -> dict:
                   # published by `disk_store.section()`, not by a rank file.
                   "anchor_spills_completed": int(
                       _state["anchor_spills_completed"]),
+                  # WHY A RANK'S SPAN PANEL IS DARK, AND ON WHAT AUTHORITY IT WAS READ.
+                  # The reason and the basis live in THIS process; `span_shapes` (the
+                  # view that used to hold them) is built by `hook_section()` in the
+                  # engine process, where the cache behind it is empty, so a rank file
+                  # without these keys could report zeros and never say why. Clipped -
+                  # see `span_shape_publication`.
+                  **span_shape_publication(),
                   "retained_events": int(len(_retained)),
                   "refused": _nonzero_refusals(),
                   "refusals_total": int(_state["refusals_total"]),

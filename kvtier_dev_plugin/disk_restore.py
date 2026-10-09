@@ -7108,10 +7108,13 @@ def _refresh_index() -> dict:
 
     Bounded inside `disk_index.refresh` (one stat per journal, a byte cursor, a
     line cap, a 1 s floor; the FIRST refresh of the process additionally runs the
-    boot drain under `BOOT_DRAIN_MAX_BYTES` / `BOOT_DRAIN_DEADLINE_SECONDS`, so a
-    cold boot with deep journals converges inside the first offer attempt instead
-    of staying blind for a minute of one-share refreshes) and never raising there;
-    the try/except is for a fork that renamed something under it.
+    boot drain under the bounds `disk_index.drain_limits()` resolves, so a cold boot
+    with deep journals converges at connector creation rather than over a minute of
+    one-share refreshes) and never raising there; the try/except is for a fork that
+    renamed something under it. Since 0.2.65 that first refresh is normally the BOOT's
+    (`disk_index.drain_journal_at_boot()`, from `backport.boot_from_connector`), which
+    is what moves the drain's seconds off this path - what remains when a boot's bound
+    stops it still finishes here, one bounded pass per offer.
     """
     try:
         out = disk_index.refresh()
@@ -13022,6 +13025,17 @@ def scheduler_section() -> dict:
                   "boot_drained": bool(index.get("boot_drained")),
                   "unread_journals": dict(index.get("unread_journals") or {}),
                   "bytes_read": int(index.get("bytes_read") or 0),
+                  # WHAT THE BOOT ITSELF READ (0.2.65), passed through beside the
+                  # fields it explains. `bytes_read` above is this process's cumulative
+                  # reading; this is the FIRST refresh's record - the one that answers
+                  # "did this boot read its journals before it served, and if not,
+                  # which bound stopped it?" - because the night this was measured the
+                  # answer was "no: the 5 s deadline expired with 2.3 MB unread" and
+                  # nothing in this payload said so. `drain_limits` carries the bounds
+                  # that verdict was produced against, with each knob's origin, so the
+                  # number needs no release notes to read.
+                  "boot_drain": dict(index.get("boot_drain") or {}),
+                  "drain_limits": dict(index.get("drain_limits") or {}),
                   "entry_cap_hit": bool(index.get("entry_cap_hit")),
                   # PER-RANK PRESENCE (0.2.46), passed through from the index: a span
                   # is one file PER RANK, so an offer is an intersection over the ranks
@@ -13107,6 +13121,11 @@ def scheduler_section() -> dict:
             "refused": "refusals, one counter per reason",
             "last_refusal": "refusals",
             "index.entries": "identities known to be on disk",
+            # THE BOOT DRAIN (0.2.65) declares its OWN units inside `boot_drain` and
+            # `drain_limits` (the `disk_store` ceiling block's idiom), because
+            # `bytes_read` in the record means "what the BOOT read" while `bytes_read`
+            # here three levels up means "what this process has read", and one flat
+            # table cannot say both honestly.
             "index.ranks_expected": "rank labels a presence answer is intersected "
                                     "over: the ranks that would have to READ a span. "
                                     "The offer path asks with the ranks the worker "

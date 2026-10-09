@@ -156,7 +156,17 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # invisible, because ON is also the default. Deleting it makes 'unset = the
             # shipped default' the fact every test measures, and the tests that want
             # the other value name it.
-            config.ENV_MAMBA_ANCHOR_PATCH)
+            config.ENV_MAMBA_ANCHOR_PATCH,
+            # THE BOOT JOURNAL DRAIN (0.2.65). Listed because the shipped defaults ARE
+            # the release's claim: a suite that inherited
+            # `VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS=0.001` from a shell would "prove"
+            # the deadline fires on a journal too small to need it, and one that
+            # inherited a wide `..._BOOT_DRAIN_BYTES` would be measuring a boot cost the
+            # release does not ship. Deleting all three makes 'unset = the shipped'
+            # the fact every test measures, and a test wanting another value names it.
+            config.ENV_DISK_BOOT_DRAIN_SECONDS,
+            config.ENV_DISK_BOOT_DRAIN_BYTES,
+            config.ENV_DISK_INDEX_REFRESH_BYTES)
 
 
 def _isolate(state: dict) -> dict:

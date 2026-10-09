@@ -296,6 +296,7 @@ from . import (
     disk_layout,
     disk_shadow,
     disk_spill,
+    disk_store,
     worker_diag,
 )
 
@@ -401,10 +402,20 @@ TRIM_REASON_CHARS = 42
 # a worker's live geometry and six fat reasons arrive.
 MAX_SECTION_BYTES = 3920
 
-# The fork's own reason for calling a group's blocks positionally unstable, read from
-# the group's spec on the worker (`kv_cache_interface.py:992-998`: only `MambaSpec`
-# carries this field, so an absent attribute means "not an align-mode state group", not
-# "unknown").
+# THE CEILING ON THE BOUNDARY NOTE ITSELF. The note is published in this module's rank
+# section, whose own budget above has 176 bytes of margin to the seam's cap - so the
+# evidence `_boundary_groups` gained is CLIPPED, not hoped for, and names at most
+# `BOUNDARY_NOTE_CLASSES` spec classes.
+BOUNDARY_NOTE_CHARS = 120
+BOUNDARY_NOTE_CLASSES = 2
+
+# The fork's own reason for calling a group's blocks positionally unstable. It is read
+# through `disk_store.resolve_mamba_cache_mode`, NOT by a `getattr` on the group's spec:
+# only `MambaSpec` declares the field (`kv_cache_interface.py:998`), and a worker's
+# group entry is the aggregated container the fork projects to it, whose own attribute
+# is absent for EVERY group. An absent attribute on the CONTAINER therefore means
+# "unknown here", never "not an align-mode group" - the reading that left
+# `boundary_groups_known` at 0 on all four ranks (see `_boundary_groups`).
 MAMBA_CACHE_MODE_ALIGN = "align"
 
 # THE COUNTER KEYS. A stable set, always all present: an operator diffing two rank files
@@ -742,29 +753,69 @@ def _group_widths(worker) -> tuple:
     return sizes, None
 
 
+def _boundary_note(known, resolutions, scanned) -> str | None:
+    """The note for a boot with no boundary group, COMPACT by construction.
+
+    It lands in this module's rank section, which keeps itself under
+    `MAX_SECTION_BYTES` (3920 of the seam's 4096), so the evidence is class NAMES and a
+    status word - the fact that decides whether "no boundary group" means a positional
+    boot or a shape this build could not read - not a quotation of every attribute walk.
+    """
+    if known:
+        return None
+    classes: list = []
+    flags: list = []
+    for entry in resolutions:
+        for name in ([entry.get("spec_class")]
+                     + list(entry.get("sub_spec_classes") or ())):
+            if name and name not in classes:
+                classes.append(name)
+        verdict = entry.get("error") or ("layers disagree"
+                                         if entry.get("ambiguous") else None)
+        if verdict and verdict not in flags:
+            flags.append(verdict)
+    note = (f"no group's spec reports {MAMBA_CACHE_MODE_ALIGN!r} mamba_cache_mode"
+            f"; saw {', '.join(classes[:BOUNDARY_NOTE_CLASSES]) or 'no specs'}"
+            + (f" ({', '.join(flags[:1])})" if flags else "")
+            + f" in {scanned} group(s)")
+    return (note[:BOUNDARY_NOTE_CHARS - 3] + "..."
+            if len(note) > BOUNDARY_NOTE_CHARS else note)
+
+
 def _boundary_groups(worker) -> tuple:
     """The group ids whose blocks are align-mode state blocks, or a named reason.
 
-    The predicate is the one the WORKER can evaluate: `mamba_cache_mode` is a field only
-    `MambaSpec` carries (`kv_cache_interface.py:992-998`), so an attention spec answers
-    None and an align-mode state group answers `"align"` - the same value
-    `disk_restore._group_contract` reads (from the manager, falling back to the spec) as
-    the fork's own reason for calling a group's blocks positionally unstable. The
-    manager itself is EngineCore-only, so the spec is all this process has and it is
-    enough.
+    THE PREDICATE IS NOT DUPLICATED HERE, and that is the point. This function used to
+    ask `spec.mamba_cache_mode == "align"` itself - the same question
+    `disk_store.span_shape_state()` asks - and BOTH readings went dark together on the
+    live worker, because a worker's group entry is the AGGREGATED spec the fork
+    projects to it (`kv_cache_utils.py:1075-1077`, with
+    `_project_kv_cache_groups_to_worker` at `:2606-2614` rebuilding it as a
+    `UniformTypeKVCacheSpecs`) and the mode lives on its SUB-SPECS
+    (`kv_cache_interface.py:998`, filled from `cache_config` at `abstract.py:78`). One
+    shared resolver (`disk_store.resolve_mamba_cache_mode`) now answers for both sides,
+    so the two panels cannot disagree and cannot drift apart again: the live rank file
+    carried `boundary_groups: []` with this function's own note beside a populated
+    `group_bytes`, which is the fingerprint of that shared bug.
+
+    With no align group known this module cannot count `boundary_entry_missing` at all,
+    so the truncation shape it was written to catch was structurally invisible - the
+    same failure as the spill-side completeness counters, in the other process.
     """
     groups = getattr(getattr(worker, "kv_cache_config", None), "kv_cache_groups", None)
     if not groups:
         return [], "the worker declares no kv_cache_groups"
+    vllm_config = getattr(worker, "vllm_config", None)
+    listed = list(groups)[:worker_diag.MAX_GROUPS]
     known = []
-    for index, group in enumerate(list(groups)[:worker_diag.MAX_GROUPS]):
-        mode = getattr(getattr(group, "kv_cache_spec", None), "mamba_cache_mode", None)
-        if mode == MAMBA_CACHE_MODE_ALIGN:
+    resolutions = []
+    for index, group in enumerate(listed):
+        resolved = disk_store.resolve_mamba_cache_mode(
+            getattr(group, "kv_cache_spec", None), vllm_config)
+        resolutions.append(resolved)
+        if resolved["mode"] == MAMBA_CACHE_MODE_ALIGN:
             known.append(int(index))
-    if not known:
-        return [], (f"no group's spec reports {MAMBA_CACHE_MODE_ALIGN!r} "
-                    "mamba_cache_mode")
-    return known, None
+    return known, _boundary_note(known, resolutions, len(listed))
 
 
 def _refresh_geometry(worker) -> dict | None:
