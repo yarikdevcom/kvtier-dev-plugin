@@ -523,6 +523,37 @@ ENV_DISK_GPU_DIRECT_WRITE = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE"
 # 64", which is a silently different machine.
 ENV_DISK_CPU_SLOT_RESERVE = "VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE"
 
+# STEP 2 OF RETIRING THE ARENA: STOP THE FORK COPYING WHAT THE RESTORE DELIVERS
+# (`disk_restore.py`, 0.2.49) -------------------------------------------------
+# TODAY A DISK RESTORE IS CARRIED BY THE ARENA TWICE OVER. The read lands in a CPU
+# slot and the fork's own `start_load_kv` then DMAs that slot into the GPU block named
+# beside it. The pair is positional: `copy_blocks` pairs `load_cpu_blocks[i]` with
+# `load_gpu_blocks[i]` by INDEX and has no way to notice one list is shorter than the
+# other (`cuda_mem_ops.py:244`), which is why the entry is dropped from BOTH lists at
+# the SAME index or not at all - a one-sided prune is a silent one-block shift of every
+# later destination, a wrong-output bug and not a crash.
+#
+# WITH THIS FLAG ON, the entries of an ADOPTED and SUCCESSFULLY READ disk restore are
+# removed from both load lists at the apply point, so the engine is no longer asked to
+# copy blocks whose destination it does not need. That is the first step that takes
+# work off the arena path; step 3 stops filling the arena slot at all and step 4 shrinks
+# `KV_OFFLOAD_SIZE` to a vestige.
+#
+# READ THIS BEFORE TURNING IT ON. The fork's copy is currently the ONLY thing that puts
+# a restored block's bytes into its GPU window - `disk_gpu_write`'s own host->device
+# copy
+# is a SAMPLED WITNESS (one entry in 64, at most one per step) and is not the delivery.
+# Pruning an entry therefore removes the copy that carries its bytes, so a boot with
+# this flag on and no authoritative plugin-side write serves that request from
+# uninitialised KV: a WRONG ANSWER, not an outage. The counters say exactly this -
+# `prune_unwitnessed_entries` counts pruned entries the plugin did NOT write into the
+# GPU itself - and the README says it plainly. The default is OFF, the grammar is the
+# same DEFAULT-OFF shape as `disk_shadow_enable()` (a typo moves the direction that
+# prunes nothing), and with the flag off the apply point produces byte-identical lists
+# to every release before this one - pinned by a test, because "we did not change the
+# default path" is the claim this release must not get wrong.
+ENV_DISK_PRUNE_RESTORED_LOADS = "VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS"
+
 # The miss-attribution ledger's OPTIONAL file mirror: a path to append one JSON
 # line per tier lookup to. Unset = no file, no open(), no I/O of any kind. It is
 # env-only on purpose: an HTTP argument naming a path the engine appends to would
@@ -783,6 +814,31 @@ def disk_gpu_direct_write_enable() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_GPU_DIRECT_WRITE}
+
+
+def disk_prune_restored_loads() -> dict:
+    """Step 2 of retiring the arena, read by `disk_restore.py`. The SAME grammar as
+    `disk_shadow_enable()`: unset is OFF, an on word is ON, a disable word is OFF said
+    with `source: "env"`, and anything else is OFF *and* reported as unrecognised.
+
+    WHY OFF IS THE ONLY HONEST DEFAULT, in one line: with the flag ON the fork's own
+    arena->GPU copy is removed for the entries this plugin prunes, and until a
+    plugin-side write is the delivery (step 3), those bytes reach no GPU window. Every
+    refusal this flag can make is counted and logged once per episode, and a refused
+    prune is only a missed optimization - which is the correct trade, because the
+    alternative failure is a silently shifted destination list.
+    """
+    raw = os.environ.get(ENV_DISK_PRUNE_RESTORED_LOADS, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
 
 
 def disk_gpu_shadow_writes() -> dict:

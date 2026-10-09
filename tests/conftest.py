@@ -113,7 +113,16 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # thread, the interference would be non-deterministic rather than merely
             # wrong. Deleting it makes "unset = off" the fact every test measures, and
             # tests that want it on name it out loud.
-            config.ENV_DISK_GPU_DIRECT_WRITE)
+            config.ENV_DISK_GPU_DIRECT_WRITE,
+            # THE STEP-2 LOAD-PAIR PRUNE (0.2.49). Its DEFAULT IS OFF, and OFF is
+            # a claim every test of this release makes: a suite that inherited
+            # `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS=1` from a developer's shell would
+            # be REMOVING load pairs inside tests that assert the emitted step is what
+            # the scheduler shipped - and a positional-pairing change is exactly the
+            # kind of interference no assertion in those files would name. Deleting it
+            # makes 'unset = off' the fact every test measures; the suites that want it
+            # up raise it themselves and drop the module's cached switch with it.
+            config.ENV_DISK_PRUNE_RESTORED_LOADS)
 
 
 def _isolate(state: dict) -> dict:

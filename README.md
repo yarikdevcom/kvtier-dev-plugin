@@ -103,6 +103,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_RESTORE_VERIFY` | **the RESTORE-side byte verifier (0.2.39), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no spill file is opened and no GPU block is read by this module. `1`/`true`/`yes`/`on` = a sampled restored entry is compared byte-for-byte: the leading `W_g` bytes of the spill file against the leading `W_g` bytes of the GPU block the restore loaded it into, with the file width and the group width checked first and the tail (the other groups' stale bytes) never compared at all. A disagreement is re-read before it is reported, so `mismatch_stable` (a layout candidate) is separable from `mismatch_gpu_changed_on_recheck` (the engine moved). Since **0.2.40** the same variable arms BOTH roles of the module: the worker's byte comparison above, and the scheduler-side **binding oracle** - which since **0.2.41** witnesses `update_state_after_alloc`, the hook where the fork DECIDES which GPU block each offered CPU block pairs with: the observer captures that pairing's expected file name at the alloc and the emitter compares it against the name it is about to ship (`scheduler_*` counters; a one-slot shift and a group swap are both named findings there; `scheduler_oracle_hook` says whether the witness is actually wired). One variable, because arming half a verifier would be the worst of both: it would publish numbers about a check that is not running. `POST /disk {"op":"restore-verify"}` latches only the answering process and its answer says so. It never changes a restore decision, and the engine's step thread pays a counter and a dict of ints - the file read and the device copy happen on its own bounded thread. See *Do the RESTORED bytes match the file?*. |
 | `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` | **the GPU-DIRECT WRITE (0.2.43, cold start fixed in 0.2.44), OFF by default, same grammar, and the one dev feature in this package that WRITES into live KV memory.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = no copy is issued, no memory is page-locked, no thread starts and no counter moves. `1`/`true`/`yes`/`on` = at the restore apply point, for a sampled entry whose bytes were just memmoved into a CPU slot, the plugin copies that slot into the GPU window the entry names (`gpu_block_id`) on the tier's own `load_stream`, BEFORE the fork's body runs - and reads the window back once before its own copy and once after, so the copy is witnessed rather than assumed. The fork's own arena-to-GPU copy still runs afterwards on that same stream and keeps the last word on every byte, so a wrong addressing guess here is a wrong WITNESS and not a wrong answer. The readback is compared against the SPILL FILE (the leading `W_g` only, the tail never), never against the CPU slot it copied from - `readback_mismatch_stable` is the single counter that names THIS module's addressing as the candidate, and `readback_mismatch_gpu_changed_on_recheck` is the expected race from which nothing follows. Pinned readback rows are allocated only on this module's own thread and released only when the tier's load watermark passes the entry's event; a row whose DMA state is unknowable is leaked (`buffers_leaked`) and never handed out again. Sampled at one entry in `sample_every_n_applied`, at most one write per step, and never an allocation on the step thread. The value is read once at first use; `POST /disk {"op":"gpu-write"}` latches only the answering process, and for this feature that process has no apply point at all - its answer says so in `scope` instead of letting a zero read as an all-clear. Since **0.2.44** an armed process starts the writer's own thread when the module registers (with the write attempt asking for it again as a safety net), because pinned rows can ONLY be allocated by that thread and 0.2.43 started it on the line after a row had already been taken - so it never started, and the module wrote nothing with `errors=0`. Read `liveness.state` to ask whether the witness is alive (`off` / `armed, no apply point seen in this process` / `armed but never wrote` / `writing`); `passes`, `pool_refills` and `buffers_allocated` all zero with `applies_seen` climbing is a writer that never ran. See *Writing the window ourselves, and watching it land*. |
 | `VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE` | **how many CPU slots of the host-RAM arena's block pool an offer must NOT take (0.2.38). Unset = `disk_restore.CPU_SLOT_RESERVE` = 64, the value every release before 0.2.38 used.** An offer allocates its *destination* slots out of the same pool the RAM tier parks its own blocks in, and is clamped to `(free - reserve - boundary slots) // slots-per-span` spans - so on a shrunk arena the reserve is an offer-size lever, not a footnote: at the operator's 166 free slots per rank on the wide PP1 pair, reserve 64 leaves **98 spans (313,600 tokens)** and reserve 16 leaves **146**. `0` is **honoured** ("an offer may take the arena's last slot" - it leaves the RAM tier nothing to park, see the section). A non-integer or a negative falls back to 64 and logs once (`DISK[reserve] IGNORED`); there is deliberately **no ceiling**, because a reserve larger than the arena correctly declines every offer as `no_cpu_slots` instead of oversubscribing. The value in force, its origin (`env` / `default` / `ignored`) and the spans it leaves are published in `restore.limits`, `restore.offer_pool`, `last_offer_pool` and the boot line's `cpu_slot_reserve=64(default)`. See *Sizing the CPU-slot reserve an offer leaves alone*. |
+| `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` | **THE STEP-2 LOAD-PAIR PRUNE (0.2.49), OFF by default, same grammar.** Unset (or `0`/`false`/`off`/`no`, or anything unrecognised) = the restore apply point rewrites the load lists exactly as every release before this one did, byte for byte, and none of the `prune_*` counters move. `1`/`true`/`yes`/`on` = at the same apply point, an entry whose read SUCCEEDED and was adopted is REMOVED from BOTH `load_cpu_blocks` and `load_gpu_blocks` at the same index, in the one rewrite the module already owned, so the fork's `copy_blocks` no longer DMAs that arena slot to the GPU window. **This is the first flag in this package whose failure mode is a wrong ANSWER rather than a slower one**, for two reasons the design is built around: `copy_blocks` pairs `src[i]` with `dst[i]` POSITIONALLY (`cuda_mem_ops.py:227`, descriptors built at :239-248) and cannot see that one list got shorter: with EQUAL lengths a one-sided prune silently shifts every later block into the wrong destination, and with UNEQUAL ones `total` comes from the CPU side alone (:248) so the copy loop at :257 slices GPU descriptors past the end of a shorter array. Neither shape is an error the fork reports - which is why `prune_load_pairs` is the only door a pair leaves through, refuses a call whose two sides disagree (`one_sided_prune`, `length_mismatch`, `out_of_range`, `over_cap`, `group_delta_mismatch`, `destination_drift`) and hands back NO lists on a refusal; and a group's entry binds to `block_ids_by_group[g][num_computed // group_block_sizes[g] + i]`, so an index derived from tokens instead of from the scheduler's own index-aligned identity mis-names a `boundary_state` group - which is why the index set is read out of the bound jobs and never computed. An entry whose read FAILED is never in the prune's population (the apply point drops it and reports its GPU block as a load error exactly as it always has, so the engine recomputes: `prune_skipped_failed_entries`, and the load-error id set is identical with the flag on and off). WHAT THE RELEASE CANNOT FIX, and the number to watch: the fork's copy is today the ONLY delivery of a restored block's bytes into its window (`disk_gpu_write` writes one entry in 64 and is a witness, not the delivery), so a pruned entry has no route to the device and the request is answered from uninitialised KV. `prune_unwitnessed_entries` prices exactly that, `prune_emptied_steps` counts the steps left with nothing to copy, and both must reach zero together with Step 3's plugin-side write. Read once at first use; only a WORKER has an apply point, so an EngineCore answers `enabled: false` forever. See *Pruning the pairs an adopted restore no longer needs (`disk_restore.py`, 0.2.49)*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
 
@@ -3972,6 +3973,130 @@ plan that does not total writes nothing, the two fake cache dicts are deliberate
 different insertion orders so a positional pairing fails, and two tests drive the REAL
 `worker_bind` -> `worker_before_load` path so the hook site, the field names and the order
 against the fork's copy are pinned by the product rather than by a fake batch.
+
+## Pruning the pairs an adopted restore no longer needs (`disk_restore.py`, 0.2.49)
+
+Four steps retire the host-RAM arena. Step 1 (0.2.43-0.2.44) made the plugin able to write a
+GPU window itself and *witness* that write. **Step 2, this release, is the flag that stops
+asking the fork to copy a restored block at all**: when a disk restore is adopted and its
+bytes have landed, the entry is removed from both load lists at the same index, in one place,
+behind a default-OFF variable. Step 3 will make a plugin-side write the *delivery* (not the
+witness) of those bytes; Step 4 deletes the arena. Step 2 alone is a flag you can turn on and
+read, and - said plainly, because it is the whole point of the section - **it is not a flag you
+should turn on to serve traffic yet.**
+
+```bash
+# The worker's switch is the environment: the WORKER applies the restore, so only a worker can
+# prune (read once at first use; restart to change). Unset = off = today's behaviour, byte for
+# byte, and no `prune_*` counter moves.
+#   VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS=1
+# READ-ONLY look at the scheduler-side view. An EngineCore has NO apply point, so it answers the
+# switch and zeros, and says so; the counters that MOVE are in the worker's rank file, below.
+# Every `/disk` answer carries the restore verdict under `restore`:
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/disk' -H "$H"   | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['restore']['load_prune'], indent=2))"
+# THE COUNTERS THAT MOVE, from the rank files (the WORKER is the process with an apply point):
+ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do python3 -c "
+import json,sys
+d = json.load(open(sys.argv[1])).get("disk_restore") or {}
+print(sys.argv[1], {k: v for k, v in d.items() if k.startswith("prune")})" "$f"; done'
+```
+
+
+**Why this flag is different from every other one here.** Every previous dev feature fails slow
+or fails silent-but-harmless. This one can fail *wrong*, because the two lists the restore ships
+are a positional pair: `copy_blocks` pairs `src[i]` with `dst[i]` and has no way to notice that
+one list got shorter (`copy_blocks` at `cuda_mem_ops.py:227`; its descriptor arrays are built
+from the two id lists independently at :239-248, and `total = len(src_block_ids) * num_layers`
+at :248). Remove an entry from `load_cpu_blocks` only, and
+block K's bytes are written into block K+1's window - no crash, no error, a confident wrong
+answer. Everything below exists to make that impossible rather than unlikely.
+
+**One door, one rewrite, and a refusal that hands back nothing.**
+`prune_load_pairs(cpu, gpu, cpu_drop, gpu_drop=None, groups=…, expected=…)` is the only place a
+load pair is removed, and the apply point makes exactly one call to `_replace_load_lists` per
+step, so a failed read's removal and a prune's removal cannot be decided against two different
+snapshots of the same pair. The two index parameters exist *so that* a one-sided call is
+constructible and detectable: `cpu_drop != gpu_drop` is refused (`one_sided_prune`), as are a
+step whose sides already disagree (`length_mismatch`), an index outside the step
+(`out_of_range`), a step over `MAX_PRUNE_ENTRIES_PER_STEP` (256) (`over_cap`), a per-group count
+that no longer matches on the two sides (`group_delta_mismatch`) and an entry whose ids are not
+the ones this module recorded at bind (`destination_drift`). Every refusal is in-band - a
+returned `reason_kind`, never an `assert`, because `python -O` strips asserts and the cost here
+is a wrong answer - and a refusal returns **no lists**, so a caller cannot ship a refused prune
+by accident. The step then falls back to the pre-0.2.49 rewrite, byte for byte.
+
+**Gate B: the index set is READ, never computed.** Group `g`'s entry at index `i` binds to
+`block_ids_by_group[g][num_computed // group_block_sizes[g] + i]` (`manager.py:447-468`), and on
+the live model four `boundary_state` groups contribute `[null] * (B - 1) + [real]` - one entry
+at index `B - 1`, because a run's boundary state lives at its END - while the full-attention
+group contributes all `B`. So an index derived from tokens, block sizes or an id range mis-names
+a boundary group's entry, silently. The prune's population is therefore the bound jobs
+themselves: a job already carries `cpu_block_id`, `gpu_block_id` and `group`, keyed by its index
+in the lists. The pairing check re-reads those ids after choosing the set, and
+`pruned_by_group` / `group_deltas` are published over **every** group the step attributed -
+touched or not - so a reader can tell "group 1 lost nothing" from "group 1 is not reported".
+There is a second, stronger reason the differing-size case cannot reach the prune: the offer
+gate refuses a model where any prefix-cacheable group's `group_block_sizes[g]` differs from the
+scheduler's (`_group_serviceability`, `incomplete_group_set`, "a slot for it would land at the
+wrong GPU offset"), so every group whose bytes can appear in these lists is at the scheduler's
+block size. That is why the Gate-B test uses the box's real Qwen3-Next sizes: this code cannot
+build a 1,600-token boundary group, and the test that pins the refusal is part of the proof.
+
+**What is never pruned.** An entry whose read failed (the apply point removes it and reports
+its GPU block through `take_invalid_block_ids()` exactly as it always has, so the engine
+recomputes those tokens; the flag changes neither the drop count nor that id set - a test runs
+the identical scenario both ways and compares them). An entry the scheduler shipped without a
+path (its bytes belong to the RAM tier). An entry the scheduler did not adopt: the fork takes
+`cdiv(num_external_tokens, group_block_sizes[g])` leading entries per group, so "offered N,
+shipped M" is the normal shape on this box and the prune's population is M - the published
+chain is `pruned <= entries_in_step <= jobs_bound <= blocks_offered`.
+
+**The hazard this release cannot fix, and the number that prices it.** The fork's copy is today
+the only thing that carries a restored block's bytes into its GPU window: `disk_gpu_write` is a
+*witness*, sampling one entry in 64 at most one per step. Remove the pair and those bytes reach
+no device at all - the request is answered from uninitialised KV. So the flag publishes its own
+cost instead of hiding it: `prune_unwitnessed_entries` (pruned entries with no plugin-side write
+behind them), `prune_emptied_steps` (prunes that left the fork nothing to submit, where the load
+event is *released* rather than recorded so a later completion cannot make this one reportable -
+the phantom rule, guarded by `phantom_guard_trips`), and one `notice_once` line per episode,
+never one per step. **With Step 2 on, `prune_unwitnessed_entries` is expected to be non-zero and
+equal to `prune_entries`; it becomes a real alarm only when Step 3 makes a plugin-side write the
+delivery.**
+
+Two spellings, because the two payloads have different budgets. A **worker rank file**
+(`disk_restore.prune`) carries the compact block a byte-capped file can afford - `on`,
+`steps`, `entries`, `refused`, `skipped_failed`, `unwitnessed`, `emptied` - and `on` is that
+rank's own reading of the variable, which is the only question a rank can answer honestly:
+the process that prunes is the process that applies a restore. The **verb / `section()`
+side** carries the long names below, the closed refusal vocabulary with every key always
+present, the per-group maps and the last decision (`load_prune`).
+
+| what to watch | it means | act when |
+|---|---|---|
+| `prune_entries`, `prune_steps` | pairs removed, apply points where the switch was consulted | never on its own; these are the volume |
+| `prune_unwitnessed_entries` | the flag's own hazard, priced: a pruned entry no plugin-side write covered | today it equals `prune_entries`; after Step 3 it must fall to 0 |
+| `prune_emptied_steps` | a step left with nothing to copy, so the load event was released | if it climbs *after* Step 3, or with any `disk_restore_verify` disagreement |
+| `prune_refused` (closed vocabulary, all keys always present) | the prune was asked and declined: the step kept every destination it had | never a fault by itself; `lists_not_in_step` / `destination_drift` mean the step arrived unlike anything the module understands |
+| `prune_skipped_failed_entries` | bound entries the prune did not touch because their read failed | this is the recompute property, counted: it should track your read failures |
+| `disk_restore_verify.mismatch_stable`, `disk_gpu_shadow` counters | the byte-level oracles for the restore path | any movement with the flag on is the experiment telling you the pair mattered |
+
+**Shape discipline.** A refused prune answers with the same keys as an accepted one, and every
+time the switch is consulted the step's answer replaces `last_prune` - so a refusal can never
+leave the *previous* step's numbers looking like the current ones. `prune_switch()` publishes
+which way this process decided, from where, and whether the value was recognised at all; a typo
+(`tru`) is OFF, reported once, and is the direction that changes nothing.
+
+**Tests.** `tests/test_disk_prune_restored_loads.py` (22 tests, 0.2.49) is the spec, ordered by
+what hurts: off-is-the-default and off-is-unchanged (the expected lists are recomputed by the
+pre-0.2.49 algorithm, not snapshotted); the shift constructed and refused (and the shift it
+prevented computed, so the refusal is not a formality); both-sided correctness asserted as a
+PAIRING and never as a length; Gate B, both halves - the offer gate that keeps a differing-size
+group unreachable, and the live hybrid geometry where the pruned GPU ids are recomputed from the
+fork's per-group formula and the "B leading entries per group" rule is shown to name ids that
+are not in the step at all; adopted-not-offered; failed-read-keeps-its-range (asserted off vs on
+as an equality of the load-error id set); and the shape/log discipline. Two tests drive the real
+`worker_bind` -> `worker_before_load` path, so the hook site and the order against the fork's
+copy are pinned by the product and not by a fake batch.
 
 ## Sizing the CPU-slot reserve an offer leaves alone (`disk_restore.py`, 0.2.38)
 

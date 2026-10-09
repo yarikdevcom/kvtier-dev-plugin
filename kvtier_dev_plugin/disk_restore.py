@@ -124,6 +124,61 @@ that set in the SAME call and reports the req ids itself, and
 is ever violated (a trip means "we nearly believed garbage", and it is the one
 counter that must stay 0).
 
+STEP 2 OF RETIRING THE ARENA: PRUNE AN ADOPTED RESTORE'S DESTINATIONS (0.2.49)
+-----------------------------------------------------------------------------
+The arena is on its way out (step 3 stops filling the CPU slot at all, step 4 shrinks
+`KV_OFFLOAD_SIZE` to a vestige), and step 2 is the first change that takes WORK off that
+path: when this module has adopted a disk restore and its bytes have been read and
+applied, the pair `(load_cpu_blocks[i], load_gpu_blocks[i])` is removed from BOTH lists
+at the SAME index, so the engine is no longer asked to copy blocks whose destination it
+does not need. `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` decides it, import-time OFF, and
+with the flag off the apply point rewrites exactly what every earlier release rewrote -
+`tests/test_disk_prune_restored_loads.py` compares the produced structure field by
+field, because "the default path did not change" is the one claim this release may not
+get wrong.
+
+TWO HAZARDS DECIDED THE SHAPE OF THE CODE, and neither is decoration:
+
+1. PAIRING IS POSITIONAL. `copy_blocks` pairs `src[i]` with `dst[i]` by index and cannot
+   see that one list got shorter (`copy_blocks`, `cuda_mem_ops.py:227`, descriptors
+   built positionally at :239-248). Pruning one side alone shifts every later block
+   into the wrong destination - a wrong OUTPUT, not a crash. So
+   `prune_load_pairs` takes one index set for both lists and REFUSES a call that hands
+   it two (`reason_kind: one_sided_prune`, counted, logged once per episode). Every
+   check in it is in-band, never an `assert` that `python -O` strips, and a refusal
+   returns NO lists, which makes the caller fall back to today's behaviour: a refused
+   prune is a missed optimization, a shifted pair is a wrong answer.
+2. THE BINDING TRAVELS BY LIST, NOT BY VALUE (Gate B). The fork's
+   `update_state_after_alloc` appends per group, so group g's entry at index i binds to
+   `block_ids_by_group[g][num_computed // group_block_sizes[g] + i]`, and
+   `group_block_sizes` differs per group (groups 0-3 are `boundary_state`, group 5 is
+   `positional`). A prune that DERIVED its index set from tokens and a block size would
+   be right for the positional group and wrong for a boundary group. This prune never
+   does that arithmetic: its index set is the batch's JOB IDS, which `_worker_bind`
+   derived from the scheduler's index-aligned `load_paths`, so an entry's group is READ
+   from the job and never computed, and every surviving pair is re-verified against the
+   ids bind recorded (`destination_drift`) with a per-group survivor delta published
+   (`group_deltas`). The written proof per group, boundary groups included, is in that
+   test file.
+
+WHAT IT NEVER DOES: prune an entry whose read failed (the apply point removes those and
+reports their GPU block as a load error exactly as it always has, so the engine
+recomputes - the prune is counted OUT of that population as
+`prune_skipped_failed_entries`, because the recompute path is what makes the tier safe),
+prune what the scheduler did not adopt (an offered-but-truncated block is not in the
+step's lists at all, and `last_prune` publishes `pruned <= entries_in_step <=
+jobs_bound`), or run at all with the flag off.
+
+AND THE HAZARD THIS RELEASE CANNOT FIX, SAID WHERE IT CANNOT BE MISSED: the fork's copy
+is today the ONLY thing that puts a restored block's bytes into its GPU window.
+`disk_gpu_write` writes one sampled entry in 64, at most one per step, and is a WITNESS
+of addressing rather than a delivery. So a boot with this flag on and no authoritative
+plugin-side write answers that request from KV nobody wrote - a wrong answer, not an
+outage. `prune_unwitnessed_entries` prices exactly that gap (pruned entries with no
+plugin-side write behind them) and `prune_emptied_steps` counts the steps left with
+nothing to copy at all. Both must stay 0 until step 3 makes the plugin's own write the
+delivery; the README says the same thing to the operator who is about to turn it on.
+
 NEVER BLOCK THE ENGINE THREAD, AND NEVER WAIT FOR A READ
 ---------------------------------------------------------
 Reads are submitted at `bind_connector_metadata` and applied at `start_load_kv`,
@@ -511,6 +566,62 @@ MAX_RACE_REOFFERS_PER_REQUEST = 1    # RE-OFFERS one request may claim after a l
                                      # refilled, so a race costs at most two offers
 MAX_RANK_COUNTER = 1_000_000_000     # ceiling on a counter read from a rank file
 MAX_SPANS_REPORT = 16                # PARTIAL SPANS one shape report may name
+
+# --- STEP 2 OF RETIRING THE ARENA: PRUNE AN ADOPTED RESTORE'S DESTINATIONS ---
+# (`VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS`, 0.2.49, DEFAULT OFF)
+#
+# WHAT IS PRUNED, AND WHY IT CAN BE PRUNED AT ALL. A disk restore reaches the GPU as a
+# PAIR: the scheduler's `build_connector_meta` ships `load_cpu_blocks` (the arena slot
+# whose bytes were just read off NVMe) and `load_gpu_blocks` (the window those bytes go
+# into), and the fork's `start_load_kv` DMAs pair i to pair i. Step 2 removes the pairs
+# this module has adopted and successfully filled, so the engine is no longer asked to
+# copy blocks whose destination it does not need. The mechanism is the one this module
+# already uses to drop a FAILED entry - `abandon_disk_entries` /
+# `_replace_load_lists` - because a second mechanism for editing these lists would be a
+# second way to get it wrong.
+#
+# HAZARD 1, AND THE REASON BOTH SIDES MOVE TOGETHER. `copy_blocks` pairs `src[i]` with
+# `dst[i]` POSITIONALLY (`copy_blocks`, `cuda_mem_ops.py:227`; the descriptor arrays are
+# built from `src_block_ids`/`dst_block_ids` independently at :239-248) and cannot see a
+# list that got shorter.
+# Dropping an index from one side silently shifts every later block: the engine writes
+# block K's bytes into block K+1's window. That is a wrong-output bug, invisible, not a
+# crash. So `prune_load_pairs` takes ONE index set for both lists and REFUSES any call
+# that hands it two different sets - loudly, counted, in-band, never via `assert` (which
+# `python -O` strips). A refused prune is a missed optimization; a shifted pair is a
+# wrong answer, and the module chooses the former every time.
+#
+# HAZARD 2 (GATE B), AND THE PROOF THIS PRUNE DOES NOT DEPEND ON IT. The fork's
+# `update_state_after_alloc` (`manager.py:460-478`) appends per group, so group g's
+# entry at index i binds to
+# `block_ids_by_group[g][num_computed_tokens // group_block_sizes[g] + i]`:
+# the group's identity travels by WHICH LIST the entry was appended to and by its
+# position IN THAT GROUP, and `group_block_sizes` differs per group (groups 0-3 are
+# `boundary_state` with their own sizes, group 5 is `positional`). Any prune that
+# DERIVED its index set from a token count and a block size would therefore be right for
+# the positional group and wrong for a boundary group, because the offsets differ.
+# This prune never does that arithmetic. Its index set is the batch's JOB IDS, which
+# `_worker_bind` derived from `load_paths` - the scheduler's own index-aligned identity
+# list - so an entry's group is READ (`job["group"]`), never computed, and the pairing
+# of every survivor is RE-VERIFIED against the ids bind recorded per entry before
+# anything is written. The written proof per group, including the differing-size
+# boundary groups, is in `tests/test_disk_prune_restored_loads.py`.
+#
+# WHAT IS NEVER PRUNED: an entry whose read failed for any reason (it stays in the
+# step's `drop` set, its GPU block is reported as a load error and the engine
+# recomputes - the property that makes the whole tier safe); an entry that was OFFERED
+# but not ADOPTED (it is not in the step's lists at all, so the candidate set cannot
+# contain it: `pruned <= entries_in_step <= jobs_bound <= offered` is published in
+# `last_prune`); and everything, when the flag is off.
+MAX_PRUNE_ENTRIES_PER_STEP = MAX_SLOTS_PER_OFFER   # 256: one offer's slots is the cap
+MAX_PRUNE_REASON_CHARS = 200
+# THE CLOSED VOCABULARY OF REFUSALS. A stable key set, all published always, for the
+# reason every other section gives: an operator diffing two payloads must be able to
+# tell "this never happened" from "this build does not report it".
+PRUNE_REFUSALS = ("lists_not_in_step", "length_mismatch", "one_sided_prune",
+                  "bad_index", "duplicate_index", "out_of_range", "over_cap",
+                  "group_delta_mismatch", "destination_drift", "no_batch",
+                  "nothing_adopted")
 
 # --- what an offer costs the bounce-buffer pool (0.2.31) ---------------------
 #
@@ -1240,6 +1351,32 @@ _state: dict = {
                                       # impossible with one reader, so this counter
                                       # rising IS the concurrency finding
     "last_span_shape": None,          # the most recent batch's shape, as data
+    # STEP 2 OF RETIRING THE ARENA (0.2.49). The flag is
+    # `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` and it is OFF by default; with it off
+    # NONE of these numbers move and the apply point rewrites exactly what it rewrote
+    # before. `prune_steps` counts apply points where the switch was consulted, NOT
+    # steps where it pruned. `prune_entries` counts dropped PAIRS (one CPU id and the
+    # GPU id beside it leave together or nothing leaves). `prune_refused` is the closed
+    # vocabulary in `PRUNE_REFUSALS`, all keys always present. `prune_skipped_failed_…`
+    # is the recompute property counted: bound entries the prune did NOT touch because
+    # their read failed - the apply point drops those and reports their GPU block as a
+    # load error, exactly as it did before this flag existed.
+    # `prune_unwitnessed_entries` is the honest name for this flag's hazard: an entry
+    # pruned that `disk_gpu_write` did NOT write into the GPU window itself, i.e.
+    # one whose bytes now have no route to the device at all. It must be read beside
+    # `gpu_write.writes`; a growing count here while `writes` stays at its sampled rate
+    # IS the flag biting without a delivery path behind it. `prune_emptied_steps` counts
+    # the prunes that left the fork nothing to submit, the sharpest form of the same
+    # thing, and the one where the load event is released rather than recorded.
+    "prune_switch": None,             # the last read of the switch, as data
+    "prune_steps": 0,
+    "prune_entries": 0,
+    "prune_refused": {name: 0 for name in PRUNE_REFUSALS},
+    "prune_refusals_total": 0,
+    "prune_skipped_failed_entries": 0,
+    "prune_unwitnessed_entries": 0,
+    "prune_emptied_steps": 0,
+    "last_prune": None,
     # THE OFFER'S PRICE IN BOUNCE BUFFERS (0.2.31). `offer_pool_capped` counts offers
     # SHORTENED to what the pool can carry and `offer_pool_refused` the lookups given
     # no offer at all because not one job fits. `last_offer_pool` is the arithmetic of
@@ -1831,6 +1968,10 @@ def reset_state_for_tests() -> None:
             "spans_observed": 0, "span_entries_observed": 0, "spans_whole": 0,
             "spans_partial": 0, "spans_empty": 0, "spans_hole_in_the_middle": 0,
             "last_span_shape": None,
+            "prune_switch": None, "prune_steps": 0, "prune_entries": 0,
+            "prune_refusals_total": 0, "prune_skipped_failed_entries": 0,
+            "prune_unwitnessed_entries": 0, "prune_emptied_steps": 0,
+            "last_prune": None,
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
             "offer_block_capped": 0, "offer_block_size_seen": None,
@@ -1863,6 +2004,7 @@ def reset_state_for_tests() -> None:
         _state[key] = value
     _state["refused"] = {name: 0 for name in OFFER_REFUSALS}
     _state["reads_failed"] = {name: 0 for name in WORKER_FAILURES}
+    _state["prune_refused"] = {name: 0 for name in PRUNE_REFUSALS}
 
 
 def settle_budget(bytes_at_stake: int = 0,
@@ -2193,6 +2335,7 @@ def counters() -> dict:
     out = dict(_state)
     out["refused"] = dict(_state["refused"])
     out["reads_failed"] = dict(_state["reads_failed"])
+    out["prune_refused"] = dict(_state["prune_refused"])
     # THE POSTURE, beside the numbers it explains: "offers: 0" means something
     # different under `off` than under `disk_authority`, and the reader should not
     # have to combine two booleans to find out which.
@@ -2358,6 +2501,45 @@ def counters_view(out: dict) -> dict:
         "last_local_hit_ignored": "the last discarded host-RAM hit in the words an "
                                   "operator reads: request id, the tokens the fork "
                                   "reported, the block the disk span starts at",
+        "prune_switch": "the Step-2 switch as THIS process read it: enabled, the raw "
+                        "value, whether the grammar recognised it, and which "
+                        "`VLLM_E2_TIER_*` variable it came from (a null means the "
+                        "switch has not been consulted in this process yet)",
+        "prune_steps": "apply points where the Step-2 switch was consulted, whether or "
+                       "not anything was pruned (unit: steps)",
+        "prune_entries": "destination PAIRS an ADOPTED, successfully-read disk restore "
+                         "had removed from BOTH load lists at the same index, so the "
+                         "fork was not asked to copy them (unit: entries; one removal "
+                         "takes one CPU id and the GPU id paired with it)",
+        "prune_refused": "prunes this module REFUSED, by closed-vocabulary kind, every "
+                         "a refusal leaves the step exactly as the "
+                         "scheduler shipped it, because a refused prune is a missed "
+                         "optimization and a shifted pair is a wrong answer (unit: "
+                         "prunes)",
+        "prune_refusals_total": "prunes refused for any reason (unit: prunes)",
+        "prune_skipped_failed_entries": "bound entries the prune did NOT remove "
+                                     "because their read failed. The recompute "
+                                     "property, counted: a failed entry leaves both "
+                                     "lists exactly as every release before this one "
+                                     "removed it (its bytes never arrived), and its "
+                                     "GPU block is still reported as a load error so "
+                                     "the engine recomputes those tokens - the prune "
+                                     "changes neither (unit: entries)",
+        "prune_unwitnessed_entries": "pruned entries with NO plugin-side GPU write "
+                                     "behind them. Today the fork's copy is the only "
+                                     "delivery of a restored block's bytes, so this "
+                                     "count IS the Step-2 flag's hazard, priced: it "
+                                     "must "
+                                     "stay 0 until a plugin-side write is the delivery "
+                                     "(Step 3) (unit: entries)",
+        "prune_emptied_steps": "prunes that left a step with nothing for the fork to "
+                               "submit, so its load event was released rather than "
+                               "recorded (unit: steps)",
+        "last_prune": "the most recent prune as structure: what was pruned, how many "
+                      "disk entries the step actually carried, how many jobs were "
+                      "bound, how many entries stayed because their read failed, the "
+                      "per-group counts and the per-group deltas that prove the two "
+                      "sides left in step, and the direct-write witness count",
         "witness_kind": "the stable name of the last verdict: the emission key is "
                        "(verdict, kind) and never the sentence, because the sentence "
                        "quotes counters. AS OF THE LAST EMISSION, NOT NOW: it is the "
@@ -6895,6 +7077,468 @@ def abandon_disk_entries(worker, why: str) -> dict:
     return _ok(abandoned=len(disk_indices), released=released)
 
 
+# --- STEP 2 OF RETIRING THE ARENA: the prune, and the door it can only leave --
+
+_PRUNE_SHAPE = ("attempted", "ok", "reason_kind", "reason", "pruned", "kept",
+                "entries", "indices", "pruned_by_group", "group_deltas",
+                "entries_in_step", "jobs_bound", "direct_write_witnesses",
+                "prune_only", "also_dropped_failed", "cpu", "gpu")
+
+
+def _prune_answer(**fields) -> dict:
+    """ONE KEY SET for every prune answer, refused or not.
+
+    The shape discipline every section in this package follows: a reader diffing two
+    payloads must be able to tell "this did not happen" from "this build does not
+    report it". So a refusal carries `cpu`/`gpu` as None rather than omitting them.
+    """
+    out = {"attempted": True, "ok": False, "reason_kind": None, "reason": None,
+           "pruned": 0, "kept": 0, "entries": 0, "indices": [],
+           "pruned_by_group": {}, "group_deltas": {}, "entries_in_step": 0,
+           "jobs_bound": 0, "direct_write_witnesses": 0, "prune_only": 0,
+           "also_dropped_failed": 0, "cpu": None, "gpu": None}
+    out.update({key: value for key, value in fields.items() if key in _PRUNE_SHAPE})
+    return out
+
+
+def prune_switch() -> dict:
+    """The Step-2 flag, read ONCE per process, with the typo direction named.
+
+    Cached because a live boot's environment does not change and a fresh lookup through
+    `config` on the engine's step thread buys nothing; the read is published in
+    `prune_switch()`
+    so a payload can always say WHICH way this process decided and from where. A value
+    that is neither an on word nor an off word is OFF and reported, the same grammar as
+    `disk_shadow_enable()` and for the same reason: the direction a typo moves in must
+    be the direction that changes nothing.
+    """
+    if _state["prune_switch"] is None:
+        read = config.disk_prune_restored_loads()
+        _state["prune_switch"] = {"enabled": bool(read["enabled"]),
+                                  "raw": read["raw"],
+                                  "recognised": bool(read["recognised"]),
+                                  "source": read["source"],
+                                  "env_var": read["env_var"]}
+        if read["enabled"]:
+            notice_once(
+                "prune-on",
+                f"DISK[prune] ENABLED by {read['env_var']}={read['raw']!r}: an adopted "
+                f"disk restore whose read succeeded is REMOVED from both load lists at "
+                f"the apply point (up to {MAX_PRUNE_ENTRIES_PER_STEP} entries per "
+                "step), so the fork no longer DMAs those arena slots to the GPU. THE "
+                "FORK'S COPY IS TODAY THE ONLY DELIVERY of a restored block's bytes - "
+                "`disk_gpu_write` writes one sampled entry in "
+                f"{disk_gpu_write.SAMPLE_EVERY_N_APPLIED} and is a witness, not the "
+                "delivery - so with this flag on a pruned entry has no route to the "
+                "device. Watch `prune_unwitnessed_entries` and "
+                "`disk_restore_verify.mismatch_stable`.",
+            )
+        elif read["raw"] is not None and not read["recognised"]:
+            notice_once("prune-unrecognised",
+                        f"DISK[prune] {read['env_var']}={read['raw']!r} is neither an "
+                        "on word nor an off word: the prune is OFF, the direction a "
+                        "typo never overrides")
+    return dict(_state["prune_switch"])
+
+
+def prune_restored_loads_enabled() -> bool:
+    """The one question the apply point asks the environment."""
+    return bool(prune_switch()["enabled"])
+
+
+def _prune_indices(value) -> tuple:
+    """A sorted, checked index set, or the name of the way it is malformed."""
+    if value is None:
+        return set(), None
+    try:
+        raw = list(value)
+    except TypeError:
+        return set(), "bad_index"
+    out: set = set()
+    for item in raw:
+        index = _int(item)
+        if index is None or index < 0:
+            return set(), "bad_index"
+        if index in out:
+            return set(), "duplicate_index"
+        out.add(index)
+    return out, None
+
+
+def prune_load_pairs(cpu_blocks, gpu_blocks, cpu_drop, gpu_drop=None,
+                     groups=None, expected=None,
+                     cap: int = MAX_PRUNE_ENTRIES_PER_STEP) -> dict:
+    """THE ONLY DOOR A LOAD PAIR LEAVES THROUGH, and the door that cannot shift one.
+
+    `copy_blocks` pairs `cpu[i]` with `gpu[i]` POSITIONALLY (`cuda_mem_ops.py:227`; and
+    `total = len(src_block_ids) * num_layers` at :248 means a shorter GPU side is not
+    even a clean shift - the loop at :257 slices descriptors past the end of a shorter
+    array) - and it cannot notice that one list is shorter than the other. So the two
+    sides are dropped from ONE index set, and a call that hands this function two
+    different sets is REFUSED rather than honoured: that is the whole reason the
+    parameter pair exists
+    and is not a single set, and the reason `tests/test_disk_prune_restored_loads.py`
+    constructs the one-sided call and asserts a refusal instead of a payload.
+
+    Two further checks, both in-band and neither an `assert` (which `python -O`
+    strips), because a silent positional shift is the failure that hurts users:
+
+    * PER-GROUP DELTA. `groups` maps an entry's index to the group it belongs to and
+      `expected` maps it to the (cpu, gpu) ids THIS module recorded for it at bind. For
+      every group we can attribute, the surviving, CONFIRMED entries must be the same
+      count on both sides - the "equal length per group, or equal length plus a
+      recorded per-group delta" rule, with the delta published either way.
+    * PAIRING. For every surviving index, the id on each side must still be the id bind
+      recorded. A shift moves an id off its recorded partner, so this check names a
+      shift rather than length-equality declaring it fine.
+
+    Returns the kept lists on success and NOTHING but a name on refusal.
+    """
+    cpu = list(cpu_blocks or [])
+    gpu = list(gpu_blocks or [])
+    entries = min(len(cpu), len(gpu))
+    if len(cpu) != len(gpu):
+        return _prune_answer(
+            reason_kind="length_mismatch", entries=entries,
+            reason=(f"{FIELD_LOAD_CPU} has {len(cpu)} and {FIELD_LOAD_GPU} has "
+                    f"{len(gpu)}: the two sides do not correspond before anything was "
+                    "dropped, so nothing can be dropped safely"))
+    left, kind = _prune_indices(cpu_drop)
+    if kind:
+        return _prune_answer(reason_kind=kind, entries=entries,
+                             reason=f"the CPU-side index set is not usable ({kind})")
+    right, kind = _prune_indices(gpu_drop if gpu_drop is not None else cpu_drop)
+    if kind:
+        return _prune_answer(reason_kind=kind, entries=entries,
+                             reason=f"the GPU-side index set is not usable ({kind})")
+    if left != right:
+        only_cpu = sorted(left - right)[:8]
+        only_gpu = sorted(right - left)[:8]
+        return _prune_answer(
+            reason_kind="one_sided_prune", entries=entries,
+            reason=(f"the two sides were asked to drop different indices "
+                    f"(cpu-only {only_cpu}, gpu-only {only_gpu}): pairing is "
+                    "positional, so honouring this would shift every later block into "
+                    "the wrong destination"))
+    dropped = left
+    for index in sorted(dropped):
+        if index >= len(cpu):
+            return _prune_answer(
+                reason_kind="out_of_range", entries=entries,
+                reason=f"index {index} is outside a step of {len(cpu)} entries")
+    if len(dropped) > int(cap):
+        return _prune_answer(
+            reason_kind="over_cap", entries=entries,
+            reason=f"{len(dropped)} entries exceed the per-step prune cap of {cap}")
+    keep = [index for index in range(len(cpu)) if index not in dropped]
+    kept_cpu = [cpu[index] for index in keep]
+    kept_gpu = [gpu[index] for index in keep]
+    # THE RE-DERIVATION, the cheap version of the shift check: the two lists we are
+    # about to hand back must be what the SAME index set produces from each side. That
+    # is true by construction here, and it is stated as a check because the day this
+    # function grows a path that builds the two sides differently, this is the line
+    # that catches it.
+    if ([cpu[index] for index in keep] != kept_cpu
+            or [gpu[index] for index in keep] != kept_gpu):
+        return _prune_answer(reason_kind="one_sided_prune", entries=entries,
+                             reason="the two sides did not re-derive identically")
+    attributed = groups if isinstance(groups, dict) else {}
+    recorded = expected if isinstance(expected, dict) else {}
+    confirmed_cpu: dict = {}
+    confirmed_gpu: dict = {}
+    touched: list = []
+    for value in attributed.values():
+        name = str(int(_int(value) or 0))
+        if name not in touched:
+            touched.append(name)
+    touched.sort(key=int)
+    pruned_by_group: dict = {name: 0 for name in touched}
+    for index in sorted(dropped):
+        group = attributed.get(index)
+        if group is not None:
+            name = str(int(group))
+            if name not in pruned_by_group:
+                touched.append(name)
+                pruned_by_group[name] = 0
+            pruned_by_group[name] += 1
+    for index in keep:
+        held = recorded.get(index)
+        if held is None:
+            continue
+        want_cpu, want_gpu = _prune_pair_ids(held)
+        group = attributed.get(index)
+        if group is None:
+            continue
+        if want_cpu is not None and cpu[index] == want_cpu:
+            confirmed_cpu[str(int(group))] = confirmed_cpu.get(str(int(group)), 0) + 1
+        if want_gpu is not None and gpu[index] == want_gpu:
+            confirmed_gpu[str(int(group))] = confirmed_gpu.get(str(int(group)), 0) + 1
+    for index in keep:
+        held = recorded.get(index)
+        if held is None:
+            continue
+        want_cpu, want_gpu = _prune_pair_ids(held)
+        if want_cpu is not None and cpu[index] != want_cpu:
+            return _prune_answer(
+                reason_kind="destination_drift", entries=entries,
+                reason=(f"entry {index} names CPU id {cpu[index]} where bind recorded "
+                        f"{want_cpu}: the step's lists moved under us, so no prune of "
+                        "any of it can be trusted"))
+        if want_gpu is not None and gpu[index] != want_gpu:
+            return _prune_answer(
+                reason_kind="destination_drift", entries=entries,
+                reason=(f"entry {index} names GPU id {gpu[index]} where bind recorded "
+                        f"{want_gpu}: the step's lists moved under us, so no prune of "
+                        "any of it can be trusted"))
+    # THE PER-GROUP MAPS, over EVERY group this step attributed - touched or not, and
+    # whether or not a survivor of theirs could be confirmed. The key set must not
+    # depend on which group a prune happened to hit: a reader comparing two steps (or
+    # has to be able to tell "group 1 lost nothing" from "group 1 is not reported here".
+    def _deltas() -> dict:
+        names = sorted(set(touched) | set(confirmed_cpu) | set(confirmed_gpu), key=int)
+        return {name: int(confirmed_cpu.get(name, 0)
+                          - confirmed_gpu.get(name, 0)) for name in names}
+
+    deltas = _deltas()
+    for group in sorted(set(confirmed_cpu) | set(confirmed_gpu), key=int):
+        if int(confirmed_cpu.get(group, 0)) != int(confirmed_gpu.get(group, 0)):
+            return _prune_answer(
+                reason_kind="group_delta_mismatch", entries=entries,
+                pruned_by_group={key: int(value)
+                                 for key, value in pruned_by_group.items()},
+                group_deltas=deltas,
+                reason=(f"group {group} keeps {confirmed_cpu.get(group, 0)} confirmed "
+                        f"CPU entries but {confirmed_gpu.get(group, 0)} confirmed GPU "
+                        "entries after the prune: the lists are no longer in step"))
+    return _prune_answer(ok=True, pruned=len(dropped), kept=len(keep),
+                         entries=len(cpu), indices=sorted(dropped),
+                         pruned_by_group={key: int(value)
+                                          for key, value in pruned_by_group.items()},
+                         group_deltas=deltas,
+                         cpu=kept_cpu, gpu=kept_gpu)
+
+
+def _prune_pair_ids(held):
+    """(cpu id, gpu id) from a bind-time record, which may be a job dict or a pair."""
+    if isinstance(held, dict):
+        return (_int(held.get("cpu_block_id")), _int(held.get("gpu_block_id")))
+    try:
+        left, right = held
+        return _int(left), _int(right)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _prune_refused(answer: dict) -> dict:
+    """Count a refusal under its name and say it once per episode, never per step."""
+    kind = answer.get("reason_kind") or "nothing_adopted"
+    name = kind if kind in _state["prune_refused"] else "nothing_adopted"
+    _state["prune_refused"][name] += 1
+    _state["prune_refusals_total"] += 1
+    notice_once(f"prune-refused:{name}",
+                f"DISK[prune] REFUSED ({name}): {_clip(answer.get('reason'), 240)}; "
+                "the step keeps every destination it had, so nothing is shifted and "
+                "nothing is saved")
+    return answer
+
+
+def _prune_step_view(answer: dict, *, step_entries_before: int = 0,
+                     skipped_failed: int = 0, drifted: int = 0) -> dict:
+    """THE LAST STEP'S PRUNE, as one fixed key set, on every path that decided one.
+
+    The same keys whether the prune was accepted, refused, or found nothing to do:
+    a reader comparing two steps - or the same step on two ranks - has to be able to
+    tell "nothing was pruned" from "this path reports nothing", and a refusal that left
+    the PREVIOUS step's numbers in place would be the worse kind of lie. Every value is
+    read out of the answer this function was called with; nothing is recomputed here.
+    """
+    return {
+        "ok": bool(answer.get("ok")),
+        "attempted": bool(answer.get("attempted")),
+        "reason_kind": answer.get("reason_kind"),
+        "reason": _clip(answer.get("reason"), MAX_PRUNE_REASON_CHARS),
+        "pruned": int(_int(answer.get("prune_only"))
+                      or _int(answer.get("pruned")) or 0),
+        "removed_indices_total": int(_int(answer.get("pruned")) or 0),
+        "pruned_indices": list(answer.get("indices") or [])[
+            :MAX_PRUNE_ENTRIES_PER_STEP],
+        "entries_in_step": int(_int(answer.get("entries_in_step")) or 0),
+        "jobs_bound": int(_int(answer.get("jobs_bound")) or 0),
+        "kept": int(_int(answer.get("kept")) or 0),
+        "step_entries_before": int(step_entries_before),
+        "also_dropped_failed": int(_int(answer.get("also_dropped_failed")) or 0),
+        "skipped_failed": int(skipped_failed),
+        "drifted": int(drifted),
+        "groups": {key: int(value) for key, value
+                   in (answer.get("pruned_by_group") or {}).items()},
+        "group_deltas": {key: int(value) for key, value
+                         in (answer.get("group_deltas") or {}).items()},
+        "direct_write_witnesses": int(_int(answer.get("direct_write_witnesses")) or 0),
+    }
+
+
+def prune_adopted_restores(metadata, batch, drop_set,
+                         direct_witnesses: int = 0) -> dict:
+    """Decide, and verify, the Step-2 prune of THIS step. Never raises.
+
+    The candidate set is the batch's JOB IDS minus the entries whose read failed. That
+    is the adopted population and nothing else: an offered block the scheduler threw
+    away is not in the step's lists at all (the fork truncates per group with
+    `cdiv(num_external_tokens, group_block_sizes[g])` leading entries and consumes the
+    RAM hit first), so it cannot be a candidate, and the invariant published in
+    `last_prune` is `pruned <= entries_in_step <= jobs_bound <= offered`. Deriving the
+    set from a token count instead would be the Gate-B mistake this function exists not
+    to make.
+    """
+    try:
+        if not prune_restored_loads_enabled():
+            return _prune_answer(attempted=False, ok=True,
+                                 reason="the Step-2 flag is off, so the step's lists "
+                                        "are exactly what the scheduler shipped")
+        _state["prune_steps"] += 1
+        cpu_blocks = list(getattr(metadata, FIELD_LOAD_CPU, None) or [])
+        gpu_blocks = list(getattr(metadata, FIELD_LOAD_GPU, None) or [])
+        paths = _metadata_paths(metadata)
+        jobs = (batch or {}).get("jobs") or {}
+
+        def decided(answer: dict, *, skipped: int = 0, drift: int = 0) -> dict:
+            """Publish this step's answer as the last step, then hand it back."""
+            _state["last_prune"] = _prune_step_view(
+                answer, step_entries_before=len(cpu_blocks),
+                skipped_failed=skipped, drifted=drift)
+            return answer
+
+        if not jobs:
+            return decided(_prune_refused(_prune_answer(
+                reason_kind="no_batch", entries=min(len(cpu_blocks), len(gpu_blocks)),
+                jobs_bound=0,
+                reason="this step's disk work was never bound (or every entry failed "
+                       "at bind), so there is no adopted population to prune")))
+        if (len(paths) != len(cpu_blocks) or len(gpu_blocks) != len(cpu_blocks)):
+            return decided(_prune_refused(_prune_answer(
+                reason_kind="lists_not_in_step", entries=min(len(cpu_blocks),
+                                                             len(gpu_blocks)),
+                jobs_bound=len(jobs),
+                reason=(f"load_paths has {len(paths)}, {FIELD_LOAD_CPU} has "
+                        f"{len(cpu_blocks)} and {FIELD_LOAD_GPU} has "
+                        f"{len(gpu_blocks)}: the index alignment is gone"))))
+        drop = {int(value) for value in (drop_set or set())}
+        candidates: list = []
+        groups: dict = {}
+        expected: dict = {}
+        kept_failed = 0
+        drifted = 0
+        for job_id, job in jobs.items():
+            index = _int(job_id)
+            if index is None or not 0 <= index < len(cpu_blocks):
+                continue
+            if index in drop:
+                # THE RECOMPUTE PROPERTY, counted: an entry whose bytes never arrived is
+                # NOT part of the prune's population. The apply point removes it from
+                # both lists and reports its GPU block as a load error exactly as it did
+                # with the flag off, so the engine recomputes those tokens; the prune
+                # only ever removes entries whose read SUCCEEDED, and it removes nothing
+                # the failure path has not already accounted for.
+                kept_failed += 1
+                continue
+            if not paths[index]:
+                # Not a disk entry any more: the scheduler shipped no identity for it,
+                # so its bytes are the RAM tier's and this module must not touch it.
+                continue
+            if not isinstance(job, dict):
+                continue
+            want_cpu = _int(job.get("cpu_block_id"))
+            want_gpu = _int(job.get("gpu_block_id"))
+            if (want_cpu is not None and cpu_blocks[index] != want_cpu) \
+                    or (want_gpu is not None and gpu_blocks[index] != want_gpu):
+                drifted += 1
+                continue
+            candidates.append(index)
+            if job.get("group") is not None:
+                groups[index] = int(job["group"])
+            expected[index] = (want_cpu, want_gpu)
+        _state["prune_skipped_failed_entries"] += kept_failed
+        if not candidates:
+            answer = _prune_answer(
+                reason_kind="nothing_adopted" if not drifted
+                else "destination_drift",
+                entries=len(cpu_blocks), entries_in_step=0, jobs_bound=len(jobs),
+                also_dropped_failed=len(drop & set(range(len(cpu_blocks)))),
+                direct_write_witnesses=int(direct_witnesses),
+                reason=(f"{len(jobs)} job(s) were bound, {kept_failed} had failed "
+                        f"reads and {drifted} named ids the step no longer holds, "
+                        "leaving no adopted, successfully-read entry to prune"))
+            return decided(_prune_refused(answer), skipped=kept_failed, drift=drifted)
+        verdict = prune_load_pairs(cpu_blocks, gpu_blocks,
+                                   sorted(drop | set(candidates)), None,
+                                   groups=groups, expected=expected)
+        verdict["prune_only"] = len(candidates)
+        verdict["also_dropped_failed"] = len(drop & set(range(len(cpu_blocks))))
+        verdict["entries_in_step"] = len(candidates)
+        verdict["jobs_bound"] = len(jobs)
+        verdict["direct_write_witnesses"] = int(direct_witnesses)
+        verdict["indices"] = sorted(candidates)[:MAX_PRUNE_ENTRIES_PER_STEP]
+        if not verdict["ok"]:
+            return decided(_prune_refused(verdict), skipped=kept_failed,
+                           drift=drifted)
+        _state["prune_entries"] += len(candidates)
+        if int(direct_witnesses) < len(candidates):
+            gap = len(candidates) - int(direct_witnesses)
+            _state["prune_unwitnessed_entries"] += gap
+            notice_once("prune-unwitnessed",
+                        f"DISK[prune] {gap} pruned entr{'y' if gap == 1 else 'ies'} "
+                        "have NO plugin-side GPU write behind them: the step's own "
+                        f"direct-write witnesses are {int(direct_witnesses)} of "
+                        f"{len(candidates)}. Until a plugin-side write is the "
+                        "delivery (Step 3), a pruned entry's bytes reach no GPU window "
+                        "and the request is answered from uninitialised KV")
+        return decided(verdict, skipped=kept_failed, drift=drifted)
+    except Exception as exc:  # noqa: BLE001 - a prune is never a step fault
+        snapshot._error(exc, "disk_restore prune")
+        answer = _prune_refused(_prune_answer(
+            reason_kind="nothing_adopted", entries=0, jobs_bound=0,
+            reason=f"the prune decision raised {type(exc).__name__}"))
+        _state["last_prune"] = _prune_step_view(answer)
+        return answer
+
+
+def prune_state() -> dict:
+    """The Step-2 view: the switch, the totals, the closed vocabulary, the last one."""
+    refused = {name: int(_state["prune_refused"].get(name) or 0)
+               for name in PRUNE_REFUSALS}
+    return {"enabled": prune_switch()["enabled"],
+            "switch": dict(_state["prune_switch"] or prune_switch()),
+            "steps": int(_state["prune_steps"]),
+            "entries": int(_state["prune_entries"]),
+            "refused": refused,
+            "refusals_total": int(_state["prune_refusals_total"]),
+            "skipped_failed_entries": int(_state["prune_skipped_failed_entries"]),
+            "unwitnessed_entries": int(_state["prune_unwitnessed_entries"]),
+            "emptied_steps": int(_state["prune_emptied_steps"]),
+            "max_entries_per_step": int(MAX_PRUNE_ENTRIES_PER_STEP),
+            "last": (dict(_state["last_prune"]) if _state["last_prune"] else None),
+            "units": {"steps": "apply points where the switch was consulted (unit: "
+                                "steps; a step that pruned nothing still counts)",
+                      "entries": "load PAIRS removed from both lists (unit: entries; "
+                                 "one removal drops one CPU id and the GPU id "
+                                 "beside it)",
+                      "refused": "prunes refused, by reason kind, all names always "
+                                 "present (unit: prunes)",
+                      "refusals_total": "prunes refused for any reason (unit: prunes)",
+                      "skipped_failed_entries": "bound entries the prune did not "
+                                             "remove because their read failed; the "
+                                             "apply point drops those and reports "
+                                             "their GPU block as a load error either "
+                                             "way, so the engine can "
+                                             "still recompute them (unit: entries)",
+                      "unwitnessed_entries": "pruned entries with no plugin-side "
+                                             "GPU write behind them - the flag's own "
+                                             "hazard, counted (unit: entries)",
+                      "emptied_steps": "prunes that left the fork nothing to submit, "
+                                       "so the load event was released rather than "
+                                       "recorded (unit: steps)"}}
+
+
 def worker_before_load(worker) -> dict:
     """Apply settled bytes, prune the rest, and never DMA a stale slot.
 
@@ -7396,7 +8040,14 @@ def _worker_before_load(worker) -> dict:
     # awaits nothing, allocates nothing on this thread and cannot raise; every refusal
     # is a name and leaves the entry entirely to the fork's copy. Default OFF: with
     # `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` unset it returns on the enablement test.
-    disk_gpu_write.observe_apply(worker, batch, failed)
+    direct = disk_gpu_write.observe_apply(worker, batch, failed)
+    # HOW MANY OF THIS STEP'S ENTRIES THE PLUGIN ITSELF WROTE INTO THE GPU. The count is
+    # read only to publish the flag's own hazard honestly: with Step 2 on, a pruned
+    # entry whose bytes no GPU-direct writer covered has NO route to the device left,
+    # because removing the pair removes the fork's copy that used to carry them. With
+    # the flag off nothing reads this number and the call above behaves exactly as it
+    # did, return value discarded, in every release before this one.
+    witnesses = _int(direct.get("written")) or 0
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
     batch_jobs = batch.get("jobs") or {}
@@ -7434,7 +8085,22 @@ def _worker_before_load(worker) -> dict:
             gpu_id = _int(gpu_blocks[job_id])
             if gpu_id is not None:
                 _remember_invalid(gpu_id)
-    if drop:
+    # THE STEP-2 PRUNE (0.2.49), decided here and applied in the SAME rewrite below:
+    # ONE place touches these two lists per step, so the entries this feature drops and
+    # the entries a failed read drops cannot be pruned against two different snapshots
+    # of the same pair. `prune_adopted_restores` re-verifies the pairing before it hands
+    # anything back and returns NO lists on a refusal, in which case the fallback below
+    # is byte-for-byte what every release before this one did. With the flag off it
+    # returns `attempted: False` and no lists, so the default path IS that fallback.
+    prune = prune_adopted_restores(metadata, batch, drop_set,
+                                   direct_witnesses=witnesses)
+    pruned_here = int(prune["prune_only"]) if prune["ok"] else 0
+    kept_cpu = None
+    kept_gpu = None
+    if prune["ok"] and prune["cpu"] is not None:
+        kept_cpu = prune["cpu"]
+        kept_gpu = prune["gpu"]
+    elif drop:
         kept_cpu = []
         kept_gpu = []
         for index in range(min(len(cpu_blocks), len(gpu_blocks))):
@@ -7442,15 +8108,33 @@ def _worker_before_load(worker) -> dict:
                 continue
             kept_cpu.append(cpu_blocks[index])
             kept_gpu.append(gpu_blocks[index])
+    if kept_cpu is not None:
         _replace_load_lists(metadata, kept_cpu, kept_gpu)
     if batch_id is not None:
         disk_read.finish_batch(batch_id)
     submitted = bool(list(getattr(metadata, FIELD_LOAD_CPU, None) or []))
     released = 0
-    if drop and not submitted:
-        released = release_event(worker, metadata, batch,
-                                 "every load entry on this step came from disk and "
-                                 "none had bytes to copy")
+    if pruned_here and not submitted:
+        # THE SHARPEST FORM OF THIS FLAG: every entry the fork would have copied is
+        # gone, so its load event is never recorded and `release_event` reports the
+        # requests finished in the same call (the phantom rule: an index left in
+        # `_pending_load_event_indices` becomes reportable as soon as a LATER event
+        # completes). Counted and said once per episode because this is the case where
+        # nothing at all stands between the flag and an uninitialised KV window.
+        _state["prune_emptied_steps"] += 1
+        notice_once("prune-emptied",
+                    f"DISK[prune] a step was left with NOTHING to copy after pruning "
+                    f"{pruned_here} entr{'y' if pruned_here == 1 else 'ies'}: the load "
+                    "event was released rather than recorded, so those GPU windows "
+                    "hold whatever they held before unless a plugin-side write covers "
+                    "them")
+    if (drop or pruned_here) and not submitted:
+        released = release_event(
+            worker, metadata, batch,
+            ("every load entry on this step came from disk and none had bytes to copy"
+             if not pruned_here else
+             f"nothing was left to copy after dropping {len(drop)} failed entrie"
+             f"{'s' if len(drop) != 1 else 'y'} and pruning {pruned_here}"))
     _phantom_guard(worker, metadata, submitted=submitted)
     for request_id in batch["req_ids"]:
         record = _wloads.get(request_id)
@@ -7474,9 +8158,15 @@ def _worker_before_load(worker) -> dict:
     applied = len([job_id for job_id in batch["jobs"] if job_id not in failed])
     kinds = sorted({str(failed.get(job_id)) for job_id in drop})[:3]
     _note(f"applied {applied} of {len(batch['jobs'])} disk read(s); dropped "
-          f"{len(drop)} for {kinds or '-'}")
+          f"{len(drop)} for {kinds or '-'}"
+          + (f"; pruned {pruned_here} restored destination pair(s) from both lists"
+             if pruned_here else ""))
     return _ok(applied=applied, dropped=len(drop), released=released,
-               submitted=submitted)
+               submitted=submitted, pruned=pruned_here,
+               prune_reason=(_clip(prune.get("reason"), MAX_PRUNE_REASON_CHARS)
+                             if not prune["ok"] else None),
+               prune_reason_kind=(prune.get("reason_kind")
+                                  if not prune["ok"] else None))
 
 
 def _replace_load_lists(metadata, cpu_blocks, gpu_blocks) -> None:
@@ -8380,6 +9070,22 @@ def worker_report() -> dict:
                            "empty": int(_state["spans_empty"]),
                            "hole_in_middle": int(
                                _state["spans_hole_in_the_middle"])}
+        # STEP 2 OF RETIRING THE ARENA (0.2.49): SIX INTS AND ONE BOOLEAN, because this
+        # section is a guest in a byte-capped file. `on` is this rank's own reading of
+        # VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS - the only process that prunes is the
+        # one that applies a restore, so a zero here is the answer to 'is THIS rank
+        # pruning', not a report about the boot. `unwitnessed` is the hazard counter
+        # that must stay 0 and `emptied` names the steps left with nothing to copy. The
+        # refusal vocabulary, the per-group deltas and the last decision live in
+        # `disk_restore.section()` on the verb side.
+        report["prune"] = {"on": bool(prune_switch()["enabled"]),
+                           "steps": int(_state["prune_steps"]),
+                           "entries": int(_state["prune_entries"]),
+                           "refused": int(_state["prune_refusals_total"]),
+                           "skipped_failed": int(
+                               _state["prune_skipped_failed_entries"]),
+                           "unwitnessed": int(_state["prune_unwitnessed_entries"]),
+                           "emptied": int(_state["prune_emptied_steps"])}
         # WHAT ONE READ COSTS THIS RANK, so the scheduler can price an offer against
         # its bounce-buffer pool with a real number instead of a guess. The fingerprint
         # owns the figure; None means this rank has no fingerprint yet and the offer
@@ -9147,6 +9853,12 @@ def section() -> dict:
                  "prefix of the offer: with one reader thread that is arithmetically "
                  "impossible, so a rising count is direct evidence that N readers "
                  "changed the shape of an interrupted restore, not only its speed.")}
+    # STEP 2 OF RETIRING THE ARENA (0.2.49): the switch, the totals, the closed refusal
+    # vocabulary and the last decision. A STABLE KEY SET in every state, including the
+    # state where the flag has never been consulted - `prune_switch` is then null and
+    # every count is 0, which is a different claim from "this build has no prune".
+    view["load_prune"] = prune_state()
+    view["load_prune_reasons"] = list(PRUNE_REFUSALS)
     # THE WINDOW AND THE WAIT, next to the read latency they are measured against:
     # `waited_ms` without `read_seconds` beside it is a number with no unit of
     # comparison, and the whole point of the settle-wait fields is to be comparable.
@@ -9359,6 +10071,15 @@ def scheduler_section() -> dict:
         "reinstalls": int(state["reinstalls"]),
         "gate": {"ok": bool(opened["ok"]), "reason": opened.get("reason"),
                  "reason_kind": opened.get("reason_kind")},
+        # STEP 2 OF RETIRING THE ARENA (0.2.49), passed through from the function that
+        # owns it and recomputed nowhere: `prune_state()`. It is in THIS section because
+        # this is the one call an operator makes to ask "what is this boot doing?", and
+        # the Step-2 flag is a boot posture like any other. A scheduler process has NO
+        # apply point, so its counts are zero BY CONSTRUCTION and the field that says so
+        # is `enabled` beside them - the counters that move live in a worker rank file's
+        # `prune` block. An absent field would read as "this build has no prune", which
+        # is a different and false claim, so the view answers on every path.
+        "load_prune": prune_state(),
         # THE POSTURE AS DATA, not as a sentence inside `boot_line`. Until now the only
         # place any of this was printed was that line, and a dashboard cannot grep a
         # sentence at 3 a.m.: "is the switch up, which switch, how many ranks are
