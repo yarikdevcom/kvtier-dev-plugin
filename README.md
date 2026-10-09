@@ -1403,9 +1403,22 @@ a load that outlived `RESTORE_DEADLINE_SECONDS`, or a request returning at or be
 point where it was last offered with no re-offer left. `suppressed_after_failure` is the
 refusal; `suppressed_hits` / `suppressed_spans` / `suppressions` say which half fired,
 and `races_not_fused` / `fuses_on_data_kinds` / `fuses_on_unknown_kinds` say WHY a report
-did or did not fuse (see *What a failed load costs*). The table is bounded
-(`MAX_SUPPRESSED_REQUESTS`, oldest-first), because a fuse that grows without limit is
-its own leak.
+did or did not fuse (see *What a failed load costs*). Both tables are bounded
+(`MAX_SUPPRESSED_REQUESTS` for requests, `MAX_SUPPRESSED_SPANS` for spans since 0.2.60,
+oldest-first), because a fuse that grows without limit is its own leak - the span table
+used to be written with no bound at all.
+
+**A span is fused on evidence about the BYTES, never on a gap in our own knowledge
+(0.2.60).** A span key is the run's FIRST block, so fusing one refuses every later
+request that starts there - which is the next turn of the same conversation, under a
+different request id. That price is payable for a data-kind load failure or
+`group_hit_truncated`, and it is NOT payable for `no_read` (a load reported finished
+that this process could not show an applied read for), which fuses the request only.
+Before this release the first restore of every boot looked like `no_read` - the
+boot-wide counter was still 0, and the worker's rank file had not been read yet - and
+cost the span for the whole boot: a 241,740-token prompt recomputed in 66.3 s, 34 times
+in 5 days, with `no further disk offer for request ... the load was reported finished
+with no applied disk read behind it` in the engine log.
 
 **The scheduler refuses while any live rank refuses to serve.** A worker's rank file
 publishes `disk_restore.armed` = *will this rank service a disk load*, and
@@ -1417,11 +1430,27 @@ refusal is `reason_kind=scheduler_armed_workers_disarmed` with `ranks_armed=0/4`
 is the field that lied on 2026-10-05, when four ranks were fitted, none was armed, and
 the offers kept coming.
 
-**`restorations` cannot rise without a read.** The fork reports a load finished for its
+**`restorations` cannot rise without a read - and the read is asked about per load
+(0.2.60).** The fork reports a load finished for its
 own host-RAM blocks too, so a finished report is not evidence of a restore. A
-completion counts as a restoration only when an applied disk read can be shown -
-this process's counter, or the sum the live worker rank files attest - and otherwise
-counts as `no_read`. `verdict=CONFIRMED` needs both, which is why the witness line
+completion counts as a restoration only when an applied disk read can be shown for
+**that load's own CPU slots**: `applied_read_evidence_for` matches the slots named in
+the load's ledger record against the window the apply point records (a worker's own
+process) and against `applied_slots`, the newest-first list of filled CPU slots each
+worker now publishes in its rank file. The apply loop (`_apply_buffer`, inside
+`start_load_kv`) runs in the **worker** process, so a scheduler-only process has no
+window of its own and its per-request evidence can only ever come from that file; the
+rank file is rewritten on cadence, so the completion path is allowed one fresh, bounded
+read per `APPLIED_SLOT_REPROBE_MIN_SECONDS` to close the gap - `applied_slot_reprobes`
+counts those reads and `ranks_applied_slots` is how many slot ids the live ranks named.
+While no live rank publishes a window at all (a worker on an older plugin) the evidence
+falls back to the boot-wide counter and says so in its `source`; the moment a window
+exists the fallback is unreachable. A delivered disk->GPU write
+(`disk_gpu_write.delivery_writes`, `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY`) is
+applied evidence too - delivery writes only the entries that already passed
+`_apply_buffer`, so it counts once and never twice. A completion with no read behind it
+counts as `no_read` and
+fuses **its request, never its span** (see the paragraph above). `verdict=CONFIRMED` needs both, which is why the witness line
 carries `reads_applied=` and `no_read=`. The witness is emitted once per
 **(verdict, reason-kind)**, never once per step: keying it on the sentence re-issued
 it 1,048 times a second on the incident boot, and `witness_suppressed` counts the

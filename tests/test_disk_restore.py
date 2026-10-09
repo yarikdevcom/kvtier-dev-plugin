@@ -1318,6 +1318,12 @@ def test_a_reported_load_with_an_applied_read_is_a_restoration(armed):
     The scheduler never reads a file itself, so `reads_applied` here stands for the
     worker's attestation (its own counter in a worker process, its rank file in a
     scheduler process); `applied_reads_evidence()` names which source answered.
+
+    SINCE 0.2.60 the per-request question is answered by slot ids, not by this counter
+    (`applied_read_evidence_for`, and the worker's rank file `applied_slots`); this
+    shape - a load reported read on the strength of the boot-wide counter - is what the
+    evidence does while no live rank publishes a window at all, and it names itself as
+    such. The per-request shape is pinned in test_disk_restore_proof_gap_fuse.py.
     """
     fill(armed, blocks=1)
     disk_restore._state["reads_applied"] = 1

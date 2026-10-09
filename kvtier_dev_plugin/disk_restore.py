@@ -1168,6 +1168,21 @@ def cpu_slot_affordance(free_blocks, per_span: int = 1,
 MAX_PATHS_PER_STEP = 512             # load_paths entries one step may carry
 MIN_WITNESS_LOG_SECONDS = 30.0       # SECONDS between witness re-emissions
 MAX_SUPPRESSED_REQUESTS = 4096       # REQUESTS black-holed after a failed load
+# THE SPAN TABLE IS BOUNDED TOO (0.2.60). It has always been written by
+# `suppress_load(span=...)` with NO bound at all, while the request table beside it
+# evicts oldest-first at 4096 - so a long boot that implicated many spans kept one
+# short string per span until the process ended. Forgetting the oldest fuse costs one
+# more offer; growing without bound costs the scheduler its memory.
+MAX_SUPPRESSED_SPANS = 1024          # disk SPANS fused by a STRUCTURAL failure
+# THE APPLIED-SLOT WINDOW (0.2.60): which CPU slots the APPLY POINT actually memmoved
+# bytes into, remembered so a completion report can be asked about ITS OWN load. The
+# apply loop runs in the worker process, so the scheduler learns this through the rank
+# file, which is byte-capped: hence a small published count and a bigger in-process one.
+MAX_APPLIED_SLOTS_TRACKED = 512      # CPU slots ONE process's apply point remembers
+MAX_APPLIED_SLOTS_PUBLISHED = 32     # ...of those, how many cross the rank file
+MAX_APPLIED_SLOTS_MATCHED = 1024     # CPU slots of ONE load the evidence may scan
+APPLIED_SLOT_REPROBE_MIN_SECONDS = 1.0  # SECONDS between the fresh rank-file reads the
+                                       # completion path is allowed to ask for
 MAX_RACE_REOFFERS_PER_REQUEST = 1    # RE-OFFERS one request may claim after a load it
                                      # LOST A RACE (0.2.32): a spent allowance, never
                                      # refilled, so a race costs at most two offers
@@ -2052,6 +2067,12 @@ _state: dict = {
     # or a proven rank can show an applied disk read for it; a completion with no
     # read behind it is `no_read` and is never counted as a restoration.
     "no_read": 0, "disk_reads_applied": 0, "ranks_reads_applied": 0,
+    # THE PER-REQUEST HALF OF THAT EVIDENCE (0.2.60). `ranks_applied_slots` is how many
+    # CPU slot ids the live rank files named at the last read (the ids behind
+    # `ranks_reads_applied`, not a second count of them) and `applied_slot_reprobes` is
+    # how often the completion path had to read the rank files fresh because the cached
+    # window did not contain the load's own slots - the cadence lag, measured.
+    "ranks_applied_slots": 0, "applied_slot_reprobes": 0,
     # `offer_clamped` (0.2.31 and earlier) is DELETED with the fixed 32,000-token cap:
     # with no configured cap there is no clamp to count. See the note at
     # MAX_RESTORE_BLOCKS_PER_OFFER.
@@ -2256,8 +2277,29 @@ _suppressed: dict = {}
 _burned: dict = {}
 # Scheduler side: the same for a disk SPAN (first block's key:group of the offered
 # run), because a request the engine reset comes back with the same hashes and a
-# span that failed once will fail for whoever asks for it next.
+# span that failed once will fail for whoever asks for it next. SINCE 0.2.60 ONLY A
+# STRUCTURAL FAILURE WRITES HERE (a data-kind load failure, `group_hit_truncated`):
+# a PROOF GAP - a finished load this process could not show a read for - costs its
+# request and never the span, because the next turn of the same conversation is a
+# different request and the span is the run's FIRST block. Bounded by
+# MAX_SUPPRESSED_SPANS, oldest-first, like the request table.
 _suppressed_spans: dict = {}
+# Worker side: the CPU slot ids THIS process's apply point memmoved bytes into, newest
+# last, bounded by MAX_APPLIED_SLOTS_TRACKED. This is the per-request half of
+# `reads_applied`: the counter says a read landed somewhere in the boot, the window says
+# WHICH SLOTS, and a `_loads` record knows which slots belong to which request. A
+# scheduler-only process never applies anything, so its own window is empty by
+# construction and its evidence comes from `_ranks_applied_slots` instead.
+_applied_slots: dict = {}
+# Scheduler side: the same fact about the WORKERS, as their live rank files carried it
+# at the last read: cpu block id -> when this process learned it. Bounded, and clipped
+# on the way in like every other number read out of another process.
+_ranks_applied_slots: dict = {}
+# When the completion path last read the rank files for that window. The rank file is
+# written on cadence, so a report that arrives milliseconds after the apply point can
+# legitimately find nothing; one fresh, bounded, throttled read closes that lag without
+# turning the scheduler's step path into a file reader.
+_applied_reprobe: dict = {"mono": None}
 # Scheduler side: request id -> how its load LEFT THE LEDGER without a report (which
 # sweep branch, whether the slots had reached a worker, whether a disk read had been
 # applied, and how many GPU blocks it had mapped). The `_burned` idiom applied to the
@@ -2716,7 +2758,7 @@ def reset_state_for_tests() -> None:
     global _loads, _slot_paths, _wloads, _wbatches, _invalid, _logged_lines
     global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
     global _offered_at, _burned, _aged_out, _load_failures, _failure_log_at
-    global _race_reoffer
+    global _race_reoffer, _applied_slots, _ranks_applied_slots
     # THE STAGING CAP AND THE RUNTIME POSTURE ARE PER-PROCESS STATE TOO (0.2.59). The
     # cap's credit is charged by an offer and returned by a load, so a reset that left
     # credit charged would make every later test offer refuse with `no_staging_rows` for
@@ -2742,6 +2784,12 @@ def reset_state_for_tests() -> None:
     _aged_out = {}
     _offered_at = {}
     _race_reoffer = {}
+    # THE APPLIED-SLOT WINDOW IS PER-PROCESS BOOT STATE TOO (0.2.60): it is the evidence
+    # the per-request predicate reads, so a reset that left a previous "boot"'s slots in
+    # it would let a later test prove a read that never happened in it.
+    _applied_slots = {}
+    _ranks_applied_slots = {}
+    _applied_reprobe["mono"] = None
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
@@ -2775,6 +2823,7 @@ def reset_state_for_tests() -> None:
             "index_refreshes": 0, "index_refresh_errors": 0, "loads_released": 0,
             "ranks_proven": 0, "proof_reads": 0, "no_read": 0,
             "disk_reads_applied": 0, "ranks_reads_applied": 0,
+            "ranks_applied_slots": 0, "applied_slot_reprobes": 0,
             "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
             "bytes_applied": 0, "dma_unsettled_entries": 0, "invalid_reports": 0,
             "finished_released": 0, "worker_watchdog_fires": 0,
@@ -3371,6 +3420,18 @@ def counters_view(out: dict) -> dict:
                               "scheduler-only process by construction)",
         "ranks_reads_applied": "applied disk reads attested by live worker rank "
                                "files at the last proof read",
+        "ranks_applied_slots": "how many CPU slot ids the live rank files named at the "
+                               "last read: the per-request half of "
+                               "`ranks_reads_applied` (WHICH slots, not how many), and "
+                               "0 while no worker publishes the window - which is the "
+                               "mixed-version case, not a proof that nothing was read",
+        "applied_slot_reprobes": "times the completion path read the rank files FRESH "
+                                 "because the cached applied-slot window did not name "
+                                 "the finished load's own slots: the rank file's "
+                                 "cadence lag, measured. Bounded to one per "
+                                 "`APPLIED_SLOT_REPROBE_MIN_SECONDS`, and a growing "
+                                 "number says the cadence (or the file's absence) is "
+                                 "what hides applied reads, not the workers",
         "offers_enabled": "this boot's gap-fill switch: False until the dev verb "
                           "raises it, so an armed spill tier alone cannot put a "
                           "disk offer in front of live traffic. Up on its own it "
@@ -4495,10 +4556,31 @@ def _rank_file_proves_restore(path, notes: list | None = None) -> dict | None:
         width = _int(section.get("bytes_per_file"))
         if width is None or width < 0:
             width = None
+        # WHICH SLOTS THIS RANK FILLED (0.2.60), the per-request half of
+        # `reads_applied` and the reason a finished load can be judged on its OWN
+        # evidence instead of on the boot's counter. Untrusted like every other number
+        # read out of another process: `_int`-shaped ids only (a bool, a float and a
+        # name are not slot ids), never
+        # negative, never above the same ceiling `reads_applied` gets, and never more
+        # than the writer's own cap - a broken writer must not decide how much the
+        # scheduler remembers. An ABSENT key is an empty list, and an empty list from a
+        # rank that reports `reads_applied > 0` means a worker too old to publish the
+        # window, which `applied_read_evidence_for` reads as "no per-request evidence
+        # exists", not as "nothing was read".
+        slots: list = []
+        raw_slots = section.get("applied_slots")
+        if isinstance(raw_slots, (list, tuple)):
+            for item in raw_slots[:MAX_APPLIED_SLOTS_PUBLISHED]:
+                slot = _int(item)
+                if slot is None or slot < 0 or slot > MAX_RANK_COUNTER \
+                        or slot in slots:
+                    continue
+                slots.append(int(slot))
         return {"rank": name, "installed": installed,
                 "worker_fitted": fitted, "service_reason_kind": kind,
                 "armed": installed and armed,
                 "reads_applied": min(reads, MAX_RANK_COUNTER),
+                "applied_slots": slots,
                 "bytes_per_file": width,
                 "last_failures": _rank_failure_records(
                     section.get("last_failures")),
@@ -4724,6 +4806,7 @@ def _read_worker_proof() -> dict:
     widths: list = []
     failures: list = []
     verdicts: list = []
+    applied: list = []
     probed = names[:MAX_RANK_FILES_PROBED]
     for name in probed:
         said = _rank_file_proves_restore(directory / name, verdicts)
@@ -4732,12 +4815,19 @@ def _read_worker_proof() -> dict:
         width = said.get("bytes_per_file")
         if isinstance(width, int) and not isinstance(width, bool) and width > 0:
             widths.append(int(width))
+        # THE APPLIED-SLOT WINDOW, from EVERY readable rank file (0.2.60). Collected
+        # BEFORE the armed/service `continue`s below, because this is EVIDENCE about
+        # what a worker memmoved, not a veto about whether it will serve: a rank the
+        # gate finds silent still knows which slots it filled.
         for record in said.get("last_failures") or []:
             if len(failures) >= MAX_RANK_FILES_PROBED * MAX_FAILURES_PER_RANK_FILE:
                 break
             row = dict(record)
             row["rank"] = said["rank"]
             failures.append(row)
+        for slot in said.get("applied_slots") or ():
+            if slot not in applied:
+                applied.append(int(slot))
         if not said["installed"]:
             silent.append(f"{said['rank']}: not fitted")
             continue
@@ -4763,6 +4853,10 @@ def _read_worker_proof() -> dict:
         reads += said["reads_applied"] or 0
         armed.append(said["rank"])
     _state["proof_reads"] += len(probed)
+    # THE WINDOW TRAVELS WITH THE PROOF (0.2.60): the cached proof read is what keeps
+    # `_ranks_applied_slots` warm between the throttled fresh reads the completion path
+    # is allowed, so the two channels cannot disagree about what the ranks reported.
+    _remember_ranks_applied_slots(applied)
     armed.sort()
     seen = len(armed) + len(silent)
     _state["ranks_seen"] = seen
@@ -5775,6 +5869,13 @@ def suppress_load(request_id: str, reason: str, span=None) -> bool:
         a request that returns with no progress can be matched against when the fork
         reports only invalid block ids and those ids are GPU-side.
 
+    THE SPAN KEY IS FOR STRUCTURAL EVIDENCE ONLY (0.2.60). A span is the run's FIRST
+    block, so fusing it refuses EVERY later request that starts there - the next turn of
+    the same conversation, a different request id. That price is payable for bad bytes
+    (`_fuse_or_spare`'s data kinds, `group_hit_truncated`) and is NOT payable for a
+    PROOF GAP, where all we know is that this process could not show the read: see the
+    `no_read` branch of `note_reported`, which calls this with no `span=`.
+
     Bounded and never raising: this table is a fuse, not a database.
     """
     try:
@@ -5790,7 +5891,16 @@ def suppress_load(request_id: str, reason: str, span=None) -> bool:
         if fresh:
             _state["suppressions"] += 1
         if span:
-            _suppressed_spans[str(span)[:80]] = _clip(reason, 200)
+            # BOUNDED LIKE THE REQUEST TABLE (0.2.60). This write has always been
+            # unbounded while the line above it evicts at `MAX_SUPPRESSED_REQUESTS`, so
+            # a boot that implicated many spans kept one string per span forever. Same
+            # oldest-first rule and the same reasoning: forgetting the oldest fuse costs
+            # one more offer, and a fuse is not a database.
+            key16 = str(span)[:80]
+            if key16 not in _suppressed_spans \
+                    and len(_suppressed_spans) >= MAX_SUPPRESSED_SPANS:
+                _suppressed_spans.pop(next(iter(_suppressed_spans)), None)
+            _suppressed_spans[key16] = _clip(reason, 200)
         _logger.warning("kvtier-dev-plugin: DISK[restore] no further disk offer for "
                        "request %s (span %s): %s", key or "?",
                        str(span)[:40] or "-", _clip(reason, 160))
@@ -7233,15 +7343,16 @@ def _remember_release(request_id: str, record: dict, how: str) -> None:
     reader to INFER that the report had arrived late rather than never.
 
     The evidence stored is the strongest available AT RELEASE: `adopted` (our CPU slots
-    reached a worker's `load_cpu_blocks`) and whether any disk read had been applied in
-    this boot (`_a_read_was_applied`, boot-wide because no channel could make it
-    per-request). That is deliberately NOT a claim that this load's bytes landed; it is
-    the same evidence `restorations` is allowed to use, recorded while it was still
-    readable. Bounded oldest-first, like every other table here.
+    reached a worker's `load_cpu_blocks`) and whether a disk read had been applied FOR
+    THIS LOAD (`applied_read_evidence_for`, per-request since 0.2.60 and falling back to
+    the boot-wide attestation only while no worker publishes a slot window). That is
+    deliberately NOT a claim that this load's bytes reached the GPU; it is the same
+    evidence `restorations` is allowed to use, recorded while it was still readable.
+    Bounded oldest-first, like every other table here.
     """
     try:
         adopted = bool(record.get("adopted"))
-        with_reads = adopted and _a_read_was_applied()
+        with_reads = adopted and applied_read_evidence_for(record)["applied"]
         gpu_blocks = len(record.get("gpu_block_ids") or ())
         if len(_aged_out) >= MAX_SUPPRESSED_REQUESTS:
             _aged_out.pop(next(iter(_aged_out)), None)      # oldest first
@@ -7707,13 +7818,32 @@ def note_reported(manager, connector_output) -> dict:
                                        "slots ever reaching a step")
                 out["released"] += 1
                 continue
-            if not _a_read_was_applied():
+            # THE EVIDENCE, ASKED ONCE for this load and this report: a rank-file read
+            # is bounded and throttled inside `applied_read_evidence_for`, and asking
+            # twice would spend the allowance for nothing.
+            evidence = applied_read_evidence_for(record)
+            if not evidence["applied"]:
                 # The honest version of what the live box called a restoration.
+                #
+                # NO `span=` HERE, AND THAT IS THE WHOLE POINT (0.2.60). This branch is
+                # a PROOF GAP: this process cannot show a read behind this load. A
+                # finished load on the first restore of every boot always looked like
+                # that under the boot-wide predicate, and `suppress_load(span=...)`
+                # fused the run's FIRST BLOCK for the rest of the boot - so the next
+                # turn of the same conversation (a different request id, the same span)
+                # was refused before any index read and recomputed its whole prompt: a
+                # 241,740-token prompt in 66.3 s, 34 times in 5 days. The loop-killer
+                # needs the REQUEST key only, because the fork reschedules the same
+                # request; fusing a span on a gap in our own knowledge is what makes a
+                # healthy box lose a conversation for a boot. Span fusing belongs where
+                # the evidence is STRUCTURAL: `_fuse_or_spare` (data kinds) and
+                # `group_hit_truncated`.
                 _state["no_read"] += 1
                 out["no_read"] += 1
-                suppress_load(request_id, "the load was reported finished with no "
-                                          "applied disk read behind it",
-                              span=_span_key_of(record))
+                suppress_load(request_id,
+                              "the load was reported finished with no applied disk "
+                              "read behind it ("
+                              f"{evidence['source']})")
                 _drop_load(request_id, "reported finished with NO applied disk "
                                        "read: counted as no_read, not as a "
                                        "restoration")
@@ -7795,25 +7925,6 @@ def _span_key_of(record) -> str | None:
     except Exception as exc:  # noqa: BLE001 - no key is only a weaker fuse
         snapshot._error(exc, "disk_restore load span")
         return None
-
-
-def _a_read_was_applied() -> bool:
-    """Was there any evidence at all that a disk byte reached a CPU slot for this?
-
-    Two sources, because the scheduler process and the worker process are different
-    processes and the scheduler NEVER reads a file itself: its own `reads_applied`
-    stays 0 by construction, and the worker publishes its count in its rank file.
-    So the scheduler-side evidence is (this process's counter) OR (the sum the live
-    rank files reported at the last proof read). Neither is per-request - there is no
-    channel that could make it per-request - so this is the weakest statement that
-    still separates "disk reads are happening on this box" from "nothing has ever
-    been read", which is precisely the distinction a witness line has to get right.
-
-    A boot where workers serve reads normally keeps this true; a boot where the
-    scheduler offers and the workers refuse (2026-10-05) keeps it false forever, and
-    `restorations` stays 0 and the witness says REFUTED instead of CONFIRMED.
-    """
-    return applied_reads_evidence()["reads_applied"] >= 1
 
 
 # --- the worker's doors -------------------------------------------------------
@@ -9435,6 +9546,56 @@ def _note_span_shape(shape: dict) -> None:
     _state["last_span_shape"] = dict(shape)
 
 
+# --- THE APPLIED-SLOT WINDOW (0.2.60): WHICH slots, not just "some slots" -------
+#
+# WHY A WINDOW AT ALL. `note_reported` has to answer a per-request question - was a
+# disk read applied behind THIS finished load? - and the only counter that existed was
+# boot-wide, so its answer was "has any read EVER been applied in this process?". That
+# fused the first restore of every boot (counter still 0) and could never fire again
+# afterwards. The apply point knows the slot it wrote; a `_loads` record knows the slots
+# its own load owns; matching the two is the per-request evidence, and the worker's rank
+# file is how the scheduler gets it.
+
+def _note_applied_slot(cpu_block_id) -> None:
+    """Remember that THIS process has memmoved bytes into one CPU slot.
+
+    The only writer is the apply loop, on the same line that moves `reads_applied`, so
+    the window and the counter cannot disagree and neither can be moved without the
+    other. Bounded and never raising: this runs on the engine's step thread inside
+    `start_load_kv`, where a raise is a step fault.
+    """
+    try:
+        slot = _int(cpu_block_id)
+        if slot is None or slot < 0:
+            return
+        key = int(slot)
+        if key not in _applied_slots \
+                and len(_applied_slots) >= MAX_APPLIED_SLOTS_TRACKED:
+            # Oldest-first, the `_suppressed` idiom: the window only has to outlive the
+            # gap between an apply point and the completion report that names it.
+            _applied_slots.pop(next(iter(_applied_slots)), None)
+        _applied_slots[key] = round(time.monotonic(), 6)
+    except Exception as exc:  # noqa: BLE001 - a witness never costs a step
+        snapshot._error(exc, "disk_restore note_applied_slot")
+
+
+def applied_slots(limit=None) -> list:
+    """The CPU slots THIS process's apply point filled, NEWEST FIRST.
+
+    Empty in a scheduler-only process by construction - it applies nothing, which is the
+    same reason its `reads_applied` is 0 - so a zero here is not evidence that no worker
+    read anything. `limit` clips for the byte-capped rank-file publisher.
+    """
+    try:
+        newest_first = list(reversed(list(_applied_slots)))
+        if limit is None:
+            return newest_first
+        return newest_first[:max(0, int(limit))]
+    except Exception as exc:  # noqa: BLE001 - a report is never a step fault
+        snapshot._error(exc, "disk_restore applied_slots")
+        return []
+
+
 def _worker_before_load(worker) -> dict:
     apply_mono = time.monotonic()
     metadata = getattr(worker, "_connector_metadata", None)
@@ -9543,6 +9704,12 @@ def _worker_before_load(worker) -> dict:
                     _state["applied_settled_immediately"] += 1
                 _state["reads_applied"] += 1
                 _state["bytes_applied"] += int(outcome["bytes"])
+                # WHICH SLOT, for the report that will name this load (0.2.60). A
+                # delivered disk->GPU write (`disk_gpu_write`) passes through here too:
+                # `observe_apply` writes only the entries ABSENT from `failed`, and an
+                # entry whose `_apply_buffer` refused is IN `failed`, so a delivered
+                # entry is one applied entry and the window holds it once, never twice.
+                _note_applied_slot(job.get("cpu_block_id"))
         if status.get("incomplete"):
             # Fewer reads than declared: a caller bug, and a batch that quietly had
             # fewer reads than slots is exactly how a stale slot reaches the DMA.
@@ -10101,17 +10268,180 @@ def applied_reads_evidence() -> dict:
     through the rank file. Naming WHICH source answered is the point: `reads=0`
     because the scheduler has no fingers is a different fact from `reads=0` because
     nothing was ever read, and only the second one is news.
+
+    THIS IS THE BOOT-WIDE VIEW, and since 0.2.60 it is NOT what a completion report is
+    judged with - `applied_read_evidence_for` answers that, per load. What this one is
+    for is the witness and the payload: "did disk reads ever happen on this boot".
     """
     local = int(_state["reads_applied"] or 0) + int(_state["disk_reads_applied"] or 0)
     ranks = int(_state["ranks_reads_applied"] or 0)
+    # A DELIVERED disk->GPU WRITE (0.2.60). In delivery mode
+    # (`VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY`, on in the live launcher) the
+    # plugin itself enqueues the host->device copy. Those entries are the ones
+    # `_apply_buffer` has ALREADY memmoved into (see `observe_apply`, which writes only
+    # the entries absent from `failed`), so in a worker process this counter can never
+    # move without `reads_applied` moving with it and the branch below cannot double
+    # count. It is consulted because a counter that proves bytes moved and is read by
+    # nothing is how a healthy delivery boot reads as "nothing has applied a disk read
+    # in this boot", and because a future bypass of the CPU slot must not silently
+    # become a boot full of `no_read`.
+    delivered = 0
+    try:
+        delivered = int(disk_gpu_write.counters().get("delivery_writes") or 0)
+    except Exception as exc:  # noqa: BLE001 - a source that cannot speak stays silent
+        snapshot._error(exc, "disk_restore delivery evidence")
     if local > 0:
         return {"reads_applied": local, "source": "this process"}
+    if delivered > 0:
+        return {"reads_applied": delivered,
+                "source": ("this process's disk_gpu_write delivery writes (a delivered "
+                           "disk->GPU copy is a read that reached the engine; it also "
+                           "passes the apply point, so it counts once, not twice)")}
     if ranks > 0:
         return {"reads_applied": ranks, "source": "worker rank file"}
     return {"reads_applied": 0,
             "source": ("nothing has applied a disk read in this boot"
                        if _state["sched_fitted"] else
                        "this process runs neither half")}
+
+
+def _load_cpu_block_ids(record) -> list:
+    """The CPU slots one `_loads` record owns: int-only, clipped, never raising.
+
+    The record was built by `_register_load` from the identities THIS process allocated,
+    so these are the slots whose bytes the worker was told to fill - the join key
+    between a completion report and an apply point in another process.
+    """
+    ids: list = []
+    try:
+        for item in (record or {}).get("cpu_block_ids") or ():
+            value = _int(item)
+            if value is None or value < 0:
+                continue
+            ids.append(int(value))
+            if len(ids) >= MAX_APPLIED_SLOTS_MATCHED:
+                break
+    except Exception as exc:  # noqa: BLE001 - no ids is only a weaker proof
+        snapshot._error(exc, "disk_restore load cpu ids")
+    return ids
+
+
+def _remember_ranks_applied_slots(slots) -> int:
+    """Fold a rank file's applied-slot window into `_ranks_applied_slots`, bounded.
+
+    Newest read wins, oldest evicted first: the window exists to bridge a millisecond
+    gap between an apply point and a report, so an id from an hour ago is worth less
+    than one from this step.
+    """
+    try:
+        mono = round(time.monotonic(), 6)
+        for slot in slots or ():
+            key = int(slot)
+            if key not in _ranks_applied_slots \
+                    and len(_ranks_applied_slots) >= MAX_APPLIED_SLOTS_TRACKED:
+                _ranks_applied_slots.pop(next(iter(_ranks_applied_slots)), None)
+            _ranks_applied_slots[key] = mono
+        _state["ranks_applied_slots"] = len(_ranks_applied_slots)
+        return len(_ranks_applied_slots)
+    except Exception as exc:  # noqa: BLE001 - evidence that will not fold stays unread
+        snapshot._error(exc, "disk_restore remember applied slots")
+        return int(_state["ranks_applied_slots"] or 0)
+
+
+def _read_applied_slots_from_ranks() -> list:
+    """The applied CPU slots the live rank files name, read NOW. Never raises.
+
+    Deliberately NOT `worker_proof()`: that function drives the OFFER gate, and a
+    completion report must not be able to close it. This is the same bounded, clipped
+    rank-file reader with no cache, no state machine and no transition line, and the
+    ids are folded into `_ranks_applied_slots` on the way out so the cached proof read
+    and a fresh read cannot disagree about what the window holds.
+    """
+    ids: list = []
+    try:
+        directory = config.diagnostics_dir()
+        if directory is None:
+            return []
+        names = sorted(name for name in os.listdir(directory)
+                       if name.startswith(RANK_FILE_PREFIX)
+                       and name.endswith(RANK_FILE_SUFFIX))
+        for name in names[:MAX_RANK_FILES_PROBED]:
+            said = _rank_file_proves_restore(directory / name)
+            if said is None:
+                continue
+            for slot in said.get("applied_slots") or ():
+                if slot not in ids:
+                    ids.append(int(slot))
+        _remember_ranks_applied_slots(ids)
+    except Exception as exc:  # noqa: BLE001 - an unreadable window is no window
+        snapshot._error(exc, "disk_restore rank applied slots")
+    return ids
+
+
+def applied_read_evidence_for(record) -> dict:
+    """Was a disk read applied behind THIS load? The per-request question, answered.
+
+    THREE CHANNELS, cheapest first: the apply window in this process (a worker, or a
+    test), the window the last rank-file read left behind, and - because a rank file is
+    written on cadence and a report can arrive milliseconds after the apply point that
+    earned it - one fresh, bounded, throttled read of the rank files.
+
+    WHAT AN ANSWER COSTS. `applied: False` is a PROOF GAP, not a fault: it says this
+    process cannot show the bytes, which a crashed sshd and a rank file that has not
+    been rewritten yet look exactly like. So it counts `no_read` and it black-holes the
+    REQUEST that showed it (the loop-killer needs the request key: the fork reschedules
+    the same request), and it must never fuse the SPAN, whose key is the run's first
+    block and therefore the next turn of the same conversation. A 241,740-token prompt
+    recomputed in 66.3 s was that fuse.
+    """
+    out = {"applied": False, "source": "no applied read names this load's slots",
+           "matched": [], "asked": 0}
+    try:
+        wanted = _load_cpu_block_ids(record)
+        out["asked"] = len(wanted)
+        if not wanted:
+            out["source"] = "this load's record names no CPU slots to match"
+            return out
+        want = set(wanted)
+        for window, source in ((_applied_slots, "this process"),
+                               (_ranks_applied_slots, "worker rank file")):
+            hit = [slot for slot in window if slot in want][:8]
+            if hit:
+                return {"applied": True, "source": source, "matched": hit,
+                        "asked": len(wanted)}
+        now = time.monotonic()
+        last = _applied_reprobe.get("mono")
+        if not isinstance(last, (int, float)) \
+                or (now - float(last)) >= APPLIED_SLOT_REPROBE_MIN_SECONDS:
+            _applied_reprobe["mono"] = now
+            _state["applied_slot_reprobes"] += 1
+            hit = [slot for slot in _read_applied_slots_from_ranks()
+                   if slot in want][:8]
+            if hit:
+                return {"applied": True,
+                        "source": "worker rank file (read for this report)",
+                        "matched": hit, "asked": len(wanted)}
+        if not _applied_slots and not int(_state["ranks_applied_slots"] or 0):
+            # NO WINDOW ANYWHERE, WHICH IS A MIXED-VERSION FACT AND NOT A VERDICT.
+            # A worker running a plugin that predates 0.2.60 publishes `reads_applied`
+            # and no slot ids, and the only honest thing to do with a question nobody
+            # can answer is to keep the answer the boot used to get: fall back to the
+            # boot-wide attestation and NAME it. The moment any live rank publishes a
+            # window this branch is unreachable, which is what stops the fallback from
+            # becoming the defect again - a counter that excuses every load after the
+            # first read, in both directions.
+            boot = applied_reads_evidence()
+            if int(boot["reads_applied"] or 0) > 0:
+                return {"applied": True,
+                        "source": ("the boot-wide read counter: no live rank has "
+                                   "published an applied-slot window, so no "
+                                   "per-request evidence exists"),
+                        "asked": len(wanted)}
+        return out
+    except Exception as exc:  # noqa: BLE001 - a witness that raises is not a witness
+        snapshot._error(exc, "disk_restore applied read evidence")
+        out["source"] = f"the evidence raised {type(exc).__name__}"
+        return out
 
 
 def partial_load_verdict() -> dict:
@@ -10515,6 +10845,12 @@ def worker_report() -> dict:
                   "reads_started": int(_state["reads_started"]),
                   "reads_applied": int(_state["reads_applied"]),
                   "bytes_applied": int(_state["bytes_applied"]),
+                  # WHICH SLOTS, not only how many (0.2.60): the per-request evidence a
+                  # scheduler process has for a finished load, matched against the CPU
+                  # slots that load owns. Newest first and few - this section is a guest
+                  # in a byte-capped file, and losing THIS key is cheap next to losing
+                  # the section (the guard at the end of this function pops it first).
+                  "applied_slots": applied_slots(MAX_APPLIED_SLOTS_PUBLISHED),
                   "dma_unsettled": int(_state["dma_unsettled_entries"]),
                   "failed": {name: int(count) for name, count
                              in _state["reads_failed"].items() if count},
@@ -10660,6 +10996,14 @@ def worker_report() -> dict:
         report["last_failures"] = [_compact_failure(item) for item
                                    in _load_failures[:MAX_FAILURES_PER_RANK_FILE]]
         if len(json.dumps(report, default=str)) > worker_diag.MAX_CONTRIBUTION_BYTES:
+            # THE APPLIED-SLOT WINDOW PAYS FOR ITSELF FIRST (0.2.60). Dropping it costs
+            # the scheduler per-request evidence for ONE file-write; dropping the whole
+            # section - the fallback below, or `worker_diag`'s own over-cap refusal -
+            # costs the offer gate this rank's entire proof, which is the
+            # `no_restore_section` outage `_rank_file_proves_restore` already names. A
+            # key added to inform the gate must never be able to close it.
+            report.pop("applied_slots", None)
+        if len(json.dumps(report, default=str)) > worker_diag.MAX_CONTRIBUTION_BYTES:
             return {"section": "disk_restore", "writer": OWNER_TAG,
                     "truncated": True,
                     "installed": bool(_state["installed"]),
@@ -10692,7 +11036,14 @@ def register_contribution() -> dict:
         "disk_restore", worker_report, owner=OWNER_TAG,
         signal=lambda: (int(bool(disk_spill.is_armed())),
                         int(bool(_state["worker_fitted"])),
-                        int(bool(_state["installed"]))))
+                        int(bool(_state["installed"])),
+                        # THE APPLIED-READ GENERATION (0.2.60): the window this file
+                        # now carries is the evidence a completion report is judged
+                        # with, and a file rewritten only on the spill cadence can lag
+                        # the apply point that earned it. Folding the count into the
+                        # signature makes the NEXT beat rewrite the file, which is the
+                        # cheapest freshness this channel can buy.
+                        int(_state["reads_applied"] or 0)))
     # THE RESTORE-SIDE VERIFIER REGISTERS HERE, not from `disk_store.install()`: the
     # facts it reports are THIS module's apply point's, and a process that cannot apply
     # a restore has nothing to say about whether restored bytes reached a GPU window.
@@ -12450,6 +12801,16 @@ def scheduler_section() -> dict:
                                   "counters()",
             "ranks_reads_applied": "applied disk reads attested by live worker rank "
                                    "files at the last proof read, from counters()",
+            "ranks_applied_slots": "CPU slot ids the live rank files named at the last "
+                                   "read - the per-request evidence a finished load "
+                                   "is judged on since 0.2.60: WHICH slots were "
+                                   "filled, not how many reads landed, from "
+                                   "counters()",
+            "applied_slot_reprobes": "fresh rank-file reads the completion path asked "
+                                     "for because the cached window did not name the "
+                                     "finished load's own slots, throttled to one per "
+                                     "`APPLIED_SLOT_REPROBE_MIN_SECONDS`, from "
+                                     "counters()",
             "offer_pool": "what an offer costs the BOUNCE-BUFFER POOL: the bytes one "
                           "read needs, the pool's budget, how many jobs it can carry, "
                           "the arena's CPU-slot reserve in force and where it came "
