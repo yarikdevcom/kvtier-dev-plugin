@@ -138,6 +138,25 @@ the file contract the proxy host's reader expects):
                                       `evict_threads_requested` beside
                                       `evict_threads_configured` when they differ).
 
+  THE ONE BOUND ON A DELIVERY STEP (`disk_gpu_write.py`, 0.2.57) ----------------
+
+  VLLM_E2_TIER_DISK_GPU_WRITE_DELIVERY_TIMEOUT_SECONDS
+                                      SECONDS one delivery step may hold the engine's
+                                      step thread, checked before each entry. UNSET =
+                                      `disk_gpu_write.DELIVERY_APPLY_TIMEOUT_SECONDS`
+                                      (10 s). ONE generous timeout, deliberately, and
+                                      NOT a per-entry budget: 0.2.56's 0.25 s step
+                                      budget, its 64 MiB byte budget and the refusal
+                                      that went with it are GONE. A step that reaches
+                                      the bound DEFERS the rest of its entries, and a
+                                      deferred entry is delivered by the FORK - a
+                                      missed optimization, never a hole. Clamped at
+                                      `DELIVERY_APPLY_TIMEOUT_MAX` (60 s) and reported
+                                      (`delivery_mode.timeout_clamped`); a value that
+                                      is not a finite number above 0 means the shipped
+                                      default and is logged once. Read PER APPLY
+                                      POINT, so a drop-in needs no restart.
+
   THE CPU-SLOT RESERVE AN OFFER LEAVES ALONE (`disk_restore.py`, 0.2.38) ------
 
   VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE
@@ -521,6 +540,29 @@ ENV_DISK_GPU_DIRECT_WRITE = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE"
 # exactly that reason, and it stays a hard refuse: no ledger verdict, no write, and no
 # prune either.
 ENV_DISK_GPU_WRITE_DELIVERY = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY"
+
+# HOW LONG ONE DELIVERY STEP MAY HOLD THE STEP THREAD (`disk_gpu_write.py`,
+# 0.2.57) -----------------------------------------------------------------
+# THE ONE BOUND ON THE DELIVERY LOOP, replacing 0.2.56's two per-entry budgets (a
+# 0.25 s step budget and a 64 MiB byte budget) after the operator ruled on it: this
+# path has been strangled by fine-grained caps before - the disk read/write path - and
+# the standing answer here is ONE generous timeout, not a budget. A 0.25 s cap also
+# deferred ~92% of a normal large restore, which turned the prune it gates into a
+# no-op: a guard that disables the feature is not a safety feature.
+#
+# It is an escape hatch against a copy that never returns, not a throughput lever, and
+# the measured shape of the work says so: ~735 MB of host->device pageable PCIe at
+# ~5 GB/s is ~0.15 s, so a 10 s bound is ~60x above normal and ~30x inside the only
+# deadline the engine actually enforces (`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`, 300 s).
+# See `disk_gpu_write.DELIVERY_APPLY_TIMEOUT_SECONDS` for the arithmetic and the
+# numbers this was measured against.
+#
+# Grammar only, like `ceiling_env`: a value that is not a finite number ABOVE 0 is
+# reported in `problems` and left as None, which the consumer reads as "the operator
+# said nothing" - so a typo in a systemd drop-in gives the shipped 10 s and never a
+# step with no bound at all. The clamp is policy and lives with the consumer.
+ENV_DISK_GPU_WRITE_DELIVERY_TIMEOUT = (
+    "VLLM_E2_TIER_DISK_GPU_WRITE_DELIVERY_TIMEOUT_SECONDS")
 
 # HOW MANY CPU SLOTS AN OFFER MUST LEAVE FREE IN THE ARENA (`disk_restore.py`,
 # 0.2.38) ---------------------------------------------------------------
@@ -1286,6 +1328,48 @@ def ceiling_env() -> dict:
                 evict_threads = wanted
     return {"budget_seconds": budget, "problems": problems,
             "evict_threads": evict_threads}
+
+
+def delivery_timeout_env() -> dict:
+    """The delivery step's wall-clock bound, parsed and NOT interpreted.
+
+    The same split as `ceiling_env`, `settle_env` and `disk_read_env`: the grammar
+    ("what did the operator write") lives here, the policy that spends the number
+    (`disk_gpu_write._delivery_apply_timeout_seconds`, which every apply point reads and
+    publishes the effective value of) lives with the loop it bounds. There is therefore
+    NO default of 10 s in this function: `seconds=None` means "the operator said
+    nothing", which is the only way the constant in `disk_gpu_write` stays a fact a
+    reader can check instead of a number this module invented.
+
+    Zero is REFUSED rather than honoured, exactly like `ceiling_env` refuses a 0 budget.
+    A bound of 0 would defer every entry of every delivery step, which reads as "the
+    timeout is configured" while delivering nothing - the same silent-no-op shape, in
+    the one place where the entries the bound refuses are the entries the prune may not
+    remove. Negative and non-finite are the same story. Anything the grammar rejects is
+    named in `problems` and means the shipped default.
+    """
+    problems: list = []
+    raw = os.environ.get(ENV_DISK_GPU_WRITE_DELIVERY_TIMEOUT, "").strip()
+    seconds: float | None = None
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            problems.append(f"{ENV_DISK_GPU_WRITE_DELIVERY_TIMEOUT}={raw!r} is not a "
+                            "number and was ignored")
+            value = None
+        if value is not None:
+            # `!= value` is NaN; the explicit +inf test is what `ceiling_env`'s idiom
+            # misses, and an infinite bound is exactly the "no bound at all" a typo must
+            # never produce. Negative infinity is already caught by `<= 0.0`.
+            if value != value or value == float("inf") or value <= 0.0:
+                problems.append(
+                    f"{ENV_DISK_GPU_WRITE_DELIVERY_TIMEOUT}={raw!r} is not a finite "
+                    "number above 0 and was ignored (0 would defer every entry of "
+                    "every delivery step)")
+            else:
+                seconds = value
+    return {"seconds": seconds, "problems": problems}
 
 
 def cpu_slot_reserve_env() -> dict:

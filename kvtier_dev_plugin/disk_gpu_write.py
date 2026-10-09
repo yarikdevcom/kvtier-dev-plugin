@@ -256,45 +256,85 @@ MAX_WRITES_PER_STEP_DELIVERY = MAX_ENTRIES_SCANNED
 # "no floor", and it is the value the mode documents.
 MIN_INTERVAL_SECONDS_DELIVERY = 0.0
 
-# THE STEP-THREAD BUDGET DELIVERY MODE NEVER HAD (0.2.56, and this is the reason it
-# exists). The delivery copy's SOURCE is `worker.cpu_kv_caches`, and the running fork
-# allocates that arena with `torch.zeros(cpu_shape, dtype=..., device="cpu")`
-# (`v1/simple_kv_offload/worker.py:232`) - PAGEABLE, not page-locked. A host->device
-# `copy_(src, non_blocking=True)` out of pageable host memory is NOT asynchronous: the
-# runtime stages it through its own bounce buffer and returns only once the bytes have
-# left, so the call BLOCKS THE ENGINE STEP THREAD for the whole copy. This module states
-# that rule in the other direction at `_copy_device_to_host`: "a pageable destination
-# would have made it synchronous ON THE STEP THREAD, which is the single most expensive
-# mistake available here". The delivery branch broke the rule in the H2D direction, and
-# the mode lifted the other three guards at the same time - the sample (1-in-64 to 1),
-# the cap (1 per step to every survivor) and the 0.5 s floor - leaving
-# `MAX_ENTRIES_SCANNED = 64` as the only bound. That is a bound on ENTRIES, not on
-# BYTES: one entry is a whole rank window (11,468,800 B on the live box, see
-# MAX_PINNED_ROWS_PER_REGION's comment), so one apply point could put 64 x 11.5 MB
-# ~= 735 MB of host-synchronous PCIe in front of the worker's message loop.
+# THE ONE BOUND ON THE DELIVERY LOOP (0.2.57). The 0.2.56 fix put TWO budgets in front
+# of every entry - a 0.25 s step budget and a 64 MiB byte budget - and the operator
+# ruled that out of the design: this tier has had fine-grained caps on the disk read and
+# write paths before, they strangled throughput, and the standing answer was to replace
+# them with one generous timeout. He is right on the substance, and the numbers say so
+# twice over: a 0.25 s budget defers ~57 of the 62 blocks of a normal large restore
+# (735 MB against 64 MiB is ~5 entries), so the prune it gates would almost never fire -
+# a guard that turns the feature into a no-op is not a safety feature - while pageable
+# PCIe at ~5 GB/s puts a whole 735 MB step at ~0.15 s, so a generous bound never bites
+# in normal operation and exists ONLY for the copy that never comes back.
+#
+# WHY 10 SECONDS, stated against the two fork numbers the incident actually produced -
+# both read out of the running fork (`/home/user/Source/experiment/vllm-dev`), not from
+# memory, and one of them corrects what 0.2.56 believed:
+#
+#   * `No available shared memory broadcast block found in 60 seconds` is NOT a give-up.
+#     It is the WARNING CADENCE: `VLLM_RINGBUFFER_WARNING_INTERVAL` defaults to 60
+#     (`vllm/envs.py:20`, `:1090`) and the reader emits `LONG_WAIT_TIME_LOG_MSG` every
+#     60 s while it waits, and it WAITS FOREVER - `MessageQueue.dequeue` reads with
+#     `indefinite=True` and re-checks on `SHM_READER_RECHECK_INTERVAL_MS` (5,000 ms,
+#     `shm_broadcast.py:66`, `:739-746`). So 60 s is the first SYMPTOM of a stalled step
+#     thread, not a deadline, and there is no threshold to sit 6x inside.
+#   * The deadline that ended the process is the executor's RPC timeout:
+#     `TimeoutError: RPC call to sample_tokens timed out` (`multiproc_executor.py:686`)
+#     fires from a deadline of `envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`, which defaults
+#     to 300 s (`vllm/envs.py:242`) and is what `sample_tokens` passes
+#     (`multiproc_executor.py:609`). Nothing on this boot overrides it (no such line in
+#     the launcher). 0.2.56's "~118 s" was the observed gap between log lines in the
+#     crash window, not the threshold; the threshold is 300 s.
+#
+# So 10 s is ~30x inside the ONLY deadline the engine enforces and ~60x above the time a
+# real restore measured. It is an escape hatch with a name, not a throughput cap.
+#
+# THE MECHANISM IT BOUNDS, unchanged from 0.2.56. The delivery copy's SOURCE is
+# `worker.cpu_kv_caches`, and the running fork allocates that arena with
+# `torch.zeros(cpu_shape, dtype=..., device="cpu")`
+# (`v1/simple_kv_offload/worker.py:232`)
+# - PAGEABLE, not page-locked. A host->device `copy_(src, non_blocking=True)` out of
+# pageable host memory is NOT asynchronous: the runtime stages it through its own bounce
+# buffer and returns only once the bytes have left, so the call BLOCKS THE ENGINE STEP
+# THREAD for the whole copy. This module states the rule in the other direction at
+# `_copy_device_to_host`: "a pageable destination would have made it synchronous ON THE
+# STEP THREAD, which is the single most expensive mistake available here". The delivery
+# branch broke the rule in the H2D direction, and the mode lifted the other three guards
+# at the same time - the sample (1-in-64 to 1), the cap (1 per step to every survivor)
+# and the 0.5 s floor - leaving `MAX_ENTRIES_SCANNED = 64` as the only bound. That is a
+# bound on ENTRIES, not on BYTES: one entry is a whole rank window (11,468,800 B on the
+# live box, see MAX_PINNED_ROWS_PER_REGION's comment), so one apply point could put
+# 64 x 11.5 MB ~= 735 MB of host-synchronous PCIe in front of the worker's message loop.
 #
 # THAT IS HOW THE ENGINE DIED ON 2026-10-09 AT 14:19. With both flags up, the proxy's
 # 198,400-token conversation was adopted and its first delivery step never came back:
-# EngineCore logged `No available shared memory broadcast block found in 60 seconds`
-# and then `TimeoutError: RPC call to sample_tokens timed out`, which takes the process
-# down. This module's section in all four rank files still read `delivered=None`,
+# EngineCore logged `No available shared memory broadcast block found in 60 seconds` and
+# then `TimeoutError: RPC call to sample_tokens timed out`, which takes the
+# process down.
+# This module's section in all four rank files still read `delivered=None`,
 # `direct_writes=None` and the prune reported `steps=0` with every refusal counter 0 -
 # NOT because the apply point never ran, but because the delivery branch counted itself
 # AFTER the copy loop and the step never left that loop.
 #
-# THE BUDGET IS TWO NUMBERS CHECKED BEFORE EACH ENTRY OF THE STEP, and stopping is a
+# THE BOUND IS ONE NUMBER CHECKED BEFORE EACH ENTRY OF THE STEP, and stopping is a
 # `continue`, not a failure: an entry this module did not enqueue is absent from
 # `written_indices`, so `disk_restore.prune_adopted_restores` cannot remove it and the
-# FORK copies it. A budget stop therefore costs a MISSED OPTIMIZATION for the entries
-# after it and nothing else; no budget costs the engine. The clock is the guard against
-# a copy that is slow or stuck (a device behind on its queue, driver-lock contention
-# with this module's own pinned allocation); the byte total is what makes the worst case
-# a STATED number instead of an emergent one. The byte budget also bounds the FIRST
-# entry of a step, via `delivery_refused_entry_too_wide` below: a single
-# `cudaMemcpyAsync` cannot be interrupted from this thread, so the only honest bound on
-# it is to refuse one that is too wide to fit the step's own budget.
-DELIVERY_STEP_BUDGET_SECONDS = 0.25
-DELIVERY_STEP_BYTE_BUDGET = 64 * 1024 * 1024
+# FORK copies it. A timeout stop therefore costs a MISSED OPTIMIZATION for the entries
+# after it and nothing else; no bound at all costs the engine. "Before each entry" is
+# the only place a bound can live at all: one `copy_` out of pageable memory cannot be
+# interrupted from this thread, so an entry already started is one already paid for.
+# 0.2.56 answered that with a second bound - refusing a FIRST entry wider than its byte
+# budget (`delivery_refused_entry_too_wide`). It is GONE in 0.2.57: at 10 s the widest
+# entry this box has (11.5 MB, ~2 ms of PCIe) cannot approach the bound, so refusing it
+# bought a counter and no safety, and a key that can never move is worse than no key.
+DELIVERY_APPLY_TIMEOUT_SECONDS = 10.0
+# The clamp on an OPERATOR'S override, not a cap on the loop. Past the engine's own
+# warning cadence the number stops describing anything real: a step held longer than
+# `VLLM_RINGBUFFER_WARNING_INTERVAL` is already a stalled step thread shouting in the
+# log, and the timeout's whole job is to not get there. Published when it binds
+# (`delivery_mode.timeout_clamped`), like every other clamp in this package, so a
+# value that was clamped never reads as a value that was honoured.
+DELIVERY_APPLY_TIMEOUT_MAX = 60.0
 
 MAX_REASON_SAMPLES = 6
 MAX_REASON_CHARS = 120
@@ -351,21 +391,29 @@ _COUNTER_KEYS = (
     "delivery_writes",
     "delivered_unwitnessed",
     "delivery_steps",
-    # --- THE STEP-THREAD BUDGET (0.2.56; see DELIVERY_STEP_BUDGET_SECONDS).
-    # `delivery_attempted` is counted BEFORE the copies of a delivered entry are
-    # enqueued, which is the entire point of it: every other delivery counter moved
-    # after the copy loop, so a boot that died inside its first delivery published
-    # `delivered=None` and was indistinguishable from a boot whose apply point was never
-    # reached. `delivery_attempted > 0` beside `writes == 0` names the difference, and
-    # it is the positive proof the operator asked for before re-enabling the flags.
-    # `delivery_deferred_entries` / `delivery_deferred_steps` count what the budget
-    # refused - the fork copies those, so this is a throttle with a name, not a fault -
-    # and `delivery_refused_entry_too_wide` an entry whose own window exceeds the whole
-    # step's byte budget, refused rather than copied.
+    # --- THE STEP-THREAD BOUND (0.2.56's counters, kept by 0.2.57; see
+    # DELIVERY_APPLY_TIMEOUT_SECONDS). `delivery_attempted` is counted BEFORE the copies
+    # of a delivered entry are enqueued, which is the entire point of it: every other
+    # delivery counter moved after the copy loop, so a boot that died inside its first
+    # delivery published `delivered=None` and was indistinguishable from a boot whose
+    # apply point was never reached. `delivery_attempted > 0` beside `writes == 0` names
+    # the difference, and it is the positive proof the operator asked for before
+    # re-enabling the flags. `delivery_deferred_entries` / `delivery_deferred_steps`
+    # count what the timeout refused - the fork copies those, so this is a throttle with
+    # a name, not a fault - and they keep that meaning under one bound exactly as they
+    # had it under two budgets.
+    #
+    # `delivery_refused_entry_too_wide` (0.2.56) is REMOVED here rather than left at a
+    # permanent zero. It named a refusal the byte budget made - a first entry wider than
+    # the whole step's byte budget - and the byte budget is gone: with one 10 s
+    # bound and
+    # an entry of 11.5 MB at ~2 ms, nothing on this box can reach it. A key that can
+    # never move is worse than a removed one, because it teaches a reader to skim the
+    # zeros. The `written_indices` membership test that made the refusal safe is
+    # untouched and is what any future bound will lean on again.
     "delivery_attempted",
     "delivery_deferred_entries",
     "delivery_deferred_steps",
-    "delivery_refused_entry_too_wide",
     # --- THE KILL-SWITCH. `kill_switch_fired` is 0 or 1 and never more, because the
     # latch is one-shot; `kill_switch_declined` counts the mismatches that arrived AFTER
     # it fired or that were NOT attributable to our own copy, so "the switch never fired
@@ -463,12 +511,13 @@ def _fresh_state() -> dict:
         "pinned_peak": 0,
         "sample_cursor": 0,
         "last_write_mono": None,
-        # THE STEP-THREAD TIME THE BUDGET SAW (0.2.56). `last` is this delivery step's
-        # wall clock as the apply point measured it, `peak` the worst since boot. Both
-        # are floats, not counters, because a counter is an int and an integer second
-        # budget would be a different, worse budget. `None` means no delivery step has
-        # finished since boot - which, after 0.2.56, means either that none started or
-        # that one started and never returned; `delivery_attempted` tells those apart.
+        # THE STEP-THREAD TIME THE BOUND SAW (0.2.56's keys, kept by 0.2.57). `last` is
+        # this delivery step's wall clock as the apply point measured it, `peak` the
+        # worst since boot. Both are floats, not counters, because a counter is an int
+        # and an integer second bound would be a different, worse bound. `None` means no
+        # delivery step has finished since boot - which, after 0.2.56, means either that
+        # none started or that one started and never came back; `delivery_attempted`
+        # tells those apart.
         "delivery_step_seconds_last": None,
         "delivery_step_seconds_peak": 0.0,
         "last_pass_mono": None,
@@ -666,6 +715,46 @@ def _resolve_delivery_env() -> dict:
             "env_var": config.ENV_DISK_GPU_WRITE_DELIVERY}
 
 
+def _delivery_apply_timeout_seconds() -> dict:
+    """THE ONE BOUND ON A DELIVERY STEP, in force: the operator's, else the constant.
+
+    Read per apply point, like `disk_spill._ceiling_budget_seconds` and this module's
+    other env readers, so a test's monkeypatch and an operator's systemd drop-in both
+    take effect without a rebuild - which is the whole point of 0.2.57 making the number
+    tunable. Its only job is to sit the right distance from a threshold someone measured
+    once, and a distance is an argument, not a constant worth a redeploy.
+
+    An unusable value is NOT a second default here - `config.delivery_timeout_env`
+    already refused it and said why - it is the constant, which is what the release
+    shipped with. A refusal is ONE LOG LINE PER EPISODE (`_note_once`, the `disk_shadow`
+    idiom) rather than a published key: `delivery_state` is read by a dashboard's poller
+    and lives inside a section whose byte ceiling the rank writer ENFORCES by refusing
+    the whole section, so the effective value and the clamp are published and the text
+    that explains a typo belongs in the log.
+    """
+    problems: list = []
+    seconds = DELIVERY_APPLY_TIMEOUT_SECONDS
+    try:
+        env = config.delivery_timeout_env()
+        problems = list(env.get("problems") or [])
+        if env.get("seconds") is not None:
+            seconds = float(env["seconds"])
+    except Exception as exc:  # noqa: BLE001 - a bound is never worth a fault
+        snapshot._error(exc, "disk_gpu_write delivery timeout")
+        problems = [f"the environment could not be read: {type(exc).__name__}"]
+    clamped = seconds > DELIVERY_APPLY_TIMEOUT_MAX
+    if clamped:
+        seconds = DELIVERY_APPLY_TIMEOUT_MAX
+    for problem in problems:
+        _note_once(f"delivery-timeout:{problem}",
+                   f"[disk_gpu_write] delivery step bound IGNORED "
+                   f"({problem}); using "
+                   f"{round(seconds, 3)} s "
+                   f"({DELIVERY_APPLY_TIMEOUT_SECONDS} s shipped, or the operator's "
+                   "value under the clamp)")
+    return {"seconds": seconds, "clamped": clamped, "problems": problems}
+
+
 def delivery_state() -> dict:
     """One stable-key answer to "is this writer DELIVERING, or only witnessing?".
 
@@ -679,6 +768,9 @@ def delivery_state() -> dict:
     """
     env = _resolve_delivery_env()
     writer = bool(effective_enabled())
+    # ONE read of the bound per call: it is an `env` read plus a clamp, and calling it
+    # once per published key would read the environment twice for one answer.
+    timeout = _delivery_apply_timeout_seconds()
     with _lock:
         latched = _state["kill_switch"] is not None
         step_last = _state["delivery_step_seconds_last"]
@@ -695,9 +787,9 @@ def delivery_state() -> dict:
                   "same-execution readback mismatch proved our own copy wrong, so the "
                   "throttles are back and the fork's copy is the delivery again")
     else:
-        reason = ("delivering: every applied entry of the step is written up to the "
-                  "step budget, and the prune may remove only entries this module "
-                  "enqueued")
+        reason = ("delivering: every applied entry of the step is written until the "
+                  "step's one wall-clock bound expires, and the prune may remove only "
+                  "entries this module enqueued")
     return {"requested": bool(env["enabled"]),
             "effective": bool(env["enabled"] and writer and not latched),
             "writer_enabled": writer,
@@ -706,21 +798,28 @@ def delivery_state() -> dict:
             "recognised": bool(env["recognised"]),
             "env_var": env["env_var"],
             "reason": reason,
-            # THE STEP-THREAD TIME THE BUDGET SAW (0.2.56). THESE ARE THE TWO KEYS THAT
-            # ANSWER "DID THE APPLY POINT ACTUALLY RUN, AND HOW LONG DID THE ENGINE STEP
-            # WAIT FOR US" - the question the 2026-10-09 crash window could not answer,
-            # because every delivery counter lived after the copy loop. `last` is the
-            # step's wall clock in SECONDS (rounded to milliseconds: an unrounded
-            # `time.monotonic()` is 17 significant digits and this section has a byte
-            # budget the rank writer ENFORCES by refusing the whole section), `peak` the
-            # worst since boot. The budget itself is a build constant
-            # (`DELIVERY_STEP_BUDGET_SECONDS` / `DELIVERY_STEP_BYTE_BUDGET`) and is
-            # deliberately NOT published: the section is at its cap, and a constant is
-            # the cheapest thing to leave out when the choice is between it and the
-            # sentence that explains a fault.
+            # THE STEP-THREAD TIME THE BOUND SAW (0.2.56's keys, kept by 0.2.57). THESE
+            # ARE THE TWO KEYS THAT ANSWER "DID THE APPLY POINT ACTUALLY RUN, AND HOW
+            # LONG DID THE ENGINE STEP WAIT FOR US" - the question the 2026-10-09 crash
+            # window could not answer, because every delivery counter lived after the
+            # copy loop. `last` is the step's wall clock in SECONDS (rounded to
+            # milliseconds: an unrounded `time.monotonic()` is 17 significant digits and
+            # this section has a byte budget the rank writer ENFORCES by refusing the
+            # whole section), `peak` the worst since boot. They are also how an operator
+            # sees whether the bound has EVER bitten: `step_seconds_peak` near
+            # `timeout_seconds` is the answer, and it needs no new counter.
             "step_seconds_last": (None if step_last is None
                                   else round(float(step_last), 3)),
-            "step_seconds_peak": round(step_peak, 3)}
+            "step_seconds_peak": round(step_peak, 3),
+            # THE BOUND ITSELF, IN FORCE ON THIS PROCESS (0.2.57). 0.2.56 deliberately
+            # did not publish its budgets, because a build constant is the cheapest
+            # thing to leave out when the choice is between it and the sentence that
+            # explains a fault. That argument died with the constants: a value the
+            # operator can override through `env` must be readable back, or a typo in a
+            # systemd drop-in is a fact about the boot nobody can check. `clamped` says
+            # when the operator's number was not the number in force.
+            "timeout_seconds": round(float(timeout["seconds"]), 3),
+            "timeout_clamped": bool(timeout["clamped"])}
 
 
 def effective_delivery_mode() -> bool:
@@ -1654,8 +1753,15 @@ def observe_apply(worker, batch, failed) -> dict:
         floor = float(limits["min_interval_seconds"])
         delivery = bool(limits["delivery"])
         delivery_started = time.monotonic()
-        delivery_bytes = 0
         deferred = 0
+        # THE ONE BOUND OF THIS STEP, computed once so every entry is measured against
+        # the same deadline (re-reading the env per entry would let a value that cannot
+        # change move the goalposts mid-step). Delivery-only, like the budgets it
+        # replaced in 0.2.56: the witness posture already carries a 1-per-step cap and a
+        # 0.5 s floor, so it never reaches a volume a bound like this would bind on.
+        step_timeout = (_delivery_apply_timeout_seconds() if delivery else None)
+        delivery_deadline = (delivery_started + float(step_timeout["seconds"])
+                             if delivery else None)
         if delivery:
             with _lock:
                 _count("delivery_steps")
@@ -1723,22 +1829,20 @@ def observe_apply(worker, batch, failed) -> dict:
                 with _lock:
                     _count("throttled_step")
                 continue
-            # THE STEP-THREAD BUDGET (0.2.56), and it is DELIVERY-ONLY on purpose: the
-            # witness posture already carries a 1-per-step cap and a 0.5 s floor, so it
-            # never reaches a volume this budget would bind on, and touching its loop
-            # would change the shipped path for no protection. A stop is a `continue`,
-            # not a `return` and not a refusal: the entries already copied stay covered,
-            # the ones after the stop stay uncovered, and an uncovered entry is a FORK
-            # copy rather than a hole. The clock is the guard (a stalled or slow
-            # synchronous copy, whatever the cause); the byte total makes the worst case
-            # a stated number. Both are checked BEFORE the entry, because the entry is
-            # the thing that can block this thread.
-            if delivery:
-                spent = time.monotonic() - delivery_started
-                if spent >= DELIVERY_STEP_BUDGET_SECONDS \
-                        or delivery_bytes >= DELIVERY_STEP_BYTE_BUDGET:
-                    deferred += 1
-                    continue
+            # THE ONE BOUND OF THE STEP (0.2.57; see DELIVERY_APPLY_TIMEOUT_SECONDS),
+            # and it is DELIVERY-ONLY on purpose: the witness posture already carries a
+            # 1-per-step cap and a 0.5 s floor, so it never reaches a volume this bound
+            # would bind on, and touching its loop would change the shipped path for no
+            # protection. A stop is a `continue`, not a `return` and not a refusal: the
+            # entries already copied stay covered, the ones after the stop stay
+            # uncovered, and an uncovered entry is a FORK copy rather than a hole. This
+            # is checked BEFORE the entry because the entry is the thing that can block
+            # this thread - a `copy_` out of pageable host memory, once started, cannot
+            # be interrupted from here, so a bound placed after it would be a bound on
+            # the NEXT stall rather than this one.
+            if delivery and time.monotonic() >= delivery_deadline:
+                deferred += 1
+                continue
             with _lock:
                 last = _state["last_write_mono"]
                 if floor > 0.0 and last is not None \
@@ -1747,12 +1851,6 @@ def observe_apply(worker, batch, failed) -> dict:
                     continue
             outcome = _write_one(worker, job, event, delivery=delivery)
             if outcome.get("written"):
-                if delivery:
-                    # CHARGED TO THE STEP, AND ONLY FOR A COPY THAT WAS ENQUEUED: the
-                    # byte budget bounds the NEXT entry, and an entry that was refused
-                    # (too wide, no stream, a raised copy) put no bytes on the
-                    # wire, so charging it would let a refusing step starve itself.
-                    delivery_bytes += int(_int_or_none(job.get("bytes")) or 0)
                 written += 1
                 # THE MEMBERSHIP, not the count: `job_id` is the index into this step's
                 # `load_cpu_blocks`/`load_gpu_blocks`, which is the same index space
@@ -1774,11 +1872,13 @@ def observe_apply(worker, batch, failed) -> dict:
                 refusal = outcome.get("reason")
                 refusal_cause = outcome.get("cause")
         if delivery:
-            # THE STEP'S OWN WALL CLOCK, published (0.2.56). `step_seconds_last` is the
-            # one number in this section that says "the apply point ran AND how long the
-            # engine step waited for us", which is exactly what the 2026-10-09 crash
-            # window could not say: every delivery counter lived after the copy loop, so
-            # a step that never left it looked identical to a hook that never ran.
+            # THE STEP'S OWN WALL CLOCK, published (0.2.56's keys, kept by 0.2.57).
+            # `step_seconds_last` is the one number in this section that says "the apply
+            # point ran AND how long the engine step waited for us", which is exactly
+            # what the 2026-10-09 crash window could not say: every delivery counter
+            # lived after the copy loop, so a step that never left it looked identical
+            # to a hook that never ran. Beside `delivery_mode.timeout_seconds` it is
+            # also how an operator sees whether the bound has ever bitten.
             spent = time.monotonic() - delivery_started
             with _lock:
                 if deferred:
@@ -1946,24 +2046,20 @@ def _write_one(worker, job: dict, event, delivery: bool = False) -> dict:
         taken = None
     names = [region["name"] for region in plan["regions"]]
     if delivery:
-        # THE ENTRY'S OWN BOUND (0.2.56). One `copy_` out of pageable host
-        # memory cannot be interrupted from this thread, so the only honest bound on
-        # the FIRST entry of a step is to refuse one whose window alone exceeds the
-        # step's byte budget: it
-        # is refused here rather than copied, so it is absent from `written_indices`, so
-        # the prune cannot remove it, so the fork copies it. Counted BEFORE the copies
-        # for the same reason: a delivery that dies inside its copy must still leave a
-        # trace, and `delivery_attempted > 0` with `writes == 0` is the signature of
-        # "the apply point ran and the copy is what did not come back" - the reading the
-        # 2026-10-09 rank files could not offer, where every delivery counter read None
-        # and an unarmed hook was indistinguishable from a fatal one.
-        if width > DELIVERY_STEP_BYTE_BUDGET:
-            return _refuse("delivery_refused_entry_too_wide",
-                           f"this entry's window is {width} B and the whole delivery "
-                           f"step's budget is {DELIVERY_STEP_BYTE_BUDGET} B: one "
-                           "host->device copy out of the fork's PAGEABLE CPU arena is "
-                           "synchronous on the step thread and cannot be interrupted, "
-                           "so it is refused and left to the fork's copy thread")
+        # COUNTED BEFORE THE COPIES, and this is the one piece of 0.2.56's byte budget
+        # that survives: a delivery that dies inside its copy must still leave a trace,
+        # and `delivery_attempted > 0` with `writes == 0` is the signature of "the apply
+        # point ran and the copy is what did not come back" - the reading the 2026-10-09
+        # rank files could not offer, where every delivery counter read None and an
+        # unarmed hook was indistinguishable from a fatal one.
+        #
+        # 0.2.56 also REFUSED an entry whose window exceeded the step's byte budget here
+        # (`delivery_refused_entry_too_wide`), on the grounds that one `copy_` out of
+        # pageable host memory cannot be interrupted from this thread. The refusal goes
+        # with the byte budget: at one 10 s bound and a 11,468,800 B window that costs
+        # ~2 ms, an entry cannot reach the bound, so the branch could only ever fire on
+        # a box whose PCIe had already stopped. The bound that remains is enforced one
+        # level up, in `observe_apply`, before each entry.
         with _lock:
             _count("delivery_attempted")
     if not witness:
