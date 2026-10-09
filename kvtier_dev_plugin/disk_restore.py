@@ -7918,9 +7918,78 @@ def prune_adopted_restores(metadata, batch, drop_set,
         return answer
 
 
+# THE TRUNCATION GATE'S UNITS (its counters shipped in 0.2.53; published in the
+# `load_prune` document since 0.2.54, where the HTTP route can actually be read).
+# Every one of these is incremented ONLY by `observe_group_take_truncation`, which
+# runs on the ALLOC path - a SCHEDULER-side door a worker never calls. So a zero in an
+# answer from a process that never allocs means "this process is not the one that
+# takes", not "the boot is clean": `role` and `layer_installed_here` beside them say
+# which process answered, and `group_take_observations` says whether it looked at all.
+# Module scope, not inline in `prune_state()`, so the prose fits the line length.
+_PRUNE_TAKE_GATE_UNITS = {
+    "group_take_observations": "THE DENOMINATOR OF EVERY OTHER NUMBER IN THIS BLOCK: "
+                               "how many times the alloc-time gate measured the fork's "
+                               "own per-group take `n_take_g` against that group's CPU "
+                               "hit list. Without it a zero below is ambiguous; with "
+                               "it, `group_take_dropped_groups: 0` means 'looked and "
+                               "found nothing'. Measures LOOKS, never correctness "
+                               "(unit: alloc observations)",
+    "group_take_dropped_groups": "group observations where the fork's slice "
+                                 "`cpu_hit_blocks_full[g][:n_take_g]` is about to drop "
+                                 "trailing entries (`len(list) - n_take_g > 0`). MOST "
+                                 "OF THESE ARE HARMLESS: a partial adoption trims our "
+                                 "null padding every day, and a gate that refused "
+                                 "those would be switched off in a day. Read it with "
+                                 "`group_take_unbacked_groups` beside it, never alone "
+                                 "(unit: group observations)",
+    "group_take_dropped_entries": "the SUM of `len(list) - n_take_g` over those "
+                                  "groups: the same finding priced, so a one-entry gap "
+                                  "and a twenty-entry gap are told apart. Counts LIST "
+                                  "ENTRIES - not tokens, not bytes, and not KV blocks "
+                                  "the engine failed to load (unit: entries)",
+    "group_take_unbacked_groups": "THE WRONG-ANSWER SHAPE, the 2026-10-06 00:08 "
+                                  "finding in one number: a gap that drops at least "
+                                  "one REAL entry AND leaves the claimed span with no "
+                                  "real entry to pair, so a GDN/SSM recurrence would "
+                                  "resume from a GPU block nobody wrote. What it does "
+                                  "NOT measure is the OUTCOME: every sighting also "
+                                  "reports its claimed blocks through the load-error "
+                                  "channel so the engine RECOMPUTES them, so a "
+                                  "non-zero reading is 'the invariant broke and we "
+                                  "caught it', not 'a wrong token was served'. The "
+                                  "offers this made us refuse are counted ONCE, as "
+                                  "`refused[group_hit_truncated]` in the same "
+                                  "document, and are NOT repeated here under a second "
+                                  "name (unit: group observations)",
+    "group_take_unavailable": "alloc observations the gate could NOT measure at all: "
+                              "no `group_block_sizes`, no "
+                              "`prefix_cacheable_group_ids`, or no pending hit list "
+                              "for the request. The blind-case counter: it is what "
+                              "tells 'a gate that saw nothing' apart from 'a fork with "
+                              "nothing to see', and a boot where this is EVERY "
+                              "observation has an unaudited take invariant wearing six "
+                              "clean zeros (unit: alloc observations)",
+    "last_group_take_gap": "the arithmetic of the most recent sighting - the request, "
+                           "the group, that group's `group_block_sizes` entry, "
+                           "`num_external_tokens`, the `n_take_g` the fork's cdiv "
+                           "produced, the hit-list length, the difference, which "
+                           "groups were gapped and which of those were unbacked, "
+                           "whether the dropped entry was one this module offered, and "
+                           "when - or NULL when nothing has been seen. Null measures "
+                           "'never sighted', NOT 'the gate is off'; for that read "
+                           "`group_take_observations` (unit: the last sighting's "
+                           "record, or null)",
+}
+
+
 def prune_state() -> dict:
     """The Step-2/Step-3 view: the switch, the totals, the closed vocabulary, the last
     one, AND the delivery mode and kill-switch this process made its decisions under.
+
+    SINCE 0.2.54 ALSO THE TRUNCATION GATE. The gate's counters are pass-throughs of its
+    `_state` keys, added because THIS function is what both render sites publish and
+    `counters()` - which already carried them - is rendered by no HTTP route. See the
+    comment at the keys for why `group_take_refusals` is deliberately not among them.
 
     EVERY KEY IS ALWAYS PRESENT, IN EVERY PROCESS. This view is read in the scheduler
     process (where nothing ever writes a GPU window and the kill-switch can only ever be
@@ -7938,7 +8007,7 @@ def prune_state() -> dict:
                for name in PRUNE_REFUSALS}
     delivery = disk_gpu_write.delivery_state()
     kill_switch = disk_gpu_write.kill_switch_view()
-    return {"enabled": prune_switch()["enabled"],
+    view = {"enabled": prune_switch()["enabled"],
             "switch": dict(_state["prune_switch"] or prune_switch()),
             "steps": int(_state["prune_steps"]),
             "entries": int(_state["prune_entries"]),
@@ -7966,6 +8035,34 @@ def prune_state() -> dict:
             "kill_switch": kill_switch,
             "max_entries_per_step": int(MAX_PRUNE_ENTRIES_PER_STEP),
             "last": (dict(_state["last_prune"]) if _state["last_prune"] else None),
+            # THE TRUNCATION GATE (0.2.53), PUBLISHED (0.2.54). These are pass-throughs
+            # of `_state` keys, recomputed nowhere, and they live HERE because
+            # `prune_state()` is what both render sites publish: the route's
+            # `scheduler_section()["load_prune"]` and the verb's
+            # `section()["load_prune"]`. Until now they were reachable only through
+            # `counters()`, which no HTTP route renders - so on the live box the gate's
+            # `units` prose shipped beside a document that contained none of the
+            # numbers it described, and a green suite (which asserted the state dict)
+            # could not see the gap. Same names as the state keys, deliberately: one
+            # event, one name, no reader diffing two spellings of a counter.
+            #
+            # `group_take_refusals` is NOT re-exposed here. The refusal event it counts
+            # is ALREADY in this document, once, as `refused["group_hit_truncated"]`
+            # (the taxonomy name with the explanation attached), incremented from the
+            # same two lines - a second name for one event is how a reader adds it
+            # twice. The gate's OWN numbers, the ones nothing else can tell it, are the
+            # observation denominator, the two gap sizes, the wrong-answer count, and
+            # the blind-case count.
+            "group_take_observations": int(_state["group_take_observations"]),
+            "group_take_dropped_groups": int(
+                _state["group_take_dropped_groups"]),
+            "group_take_dropped_entries": int(
+                _state["group_take_dropped_entries"]),
+            "group_take_unbacked_groups": int(
+                _state["group_take_unbacked_groups"]),
+            "group_take_unavailable": int(_state["group_take_unavailable"]),
+            "last_group_take_gap": (dict(_state["last_group_take_gap"])
+                                    if _state["last_group_take_gap"] else None),
             "units": {"steps": "apply points where the switch was consulted (unit: "
                                 "steps; a step that pruned nothing still counts)",
                       "entries": "load PAIRS removed from both lists (unit: entries; "
@@ -8036,6 +8133,10 @@ def prune_state() -> dict:
                                            "has latched the kill-switch, which refuses "
                                            "every later prune for the life of the "
                                            "process (unit: boolean)"}}
+    # THE TRUNCATION GATE'S UNITS, defined at module scope so the prose fits
+    # the line length and lives beside the keys it explains.
+    view["units"].update(_PRUNE_TAKE_GATE_UNITS)
+    return view
 
 
 def worker_before_load(worker) -> dict:
@@ -9590,6 +9691,12 @@ def worker_report() -> dict:
         # that must stay 0 and `emptied` names the steps left with nothing to copy. The
         # refusal vocabulary, the per-group deltas and the last decision live in
         # `disk_restore.section()` on the verb side.
+        # THE TRUNCATION GATE IS DELIBERATELY NOT HERE (0.2.54). It runs on
+        # `update_state_after_alloc`, a SCHEDULER-side method a worker never calls, so
+        # these keys could only ever be permanent zeros in a rank file - the exact
+        # artifact this package's `units` rule exists to refuse, in a file with a byte
+        # cap. The gate's numbers are published where they move and where the route
+        # renders them: `load_prune` in `scheduler_section()` / `section()`.
         report["prune"] = {"on": bool(prune_switch()["enabled"]),
                            "steps": int(_state["prune_steps"]),
                            "entries": int(_state["prune_entries"]),

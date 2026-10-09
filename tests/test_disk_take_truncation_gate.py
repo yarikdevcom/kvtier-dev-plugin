@@ -529,6 +529,17 @@ def test_every_new_counter_declares_its_units_and_the_key_set_never_moves(armed)
     assert "group_hit_truncated" in published["refused"]
     assert published["refused"]["group_hit_truncated"] == 0
     assert "group_hit_truncated" in disk_restore.OFFER_REFUSAL_WHY
+    # THE SAME KEYS IN THE PUBLISHED DOCUMENT (0.2.54). The pin above walks
+    # `counters()`, which copies `_state` wholesale and was therefore ALWAYS complete -
+    # which is precisely why it could not catch that the route publishes
+    # `prune_state()` instead, and `prune_state()` had never heard of the gate. Both
+    # views are pinned from here on.
+    document = published_prune()
+    for key in PUBLISHED_TAKE_KEYS:
+        assert key in document, f"{key} is not in the published load_prune document"
+        if key != "last_group_take_gap":
+            assert document[key] == 0
+            assert "(unit:" in document["units"][key]
 
 
 def test_the_gate_never_raises_even_when_the_fork_s_shape_is_nonsense(armed):
@@ -636,3 +647,171 @@ def test_a_request_the_tier_never_offered_is_reported_but_not_refused(armed,
     reported = disk_restore.take_invalid_block_ids()
     assert reported == set().union(*[set(gpu[group][:RUN_BLOCKS])
                                      for group in GDN_GROUPS])
+
+
+# --- 5. THE PUBLISHED DOCUMENT: a counter that is not routed is not readable -----
+#
+# THE BLIND SPOT 0.2.53 SHIPPED WITH. Every counter above is asserted through
+# `disk_restore._state` or `counters()` - and the HTTP document an operator reads is
+# NOT `counters()`. Verified against the live box on 0.2.53: `GET
+# /plugins/kvtier/snapshot`'s `disk_restore.load_prune` carried 21 keys and not one of
+# them was the gate's, because the route publishes `scheduler_section()`, whose
+# `load_prune` is `prune_state()`, and `prune_state()` builds its keys from the
+# `prune_*` names by hand. So the suite was green, `counters()` was complete, and an
+# operator watching the 00:08-shaped failure live had the gate's `units` prose
+# describing numbers the document did not contain. THESE TESTS READ THE BUILDER.
+
+# THE SIX KEYS THE PUBLISHED `load_prune` MUST ALWAYS CARRY. `group_take_refusals` is
+# deliberately NOT among them: that event is ALREADY published once, under the refusal
+# taxonomy name `refused["group_hit_truncated"]`, from the same two lines of code, and
+# `test_the_refusal_is_counted_once_in_the_document` below pins that it stays that way.
+# A second name for one event in one document is how a reader ends up adding it twice.
+PUBLISHED_TAKE_KEYS = ("group_take_observations", "group_take_dropped_groups",
+                       "group_take_dropped_entries", "group_take_unbacked_groups",
+                       "group_take_unavailable", "last_group_take_gap")
+
+
+def published_prune() -> dict:
+    """THE `load_prune` BLOCK THE HTTP ROUTE SERVES - not the state dict.
+
+    `snapshot.py` publishes `disk_restore.scheduler_section()` as the document's
+    `disk_restore` section, so this call IS the HTTP-visible document builder. Reading
+    `_state` here would repeat the mistake this section exists to prevent.
+    """
+    return disk_restore.scheduler_section()["load_prune"]
+
+
+def test_the_published_document_carries_the_gate_in_every_state(armed, monkeypatch):
+    """STABLE KEYS, NOW ON THE WIRE, in every state the module can be asked about.
+
+    A key that appears only after the gate has fired is worse than no key: "the boot
+    never hit the shape" and "this build does not report it" are the same reading on
+    the page, and the second is the one that sends an operator to read the fork.
+    Checked in the order a boot actually visits these: a fresh process, the armed
+    posture with nothing done, the prune switch OFF, a clean audited alloc, and a gate
+    that could not measure at all. Every one must carry the same key set, and the verb
+    side must agree with the route.
+    """
+    def keys_of(view: dict) -> set:
+        return {key for key in PUBLISHED_TAKE_KEYS if key in view}
+
+    # (a) THE FIRST READ OF A FRESH BOOT (the `fresh` fixture's own posture): the
+    # counters exist and read zero. NOT `reset_state_for_tests()` - that would also
+    # drop the switches the `armed` fixture raised, and the states below need them.
+    fresh_boot = published_prune()
+    assert keys_of(fresh_boot) == set(PUBLISHED_TAKE_KEYS)
+    for key in PUBLISHED_TAKE_KEYS:
+        if key != "last_group_take_gap":
+            assert fresh_boot[key] == 0, f"{key} does not start at zero on the wire"
+    assert fresh_boot["last_group_take_gap"] is None
+
+    # (b) ARMED, SWITCH UP, NOTHING DONE: the same keys, the same zeros.
+    never_fired = published_prune()
+    assert keys_of(never_fired) == set(PUBLISHED_TAKE_KEYS)
+    assert never_fired["group_take_observations"] == 0
+    # EVERY ONE OF THEM DECLARES ITS UNIT IN THIS DOCUMENT, not only in `counters()`:
+    # the route serves `load_prune`'s own `units`, and a bare number there is the same
+    # bug as a missing one.
+    units = never_fired["units"]
+    for key in PUBLISHED_TAKE_KEYS:
+        assert str(units.get(key, "")).strip(), f"{key} reaches the wire with no unit"
+        assert "(unit:" in units[key], f"{key}'s unit is not stated on the wire"
+
+    # (c) THE PRUNE SWITCH OFF: a disarmed posture is a reading, not an absence.
+    # A SCOPED context, not `monkeypatch.undo()`: the `armed` fixture's own patches
+    # (the spill root among them) would go with it, and the two states after this one
+    # still need them.
+    with monkeypatch.context() as patch:
+        patch.setattr(disk_restore, "prune_switch",
+                      lambda: {"enabled": False, "raw": None,
+                               "recognised": True, "source": "test",
+                               "env_var":
+                               "VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS"})
+        disarmed = published_prune()
+    assert disarmed["enabled"] is False
+    assert keys_of(disarmed) == set(PUBLISHED_TAKE_KEYS)
+
+    # (d) A CLEAN AUDITED ALLOC: the DENOMINATOR moves on the wire, which is the only
+    # thing that makes the zeros above mean "audited and clean".
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    clean = live_offer("req-clean-wire")
+    Alloc(clean, "req-clean-wire").see()
+    audited = published_prune()
+    assert audited["group_take_observations"] >= 1
+    assert audited["group_take_dropped_groups"] == 0
+    assert audited["last_group_take_gap"] is None
+
+    # (e) THE GATE COULD NOT MEASURE: the blind case has its own name on the wire too.
+    del clean.prefix_cacheable_group_ids
+    del clean.group_block_sizes
+    Alloc(clean, "req-clean-wire").see()
+    blind = published_prune()
+    assert blind["group_take_unavailable"] >= 1
+    assert keys_of(blind) == set(PUBLISHED_TAKE_KEYS)
+
+    # THE VERB SIDE AND THE ROUTE AGREE, key for key: one builder, two render sites.
+    assert set(disk_restore.section()["load_prune"]) == set(audited)
+
+
+def test_a_process_with_nothing_fitted_still_answers_the_gate_keys():
+    """THE DEGRADED VIEW: a process that installed nothing answers in full.
+
+    The state an operator meets when the layer never fitted - no class, no boot
+    switches, no spill root - is the one where a missing key is most likely to be read
+    as "this build has no gate". `prune_state()` builds its keys from `_state`, and
+    every gate key is in `_state` at import, so the empty process answers zeros and a
+    null and the verb side agrees with the route key for key.
+    """
+    disk_restore.reset_state_for_tests()
+    view = disk_restore.scheduler_section()
+    document = view["load_prune"]
+    assert view["layer_installed_here"] is False
+    assert {key for key in PUBLISHED_TAKE_KEYS if key in document} \
+        == set(PUBLISHED_TAKE_KEYS)
+    assert document["group_take_observations"] == 0
+    assert document["last_group_take_gap"] is None
+    for key in PUBLISHED_TAKE_KEYS:
+        assert "(unit:" in document["units"][key]
+    assert set(disk_restore.section()["load_prune"]) == set(document)
+
+
+def test_the_gate_counters_move_in_the_published_document_not_only_the_state(
+        armed, monkeypatch):
+    """THE COUNTER AN OPERATOR CAN READ, proved by the same mutation as section 3.
+
+    The mutation is the cheapest available way to make the gate fire for real on the
+    live geometry, and the assertion is deliberately NOT on `_state`: 0.2.53's tests
+    all read the dict, which is exactly how an unrouted counter survived a green
+    suite. If the counter moves in `disk_restore._state` and not in
+    `scheduler_section()["load_prune"]`, this fails - and that gap is the bug.
+    """
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    before = published_prune()
+    assert before["group_take_unbacked_groups"] == 0
+
+    _mutated_merge(monkeypatch)
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    manager = live_offer("req-wire")
+    verdict = Alloc(manager, "req-wire").see()
+    assert verdict["refused"] is True
+
+    view = disk_restore.scheduler_section()
+    published = view["load_prune"]
+    assert published["group_take_observations"] >= 1
+    assert published["group_take_dropped_groups"] == len(GDN_GROUPS)
+    assert published["group_take_dropped_entries"] == len(GDN_GROUPS)
+    assert published["group_take_unbacked_groups"] == len(GDN_GROUPS), \
+        "the wrong-answer count is invisible on the wire"
+    assert published["group_take_unavailable"] == 0
+    gap = published["last_group_take_gap"]
+    assert isinstance(gap, dict) and gap["unbacked_groups"] == list(GDN_GROUPS)
+    assert gap["our_entry_is_dropped"] is True
+    # THE REFUSAL IS COUNTED ONCE, in this same document, under the taxonomy name -
+    # and NOT re-exposed beside it under the gate's own name.
+    assert view["refused"]["group_hit_truncated"] == 1
+    assert "group_take_refusals" not in published, \
+        "one event, one name in one document"
+    # And the pass-through is a copy: a reader mutating the document cannot move the
+    # module's own record of the sighting.
+    gap["request_id"] = "scribbled"
+    assert disk_restore._state["last_group_take_gap"]["request_id"] != "scribbled"

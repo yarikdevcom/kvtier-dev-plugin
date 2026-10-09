@@ -4400,7 +4400,8 @@ The refusal reason is in the existing taxonomy: `group_hit_truncated` is a membe
 `OFFER_REFUSALS` with an `OFFER_REFUSAL_WHY` entry, so `refused[group_hit_truncated]` and
 `last_refusal` carry it without a new payload key.
 
-**Tests.** `tests/test_disk_take_truncation_gate.py` (17 tests, 0.2.53) opens with the pure
+**Tests.** `tests/test_disk_take_truncation_gate.py` (20 tests, 0.2.53 + 0.2.54) opens with the
+pure
 predicate - exact take, shorter list, one entry longer, a tail of nulls, an unmeasurable
 geometry - and then the door itself. The test to read first is
 `test_the_mutated_padding_line_moves_the_truncation_counter`: it does not hand the gate a
@@ -4419,6 +4420,64 @@ alloc; a foreign claim (a tuple with no `_loads` entry) reported but NOT refused
 (string entries, `None` sizes, an argument-less request) coming back as a status and never an
 exception; and the wiring itself asserted through `make_wrapper(METHOD_ALLOC)` - the fork's body
 pops the tuple, and the gate still saw it.
+
+### Reading the gate in production (`load_prune.group_take_*`, 0.2.54)
+
+0.2.53 shipped the gate with a hole in it: **its counters were not readable on the wire.** They
+lived in `disk_restore._state`, and `counters()` - which copies that dict wholesale - is rendered
+by no HTTP route. The route publishes `disk_restore/scheduler_section()`, whose `load_prune` block
+is `prune_state()`, and `prune_state()` assembles its keys by hand from the `prune_*` names and had
+never heard of the gate. Verified live on the running 0.2.53 box: `GET /plugins/kvtier/snapshot`'s
+`disk_restore.load_prune` carried 21 keys, none of them the gate's, while its own `units` prose
+described numbers the document did not contain. The suite was green throughout, because every test
+in it asserted `disk_restore._state` - a counter in the state dict and a counter in the published
+document are two different facts, and only one of them can be read during an incident.
+
+0.2.54 publishes them, as pass-throughs, under the same names. **`group_take_refusals` is
+deliberately not among them**: that event is already in the document once, as
+`refused[group_hit_truncated]`, incremented from the same two lines, and a second name for one
+event is how a reader ends up counting it twice.
+
+```bash
+# READ-ONLY. The snapshot route is token-gated; the token is read from the engine's own environ.
+# The box's shell is zsh: every path is quoted and no glob is allowed to fail.
+T=$(tr "\0" "\n" < /proc/$(systemctl show vllm-engine -p MainPID --value)/environ \
+     | sed -n "s/^VLLM_E2_TIER_DEV_TOKEN=//p" | head -1)
+ssh llm "curl -s -H 'x-kvtier-dev-token: $T' http://127.0.0.1:8000/plugins/kvtier/snapshot" \
+  | python3 -c 'import json,sys
+ d = json.load(sys.stdin).get("disk_restore") or {}
+ p = d.get("load_prune") or {}
+ for k in ("group_take_observations", "group_take_dropped_groups",
+           "group_take_dropped_entries", "group_take_unbacked_groups",
+           "group_take_unavailable", "last_group_take_gap"):
+     print(f"{k:29}", p.get(k))   # .get(): a 0.2.53 or older build prints None, and says so
+ print("refused[group_hit_truncated]  ", (d.get("refused") or {}).get("group_hit_truncated"))
+ print("role", d.get("role"), "installed_here", d.get("layer_installed_here"))'
+```
+
+**What was actually observed on the live box** (read-only, just now, on the deployed 0.2.53): the
+five counters and `last_group_take_gap` printed `None` - the hole, on the wire, in six lines - and
+the one gate fact the build *did* route, `refused[group_hit_truncated]`, read **0**. `role
+scheduler+worker`, `layer_installed_here True`. On 0.2.54 the same command reads six zeros plus
+that same `0` on a box that has served traffic all day, and that is the expected healthy reading.
+
+**A zero there is a measurement of "the gate never fired", not of "the gate is working."** The
+proof it is working is the denominator beside it: `group_take_observations` must be climbing (it
+moves once per alloc that reaches `update_state_after_alloc` with an external load) and
+`group_take_unavailable` must stay 0 - a boot where every observation is `unavailable` has an
+unaudited take invariant and six pretty zeros. And a zero in an answer from a process that never
+allocs means "this process is not the one that takes": the gate runs on the scheduler-side alloc
+path, which is why the numbers are published where they move (`load_prune` in the route's and the
+verb's answer) and NOT in a worker rank file, where they could only ever be permanent zeros in a
+byte-capped file.
+
+**How to prove a counter increments without touching production.** You do not need a load, a
+request or a restart: `uv run pytest tests/test_disk_take_truncation_gate.py -k
+move_in_the_published` re-executes the shipped `_merge_into_pending` in memory with the ONE line
+changed that makes an align group's hit list longer than the fork's take, runs the same offer as
+its own control, and asserts the counters moved **in `scheduler_section()["load_prune"]`** - the
+builder the route serves, not the state dict. It runs on ctypes fakes: no engine, no torch, no
+network, no box.
 
 ## Pruning the pairs an adopted restore no longer needs (`disk_restore.py`, 0.2.49)
 
