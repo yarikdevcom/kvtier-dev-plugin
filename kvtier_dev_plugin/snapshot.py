@@ -22,6 +22,13 @@ method is dispatched from the EngineCore busy loop
     at :92). It catches `Exception`, never `BaseException`: a
     KeyboardInterrupt or SystemExit must not be swallowed by a diagnostic.
 
+TWO `*VERSION` FACTS, NEVER ONE: the top-level `version` is the SCHEMA of this
+document (`PROTOCOL_VERSION`, what a parser pins) and `plugin_version` is the
+version of the CODE that built it, read live from `kvtier_dev_plugin.__version__`
+by the EngineCore process. A reader asking "which build is running?" reads the
+second; a reader asking "can I parse this?" reads the first. See
+`loaded_version.py` for why the installed distribution's metadata is neither.
+
 Field names below were read out of the fork at HEAD (10b8e07):
   manager.py  : `_lazy_mode`, `_target_free`, `block_size`, `hash_block_size`,
                 `fa_block_size`, `fa_gidx`, `group_block_sizes`,
@@ -120,6 +127,41 @@ def _count(container) -> int | None:
         return len(container)
     except TypeError:
         return None
+
+
+# WHICH PROCESS'S VERSION THE SNAPSHOT CARRIES. This document is built on the
+# EngineCore loop thread (the UTILITY handler in `engine_side`), and the API
+# server only forwards the bytes it was handed - so `plugin_version` here is the
+# ENGINE's loaded version and never the API server's. `/status` answers from the
+# API-server process and carries its own; the two disagreeing is the finding.
+VERSION_SCOPE = ("the EngineCore process that built this document (the API "
+                 "server forwarded it unmodified, so this is the engine's "
+                 "loaded version, not the API server's)")
+
+
+def loaded_version_fields() -> dict:
+    """The version keys, present with the same key set in EVERY state.
+
+    `version` in this document is the SCHEMA (`PROTOCOL_VERSION`) and stays that.
+    These keys answer a different question - which code is running - and are read
+    live off the package module, so they cannot be a copied literal: see
+    `loaded_version.py`.
+
+    Contained like everything else on this path: a version field that could not be
+    built is a `plugin_version: null` plus a reason, never a snapshot failure. The
+    fallback spells the three keys literally so the key set cannot drift from the
+    helper's; `tests/test_loaded_version.py` asserts the two agree. Function-level
+    import so this module's module-level imports stay `json`/`secrets`/`time`.
+    """
+    try:
+        from . import loaded_version  # noqa: PLC0415 - cycle-free stdlib sibling
+        return loaded_version.fields(VERSION_SCOPE)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic is never a snapshot
+        _error(exc, "loaded version fields")
+        return {"plugin_version": None,
+                "plugin_version_reason":
+                    f"did not build: {type(exc).__name__}",
+                "plugin_version_scope": VERSION_SCOPE}
 
 
 def _pool_view(pool) -> dict:
@@ -859,7 +901,10 @@ def build_view(engine) -> dict:
     # readable unarmed: this is the number that was three different numbers.
     tier["cpu_retained_depth"] = retained_depth_section(engine)
     return {
+        # SCHEMA version of this document. NOT a code version - `plugin_version`
+        # below is that, and it is the answer to "which build is running?".
         "version": PROTOCOL_VERSION,
+        **loaded_version_fields(),
         "epoch": epoch(),
         "ts": round(time.time(), 6),
         "mono": round(time.monotonic(), 6),
@@ -1169,6 +1214,10 @@ def snapshot_for_engine(engine, holder) -> dict:
         # Hand-built from formatted strings only: this path cannot raise. The
         # guard question is still the first thing a reader wants, even here.
         return {"version": PROTOCOL_VERSION,
+                # The version keys ride EVERY state this document can be in,
+                # including the containment path - the build question is the FIRST
+                # thing a reader wants when a snapshot came out broken.
+                **loaded_version_fields(),
                 "epoch": str(epoch()),
                 "error": f"{type(exc).__name__}: {exc}"[:300],
                 "guard_mode": _guard_mode_quietly(),

@@ -48,6 +48,7 @@ so these routes answer between requests.
 | `kvtier_dev_plugin/step_trace.py` | the two scheduler-step observers the ring reads from. Pure observers, no catching |
 | `kvtier_dev_plugin/guard_mode.py` | **development only**: the tier exception capture-and-decline, its captures, and the `guard` verb |
 | `kvtier_dev_plugin/worker_diag.py` | the worker-side per-rank JSON writer (files are how a worker reports; it has no utility channel) |
+| `kvtier_dev_plugin/loaded_version.py` | the one accessor for "which code did THIS process load?" - `kvtier_dev_plugin.__version__`, read live, never `importlib.metadata`. It publishes `plugin_version`/`plugin_version_reason`/`plugin_version_scope` into `/snapshot`, `/status` and every rank file |
 | `kvtier_dev_plugin/disk_store.py` | **development only**: the worker half of the SSD spill tier - the fingerprint THIS rank builds, the `store_keys` resolver, the store-completion spill hook (composing over `worker_diag`/`blockdump`), and the engine half of the `/disk` verb. Drives `disk_spill.py` (the queue + writer) and `disk_layout.py` (the naming rules). Stdlib only |
 | `kvtier_dev_plugin/policy_holder.py` | late-bound holder for the policy module; trial-load + swap, rollback on failure |
 | `kvtier_dev_plugin/policy.py` | **the file you edit.** `decide(view)` observes, `decide_store(ctx)` vetoes |
@@ -211,6 +212,108 @@ tests/test_routes.py asserts it never can). (`app.routes` is also fine on the fo
 pinned to `>=0.133.0,<0.137.0` and flattens included routers; newer FastAPI
 nests them behind an `_IncludedRouter`, so prefer the openapi check there.)
 
+## Which version is running - and which is only *installed*
+
+Two different facts, and on a box that was upgraded after it booted only one of
+them describes the engine:
+
+| Field | Meaning | Where it appears |
+|-------|---------|------------------|
+| `plugin_version` | the version of the code **this process imported** (`kvtier_dev_plugin.__version__`, read when the payload is built) | `/status`, `/snapshot`, every `rank-*.json` (0.2.50+) |
+| `version` | the **schema** version of the document - what a parser pins to answer "can I read this?". It has been `1` since the first release and still is | `/snapshot`, every `rank-*.json`, every verb payload |
+
+Never read one for the other. Adding a code version by *redefining* `version`
+would break every consumer that pins its schema meaning, so the two live under
+different names - and `protocol_version` / `schema_version` inside a contributed
+section stay those sections' own numbers too.
+
+**And never read `importlib.metadata.version("kvtier-dev-plugin")` as "what is
+running."** That answers which distribution is INSTALLED on the disk, i.e. what the
+NEXT process to import this package will get. A long-running engine keeps the code
+it imported at boot, so installed and loaded can legitimately disagree: they did
+in this repository while 0.2.50 was being written (`installed = 0.2.49`,
+`loaded = 0.2.50`). This is the field's only purpose - an instrument that printed
+the installed metadata reported `plugin=0.2.49` for an engine that had been running
+since before 0.2.49 existed, three times in one night.
+
+### Three surfaces, three processes
+
+The same field name, and three different processes answering for themselves. A
+value from one is never a value for another - which is why each payload also
+carries `plugin_version_scope` saying who is speaking, and
+`plugin_version_reason` (non-null only when the answer is unknowable - never a
+plausible default).
+
+| Where | Which process builds it | Notes |
+|-------|------------------------|-------|
+| `GET /plugins/kvtier/status` -> `plugin_version` | the **API-server** process | makes no engine call, so this is NOT the engine's version |
+| `GET /plugins/kvtier/snapshot` -> `plugin_version` | the **EngineCore** process (built on the loop thread; the API server forwards it unmodified) | one read-only UTILITY hop |
+| `rank-PP<pp>_TP<tp>.json` -> `plugin_version` | that **worker** rank's process | a worker answers no route, so the file is the only channel it has |
+
+The two HTTP answers disagreeing is a FINDING, not noise: it means the package was
+upgraded and one process restarted while another kept running the code it imported
+before the upgrade. Read both.
+
+### The read-only commands
+
+No restart, no engine write, no request traffic - `status` touches no engine at all
+and `snapshot` is a pure read on the utility channel. The box's login shell is zsh,
+so every remote path is quoted and the file listing uses `find`, never a bare glob.
+
+```bash
+# 1. the API-server process (no engine call at all)
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/status' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("api-server", d.get("plugin_version"), d.get("plugin_version_reason") or "")'
+
+# 2. the EngineCore process (one read-only utility hop). The `version` beside it is
+#    the SCHEMA, which stays 1.
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("engine", d.get("plugin_version"), "| schema", d.get("version"))'
+
+# 3. every worker rank, from the files the workers write. The directory is the one
+#    /status names in `worker_diagnostics.dir` (`/tmp/kv-tier-diagnostics` on the box).
+#    `ssh -n` in the loop, or the first ssh eats the list on stdin and you get one
+#    rank and a green exit.
+ssh llm 'find /tmp/kv-tier-diagnostics -maxdepth 1 -name "rank-*.json"' \
+  | while read -r f; do
+      ssh -n llm "cat $f" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["rank"], d.get("plugin_version"), "schema", d["version"])'
+    done
+```
+
+`.get()` everywhere, because a build older than 0.2.50 has no such key and the read
+must print `None` rather than raise. That is exactly what these three commands did
+on the live box on 2026-10-09, before this release was deployed: `api-server None`,
+`engine None | schema 1`, and four ranks of `PPx_TPy None schema 1` - the cue for the
+fallback below, not a bug in the reads.
+
+The engine's own `BOOT[auto]` log line carries no version string and
+`/plugins/kvtier/version` does not exist (both re-checked on the live box on
+2026-10-09); the three reads above are the whole answer.
+
+### Before 0.2.50: the fallback stays necessary
+
+An engine booted on an older build publishes none of these fields, so its running
+version can only be INFERRED from version-gated keys. That inference is the only
+tool for an old boot and must not be forgotten:
+
+- a **rank file's** `disk_gpu_shadow.pairs_cross_execution` present -> **0.2.48 or
+  newer**. Read it from `rank-PP<pp>_TP<tp>.json`, NOT from `snapshot`: that section
+  is a worker's own contribution and the snapshot has no `disk_gpu_shadow` key at all
+  (confirmed on the live box on 2026-10-09 - the snapshot's top-level sections are
+  `blockdump`, `cpu_capacity`, `disk_fill`, `disk_gpu_write`, `disk_restore`,
+  `disk_restore_verify`, `disk_spill`, `disk_store`, `guard`, `lookup_ledger`,
+  `policy`, `pr56810`, `scheduler`, `store_hook`, `tier`, `trace`, `worker_diag`).
+- a rank file's `writer.heartbeat` present -> **0.2.47 or newer**.
+
+Both were read live on 2026-10-09 on a box running such a build: its rank files
+reported `writer.heartbeat` present and `disk_gpu_shadow.pairs_cross_execution = 2`,
+so it was 0.2.48 or newer - while `/plugins/kvtier/version` answered 404,
+`/snapshot` said `"version": 1`, `/status` had no key containing "version" at all
+and only `"plugin": "kvtier_dev"` (a name), and every rank file's `version` was `1`.
+That is the state of the art for an old boot: an inference you have to remember to
+make is one you will eventually skip, which is what 0.2.50 fixed.
+
 ## Using it
 
 The whole surface, all under `/plugins/kvtier`:
@@ -286,12 +389,16 @@ level, the same facts again in `dev_state` with their `source`, `epoch` and
 `age_seconds`, and `worker_diagnostics` with the directory the worker writer was
 told to use. Because `/status` never calls the engine, `guard_mode` is `null` until
 this API process has seen an engine answer that says otherwise - it is never a
-guessed `false`.
+guessed `false`. It also answers "which code is THIS process running?" with
+`plugin_version` - the API server's own loaded version, not the engine's (see
+*Which version is running* above).
 
 `snapshot` returns the CPU pool totals/free, GPU pool totals/free,
 `pending_stores`, the ten in-flight/queue lengths, the load/store event counters,
 the eight `BoundaryStoreStats` decline reasons, scheduler lengths, the plugin's
-per-boot `epoch` (proof that two snapshots came from the same boot), the policy's
+per-boot `epoch` (proof that two snapshots came from the same boot), `plugin_version`
+(the version of the code the ENGINE process imported; the top-level `version` beside
+it is the document's SCHEMA and has been `1` all along), the policy's
 own verdict plus `decide_us` and `build_us`, the `store_hook` patch report (below)
 that says whether the runtime veto is actually live, the `cpu_capacity` clamp
 report, and the development sections - `guard_mode` (a top-level copy of the answer,
@@ -828,14 +935,24 @@ EngineCore-only. So a worker reports through a **file**: one per rank, into
   and one raising `SystemExit` cannot end it. **Read the state in the rank file -
   `writer.heartbeat.state`** (`beating`, `alive_not_beating`, `started_not_alive`,
   `never_started`, `not_applicable`): `heartbeat_alive` in `snapshot` describes the
-  process that SERVED the snapshot, which is the API server, so for a worker it is `false`
-  by construction. See *Silence is not death, part two* below, and
+  process that BUILT the snapshot - the EngineCore, reached over the utility hop, with
+  the API server forwarding the payload unmodified - so for a worker it is `false` by
+  construction either way. Hence the state lives in the file. See
+  *Silence is not death, part two* below, and
   *An idle engine keeps its disk proof alive*.
 * **The schema is the reader's contract**: `version` 1, a per-boot `epoch`, `ts`,
   `role: "worker"`, `rank` matching the file name (the reader calls a mismatch
   `malformed`), `arena.bytes_total`/`bytes_used`/`num_blocks` (plus
   `block_bytes_by_group` = `len(layer_names) * page_size_bytes` per group),
   `counters`, and `writer` prose that states where each number came from.
+  Since 0.2.50 the file also carries `plugin_version` - the version of the code THAT
+  WORKER imported, read live from `kvtier_dev_plugin.__version__` by the process that
+  wrote the file, because a worker answers no route and this is the only place its
+  build can be published. Three names in this file look like versions and are three
+  different facts: `version` (the FILE SCHEMA, still 1), `writer.plugin` (a TAG whose
+  trailing `/1` is part of its shape, not a release number), and `plugin_version` (the
+  build). All three survive the byte-ceiling triage: `KEEP_KEYS` sheds a contributed
+  section before it sheds the answer to "which build wrote this file?".
   `arena.bytes_used` is a **proven floor** (blocks in flight x bytes per block), not
   the pool's occupancy, and says so; `counters.dropped_cpu_full` and
   `counters.boundary_stored` are deliberately absent because they are scheduler-side
@@ -5342,7 +5459,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2583 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2653 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
@@ -5603,6 +5720,7 @@ The debugger verbs add six files:
 | `tests/test_trace_ring.py` | 36 | the ring's fixed capacity and wrap accounting, `read` never walking O(depth), the `gap_records` a slow poller gets, `clear` not resetting `seq`, arming installing and disarming removing the observers, a disarmed ring costing no allocation and no wrap, the step observer returning the fork's value untouched |
 | `tests/test_guard_mode.py` | 49 | every declined method returning the fork's documented no-op shape (and the one method that must re-raise), `BaseException` never swallowed, the metadata rebuild falling back to a re-raise if the fork renames its class, captures bounded with the full text only via the `captures` op, `guard_mode: true` in every payload, disarm restoring the originals by identity, tracing keeping the wrappers alive after a disarm, **no env var that can arm it** (the boot does, and the opt-out can only turn that off) |
 | `tests/test_worker_diag.py` | 43 | the file schema against the reader's contract (`version`/`epoch`/`ts`/`role`/`rank`/`arena`/`counters`), the rank name matching the file name, an unknown rank meaning no file at all, the cadence and the time floor, "a change writes now", the empty pool still writing zeros, atomic replace and the no-truncate rule, the size cap trimming prose before data, a full disk failing a step never, `bytes_used` as a proven floor |
+| `tests/test_loaded_version.py` | 46 | WHICH CODE IS RUNNING, published: every surface (`/snapshot`, `/status`, the rank file) publishes `kvtier_dev_plugin.__version__` in EVERY state it can be in (tier present/absent, guard armed/disarmed, the containment path; never-observed/mirrored/blockdump-armed/fill-degraded/inert status; plain, in-flight, all-sections, refused, raised and degraded rank documents), a runtime change to `__version__` moves the payload so no field can be a copied literal while the schema `version` stays 1 in all three, `importlib.metadata` is never consulted and its answer never appears in a payload, installed-vs-loaded disagreement resolves to the loaded value, the three surfaces name three different processes and `/status` cannot forward the engine's value nor `/snapshot` the API server's, the keys survive the rank file's byte ceiling and its section budget, a contributor cannot take a writer-owned key, the file is still `counted` by `disk_store`'s reader, and the version is one fact in `__init__.py`, `pyproject.toml` and `uv.lock` |
 | `tests/test_quiet_rank_bytes_are_not_dead_bytes.py` | 12 | a rank that has not written for 300 s keeps its bytes while its worker is alive and publishing that digest (the defect, on a real filesystem); the peer map dropping a quiet rank's digest is not evidence of death; liveness from the RANK FILES, not the digest map; `stale_geometry` reclaim still runs and still runs ahead of this rank's own cold bytes; `stale_geometry_removed` and `peer_files_removed_live` separate the two doctrines; an empty peer map claims nothing, so no identity may be called dead on it; `identity_known`/`liveness_source` name the evidence a pass had |
 | `tests/test_index_forgets_no_bytes_on_disk.py` | 13 | eviction is LRU-by-TOUCH and not insertion order (a just-restored identity is the last to leave, and on the unpatched tree it was the first); a read that promotes a file touches the index on the throttled path too; `VLLM_E2_TIER_DISK_INDEX_ENTRIES` configures the cap and a bad value falls back and reports; `entries_dropped` balances its three reason counters exactly; `entries_dropped_file_present` counts the index forgetting a live file and never guesses at an unchecked one (`unverified`); `note_restored_path` re-admits an identity a restore proved |
 | `tests/test_idle_engine_keeps_its_disk_proof_alive.py` | 10 | install alone with ZERO engine steps produces and refreshes the rank file (the defect: only a step used to write it); `disk_restore.worker_proof` stays open across an idle spell and re-opens after a forced-stale file with no step in sight; the heartbeat starts at `install()` and never stacks a thread; it is a daemon with a findable name; the handler is held WEAKLY and a beat with no handler still writes; the write floor bounds forced beats; no `VLLM_E2_TIER_DIAG` means no thread and no file; the shipped interval fits the 900 s window with four beats to spare (pinned against the UNPATCHED default); the payload reports age and margin; a dead thread is respawned and counted |

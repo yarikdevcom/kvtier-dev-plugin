@@ -540,14 +540,22 @@ def test_a_directory_that_cannot_be_created_is_recorded_not_raised(monkeypatch,
 
 def test_an_oversized_document_is_trimmed_then_written(writes_to, monkeypatch,
                                                        worker_class):
-    monkeypatch.setattr(worker_diag, "MAX_FILE_BYTES", 600)
     worker_diag.install(worker_class)
-    report = worker_diag.write_snapshot(handler(), "PP0_TP0", "env")
+    worker = handler()
+    # THE CEILING IS DERIVED, NOT HARD-CODED. This test's job is to force the triage
+    # that sheds the `writer` PROSE, and the smallest ceiling that does that is one
+    # just under the document itself; a fixed number (it was 600) silently starts
+    # measuring the fixture once the always-present key set moves - 0.2.50 added the
+    # three `plugin_version*` keys and 600 fell under the floor the triage can reach.
+    full = len(worker_diag._dump(worker_diag.build_document(worker, "PP0_TP0",
+                                                            "env")))
+    monkeypatch.setattr(worker_diag, "MAX_FILE_BYTES", full - 5)
+    report = worker_diag.write_snapshot(worker, "PP0_TP0", "env")
     assert report["written"] is True
     document = json.loads((writes_to / "rank-PP0_TP0.json").read_text())
     assert document["writer"]["trimmed"] is True
     assert "exceeded" in document["writer"]["trimmed_reason"]
-    assert len((writes_to / "rank-PP0_TP0.json").read_bytes()) <= 600
+    assert len((writes_to / "rank-PP0_TP0.json").read_bytes()) <= full - 5
 
 
 def test_a_document_that_cannot_be_trimmed_enough_is_refused(writes_to, monkeypatch,
@@ -734,7 +742,13 @@ def test_no_contributor_leaves_the_file_the_shape_it_had(worker_class, writes_to
     worker.get_finished(set())
     document = rank_document(writes_to)
     assert "disk" not in document
-    assert set(document) == REQUIRED_TOP_LEVEL | {"writer", "error"}
+    # The writer's OWN always-present keys, and nothing else. `plugin_version`,
+    # `plugin_version_reason` and `plugin_version_scope` joined that set in 0.2.50
+    # (a rank file could not say which build wrote it, and a worker has no route to
+    # say it on); this test measures whether a CONTRIBUTOR adds a key, and it still
+    # measures exactly that.
+    assert set(document) == REQUIRED_TOP_LEVEL | {"writer", "error"} | set(
+        worker_diag.PLUGIN_VERSION_FIELDS)
 
 
 def test_a_contributor_that_raises_costs_only_its_own_section(worker_class,

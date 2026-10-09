@@ -31,12 +31,26 @@ SCHEMA (version 1; the reader's `KV_TIER_SNAPSHOT_VERSION`)
 -----------------------------------------------------------
     {"version": 1, "epoch": "<8 hex>", "ts": 1790000000.123,
      "role": "worker", "rank": "PP0_TP0",
+     "plugin_version": "0.2.50", "plugin_version_reason": null,
+     "plugin_version_scope": "<which process this value describes>",
      "arena": {"bytes_total": int, "bytes_used": int, "num_blocks": int,
                "block_bytes_by_group": [int, ...] | null},
      "counters": {"stored": int, "restored_hits": int,
                   "store_events_pending": int, "load_events_pending": int},
      "writer": {"plugin": "kvtier-dev-plugin/1", "writes": int, ...},
      "error": null}
+
+THREE NAMES THAT LOOK LIKE VERSIONS AND ARE NOT THE SAME FACT:
+  * `version` = 1 is the FILE SCHEMA (the reader's `KV_TIER_SNAPSHOT_VERSION`). It
+    says "you can parse me", never "this build is 1".
+  * `writer.plugin` = "kvtier-dev-plugin/1" is a TAG (a trailing `/1` is part of the
+    tag's shape, not a release number), and `writer.heartbeat`/`version` fields in
+    contributed sections are those sections' own protocol/schema numbers.
+  * `plugin_version` (0.2.50+) is the version of the CODE THIS WORKER IMPORTED,
+    read live from `kvtier_dev_plugin.__version__` by the writer process. A worker
+    answers no HTTP route, so this file is the only place its loaded version can
+    ever be published. It is a writer-owned top-level key, listed in `KEEP_KEYS`,
+    so the byte-ceiling triage sheds everything else before it.
 
     Optionally, a sibling per CONTRIBUTING worker module: today
     `"disk": {...}` from `disk_store`. That is the contribution seam - another
@@ -165,7 +179,7 @@ import threading
 import time
 import weakref
 
-from . import config, snapshot
+from . import config, loaded_version, snapshot
 
 _logger = logging.getLogger("kvtier_dev_plugin.worker_diag")
 # Once-per-episode notices, the `disk_restore.notice_once` idiom. The one thing this
@@ -193,13 +207,21 @@ ORIGINAL_ATTR = "__kvtier_dev_workerdiag_original__"
 SIBLING_PACKAGE = (__package__ or "kvtier_dev_plugin") + "."
 
 SCHEMA_VERSION = 1          # the reader's KV_TIER_SNAPSHOT_VERSION
+# The three version keys, published writer-owned at the top level of the file, and
+# exported so a test can name them instead of copying them. `plugin_version` is the
+# code THIS worker loaded; `version` above stays the file's schema number.
+PLUGIN_VERSION_FIELDS = loaded_version.VERSION_FIELDS
 # The keys `_clip_document` may never drop. The first seven are what the proxy
 # host's reader REQUIRES (a file missing one is `malformed`); the rest are the
 # writer's own optional halves, which the triage sheds in a fixed order. Anything
 # NOT listed - a contributed section, or a field a future writer adds - is what
-# gets dropped first, so a byte ceiling can never cost a required field.
+# gets dropped first, so a byte ceiling can never cost a required field. The three
+# version keys are listed because "which build wrote this file?" must survive even
+# a trimmed file - a rank file that cannot say what wrote it is the exact hole this
+# release closed.
 KEEP_KEYS = ("version", "epoch", "ts", "role", "rank", "arena", "counters",
-             "writer", "error", "parked", "equality_sample")
+             "writer", "error", "parked", "equality_sample",
+             "plugin_version", "plugin_version_reason", "plugin_version_scope")
 ROLE = "worker"
 MAX_FILE_BYTES = 32 * 1024  # the reader's own cap is 256 KiB; we stay far below
 MAX_STRING_CHARS = 200
@@ -868,6 +890,9 @@ def build_document(handler, rank, rank_source) -> dict:
     if in_flight_blocks:
         bytes_used = in_flight_blocks * per_block
     epoch, epoch_scope = config.diagnostics_epoch()
+    version_scope = (f"the worker process that wrote this file (rank {rank}, "
+                     f"role {ROLE}); a worker answers no HTTP route, so this is "
+                     f"the only place its loaded version can appear")
     arena: dict = {"bytes_total": arena_bytes if arena_bytes is not None else 0,
                    "bytes_used": bytes_used,
                    "num_blocks": _int(getattr(handler, "num_cpu_blocks", None))
@@ -895,6 +920,11 @@ def build_document(handler, rank, rank_source) -> dict:
     sections, contribution_notes = _contribution_sections()
     document = {
         "version": SCHEMA_VERSION,
+        # WHICH CODE WROTE THIS FILE, read live in this process (see
+        # `loaded_version.py`). Beside `version`, which is the file's SCHEMA and
+        # keeps meaning that: a reader must never have to guess which of the two a
+        # `version` key is.
+        **loaded_version.fields(version_scope),
         "epoch": epoch,
         "ts": round(time.time(), 6),
         "role": ROLE,

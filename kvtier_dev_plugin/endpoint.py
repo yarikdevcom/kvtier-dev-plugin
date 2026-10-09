@@ -4,7 +4,9 @@ The whole surface, all under `/plugins/kvtier` (the prefix is baked into the
 APIRouter, not added at mount time, so it cannot be forgotten by whoever mounts
 it):
 
-    GET  /plugins/kvtier/status          what is live; makes NO engine call
+    GET  /plugins/kvtier/status          what is live, including WHICH CODE THIS
+                                         PROCESS loaded (`plugin_version`); makes
+                                         NO engine call
     GET  /plugins/kvtier/snapshot        the scheduler-side tier view, live
     POST /plugins/kvtier/snapshot        the same, body forwarded as one dict
     GET|POST /plugins/kvtier/kvconfig    the KV-cache geometry, including every
@@ -116,7 +118,7 @@ import time
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import config, loaded_version
 
 logger = logging.getLogger("kvtier_dev_plugin.endpoint")
 
@@ -721,6 +723,17 @@ def blockdump_capability(deployed: bool, armed) -> str:
     return "deployed_armed_state_unobserved"
 
 
+# WHICH PROCESS'S VERSION `/status` CARRIES. The route is answered here, in the
+# API-server process, and deliberately makes no engine call - so its
+# `plugin_version` is what THIS process imported. `/snapshot`'s is the engine's.
+# Comparing the two is how a reader catches "the package was upgraded, the API
+# server restarted, the engine did not".
+STATUS_VERSION_SCOPE = ("the API-server process that answered this route; it "
+                        "makes no engine call, so this is NOT the engine's "
+                        "loaded version - read " + config.ROUTE_PREFIX +
+                        "/snapshot for that")
+
+
 def status_payload(dev_state: dict | None = None) -> dict:
     # HOW FULL THE SSD TIER IS, built BEFORE the payload so a failure cannot take the
     # route down with it. THE SAME BLOCK as `snapshot.disk_fill`, deliberately: the
@@ -757,6 +770,12 @@ def status_payload(dev_state: dict | None = None) -> dict:
         "blockdump_armed": None, "note": DEV_STATE_UNKNOWN_NOTE}
     return {
         "plugin": config.PLUGIN_NAME,
+        # WHICH CODE IS RUNNING HERE. `plugin` above is a NAME, and no field in
+        # this payload carried a version before 0.2.50: an operator could not tell
+        # a loaded 0.2.47 from a loaded 0.2.49 from either route. See
+        # `loaded_version.py` for why this is `__version__` and never the installed
+        # distribution metadata.
+        **loaded_version.fields(STATUS_VERSION_SCOPE),
         "enabled": config.enabled(),
         "enable_env": config.ENV_ENABLE,
         "route_prefix": config.ROUTE_PREFIX,
