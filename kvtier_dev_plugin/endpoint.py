@@ -414,7 +414,8 @@ ARG_SPECS: dict[str, dict] = {
                                           "ls", "contains", "identities", "offers",
                                           "authority", "failures", "shadow",
                                           "gpu-shadow", "restore-verify",
-                                          "gpu-write", "restore-source")},
+                                          "gpu-write", "restore-source",
+                                          "adoptions")},
                         # `op=restore-source` (0.2.59): where a restore's destination
                         # rows come from, and how many of them may be in flight. A
                         # three-word enum: two postures (`arena`, `bounded`) and one

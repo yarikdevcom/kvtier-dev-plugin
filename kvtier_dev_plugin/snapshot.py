@@ -44,6 +44,101 @@ Field names below were read out of the fork at HEAD (10b8e07):
                 `BoundaryStoreStats` fields (:125-132)
   connector   : `scheduler_manager` (simple_cpu_offload_connector.py:129,157)
   block_pool  : `num_gpu_blocks` (:173), `get_num_free_blocks()` (:861)
+
+PER-REQUEST DISK-ADOPTION ATTRIBUTION - `disk_restore.recent_adoptions` (plugin 0.2.61+)
+=========================================================================================
+The ONE place any payload answers "for request id X, how many of its prefix tokens came
+from disk". It is a BOUNDED RING of records inside the `disk_restore` section of this
+document (a sibling of `adopted` / `adopted_tokens`), built by
+`disk_restore.scheduler_section()`.
+
+WHY THIS DOCUMENT AND NOT A RANK FILE: an adoption is a SCHEDULER fact - the fork put
+our CPU slots into a step's `load_cpu_blocks`, which only the EngineCore can see - and
+`rank-*.json` files are written by WORKERS, which never adopt. Shipping the number into
+a rank file would mean new cross-process state and a new writer for one integer, so it
+rides the transport that already carries scheduler-side state (the precedent is
+`tier.gpu_pool_census`: route-only, scheduler-side, and the proxy reads it over SSH).
+Every record says which process wrote it, in `role` ("scheduler" in production) and
+`rank` (null there, because a scheduler has no TP rank).
+
+THE ROWS, `recent_adoptions`: at most `disk_restore.MAX_ADOPTIONS_PUBLISHED` (48)
+records, NEWEST FIRST, taken from the `disk_restore.MAX_ADOPTION_RECORDS` (256) deep
+ring, each a dict with EXACTLY these keys:
+
+    {"seq": 41,                 # int, monotone for the boot, never renumbered by a wrap
+     "request_id": "0b9c...",   # str|null, clipped at 48 chars (real ids: 36, UUIDv4)
+     "tokens": 89600,           # int|null: THIS request's tokens adopted from disk.
+                                #   null only if the ledger row was malformed; a real
+                                #   "adopted nothing" is 0, never null
+     "blocks": 28,              # int: entries adopted (one per group per span)
+     "spans": 7,                # int: distinct whole scheduler spans that carried them
+     "epoch": "a1b2c3d4",       # str: the writer's boot id - a row from another boot
+                                #   is not evidence about this one
+     "ts": 1791568060.712389,   # float, wall-clock seconds at the adoption
+     "mono": 560221.732312,     # float, `time.monotonic()` at the adoption (same boot
+                                #   only: comparable across rows, never across restarts)
+     "rank": null,              # str|null: the worker rank that recorded it, else null
+     "role": "scheduler",       # str: `role_here()` of the recording process
+     "restore_source": "bounded"}  # str|null: "arena"|"bounded" (0.2.59), null if unset
+
+BESIDE THE ROWS (all ints, all exact for the whole boot regardless of what the ring
+recycled): `adoptions_recorded` (records ever written; the `seq` source),
+`adoptions_dropped` (records the 256-deep ring recycled), `adoption_record_errors`
+(rows that could not be built and were contained - must stay 0), `adoption_ring_depth`
+(256), `adoptions_published` (48), plus the two sentences `adoption_meaning` and
+`adoption_perishable`, which a UI should surface rather than paraphrase.
+
+DROP SEMANTICS, AND THE RULE ABOUT ABSENCE. The ring holds 256 records; when it is
+full the OLDEST is dropped and `adoptions_dropped` moves. It never blocks, never
+waits and never refuses the newest row, and a failure to build a row costs that row
+only - `adopted` and `adopted_tokens` were already moved and stay exact. THE RING IS
+PERISHABLE, SO ABSENCE IS NOT ZERO: a request missing from `recent_adoptions` may
+have adopted nothing OR may have adopted 89,600 tokens in a row the ring already
+evicted. Only the boot-scoped `adopted` / `adopted_tokens` may carry a "nothing came
+from disk"
+claim, and a reader that must answer per request distinguishes the two cases by
+`adoptions_dropped` (non-zero between two polls = rows were lost). `seq` gaps say the
+same thing from the rows themselves.
+
+WHAT ABSENCE OF THE FIELDS MEANS, BY WRITER VERSION. A `disk_restore` section with NO
+`recent_adoptions` key was built by a plugin older than 0.2.61: report
+`not_reported` with every number null, NEVER 0 and never an empty list inferred - "no
+disk adoption" and "this build never attributed adoption per request" are different
+statements, and this column sits next to a reuse percentage a reader will trust. A
+section that HAS the keys with `recent_adoptions: []` and `adoptions_recorded: 0` means
+a live 0.2.61+ writer that has adopted nothing yet this boot - a real zero, and the
+only shape that licenses one. `plugin_version` / `plugin_version_reason` at the top of
+this document are how a reader tells the two cases apart without guessing.
+
+WHAT A CEILING PASS COULD NOT DELETE - `spill.ceiling_measurement`'s grace and claim
+fields (plugin 0.2.62+). A capacity pass ranks by the touch clock and unlinks; two rules
+now stop it, and both are published because a pass that comes up SHORT is only
+explainable if the reader can see what was withheld.
+`grace_seconds` (the window in force), `grace_entries_last_pass` /
+`grace_bytes_last_pass` (entries the PLANNER withheld from this pass's shed candidates
+because their touch clock sat inside the window), `grace_entries_excluded` (the boot
+total), `grace_unlink_refused` (a path a plan had already NAMED that the executor
+refused at the moment of the unlink - the race the planner's own check cannot see),
+`claim_paths_last_pass` / `claim_set_truncated` (how many paths this process had a read
+in flight for when the pass ran, and whether that witness hit its cap, in which case it
+is a SUBSET and not "nothing else is claimed"), and `claim_unlink_refused` (a plan named
+one of those anyway). Every field is per-process and boot-scoped, monotonic except the
+`*_last_pass` pair.
+
+ABSENCE IS NOT ZERO, AND HERE IT IS A VERSION TEST: a `spill` section whose
+`ceiling_measurement` block has no `grace_seconds` key was written by a plugin older
+than 0.2.62, which had no rule to count - report `not_reported`, never "the grace
+withheld nothing". A 0.2.62+ block that reports `grace_entries_last_pass: 0` with
+`plan_short: true` says something quite different: the pass came up short for a reason
+that was NOT the clock, and the reader should look at the attribution and peer blocks.
+
+DEEPER HISTORY: `POST /plugins/kvtier/disk {"op":"adoptions","limit":N}` returns up to
+the whole 256-record ring with the same rows and the same counters, under the stable
+key set of `disk_restore.disk_adoption_report()` (`ok`, `error`, `records`,
+`records_here`, `limit`, `newest_first`, `ring_depth`, `ring_published`,
+`ring_written`, `ring_dropped`, `record_errors`, `epoch`, `adopted`, `adopted_tokens`,
+`meaning`, `perishable`). It is a read-only op. Contained on every path: this writer
+never raises into the engine step and never performs I/O on the step path.
 """
 
 from __future__ import annotations

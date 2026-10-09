@@ -264,16 +264,35 @@ def journal(tmp_path, monkeypatch):
 def build_shared_store(root) -> dict:
     """Four ranks' files in ONE directory: 160 committed files, 16,384,000 bytes.
 
-    Written fresh, because peer-liveness is `PEER_DIGEST_FRESH_SECONDS`-bounded and a
-    rank whose sibling stopped writing 20 minutes ago is correctly NOT a live sibling.
+    Written at an age chosen in the OVERLAP BAND, and since 0.2.62 there are two clocks
+    a fixture here has to sit between:
+
+      * peer liveness is `PEER_DIGEST_FRESH_SECONDS`-bounded, so a file older than that
+        cannot prove its writer is alive - and a rank whose sibling stopped writing 20
+        minutes ago is correctly NOT a live sibling, which is the arithmetic this file
+        exists to test;
+      * the unlink grace (`disk_layout.UNLINK_GRACE_SECONDS`, 0.2.62) means a file
+        YOUNGER than that is not sheddable at all, and a store of nothing but young
+        files is one a ceiling pass must (correctly) come up short on.
+
+    So the files are written older than the grace and younger than liveness. The assert
+    below is the invariant that band is non-empty: if a future change pushes the grace
+    past the liveness window, a multi-rank pass would have NOTHING it is allowed to
+    shed, and that has to fail here rather than on a box.
     """
+    age = disk_layout.UNLINK_GRACE_SECONDS + 15.0
+    assert age < disk_spill.PEER_DIGEST_FRESH_SECONDS, (
+        f"grace {disk_layout.UNLINK_GRACE_SECONDS}s + margin leaves no room inside the "
+        f"{disk_spill.PEER_DIGEST_FRESH_SECONDS}s peer-liveness window: a live peer's "
+        "files would be unsheddlable, and a fair-share pass could never converge")
+    stamp = time.time() - age
     paths = {}
     index = 0
     for rank in RANK_IDS:
         paths[rank] = []
         for _ in range(FILES_PER_RANK):
             index += 1
-            paths[rank].append(make_file(root, DIGESTS[rank], index))
+            paths[rank].append(make_file(root, DIGESTS[rank], index, when=stamp))
     assert store_bytes(root) == STORE_BYTES, store_bytes(root)
     return paths
 
@@ -403,8 +422,12 @@ def test_a_lone_rank_still_sheds_to_nine_tenths_of_the_whole_ceiling(clean_store
     direction has to be "sheds like before", never "too timid to protect the disk".
     """
     root = clean_store
-    # The whole store, one writer: no sibling to share the ceiling with.
-    lone = [make_file(root, DIGESTS["PP0_TP0"], index)
+    # The whole store, one writer: no sibling to share the ceiling with. Stamped at the
+    # same age as `build_shared_store` uses - outside the unlink grace, inside peer
+    # liveness - because a store of nothing-but-young files is one the grace (0.2.62)
+    # correctly refuses to shed, and this test is about the SHARE, not the grace.
+    lone_stamp = time.time() - (disk_layout.UNLINK_GRACE_SECONDS + 15.0)
+    lone = [make_file(root, DIGESTS["PP0_TP0"], index, when=lone_stamp)
             for index in range(1, FILES_PER_RANK * RANKS + 1)]
     assert store_bytes(root) == STORE_BYTES
 

@@ -334,7 +334,8 @@ The whole surface, all under `/plugins/kvtier`:
 | `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
 | `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
 | `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `identities` (the paged, digest-only per-rank view of the index, 0.2.46 - the other half of the diff against `ls`), `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs) and `restore-source` (0.2.59: where a restore's destination rows come from, `arena` or the plugin's staging ring; per boot, and its answer carries the ring's pressure beside the posture). A mutating `op` on GET is a `405` |
+| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `identities` (the paged, digest-only per-rank view of the index, 0.2.46 - the other half of the diff against `ls`), `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs) and `restore-source` (0.2.59: where a restore's destination rows come from, `arena` or the plugin's staging ring; per boot, and its answer carries the ring's pressure beside the posture) and `adoptions` (0.2.61: WHICH request got how many tokens from
+disk, newest first, `limit` up to the whole 256-record ring). A mutating `op` on GET is a `405` |
 | `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
@@ -4621,6 +4622,128 @@ changed that makes an align group's hit list longer than the fork's take, runs t
 its own control, and asserts the counters moved **in `scheduler_section()["load_prune"]`** - the
 builder the route serves, not the state dict. It runs on ctypes fakes: no engine, no torch, no
 network, no box.
+
+## Which request got how many tokens off the disk (`disk_restore.py`, 0.2.61)
+
+`_mark_adopted()` has always known the number and thrown it away. "Adopted" means the
+scheduler put our CPU slot ids into a step's `load_cpu_blocks` - the only observable
+proof the fork took the external tokens - and at that instant the load ledger row holds
+the request id AND the token count it adopted. Everything published afterwards is a
+BOOT total (`adopted`, `adopted_tokens`), which cannot fill a table of requests: with
+`adopted_tokens: 297,600` on the page, no dashboard can say how much of ANY single
+prompt came from NVMe. The per-request number now goes into a bounded ring that the
+snapshot payload publishes as `disk_restore.recent_adoptions` and the `disk` verb's
+`adoptions` op reads deeper.
+
+**One row per adopted request**, newest first: `seq` (monotone for the boot, never
+renumbered by a wrap, so a gap is visible), `request_id`, **`tokens`** (this request's
+tokens adopted from disk - `0` is a real "adopted nothing", `null` only a malformed
+ledger row), `blocks` (entries, one per group per span), `spans` (distinct whole
+scheduler blocks), `epoch` (the boot that knew it), `ts` + `mono` (both clocks), and
+`rank` + `role` (which process recorded it: in production `role: "scheduler"`, `rank:
+null`, because a worker never adopts).
+
+**THE CAP, AND THE ARITHMETIC.** 256 records deep, 48 of them in the polled payload.
+An adoption is at most one per request, so arrivals bound the fill rate: the busiest
+minute in 5.5 months of proxy rows is 142 requests (`llm_requests.db`, 2026-07-27
+15:55) and the mean busy minute is 5.66, while the live box today adopts 4 times in 28
+minutes (its own `restore-witness` lines) because the whole-scheduler-block floor
+rejects most offers. 256/142 = 108 s of history - 36 intervals of a 3 s poll - in the
+worst minute this box has ever had, and ~45 minutes at the typical busy rate; 48 rows
+cost 11,371 B measured on a 51,839 B snapshot document (+21.9%) and still cover 20 s at
+the worst rate. A record is ~237 B of ten scalars, so the full ring is ~60 KiB next to
+the 7.99 GiB arena. The shape mirrors `failures` (ring 32, published 6, the verb reads
+the rest).
+
+**A FULL RING DROPS THE OLDEST AND SAYS SO.** `adoptions_dropped` counts every
+recycled row; the writer never blocks, never waits and never refuses the newest row
+(it is the row a reader polling now wants), and it runs inside the step thread, so it
+is contained whole: a row that cannot be built moves `adoption_record_errors` and costs
+nothing else, because `adopted`/`adopted_tokens` were already updated and stay exact.
+
+**READ THIS BEFORE DRAWING A ZERO: the ring is perishable.** A request missing from
+`recent_adoptions` may have adopted nothing OR may have adopted 89,600 tokens in a row
+the ring already evicted. Only the boot totals (`adopted`, `adopted_tokens`) may carry
+a "nothing came from disk" claim, with `adoptions_dropped` as the tripwire that rows
+were lost. A `disk_restore` section with NO `recent_adoptions` key is a writer older
+than 0.2.61 and reads as `not_reported` - never as an empty list, and never as 0. The
+wire contract the reader in `llm-api/kv_tier_diagnostics.py` is written against is
+`snapshot.py`'s module docstring.
+
+**WHY THE SNAPSHOT AND NOT A RANK FILE:** an adoption is a scheduler fact and
+`rank-*.json` files are written by workers, which never see it; carrying it there would
+be new cross-process state and a second writer for one integer. `tier.gpu_pool_census`
+is the existing precedent for a route-only, scheduler-side field.
+
+## A capacity unlink waits for the clock and for the reader (`disk_layout.py`, 0.2.62)
+
+**What was asked**: the eviction clock became a touch clock in 0.2.29, so a restored span
+outranks a never-read one. Does that make a capacity pass safe?
+
+**What the source said**: not yet, in two ways, both of them races between the one thread
+that deletes and the threads that write and read.
+
+**1. A pass can race its own store.** A ceiling pass runs at the end of *every spill*
+(`disk_spill._handle_job` -> `_enforce_ceiling`), so the file that triggered the pass was
+committed seconds earlier, and the pass walks up to `MAX_EVICTION_PLAN` (4096) entries and
+unlinks up to 4096 of them - a window in which the store moved under the walk. Ranking by
+`st_mtime` does not notice: "oldest" has no notion of "too young to judge yet". So a
+capacity unlink now refuses a file whose touch clock sits inside
+`disk_layout.UNLINK_GRACE_SECONDS` (90 s), **in the planner and again in the executor** -
+the executor's copy is the one that closes the race, because a touch can land after the
+plan was built. A withheld entry is counted (`excluded_grace`, and in the spill section
+`ceiling_measurement.grace_entries_last_pass` / `grace_bytes_last_pass` /
+`grace_entries_excluded`), and a refusal by the executor is counted by rule name
+(`grace_unlink_refused`), never by string-matching a sentence.
+
+**2. Nothing knew a read was in flight.** `disk_read` promises, on a reader thread, to
+apply bytes it has queued; `disk_spill` deletes on the writer thread. No age window can
+express that promise - a file being read right now may have been touched a minute ago (the
+throttle) or an hour ago (its first service). The reader now publishes the claim itself:
+`disk_read.inflight_paths()` walks the open batches and returns the paths of every job
+that is `queued`, `running` or `done` (bytes not yet applied), capped at
+`MAX_EVICTION_PLAN` so a claim can never be dropped for being outside a set smaller than
+the plan that wants to delete it, with `truncated` saying whether the cap bit. The spill
+pass asks **once per pass**, hands the set to `execute_unlink_plan(protected=...)`, and
+publishes `claim_paths_last_pass`, `claim_set_truncated` and `claim_unlink_refused`. A
+claimed path is refused **whatever its clock says and whatever path the caller took** -
+including an operator's sweep, which keeps its authority over *age* but not over a
+promise.
+
+**The arithmetic, since a window with no derivation is a knob with no owner.** From
+below: the writer's own cap (`MAX_FILES_PER_WINDOW` = 200 files / `SPILL_WINDOW_SECONDS` =
+60 s, so ~130 files per minute per rank at 11.4 MB slots) re-triggers the pass constantly,
+a restore's `RESTORE_DEADLINE_SECONDS` = 45 s bounds one offer-to-apply lifetime, and
+`disk_read.TOUCH_MIN_INTERVAL_SECONDS` = 60 s is the blind spot the rule exists to cover.
+From above: `disk_spill.PEER_DIGEST_FRESH_SECONDS` = 120 s is how long a foreign digest
+counts as a live sibling, and a grace reaching that far would make every file that *proves*
+a peer is alive unsheddable - a four-rank fair-share pass would have nothing it is allowed
+to delete. 90 s = 2 x 45 s sits between the two, leaving a 30 s band that is both live and
+sheddable; both bounds are asserted in
+`tests/test_unlink_grace_and_pending_claim.py`, so a future retune fails a test rather than
+a box. **The condition that would force this number up**: one full ceiling pass must fit
+inside it, and no pass duration is observable on the live store
+(`evictions: 0`, `journal_removals: 0`, `ceiling_passes_declined: 0`) because no pass has
+run since the store was written. Read `spill.ceiling_measurement.pass_seconds` when one
+does; if it approaches 90 s, the honest fix is to bound the pass, not to keep growing the
+grace.
+
+**What this deliberately does NOT do: promote a whole span on one hit.** The plan was to
+extend a restore's `os.utime` to every file of every span it served, plus the boundary
+anchors it might have used. Both were dropped on measurement, and the reason is worth
+keeping. A successful restore already reads the anchor it adopted: `_disk_run` puts the
+run-end boundary pairs into the same `keys` list as the positional ones
+(`disk_restore.py:5878`), `_merge_into_pending` builds a `load_paths` entry for each, and
+the worker reads every non-empty path - so the anchor of an adopted run **is** touched by
+the serving that needed it, and a span-wide promotion protects nothing that serving does
+not already protect. Worse, the live boot reports `boundary_groups_known: 0` ("no group's
+spec reports 'align' mamba_cache_mode"), so on the geometry that filled this store there
+are no anchors at all and no read-set that touches groups 0-3: every one of the 356 files
+whose clock has moved since its write is a group-5 copy. Promoting siblings for that read
+would pin bytes the current restore rule cannot load, which is the opposite of what the
+tier is for. If a future boot runs an align-mode group and its anchors are seen to age out
+anyway, this section is the place to say so.
+
 
 ## Pruning the pairs an adopted restore no longer needs (`disk_restore.py`, 0.2.49)
 

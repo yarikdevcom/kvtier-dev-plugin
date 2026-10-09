@@ -324,6 +324,7 @@ from . import (
     config,
     disk_index,
     disk_layout,
+    disk_read,
     snapshot,
     worker_diag,
 )
@@ -752,6 +753,22 @@ _state: dict = {
     "unattributable_entries_last_pass": 0,
     "unattributable_bytes_last_pass": 0,
     "unattributable_entries_excluded": 0,
+    # THE GRACE AND THE PENDING CLAIM (0.2.62). The grace's pair mirrors the gate's
+    # above: entries and bytes the PLANNER withheld because the touch clock says they
+    # were used inside the window, plus the boot total. The two refusal counters are
+    # the EXECUTOR's: files a plan named that the executor refused to delete because
+    # they were in the grace, or because this process has a read in flight for them.
+    # A boot total with no last-pass twin would make a single unlucky pass
+    # indistinguishable from a rank that is permanently short of sheddable files.
+    "grace_entries_last_pass": 0,
+    "grace_bytes_last_pass": 0,
+    "grace_entries_excluded": 0,
+    "grace_unlink_refused": 0,
+    "grace_unlink_refused_last_pass": 0,
+    "claim_unlink_refused": 0,
+    "claim_unlink_refused_last_pass": 0,
+    "claim_paths_last_pass": 0,
+    "claim_set_truncated": False,
     "ceiling_passes_short": 0,
     "ceiling_plan_short": False,
     "ceiling_plan_short_bytes": 0,
@@ -937,6 +954,13 @@ def reset_state_for_tests() -> None:
         "unattributable_entries_last_pass": 0,
         "unattributable_bytes_last_pass": 0,
         "unattributable_entries_excluded": 0, "ceiling_passes_short": 0,
+        # The grace and the pending claim (0.2.62): a reset that left these behind
+        # hands the next test another test's withheld tally.
+        "grace_entries_last_pass": 0, "grace_bytes_last_pass": 0,
+        "grace_entries_excluded": 0, "grace_unlink_refused": 0,
+        "grace_unlink_refused_last_pass": 0, "claim_unlink_refused": 0,
+        "claim_unlink_refused_last_pass": 0, "claim_paths_last_pass": 0,
+        "claim_set_truncated": False,
         "ceiling_plan_short": False, "ceiling_plan_short_bytes": 0,
         "ceiling_plan_short_reason": None, "peer_files_removed": 0,
         "peer_files_removed_bytes": 0, "peer_files_removed_last_pass": 0,
@@ -3141,7 +3165,7 @@ def shutdown_evict_pool() -> None:
 
 
 def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
-                       deadline) -> tuple:
+                       deadline, protected=frozenset()) -> tuple:
     """Unlink every batch, on the pool if there is one. Returns per-batch reports.
 
     `batches` is a list of `(directory, paths)` pairs, DISJOINT by construction (they
@@ -3185,7 +3209,8 @@ def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
             attempted += len(paths)
             _state["evict_batches_serial"] += 1
             reports.append((directory, _unlink_batch(directory, paths, peers,
-                                                      peers_known)))
+                                                     peers_known,
+                                                     protected=protected)))
             if _deadline_expired(deadline):
                 truncated = bool(batches[index:])
                 break
@@ -3197,7 +3222,7 @@ def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
             try:
                 futures.append((directory,
                                 pool.submit(_unlink_batch, directory, paths, peers,
-                                            peers_known),
+                                            peers_known, protected),
                                 len(paths)))
             except Exception as exc:  # noqa: BLE001 - no pool means inline, not no work
                 snapshot._error(exc, "disk_spill evict submit")
@@ -3205,7 +3230,8 @@ def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
                 attempted += len(paths)
                 _state["evict_batches_serial"] += 1
                 reports.append((directory, _unlink_batch(directory, paths, peers,
-                                                          peers_known)))
+                                                          peers_known,
+                                                          protected=protected)))
         if futures:
             _state["evict_batches_submitted"] += len(futures)
             _state["evict_peak_in_flight"] = max(
@@ -3229,7 +3255,8 @@ def _run_evict_batches(batches: list, *, peers, peers_known: bool = True,
     return reports, attempted, truncated
 
 
-def _unlink_batch(directory, paths, peers, peers_known: bool = True) -> dict | None:
+def _unlink_batch(directory, paths, peers, peers_known: bool = True,
+                  protected=frozenset()) -> dict | None:
     """ONE directory's unlink batch, on whatever thread owns it. Never raises.
 
     `execute_unlink_plan` re-validates every path against the CURRENT digest and the
@@ -3244,7 +3271,7 @@ def _unlink_batch(directory, paths, peers, peers_known: bool = True) -> dict | N
         return disk_layout.execute_unlink_plan(
             directory, paths, dry_run=False,
             geometry_digest=_state["geometry_digest"], peer_digests=peers,
-            for_capacity=True, peers_known=peers_known)
+            for_capacity=True, peers_known=peers_known, protected=protected)
     except Exception as exc:  # noqa: BLE001 - a worker that raises loses its own batch
         snapshot._error(exc, "disk_spill unlink batch")
         return None
@@ -3371,6 +3398,12 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     _state["ceiling_plan_short"] = False
     _state["ceiling_plan_short_bytes"] = 0
     _state["ceiling_plan_short_reason"] = None
+    _state["grace_entries_last_pass"] = 0
+    _state["grace_bytes_last_pass"] = 0
+    _state["grace_unlink_refused_last_pass"] = 0
+    _state["claim_unlink_refused_last_pass"] = 0
+    _state["claim_paths_last_pass"] = 0
+    _state["claim_set_truncated"] = False
     walk = _walk_store(root, deadline=deadline)
     if not walk["ok"]:
         _state["last_reason"] = str(walk["reason"])[:MAX_STRING_CHARS]
@@ -3478,6 +3511,17 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
         target_fraction=EVICT_TARGET_FRACTION, peer_digests=peers,
         peers_known=peers_known)
     _state["plan_truncated"] = bool(plan.get("truncated"))
+    # THE GRACE'S WITHHOLDING, published before the short/nothing-sheddable branches
+    # below, because a pass that withheld its way to a SHORT plan is exactly the pass a
+    # reader needs to be able to explain. Counted once per entry: the attribution pass
+    # withheld nothing here (it filters by owner, not by clock), so the planner's number
+    # is the pass's number and there is nothing to reconcile.
+    plan_grace = int(plan.get("excluded_grace") or 0)
+    if plan_grace:
+        _state["grace_entries_last_pass"] = plan_grace
+        _state["grace_bytes_last_pass"] = int(plan.get("excluded_grace_bytes") or 0)
+        _state["grace_entries_excluded"] = int(
+            _state["grace_entries_excluded"]) + plan_grace
     # The planner ran the same gate over the entries it was handed, so it normally
     # reports nothing further to withhold (the attribution already filtered them).
     # Adding the two is exact and never double-counts: whichever half removed an
@@ -3542,8 +3586,16 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # shape (a shard's entries leave one directory) and the partition that guarantees no
     # path is attempted by two workers: the groups are disjoint by construction.
     batches = list(by_directory.items())
+    # THE PENDING CLAIMS, read ONCE per pass: the paths this process's reader threads
+    # have promised to apply. Same process, so no channel and no new state - the reader
+    # is the only witness, and an age window cannot express it (a file being read right
+    # now may have been touched a minute ago, or an hour ago on its first service).
+    claims = disk_read.inflight_paths()
+    _state["claim_paths_last_pass"] = int(claims["count"])
+    _state["claim_set_truncated"] = bool(claims["truncated"])
     reports, attempted, cut_off = _run_evict_batches(
-        batches, peers=peers, peers_known=peers_known, deadline=deadline)
+        batches, peers=peers, peers_known=peers_known, deadline=deadline,
+        protected=claims["paths"])
     freed = 0
     unlinked = 0
     failed = 0
@@ -3570,6 +3622,24 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
             if not isinstance(action, dict):
                 continue
             outcome = action.get("action")
+            if outcome == "refused":
+                # THE EXECUTOR'S OWN TWO RULES, counted by NAME rather than by
+                # string-matching the sentence (`rule` is the machine-readable tag
+                # `execute_unlink_plan` copies from `_validate_unlink`). A plan that
+                # named a file and did not delete it is a pass that came in under its
+                # target for a reason, and the reason is which of the two rules fired:
+                # the clock (grace) or an in-flight read (pending claim).
+                rule = action.get("rule")
+                if rule == disk_layout.UNLINK_RULE_GRACE:
+                    _state["grace_unlink_refused"] = int(
+                        _state["grace_unlink_refused"]) + 1
+                    _state["grace_unlink_refused_last_pass"] = int(
+                        _state["grace_unlink_refused_last_pass"]) + 1
+                elif rule == disk_layout.UNLINK_RULE_CLAIM:
+                    _state["claim_unlink_refused"] = int(
+                        _state["claim_unlink_refused"]) + 1
+                    _state["claim_unlink_refused_last_pass"] = int(
+                        _state["claim_unlink_refused_last_pass"]) + 1
             if outcome == "unlinked":
                 unlinked += 1
                 removed_size = int(action.get("size_bytes") or 0)
@@ -4445,11 +4515,42 @@ def section() -> dict:
             # store it did not write. Zero here with a full store and a quiet
             # `estimated_bytes` is the story of a ceiling that never woke up.
             "seed_walks": int(_state["estimate_seed_walks"]),
+            # THE TWO 0.2.62 RULES, as numbers. `grace_entries_last_pass` is what the
+            # PLANNER withheld from this rank's shed candidates because the touch clock
+            # put them inside `disk_layout.UNLINK_GRACE_SECONDS`; `grace_unlink_refused`
+            # is what the EXECUTOR refused on a path a plan had already named (the two
+            # differ when the touch landed between the walk and the unlink, which is the
+            # race the rule exists for). `claim_paths_last_pass` is how many paths this
+            # process had reads in flight for when the pass ran, and
+            # `claim_unlink_refused` how many of those a plan had named anyway.
+            # A pass with `plan_short: true` and a non-zero grace count is a pass that
+            # came up short because the store's young files were the only ones left -
+            # which is the intended failure mode, not a fault.
+            "grace_seconds": disk_layout.UNLINK_GRACE_SECONDS,
+            "grace_entries_last_pass": int(_state["grace_entries_last_pass"]),
+            "grace_bytes_last_pass": int(_state["grace_bytes_last_pass"]),
+            "grace_entries_excluded": int(_state["grace_entries_excluded"]),
+            "grace_unlink_refused": int(_state["grace_unlink_refused"]),
+            "grace_unlink_refused_last_pass": int(
+                _state["grace_unlink_refused_last_pass"]),
+            "claim_unlink_refused": int(_state["claim_unlink_refused"]),
+            "claim_unlink_refused_last_pass": int(
+                _state["claim_unlink_refused_last_pass"]),
+            "claim_paths_last_pass": int(_state["claim_paths_last_pass"]),
+            "claim_set_truncated": bool(_state["claim_set_truncated"]),
             "units": disk_layout._units("measured_bytes", "sampled_files",
                                         "total_files", "entries_examined",
                                         "skipped_files", "ceiling_checks",
                                         "seed_walks", "deadline_hits",
-                                        "budget_seconds", "pass_seconds"),
+                                        "budget_seconds", "pass_seconds",
+                                        "grace_seconds", "grace_entries_last_pass",
+                                        "grace_bytes_last_pass",
+                                        "grace_entries_excluded",
+                                        "grace_unlink_refused",
+                                        "grace_unlink_refused_last_pass",
+                                        "claim_unlink_refused",
+                                        "claim_unlink_refused_last_pass",
+                                        "claim_paths_last_pass"),
         },
         # THE FAIR SHARE (0.2.30): THE NUMBER THE CEILING WAS ACTUALLY COMPARED
         # AGAINST, and who else is sharing it. This is the block that makes tonight's

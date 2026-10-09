@@ -1620,6 +1620,57 @@ def job_states(batch_id, limit: int = MAX_JOB_STATES_REPORT) -> dict:
                 "truncated": count > len(kept)}
 
 
+def inflight_paths(limit: int = disk_layout.MAX_EVICTION_PLAN) -> dict:
+    """The paths OPEN batches claim right now - a pending offer, in path shape.
+
+    WHY THIS EXISTS (0.2.62). The eviction executor must not delete a file a read has
+    already promised to apply, and no age window can express that: a file being read
+    RIGHT NOW may have been touched a minute ago (the throttle) or an hour ago (its
+    first service ever), so "young" is not the same predicate as "claimed". The reader
+    is the only place that knows the claim, and it is in the SAME process as the spill
+    writer whose ceiling pass does the deleting - which is what makes this a set of
+    paths rather than a message: no channel, no new state, one walk of the batch table
+    the caller already owns.
+
+    A job claims its path from the moment it is queued until it settles into an answer
+    the caller has acted on: `queued` (bytes not yet read), `running` (inside the
+    kernel) and `done` (bytes sitting in a bounce buffer waiting for the apply point)
+    all claim; `failed` and `cancelled` do not, because there are no bytes to apply and
+    the buffer is already back in the pool.
+
+    BOUNDED, in the unit that matters to the caller: at most `limit` paths, defaulting
+    to `disk_layout.MAX_EVICTION_PLAN` - the largest plan one pass can name - so a
+    claim can never be dropped because the claim set was capped below the plan that
+    wants to delete it. `truncated` says whether it was capped; a caller that sees it
+    must treat the set as a SUBSET, never as "nothing else is claimed".
+    """
+    out: list = []
+    batches = 0
+    truncated = False
+    cap = max(0, int(limit))
+    try:
+        with _state_lock:
+            for batch in _batches.values():
+                batches += 1
+                for entry in (batch.get("jobs") or {}).values():
+                    if str(entry.get("state")) not in (QUEUED, RUNNING, DONE):
+                        continue
+                    if len(out) >= cap:
+                        truncated = True
+                        break
+                    path = (entry.get("job") or {}).get("path")
+                    if path:
+                        out.append(str(path))
+                if truncated:
+                    break
+    except Exception as exc:  # noqa: BLE001 - a witness is never worth a fault
+        snapshot._error(exc, "disk_read inflight_paths")
+        return {"paths": frozenset(), "count": 0, "batches": batches,
+                "truncated": True, "reason": f"the walk raised {type(exc).__name__}"}
+    return {"paths": frozenset(out), "count": len(out), "batches": batches,
+            "truncated": bool(truncated), "reason": None}
+
+
 def batch_buffer(batch_id, job_id):
     """The buffer of one DONE job, or None. The bytes are not copied out.
 

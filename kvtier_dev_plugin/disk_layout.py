@@ -474,12 +474,29 @@ UNITS_BY_NAME = {
     # "this rank has come up short 400 times" are different facts.
     "excluded_unattributable": "files",
     "excluded_unattributable_bytes": "bytes",
+    # THE GRACE (0.2.62): files and bytes WITHHELD because the touch clock says they
+    # were used inside the window, and the window itself. Same shape as the gate's
+    # pair above: a count, a volume, and the number that explains both.
+    "excluded_grace": "files",
+    "excluded_grace_bytes": "bytes",
+    "grace_seconds": "seconds",
     "short_by_bytes": "bytes",
     "unattributable_entries": "files",
     "unattributable_bytes": "bytes",
     "unattributable_entries_last_pass": "files",
     "unattributable_entries_excluded": "files",
     "unattributable_bytes_last_pass": "bytes",
+    # THE UNLINK GRACE AND THE PENDING CLAIM (0.2.62): files the planner withheld from
+    # the destructive set because the touch clock says they were used inside the window,
+    # and files the executor refused to delete. `grace_seconds` is the window itself.
+    "grace_entries_last_pass": "files",
+    "grace_entries_excluded": "files",
+    "grace_bytes_last_pass": "bytes",
+    "grace_unlink_refused": "files",
+    "grace_unlink_refused_last_pass": "files",
+    "claim_unlink_refused": "files",
+    "claim_unlink_refused_last_pass": "files",
+    "claim_paths_last_pass": "files",
     "peer_files_removed": "files",
     "peer_files_removed_bytes": "bytes",
     "peer_files_removed_last_pass": "files",
@@ -1882,10 +1899,90 @@ def _empty_sweep_counts() -> dict:
 
 # --- capacity: an LRU clock that is not st_atime -----------------------------
 
+
+def _now_ns() -> int:
+    """The grace's clock: wall clock, nanoseconds, behind a NAME a test can rebind.
+
+    Wall, not monotonic, for the same reason `st_mtime` is wall: the comparison is
+    against a file's `st_mtime_ns`, which the kernel stamps from the wall clock. A
+    monotonic value here would compare against a different epoch and the grace would
+    either protect the whole store or none of it. Tests rebind this function instead
+    of sleeping - the same posture as `disk_read._touch_clock`.
+    """
+    return int(time.time() * 1_000_000_000)
+
+
+# WHY 90 SECONDS, in the units this file is written in - and not tuned to a quiet
+# store. Three races have to be covered from below, and one production constraint
+# bounds it from above.
+#
+# FROM BELOW:
+#  1. THE PASS'S OWN WRITES. A ceiling pass runs at the END of every spill
+#     (`disk_spill._handle_job` -> `_enforce_ceiling`), and the spill that triggered it
+#     committed a file seconds earlier. At the writer's own cap
+#     (`disk_spill.MAX_FILES_PER_WINDOW` = 200 per `SPILL_WINDOW_SECONDS` = 60 s) a
+#     900 GiB store holds 4 ranks x 130 files/minute, so a pass fires roughly every
+#     0.08 s store-wide and ALWAYS has a just-written file in front of it. The writer
+#     pays to spill a span and the very next pass can take it back: an LRU with no floor
+#     turns the ceiling into a tax on writing.
+#  2. A RESTORE'S OFFER-TO-APPLY LIFETIME, `disk_restore.RESTORE_DEADLINE_SECONDS` =
+#     45 s, and a load may be re-offered once inside one boot. 2 x 45 = 90 s is the
+#     window in which a file someone was told to load can still be handed to the
+#     worker. Beyond 90 s the pending-claim rule (`inflight_paths`) is the defence.
+#     A grace that turns out too SHORT is a lost read, not a wrong answer: the reader
+#     stats the file before it trusts it (`disk_read._read_file` reports
+#     `file_missing` / `size_mismatch`) and a failed read never promotes, so the tier
+#     loses the bytes and the restore declines. Being too LONG is the dangerous
+#     direction - it is how a full store stops buying back capacity - which is why the
+#     upper bound below is a hard constraint and the number is not simply "bigger is
+#     safer".
+#  3. THE TOUCH THROTTLE'S OWN BLINDNESS: `disk_read.TOUCH_MIN_INTERVAL_SECONDS` = 60 s
+#     lets a serving read skip re-stamping a file it is using right now, so an LRU can
+#     age out a byte that has been served all afternoon. A grace at or under 60 s is a
+#     second copy of a hole that already exists; 90 s = 1.5 x the interval.
+#
+# FROM ABOVE: `disk_spill.PEER_DIGEST_FRESH_SECONDS` = 120 s is how long a foreign
+# digest counts as LIVE, and a grace at or above it would make every live sibling's
+# files unsheddable, so a four-rank fair-share pass could never converge. 90 < 120
+# leaves a 30 s overlap band (sheddable AND live) that
+# `tests/test_ceiling_fair_share_multi_rank.build_shared_store` asserts is non-empty.
+#
+# THE CONDITION THAT WOULD RAISE THIS NUMBER, stated so a reader can falsify it rather
+# than trust it: the grace must exceed one full ceiling pass. The code bound is
+# `disk_spill.CEILING_PASS_BUDGET_SECONDS` (1.5 s) plus the unlink batch a pass is
+# allowed to run (`MAX_EVICTION_PLAN` = 4096), and the live store shows neither
+# measured - `evictions: 0`, `journal_removals: 0`, `ceiling_passes_declined: 0` in
+# `/tmp/kv-tier-diagnostics/rank-PP0_TP0.json`: no pass has run since the boot that
+# wrote this store, so no pass duration is observable. When one does run, the field to
+# read is the spill section's `ceiling_measurement.pass_seconds`; if it ever reaches
+# 90 s, this
+# constant is too small, and the honest fix is to bound the pass, not to keep growing
+# the grace.
+UNLINK_GRACE_SECONDS = 90.0
+
+# WHICH RULE REFUSED, in the one vocabulary this file owns. `execute_unlink_plan`
+# copies the tag onto the action it refused, so a reader can tell "the clock said this
+# file was used a moment ago" from "this process has a read in flight for it" without
+# parsing a sentence - and the spill writer counts the two separately.
+UNLINK_RULE_GRACE = "grace"
+UNLINK_RULE_CLAIM = "pending_claim"
+
+
+def _grace_floor_ns(grace_seconds, now_ns=None) -> int:
+    """The mtime a file must be OLDER than to be unlinkable, in ns. 0 = no grace."""
+    seconds = float(grace_seconds or 0.0)
+    if seconds <= 0.0:
+        return 0
+    moment = _now_ns() if now_ns is None else int(now_ns)
+    return moment - int(seconds * 1_000_000_000)
+
+
 def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                       used_bytes=None, peer_digests=(),
                       target_fraction: float = 0.9,
                       peers_known=None,
+                      grace_seconds: float = UNLINK_GRACE_SECONDS,
+                      now_ns: int | None = None,
                       max_plan: int = MAX_EVICTION_PLAN) -> dict:
     """Which files to delete, oldest-touch-first, to get back under a byte ceiling.
 
@@ -1905,6 +2002,17 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     wrong-sized or unreadable file alive is strictly worse than evicting it.
     Restart survival is why promotion is an mtime and not a side table: there is
     nothing to replay, and a promoted file is exactly as durable as the file is.
+
+    THE GRACE (0.2.62) is applied HERE, at plan time, as well as at the executor:
+    an entry whose touch clock is inside ``grace_seconds`` is WITHHELD and counted
+    (``excluded_grace`` / ``excluded_grace_bytes``), never planned. Doing it here is
+    what keeps the plan honest about what it can actually spend - the caller's cap is
+    `MAX_EVICTION_PLAN` files per pass and a pass that filled its cap with files the
+    executor would refuse would simply come up short for the wrong reason. The
+    executor re-checks anyway (`_validate_unlink`), because nothing planned upstream
+    is trusted at the point of deletion. See `UNLINK_GRACE_SECONDS` for the arithmetic
+    that sizes the window and what it costs; ``grace_seconds=0`` asks for the old
+    behaviour, and is what a test that wants a bare LRU passes.
 
     ORDER: shed by ``SHED_ORDER_BY_CLASSIFICATION`` - bytes POSITIVELY claimed by no
     live rank first, then this boot's own files oldest-touch first, then a live PEER
@@ -1972,11 +2080,25 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     # payload can never report a different answer than the gate applied
     # (`resolve_peers_known`).
     peers_known = resolve_peers_known(peer_digests, peers_known)
+    # THE GRACE WINDOW, resolved once for the same reason: a plan whose payload says
+    # one window and whose loop applied another is a plan nobody can audit. A day is
+    # the ceiling because a window that long is a mis-typed constant, not a grace: it
+    # would make the store unevictable and read as "the tier stopped reclaiming".
+    if isinstance(grace_seconds, bool) or not isinstance(
+            grace_seconds, (int, float)):
+        return _fail("grace_seconds must be a number (unit: seconds)")
+    if not 0.0 <= float(grace_seconds) <= 86_400.0:
+        return _fail(f"grace_seconds {grace_seconds} is outside [0, 86400] "
+                     "(unit: seconds; 0 disables the grace)")
+    grace_seconds = float(grace_seconds)
+    grace_floor_ns = _grace_floor_ns(grace_seconds, now_ns)
 
     usable: list[dict] = []
     skipped = 0
     excluded = 0
     excluded_bytes = 0
+    withheld_grace = 0
+    withheld_grace_bytes = 0
     for item in entries:
         if not isinstance(item, dict):
             skipped += 1
@@ -2004,6 +2126,15 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
             excluded += 1
             excluded_bytes += int(size)
             continue
+        if grace_floor_ns and int(when) > grace_floor_ns:
+            # THE GRACE. Counted here, and refused again by the executor: whichever
+            # half removed an entry is the half that counted it, so the two never
+            # double-count. This entry is not "cold and unlucky" - the touch clock
+            # says the tier used it inside the window in which a write or a restore
+            # can still race a plan, so it is not this pass's to take.
+            withheld_grace += 1
+            withheld_grace_bytes += int(size)
+            continue
         usable.append({"path": path, "size_bytes": int(size),
                        "mtime_ns": int(when), "classification": classification,
                        "units": _units("size_bytes", "mtime_ns")})
@@ -2014,10 +2145,13 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
         # disk, which INCLUDES the entries the gate withheld: they occupy the store
         # whether or not this rank is allowed to delete them, and dropping them here
         # would let a blind rank read its own ceiling as already met. The gate's
-        # consequence must be a SHORT plan, never a false "under target".
-        measured = sum(int(item["size_bytes"]) for item in usable) + excluded_bytes
+        # consequence must be a SHORT plan, never a false "under target". The grace's
+        # withheld bytes are the same argument: in the window, occupancy is occupancy.
+        measured = (sum(int(item["size_bytes"]) for item in usable)
+                    + excluded_bytes + withheld_grace_bytes)
     target = int(ceiling_bytes * float(target_fraction))
     gate_units = ("excluded_unattributable", "excluded_unattributable_bytes",
+                  "excluded_grace", "excluded_grace_bytes", "grace_seconds",
                   "short_by_bytes")
     verdict = _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
                                "planned_bytes", "freed_bytes", "planned",
@@ -2030,6 +2164,9 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                   files=len(usable), truncated=False,
                   excluded_unattributable=excluded,
                   excluded_unattributable_bytes=excluded_bytes,
+                  excluded_grace=withheld_grace,
+                  excluded_grace_bytes=withheld_grace_bytes,
+                  grace_seconds=grace_seconds,
                   peers_unconfirmed=not bool(peer_digests),
                   peers_known=bool(peers_known),
                   short=False, short_by_bytes=0,
@@ -2078,6 +2215,9 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
     # nobody deletes a file it cannot prove is its own to delete.
     short = bool(remaining > target and not truncated)
     short_by = max(0, int(remaining) - target) if short else 0
+    grace_note = (f"; {withheld_grace} file(s) ({withheld_grace_bytes} byte(s)) were "
+                  f"WITHHELD by the {grace_seconds:g}s grace as touched inside the "
+                  "window" if withheld_grace else "")
     reason = None
     if planned:
         reason = (f"{len(planned)} file(s) shed the measured "
@@ -2091,12 +2231,14 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                 "UNATTRIBUTABLE because no peer digest is confirmed - the ceiling "
                 "is expected to be exceeded rather than a sibling's live restore "
                 "be deleted")
+        reason += grace_note
     elif short:
         reason = (
             f"nothing is sheddable: over the {target}-byte target by "
             f"{short_by} byte(s) with {excluded} file(s) ({excluded_bytes} "
             "byte(s)) withheld as UNATTRIBUTABLE because this rank cannot name their "
             "owner (no peer digest confirmed, or the live-peer view is incomplete)")
+        reason += grace_note
     elif truncated:
         reason = f"the plan cap {limit} was reached before the target was met"
     return _ok(units=_units("ceiling_bytes", "used_bytes", "target_bytes",
@@ -2111,6 +2253,9 @@ def lru_eviction_plan(entries, *, geometry_digest, ceiling_bytes,
                peer_rank=peer_rank,
                lru_files=len(planned) - stale_first, skipped=skipped,
                files=len(usable), truncated=truncated,
+               excluded_grace=withheld_grace,
+               excluded_grace_bytes=withheld_grace_bytes,
+               grace_seconds=grace_seconds,
                excluded_unattributable=excluded,
                excluded_unattributable_bytes=excluded_bytes,
                peers_unconfirmed=not bool(peer_digests),
@@ -2307,6 +2452,9 @@ def _remove_quietly(path) -> None:
 def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
                         geometry_digest=None, peer_digests=(),
                         for_capacity: bool = False, peers_known=None,
+                        grace_seconds: float = UNLINK_GRACE_SECONDS,
+                        protected=(),
+                        now_ns: int | None = None,
                         max_unlinks: int = MAX_UNLINK_PLAN) -> dict:
     """Unlink the plan, re-validating EVERY entry. Destructive; dry-run by default.
 
@@ -2330,6 +2478,31 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
     planner's rule, because nothing planned upstream is trusted at the point of
     deletion. Every refusal is counted and carries a reason; a directory that is
     itself a symlink is refused outright.
+
+    THE TWO 0.2.62 RULES, both enforced here because this is the only place a file is
+    actually removed:
+
+    * THE GRACE (`grace_seconds`, see `UNLINK_GRACE_SECONDS` for the arithmetic): a
+      capacity unlink of a file whose touch clock is inside the window is refused.
+      The planner already withholds such entries, and this is the executor's copy of
+      the rule for the same reason the attribution gate is duplicated: the plan may
+      have been computed before the touch happened, and the lstat this function does
+      anyway is the freshest clock there is. It is gated on `for_capacity` on purpose:
+      the sweep path's allowed set is a deliberate operator request to reclaim dead
+      bytes, and an operator who names stale geometry gets it reclaimed - a grace that
+      blocked the sweep would be a grace that no longer lets anything be deleted.
+    * A PENDING CLAIM (`protected`): paths a caller names as claimed by work already
+      in flight - today `disk_spill` hands it the paths of `disk_read`'s OPEN batches,
+      which are the reads this process has promised to apply - are refused whatever
+      their clock says. The grace covers the claim a SCHEDULER holds (an offer whose
+      paths reached a worker, sized by 2x the load deadline above); this covers the
+      claim a WORKER holds, which can be an old file being read right now and so is
+      not bounded by age at all. Two complementary predicates, because the two claims
+      live in different processes.
+
+    A refusal from either rule carries a machine-readable `rule` on its action
+    (`grace` / `pending_claim`), so a caller counts a rule instead of string-matching
+    a sentence. An action without that key came from an older build.
     """
     if not isinstance(paths, (list, tuple)):
         return _fail(f"paths must be a list, got {type(paths).__name__}")
@@ -2358,11 +2531,14 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
     bytes_freed = 0
     for path in pending:
         verdict = _validate_unlink(path, root, geometry_digest, peer_digests,
-                                   for_capacity, peers_known)
+                                   for_capacity, peers_known,
+                                   grace_seconds=grace_seconds,
+                                   protected=protected, now_ns=now_ns)
         if not verdict["ok"]:
             counts["refused"] += 1
             actions.append({"path": str(path), "action": "refused",
                             "reason": verdict["reason"], "size_bytes": None,
+                            "rule": verdict.get("rule"),
                             "units": _units("size_bytes")})
             continue
         if dry_run:
@@ -2397,8 +2573,16 @@ def execute_unlink_plan(directory, paths, *, dry_run: bool = True,
 
 
 def _validate_unlink(path, root, geometry_digest, peer_digests,
-                     for_capacity, peers_known=None) -> dict:
-    """Prove one path is a regular, non-link, ours, in-directory, deletable file."""
+                     for_capacity, peers_known=None,
+                     grace_seconds: float = UNLINK_GRACE_SECONDS,
+                     protected=(), now_ns: int | None = None) -> dict:
+    """Prove one path is a regular, ours, in-directory, deletable file, and that now
+    is not the wrong moment to delete it.
+
+    The last two clauses are 0.2.62 and both cost nothing: the pending-claim test is a
+    set lookup on a path this function already resolved, and the grace reads the
+    `st_mtime_ns` of the `lstat` the regular-file check already did.
+    """
     if not isinstance(path, (str, os.PathLike)):
         return _fail(f"the path is not a filesystem path: {type(path).__name__}")
     text = os.fspath(path)
@@ -2456,6 +2640,26 @@ def _validate_unlink(path, root, geometry_digest, peer_digests,
         return _fail(f"{base} is not a regular file")
     if os.path.dirname(os.path.realpath(target)) != root:
         return _fail(f"{base} resolves outside {root}")
+    # THE PENDING CLAIM, before the clock: a file this process has a promised read for
+    # is not capacity, whatever its mtime says. Checked on both spellings of the path
+    # (the resolved one and the one a caller handed in) because a claim is recorded by
+    # whoever made it and the two differ by a symlink resolution at worst.
+    if protected and (target in protected or text in protected):
+        return _fail(f"{base} is claimed by work already in flight (a read this "
+                     "process has promised to apply): it is not capacity this pass "
+                     "may take", rule=UNLINK_RULE_CLAIM)
+    # THE GRACE, on the capacity path only - see `execute_unlink_plan` for why the
+    # operator's sweep keeps its authority over stale bytes.
+    if for_capacity:
+        floor_ns = _grace_floor_ns(grace_seconds, now_ns)
+        if floor_ns and int(info.st_mtime_ns) > floor_ns:
+            age_seconds = max(0.0, (_now_ns() if now_ns is None
+                                    else int(now_ns))
+                              - int(info.st_mtime_ns)) / 1e9
+            return _fail(f"{base} was touched {age_seconds:.1f}s ago, inside the "
+                         f"{float(grace_seconds):g}s grace: a plan this fast can "
+                         "still race the write or the restore that clock records",
+                         rule=UNLINK_RULE_GRACE)
     return {"ok": True, "reason": None, "path": target,
             "size_bytes": int(info.st_size)}
 

@@ -211,6 +211,7 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 
 from . import (
     config,
@@ -1355,6 +1356,51 @@ MAX_FAILURES_PER_BIND = 4            # records ONE bind may write (a big step re
 MAX_FAILURES_PER_RANK_FILE = 2       # records ONE rank file may carry (byte budget)
 MAX_FAILURES_PUBLISHED = 6           # records a section or an op surfaces
 MAX_FAILURE_STRING_CHARS = 80        # a string inside one failure record
+
+# --- PER-REQUEST DISK-ADOPTION ATTRIBUTION (0.2.61) --------------------------
+#
+# THE NUMBER THIS EXISTS TO SAVE. `_loads[request_id]["tokens"]` is how many of
+# THIS request's prefix tokens came off NVMe, and it is known exactly once: at the
+# moment `_mark_adopted()` sees the fork put our CPU slots into a step's
+# `load_cpu_blocks`. Until now that call added it to the boot-scoped
+# `_state["adopted_tokens"]` and the request identity was gone with it, so a
+# dashboard holding a request id could never be told "89,600 of this prompt came
+# from disk" - only "this boot adopted 297,600 tokens from disk, somewhere".
+#
+# THE CAP, AND THE ARITHMETIC BEHIND IT (measured, not felt). The unit is ADOPTIONS,
+# and an adoption is at most ONE PER REQUEST (one disk offer per request, and
+# `_mark_adopted()` marks each ledger record exactly once):
+#   * CEILING, from 5.5 months of proxy request rows (`llm_requests.db`, 88,780
+#     requests): the busiest single minute ever recorded is 142 requests
+#     (2026-07-27 15:55); the mean over minutes that had traffic is 5.66. Adoption
+#     cannot outrun arrivals, so 142/min is a hard ceiling on this ring's fill rate
+#     and 5.66/min is the typical busy rate. (The live box today is far below both:
+#     its own `restore-witness` journal lines report 4 adoptions in 28 minutes and 6
+#     per boot, because the whole-scheduler-block adoption floor rejects most offers.)
+#   * WHAT A READER NEEDS. A dashboard polls the snapshot every ~3 s. At the
+#     all-time-worst 142/min the ring takes 256/142 = 108 s to cycle - 36 poll
+#     intervals - so a record is readable for over half a minute after the request
+#     that earned it even in the worst minute this box has ever had; at the typical
+#     busy rate the same 256 records cover ~45 minutes.
+#   * WHAT IT COSTS. A record is 10 scalar fields and ~237 B as JSON (measured, with
+#     real ids), so the ring is ~60 KiB at its cap - against the 7.99 GiB host arena
+#     this module already shares a process with. The POLLED payload carries only the
+#     newest 48 (`MAX_ADOPTIONS_PUBLISHED`) = 11,371 B measured on a 51,839 B
+#     snapshot document (+21.9%), which still covers 20 s - about 7 poll intervals -
+#     at the worst-ever rate and ~8 minutes at the live rate; the deeper 256 stay
+#     reachable through `POST /plugins/kvtier/disk {"op":"adoptions"}`, the same
+#     split `failures`/`MAX_LOAD_FAILURE_RECORDS` already uses (ring 32, published 6).
+#   * A FULL RING DROPS THE OLDEST AND COUNTS IT (`adoptions_dropped`). Never
+#     blocks, never waits, never refuses the newest: the newest record is the one a
+#     reader polling now is looking for.
+MAX_ADOPTION_RECORDS = 256           # adoption records this process keeps
+MAX_ADOPTIONS_PUBLISHED = 48         # records a polled payload surfaces
+MAX_ADOPTION_ID_CHARS = 48           # CHARS of a request id in one record (`_clip`
+                                     # adds its "..." after these). The join key has
+                                     # to stay EXACT, and real ids fit: the max
+                                     # `requests.id` length in 88,780 proxy rows is 36
+                                     # (UUIDv4), so nothing is truncated in practice
+MAX_ADOPTION_SOURCE_CHARS = 16       # CHARS of a restore-source label in one record
 REFUSAL_LOG_MIN_SECONDS = 30.0       # SECONDS between load-failure lines of one kind
 POOL_PRICE_MAX_IDENTITIES = 256      # index lookups ONE price walk may make.
 # 0.2.35 raises this from 64, and the number is the SAME derivation as the reader's
@@ -2016,6 +2062,16 @@ _state: dict = {
     # scheduler-side ledger
     "lookups": 0, "offers": 0, "offered_tokens": 0, "blocks_offered": 0,
     "adopted": 0, "adopted_tokens": 0, "restorations": 0,
+    # THE ADOPTION RING'S OWN ACCOUNTING (0.2.61). `adoptions` counts records EVER
+    # written (and is the ring's `seq` source, so a reader can tell a gap from a
+    # contiguous stretch); `adoptions_dropped` counts the rows the cap recycled. The
+    # two live here, not beside the ring, because `counters()` copies `_state` and a
+    # counter that only exists inside the ring's own module cannot be polled.
+    "adoptions": 0, "adoptions_dropped": 0, "adoption_record_errors": 0,
+    # Which rank/process signs an adoption record, read ONCE and remembered: the
+    # answer cannot change within a process, and asking `parallel_state` on every
+    # adoption would put a group lookup on the step path for a constant.
+    "adoption_rank": None, "adoption_rank_source": None,
     # THE LEDGER'S OWN HONESTY (0.2.25). A load can leave the ledger three ways
     # without ever being correlated with a completion report: the fork stopped owning
     # it (`_reqs_to_load` no longer names it - the shape of the fork's own
@@ -2372,6 +2428,35 @@ def notice_once(key: str, message: str, level: str = "warning") -> bool:
 # structurally zero on EngineCore and a hunt for "why did this read not happen" had
 # to be settled by reading four rank files by hand.
 _load_failures: list = []
+# THE ADOPTION RING (0.2.61): one record per ADOPTED disk restore, oldest last, so a
+# reader takes the newest with `reversed()` and one `popleft()` recycles the oldest.
+# A `deque` rather than a list because the two engine-path operations - append, and
+# evict-when-full - are both O(1) here, while a newest-first list would memmove the
+# whole ring on every adoption (the `_load_failures.insert(0, ...)` cost, 8x deeper).
+_adoptions: deque = deque(maxlen=MAX_ADOPTION_RECORDS)
+
+# The two sentences a reader of the payload needs beside the records, so the ring
+# cannot be read as a ledger. They are module constants because the rank-file section,
+# the snapshot section and the `adoptions` op must carry the SAME words (a reader that
+# gets one and not the other is the `worker_proof` drift this repo keeps being bitten
+# by), and the wire contract in `snapshot.py`'s docstring quotes them verbatim.
+ADOPTION_MEANING = (
+    "one record per REQUEST whose disk-adopted token count this process knew: "
+    "`tokens` is how many of THAT request's prefix tokens the scheduler adopted "
+    "from NVMe into its GPU slots, and `blocks`/`spans` are the entries and whole "
+    "scheduler blocks that carried them. `epoch` proves which boot knew it and "
+    "`rank`/`role` which process recorded it (a restore is always adopted in the "
+    "scheduler process, so `role` is scheduler and `rank` is null there: a worker "
+    "never adopts).")
+ADOPTION_PERISHABLE = (
+    "PERISHABLE: this is a ring, not a ledger. Records leave it when it wraps, so "
+    "ABSENCE OF A REQUEST NEVER MEANS ZERO TOKENS FROM DISK - it means either no "
+    "adoption or an adoption the ring already recycled. A reader that must answer "
+    "'0 from disk' has to say so from `adopted`/`adopted_tokens` and "
+    "`adoptions_dropped` together, never from a missing row; `adoptions_dropped` "
+    "rising between two polls is positive proof that rows were lost, and the boot "
+    "totals in `adopted`/`adopted_tokens` stayed exact while it happened.")
+
 # Kind -> monotonic of the last line logged for it: the rate limit that lets a line
 # be printed per EPISODE and never per step.
 _failure_log_at: dict = {}
@@ -2794,6 +2879,11 @@ def reset_state_for_tests() -> None:
     _install_refusal_lines = []
     _sched_cls_seen = None
     del _load_failures[:]
+    # THE ADOPTION RING IS PER-BOOT STATE TOO (0.2.61): it is the evidence a
+    # per-request attribution is read from, so a reset that left a previous "boot"'s
+    # rows in it would let a later test attribute tokens to a request that never
+    # made one in it.
+    _adoptions.clear()
     _failure_log_at.clear()
     for samples in _apply_samples.values():
         del samples[:]
@@ -2816,6 +2906,8 @@ def reset_state_for_tests() -> None:
             "install_refusal_line": None, "install_deferral_line": None,
             "lookups": 0, "offers": 0, "offered_tokens": 0,
             "blocks_offered": 0, "adopted": 0, "adopted_tokens": 0,
+            "adoptions": 0, "adoptions_dropped": 0, "adoption_record_errors": 0,
+            "adoption_rank": None, "adoption_rank_source": None,
             "restorations": 0, "refusals_total": 0, "last_refusal": None,
             "last_reason": None, "paths_emitted_steps": 0, "path_entries": 0,
             "path_entries_empty": 0, "path_length_violations": 0,
@@ -3268,6 +3360,32 @@ def counters() -> dict:
 
 def counters_view(out: dict) -> dict:
     out["units"] = {
+        # THE ADOPTION RING (0.2.61): the three counts, and the two caps a reader
+        # needs to interpret them. `adoptions` is a RECORD count, never a token count
+        # - the tokens a boot adopted are `adopted_tokens`, and a reader that confuses
+        # the two has the bug this ring is supposed to remove.
+        "adoptions": "adoption records this process has EVER written (unit: "
+                     "requests whose disk slots reached a worker): the ring's "
+                     "`seq` runs over it, so a reader can tell a contiguous stretch "
+                     "from a gap. Exact for the whole boot; the ring is only a "
+                     "window over it",
+        "adoptions_dropped": "adoption records the ring recycled to stay at "
+                             f"{MAX_ADOPTION_RECORDS} (unit: records): the cap "
+                             "working. Non-zero is NOT a lost restore and NOT a "
+                             "lost token - `adopted`/`adopted_tokens` stayed exact "
+                             "while it happened; only the per-request ROW is gone",
+        "adoption_record_errors": "times building one adoption record raised and "
+                                  "was contained (unit: internal exceptions): must "
+                                  "stay 0; a rising count means the ledger's shape "
+                                  "stopped being what this writer models",
+        "adoption_ring_depth": "records the ring holds at its cap (unit: records; "
+                               f"{MAX_ADOPTION_RECORDS}): see `snapshot.py`'s "
+                               "module docstring for the arrival-rate arithmetic "
+                               "behind the number",
+        "adoptions_published": "newest records a polled payload carries (unit: "
+                               f"records; {MAX_ADOPTIONS_PUBLISHED}); the rest of "
+                               "the ring is reachable through the `disk` verb's "
+                               "`adoptions` op",
         # THE PROOF'S STATE MACHINE (0.2.47): the two counts, in transitions, and the
         # sentence they belong to. A `refused: {no_worker_proof: N}` without these tells
         # an operator how often and nothing else; with them the same payload says the
@@ -7629,6 +7747,170 @@ def _mark_adopted() -> None:
         record["adopted"] = True
         _state["adopted"] += 1
         _state["adopted_tokens"] += int(record["tokens"])
+        # THE PER-REQUEST HALF OF THE SAME FACT (0.2.61), recorded at the one moment
+        # it is knowable. Contained inside `_note_disk_adoption`: nothing here may
+        # cost a step its restore, and the aggregate counters above are updated
+        # FIRST so the ring can never be the reason a boot under-counts.
+        _note_disk_adoption(record)
+
+
+# --- the adoption ring: one record per adopted request (0.2.61) --------------
+
+def _adoption_rank_fields() -> tuple:
+    """(rank, source) a record is signed with, computed ONCE per process.
+
+    A scheduler process has no TP rank and says so with `rank: null` beside
+    `role: "scheduler"` - the honest answer, and the reason the record carries BOTH:
+    `rank` alone cannot distinguish "a scheduler" from "a worker whose rank lookup
+    failed". Memoised because `worker_diag.rank_id()` asks the already-imported
+    `parallel_state`, and an adoption happens on the step path.
+    """
+    if _state["adoption_rank"] is not None \
+            or _state["adoption_rank_source"] is not None:
+        return _state["adoption_rank"], _state["adoption_rank_source"]
+    rank, source = None, None
+    try:
+        from . import worker_diag  # noqa: PLC0415 - it owns the rank derivation
+        rank, source = worker_diag.rank_id()
+    except Exception as exc:  # noqa: BLE001 - a rank we cannot name is a null
+        snapshot._error(exc, "disk_restore adoption rank")
+        rank, source = None, "rank lookup raised"
+    _state["adoption_rank"] = (_clip(str(rank), 32) if isinstance(rank, str)
+                               else None)
+    _state["adoption_rank_source"] = (_clip(str(source), 48)
+                                      if isinstance(source, str) else None)
+    return _state["adoption_rank"], _state["adoption_rank_source"]
+
+
+def _note_disk_adoption(record: dict) -> None:
+    """Publish ONE adopted request's disk attribution into the bounded ring.
+
+    WHY HERE AND NOWHERE ELSE. This is the only place the per-request number exists:
+    the ledger row carries `tokens` from the moment the offer was built, and this is
+    the moment the fork is known to have TAKEN it. Everything the record needs is
+    already in the caller's hands, so the cost is one dict, ten scalar reads and one
+    O(1) `append` on the step path - no lock, no I/O, no allocation proportional to
+    the batch or to the offer's block count.
+
+    NEVER RAISES, NEVER BLOCKS. The whole body is contained and a failure is counted
+    (`adoption_record_errors`) and reported through `snapshot._error`; a ring that
+    cannot build a row costs the row and nothing else. The aggregate counters the
+    caller has already moved are the boot's truth either way, so the payload loses
+    detail rather than becoming a lie.
+    """
+    try:
+        if not isinstance(record, dict):
+            _state["adoption_record_errors"] += 1
+            return
+        identities = record.get("identities")
+        if not isinstance(identities, (list, tuple)):
+            identities = ()
+        blocks = len(identities)
+        if not blocks:
+            # An offer with no identities is not an offer, but a ledger row that got
+            # here with only its slot list still deserves its token count: count the
+            # slots rather than reporting nothing.
+            slots = record.get("cpu_block_ids")
+            blocks = len(slots) if isinstance(slots, (list, tuple)) else 0
+        spans: set = set()
+        for item in identities:
+            if isinstance(item, dict):
+                position = _int(item.get("span"))
+                if position is not None:
+                    spans.add(position)
+        rank, _source = _adoption_rank_fields()
+        tokens = _int(record.get("tokens"))
+        source = record.get("restore_source")
+        _state["adoptions"] += 1
+        row = {
+            # Monotone across the boot and NEVER renumbered by a wrap, so a reader
+            # that polled `seq` 41 and now sees 44..60 knows it lost 42-43 rather
+            # than assuming it polled a contiguous window.
+            "seq": int(_state["adoptions"]),
+            "request_id": (_clip(str(record.get("request_id") or ""),
+                                 MAX_ADOPTION_ID_CHARS) or None),
+            # THE FIELD THIS CHANGE EXISTS FOR: this request's adopted-from-disk
+            # tokens. Never a default: an absent token count is a broken ledger row,
+            # and 0 here would be indistinguishable from "came from disk, took none".
+            "tokens": int(tokens) if tokens is not None else None,
+            "blocks": int(blocks),
+            "spans": int(len(spans)),
+            "epoch": str(snapshot.epoch()),
+            "ts": round(time.time(), 6),
+            "mono": round(time.monotonic(), 6),
+            "rank": rank,
+            "role": role_here(),
+            # `arena` | `bounded` (0.2.59) when the offer carried one: which staging
+            # path served this request. Null when the ledger row never set it.
+            "restore_source": (_clip(str(source), MAX_ADOPTION_SOURCE_CHARS)
+                               if source else None),
+        }
+        if len(_adoptions) >= MAX_ADOPTION_RECORDS:
+            _adoptions.popleft()
+            _state["adoptions_dropped"] += 1
+        _adoptions.append(row)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic ring never costs a step
+        _state["adoption_record_errors"] += 1
+        snapshot._error(exc, "disk_restore adoption record")
+
+
+def disk_adoptions(limit=None) -> list:
+    """The adoption ring's records, NEWEST FIRST. Copies, bounded, never raises.
+
+    Walks backwards from the newest and stops at `limit`, so the cost is O(returned)
+    and never O(depth) - the `trace_ring.read()` idiom, on a polled path.
+    """
+    try:
+        wanted = _int(limit)
+        if wanted is None or wanted < 1:
+            wanted = MAX_ADOPTIONS_PUBLISHED
+        wanted = min(int(wanted), MAX_ADOPTION_RECORDS)
+        out: list = []
+        for row in reversed(_adoptions):
+            if len(out) >= wanted:
+                break
+            out.append(dict(row))
+        return out
+    except Exception as exc:  # noqa: BLE001 - a payload field never breaks a poll
+        snapshot._error(exc, "disk_restore adoptions")
+        return []
+
+
+def disk_adoption_report(limit=None) -> dict:
+    """The attribution rows plus the counters that make them readable. Never raises.
+
+    THE KEY SET IS THE SAME ON EVERY PATH, including the one that raised: a reader
+    that has to branch on which fields a degraded answer carries is a reader that
+    will get it wrong at 3 a.m. (`load_failure_report()`'s contract, borrowed).
+    """
+    wanted = _int(limit)
+    if wanted is None or wanted < 1:
+        wanted = MAX_ADOPTIONS_PUBLISHED
+    wanted = min(int(wanted), MAX_ADOPTION_RECORDS)
+    records: list = []
+    error = None
+    try:
+        records = disk_adoptions(wanted)
+    except Exception as exc:  # noqa: BLE001 - disk_adoptions is already contained
+        error = f"{type(exc).__name__}"
+    return {"ok": error is None,
+            "error": error,
+            "records": records,
+            "records_here": len(records),
+            "limit": wanted,
+            "newest_first": True,
+            "ring_depth": MAX_ADOPTION_RECORDS,
+            "ring_published": MAX_ADOPTIONS_PUBLISHED,
+            "ring_written": int(_state["adoptions"]),
+            "ring_dropped": int(_state["adoptions_dropped"]),
+            "record_errors": int(_state["adoption_record_errors"]),
+            "epoch": str(snapshot.epoch()),
+            # The boot-scoped truth the rows are a window OVER: exact, never
+            # recycled, and the only thing a "zero from disk" claim may rest on.
+            "adopted": int(_state["adopted"]),
+            "adopted_tokens": int(_state["adopted_tokens"]),
+            "meaning": ADOPTION_MEANING,
+            "perishable": ADOPTION_PERISHABLE}
 
 
 # --- the scheduler's door 3: completions, and the ledger's expiry -------------
@@ -12491,6 +12773,33 @@ def scheduler_section() -> dict:
         "restorations": int(state["restorations"]),
         "adopted": int(state["adopted"]),
         "adopted_tokens": int(state["adopted_tokens"]),
+        # PER-REQUEST DISK ATTRIBUTION (0.2.61). The two fields above answer the BOOT's
+        # question; a dashboard showing a TABLE OF REQUESTS needs the per-request
+        # number, and until now it was computed here and thrown away by
+        # `_mark_adopted()`. `recent_adoptions` is the newest `MAX_ADOPTIONS_PUBLISHED`
+        # of a `MAX_ADOPTION_RECORDS` ring, newest first, and the four counters beside
+        # it say how much of the boot's history that window is.
+        #
+        # WHY THE SNAPSHOT DOCUMENT AND NOT A RANK FILE: an adoption is decided by the
+        # SCHEDULER (it is the fork putting our slot ids into a step's
+        # `load_cpu_blocks`, and `role` in every row says so), and a worker never sees
+        # it - the rank files are worker-written, so carrying this there would mean
+        # NEW cross-process state and a new writer. The snapshot document is the
+        # existing transport for scheduler-side state (`scheduler_section()` exists for
+        # exactly that reason, and `tier.gpu_pool_census` is the precedent for a
+        # route-only scheduler fact).
+        #
+        # A READER MUST TREAT THIS AS PERISHABLE: records leave the ring, so a request
+        # that is ABSENT here has not been told "zero from disk" - see
+        # `adoption_perishable`, and the wire contract in `snapshot.py`'s docstring.
+        "recent_adoptions": disk_adoptions(),
+        "adoptions_recorded": int(state["adoptions"]),
+        "adoptions_dropped": int(state["adoptions_dropped"]),
+        "adoption_record_errors": int(state["adoption_record_errors"]),
+        "adoption_ring_depth": MAX_ADOPTION_RECORDS,
+        "adoptions_published": MAX_ADOPTIONS_PUBLISHED,
+        "adoption_meaning": ADOPTION_MEANING,
+        "adoption_perishable": ADOPTION_PERISHABLE,
         # THE DIRECT EVIDENCE THAT A READ HAPPENED, passed through from `counters()`
         # with no recomputation here.
         #
@@ -12698,6 +13007,25 @@ def scheduler_section() -> dict:
             "restorations": "loads that reported disk bytes back",
             "adopted": "requests whose disk slots reached a worker",
             "adopted_tokens": "tokens the scheduler adopted from disk",
+            # THE PER-REQUEST WINDOW (0.2.61): the counts beside `recent_adoptions`,
+            # so no reader has to guess whether the rows it can see are the rows that
+            # happened.
+            "adoptions_recorded": "adoption records EVER written this boot (unit: "
+                                  "requests): the same count as `counters()`'s "
+                                  "`adoptions` and the ring's `seq` source; exact "
+                                  "for the whole boot while the rows are a window",
+            "adoptions_dropped": "adoption records the ring recycled (unit: "
+                                 "records): proof that rows were lost, which costs a "
+                                 "per-request row and never a token",
+            "adoption_record_errors": "times an adoption record could not be built "
+                                      "and was contained (unit: internal "
+                                      "exceptions): must stay 0",
+            "adoption_ring_depth": "records the ring holds at its cap (unit: "
+                                   "records), sized from the measured arrival rate "
+                                   "in `snapshot.py`'s docstring",
+            "adoptions_published": "newest records this payload carries (unit: "
+                                   "records); the rest of the ring answers the "
+                                   "`disk` verb's `adoptions` op",
             "refused": "refusals, one counter per reason",
             "last_refusal": "refusals",
             "index.entries": "identities known to be on disk",

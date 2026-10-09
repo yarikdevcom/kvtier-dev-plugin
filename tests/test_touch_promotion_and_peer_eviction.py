@@ -633,13 +633,14 @@ def _arm_the_deadline_after_the_first_batch(monkeypatch):
     monkeypatch.setattr(disk_spill, "_deadline_expired",
                         lambda deadline: state["armed"])
 
-    def spy(directory, paths, peers, peers_known=True):
+    def spy(directory, paths, peers, peers_known=True, protected=frozenset()):
         state["batches"].append(list(paths))
         state["armed"] = True
         return disk_layout.execute_unlink_plan(
             directory, paths, dry_run=False,
             geometry_digest=disk_spill._state["geometry_digest"],
-            peer_digests=peers, for_capacity=True, peers_known=peers_known)
+            peer_digests=peers, for_capacity=True, peers_known=peers_known,
+            protected=protected)
 
     monkeypatch.setattr(disk_spill, "_unlink_batch", spy)
     return state
@@ -995,7 +996,7 @@ def test_a_batch_that_could_not_run_is_counted_and_never_journalled(tier, channe
     monkeypatch.setenv(config.ENV_DISK_EVICT_THREADS, "4")
     paths = _pooled_store(tier["root"], shards=2, per_shard=2)
 
-    def broken(_directory, _paths, _peers, _peers_known=True):
+    def broken(_directory, _paths, _peers, _peers_known=True, protected=frozenset()):
         return None
 
     monkeypatch.setattr(disk_spill, "_unlink_batch", broken)

@@ -628,9 +628,18 @@ def test_a_removal_under_a_known_peers_digest_is_counted_and_said(tier, channel,
     """
     root = tier["root"]
     now = time.time()
+    # THE AGES, and they are load-bearing since 0.2.62: OUTSIDE the unlink grace (a
+    # file touched inside `disk_layout.UNLINK_GRACE_SECONDS` is not sheddable at all)
+    # and INSIDE `PEER_DIGEST_FRESH_SECONDS` (the walk must still believe this peer is
+    # LIVE, which is the whole point of the counters under test). A live sibling whose
+    # newest file was written 100 s ago is exactly the shape both rules describe.
+    shed_age = disk_layout.UNLINK_GRACE_SECONDS + 10.0
+    assert shed_age + 2.0 < disk_spill.PEER_DIGEST_FRESH_SECONDS, (
+        "the grace and the peer-liveness window no longer overlap: this test needs "
+        "an age that is sheddable and still live")
     make_file(root, OWN_GEO, 121, when=now - 10_000.0)
-    sibling_a = make_file(root, PEER_GEO, 122, when=now - 1.0, group=4)
-    sibling_b = make_file(root, PEER_GEO, 123, when=now - 2.0, group=5)
+    sibling_a = make_file(root, PEER_GEO, 122, when=now - shed_age - 1.0, group=4)
+    sibling_b = make_file(root, PEER_GEO, 123, when=now - shed_age - 2.0, group=5)
     real = disk_spill._attribute_walk_bytes
 
     def handing_peers_back(walk, peers, peers_known=True):

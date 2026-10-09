@@ -303,7 +303,7 @@ MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "identities",
              "offers", "authority", "failures", "shadow", "gpu-shadow",
-             "restore-verify", "gpu-write", "restore-source")
+             "restore-verify", "gpu-write", "restore-source", "adoptions")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
                      "gpu-shadow", "restore-verify", "gpu-write", "restore-source")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
@@ -3254,6 +3254,26 @@ def _op_failures(body: dict) -> dict:
     return disk_restore.load_failure_report(limit=body.get("limit"))
 
 
+def _op_adoptions(body: dict) -> dict:
+    """WHICH REQUEST got how many tokens from disk, newest first (0.2.61).
+
+    `{"op":"adoptions"}` reads the newest `MAX_ADOPTIONS_PUBLISHED` adoption records;
+    `{"op":"adoptions","limit":N}` reads at most N (capped at
+    `MAX_ADOPTION_RECORDS`, so a caller can ask for the whole ring in one read). A
+    read-only op, so a safe method reaches it.
+
+    WHY AN OP AT ALL. The polled snapshot carries only the newest 48 rows to keep its
+    ~52 KiB document from inflating further, and 48 rows is 20 seconds of history in
+    the busiest minute this box has ever measured. The ring holds 256; this is how a
+    hunt that started an hour ago gets the rest of them. It is ALSO the only door for
+    a reader that must distinguish "this request adopted nothing" from "the ring
+    already recycled it": the answer is the report's `adopted`/`adopted_tokens`
+    boot totals read against `ring_dropped`, never the absence of a row.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    return disk_restore.disk_adoption_report(limit=body.get("limit"))
+
+
 def _op_shadow(body: dict) -> dict:
     """The SHADOW VERIFIER: read its counters, or arm it in this process.
 
@@ -3488,7 +3508,10 @@ _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              # inserted mid-table is a route advertising an order it does not dispatch
              # in.
              "gpu-write": _op_gpu_write,
-             "restore-source": _op_restore_source}
+             "restore-source": _op_restore_source,
+             # LAST, for the same in-order reason: per-request disk-adoption
+             # attribution out of the scheduler's bounded ring (0.2.61).
+             "adoptions": _op_adoptions}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring
