@@ -326,6 +326,65 @@ REFUSAL_REASONS = ("no_key_for_slot", "key_count_mismatch", "bad_key_text",
                    "fingerprint_mismatch", "bad_digest", "bad_call", "not_armed",
                    "not_configured", "no_channel", "expired", "over_tick_cap")
 
+# --- SPAN COMPLETENESS AT THE HAND-OFF ----------------------------------------
+#
+# WHY THESE COUNTERS EXIST. A span on the SSD tier is one file PER PREFIX-CACHEABLE
+# GROUP, and the restore walk needs those files in two different shapes
+# (`disk_restore._disk_run`, disk_restore.py:5829-5852): a POSITIONAL group's file for
+# every block of the run, and an ALIGN-MODE group's file for ONE block - the run's END.
+# That one file is the anchor, and without it the offer dies as `no_boundary_anchor`
+# ("the positional groups have the whole run and NO run end has a boundary-state file
+# in every align-mode group"). So a hand-off that carries the attention block and not
+# the align state produces a span that can extend a run but never end one, and one that
+# carries the align state without attention produces a span no run can walk over.
+#
+# THE MEASURED COST, from the per-rank spill journals over 71 hours on the live box
+# (2026-10-06 22:26 to 2026-10-09 21:32, 150k lines per rank, seq starting at 1):
+# 16,597 spans received an attention spill and 3,326 of them (20.0%) received NO align
+# state on ANY rank, while 2,281 received align state without attention - together
+# about a quarter of everything ever spilled, dead on arrival, unanchored by
+# construction. The rate is FLAT across the whole journal (20.4% in the first 5,000
+# attention spills, 20.1% by the 65,000th), so this is not a regression: it is the
+# steady-state shape of the fork's boundary hand-off supply since the align-mode tier
+# landed (`9f8153d`, 2026-10-06), and it was invisible because the only way to see it
+# was to fold four journals by hand.
+#
+# WHY MEASURING IS ALL THIS MODULE DOES. The align bytes for a block are in host RAM
+# only when the fork published a boundary hand-off for it: the connector allocates a
+# CPU block inside that loop and nowhere else (`manager.py:701-745` of the live tree),
+# and the metadata that reaches this process is flat - `store_cpu_blocks` plus
+# `store_keys`, with the group recoverable only from the key's 4-byte suffix
+# (`metadata.py:35-37`; `disk_layout.split_block_key`). So a pair is either already in
+# `record["pairs"]` below - and today it is already spilled - or the copy never
+# happened, and there is nothing here that can reach the state without reading GPU
+# memory on the step thread. Widening the supply is a fork change; making the 20% a
+# live number is this change.
+#
+# THE RULE THAT MAKES IT SAFE: strictly additive. A `{5}`-only span may receive its
+# align state from a LATER hand-off, so a span that looks incomplete here is a maybe,
+# and refusing it would make it a never. Nothing below gates, drops, reorders or
+# refuses a spill; the classification reads `record["pairs"]`, counts, and stops.
+SPAN_SHAPE_COUNTERS = ("spill_spans_classified", "spill_spans_complete",
+                       "spill_incomplete_state", "spill_incomplete_attention")
+
+# THE ONE VALUE, duplicated on purpose. `disk_restore.MAMBA_CACHE_MODE_ALIGN`
+# (disk_restore.py:1612) reads the same string from the manager; disk_restore IMPORTS
+# this module, so a hot-path `from . import disk_restore` inside the spill hook would
+# make the spill's cheapest witness depend on loading the heaviest layer in the
+# package. `test_the_two_readings_of_the_forks_align_mode_cannot_drift` keeps the two
+# copies honest, which is the cheap direction for that trade.
+MAMBA_CACHE_MODE_ALIGN = "align"
+
+# WHERE the split was read from, published beside the numbers so a reader can tell
+# "the geometry says X" from "the plugin guessed".
+SPAN_SHAPE_BASIS = ("kv_cache_groups[i].kv_cache_spec."
+                    "{prefix_cacheable,mamba_cache_mode}")
+
+# The last readable answer, and the config object it was read out of. A holder rather
+# than two module globals because this module has already been crashed twice by a
+# `global` declared in the wrong place (`test_global_shadowing.py`).
+_span_shape_cache: dict = {"config": None, "shapes": None}
+
 _state: dict = {
     # the hook
     "installed": False,
@@ -346,6 +405,20 @@ _state: dict = {
     "delegated_refusals": 0,
     "slots_capped": 0,
     "scan_skipped": 0,
+    # THE COMPLETENESS TALLY (see SPAN_SHAPE_COUNTERS above). Three mutually
+    # exclusive classes plus their denominator, so the orphan rate is a division
+    # rather than a journal-folding exercise: `spill_incomplete_state` counts the
+    # spans that can never ANCHOR a run, `spill_incomplete_attention` the ones no run
+    # can walk over, `spill_spans_complete` the rest, and `spill_spans_classified`
+    # every span the tier was able to classify at all.
+    "spill_spans_classified": 0,
+    "spill_spans_complete": 0,
+    "spill_incomplete_state": 0,
+    "spill_incomplete_attention": 0,
+    # Pairs this module could not read (no group suffix, not a key, a group the table
+    # does not have). They are IGNORED, never a span of their own, and published so an
+    # all-zero tally can be told apart from a classifier being fed garbage.
+    "span_shape_pairs_ignored": 0,
     "refused": {reason: 0 for reason in REFUSAL_REASONS},
     "refusals_total": 0,
     "last_refusal": None,
@@ -402,6 +475,9 @@ def reset_state_for_tests() -> None:
         "events_retained": 0, "retained_dropped": 0, "retained_now": 0,
         "slots_offered": 0, "spill_queued": 0, "delegated_refusals": 0,
         "slots_capped": 0, "scan_skipped": 0,
+        "spill_spans_classified": 0, "spill_spans_complete": 0,
+        "spill_incomplete_state": 0, "spill_incomplete_attention": 0,
+        "span_shape_pairs_ignored": 0,
         "refused": {reason: 0 for reason in REFUSAL_REASONS},
         "refusals_total": 0, "last_refusal": None, "boot_line": None,
         "fallbacks": 0, "errors": 0,
@@ -421,6 +497,8 @@ def reset_state_for_tests() -> None:
     })
     _state["served"] = {}
     _state["handled"] = {}
+    _span_shape_cache["config"] = None
+    _span_shape_cache["shapes"] = None
     _logged_lines.clear()
     _retained.clear()
 
@@ -1198,6 +1276,210 @@ def observe_bind(handler, metadata) -> dict:
         return _fail(f"the bind observation raised {type(exc).__name__}")
 
 
+def span_shape_state(handler) -> dict:
+    """Which prefix-cacheable groups must be in a run, and which supply its anchor.
+
+    READ FROM THE FORK'S OWN GROUP TABLE, the same object `_group_fields` reads for the
+    fingerprint (`handler.kv_cache_config.kv_cache_groups`, kept by `worker.py:41`):
+    `kv_cache_spec.prefix_cacheable` says whether a restore asks for the group at all
+    (group 4, the parked QSA ring, says no), and `kv_cache_spec.mamba_cache_mode ==
+    "align"` says it is a boundary-state group (`MambaSpec` declares the field,
+    `kv_cache_interface.py:998`; an attention spec does not declare it at all, which is
+    the fork's way of saying "positional"). That is `disk_restore._group_contract`'s
+    rule, applied to the spec because a worker has no manager to ask.
+
+    EVERY failure is an answer with a reason, never an exception and never a default:
+    a geometry whose shape cannot be read classifies NOTHING. A guessed denominator
+    would be worse than no number - it would move the one ratio this exists to report,
+    in whichever direction the guess happened to point.
+    """
+    base = {"ok": False, "basis": None, "align_group_ids": [],
+            "positional_group_ids": [], "prefix_cacheable_group_ids": [],
+            "reason": None}
+    groups = getattr(getattr(handler, "kv_cache_config", None),
+                     "kv_cache_groups", None)
+    if not groups:
+        return {**base, "reason": "kv_cache_config.kv_cache_groups is absent or "
+                                  "empty, so which group a restore must find at a "
+                                  "run's end is unknown"}
+    listed = list(groups)
+    if len(listed) > disk_layout.MAX_NUM_GROUPS:
+        return {**base, "reason": f"{len(listed)} groups exceeds the cap "
+                                  f"{disk_layout.MAX_NUM_GROUPS}"}
+    align: list = []
+    positional: list = []
+    cacheable: list = []
+    for index, group in enumerate(listed):
+        spec = getattr(group, "kv_cache_spec", None)
+        if spec is None:
+            return {**base, "reason": f"group {index} has no kv_cache_spec, so its "
+                                      "block shape is unknown"}
+        cacheable_attr = getattr(spec, "prefix_cacheable", None)
+        if not isinstance(cacheable_attr, bool):
+            return {**base, "reason": f"group {index} kv_cache_spec."
+                                      "prefix_cacheable is not a bool"}
+        if not cacheable_attr:
+            continue
+        cacheable.append(index)
+        mode = getattr(spec, "mamba_cache_mode", None)
+        if mode is None:
+            positional.append(index)      # an attention spec declares no mode
+            continue
+        if not isinstance(mode, str):
+            return {**base, "reason": f"group {index} kv_cache_spec."
+                                      "mamba_cache_mode is "
+                                      f"{type(mode).__name__}, not a str"}
+        (align if mode == MAMBA_CACHE_MODE_ALIGN else positional).append(index)
+    if not cacheable:
+        return {**base, "reason": "no prefix-cacheable group exists, so there is no "
+                                  "span here for a restore to want"}
+    if not align:
+        return {**base, "prefix_cacheable_group_ids": cacheable,
+                "reason": "no prefix-cacheable group reports mamba_cache_mode == "
+                          "'align', so the group a run must find its boundary-state "
+                          "anchor in is unknown and every span would be counted in "
+                          "one direction or the other"}
+    if not positional:
+        return {**base, "prefix_cacheable_group_ids": cacheable,
+                "reason": "no prefix-cacheable group is positional, so no span could "
+                          "ever be part of a contiguous run"}
+    return {"ok": True, "basis": SPAN_SHAPE_BASIS, "align_group_ids": align,
+            "positional_group_ids": positional,
+            "prefix_cacheable_group_ids": cacheable, "reason": None}
+
+
+def _span_shapes_for(handler) -> dict:
+    """The cached `span_shape_state()`. The group table is boot-stable; the cache is
+    only to keep a witness that runs once per completed store from re-reading fifteen
+    attributes each time. A FAILURE is not cached (a worker that binds before its
+    config exists heals on the next completion), and the cache is keyed on the config
+    object's identity, so a rebuilt config is re-read rather than believed.
+    """
+    config_object = getattr(handler, "kv_cache_config", None)
+    cached = _span_shape_cache["shapes"]
+    if (cached is not None and cached.get("ok")
+            and _span_shape_cache["config"] is config_object):
+        return cached
+    shapes = span_shape_state(handler)
+    _span_shape_cache["config"] = config_object
+    _span_shape_cache["shapes"] = shapes
+    return shapes
+
+
+def classify_handoff(pairs, shapes) -> dict:
+    """Group one hand-off's `(slot, key)` pairs into spans and classify each one.
+
+    PURE: no file, no engine object, no state, no allocation beyond a dict bounded by
+    `MAX_SLOTS_PER_EVENT` (the cap on pairs a hand-off can hold), so the loop cannot
+    grow with the workload. The span's identity is `disk_layout.split_block_key`'s
+    `key16` - the same digest the spill journal records, and the only position-free
+    name a span has: nothing here synthesizes a key or a position, and a pair whose key
+    cannot be read is IGNORED and counted, because a half-resolved identity is the one
+    thing this module is not allowed to write or count.
+
+    THE PARTITION, which is the invariant the counters depend on:
+      * `incomplete_attention` - no positional group at all. Not walkable over, so it
+        can never be an anchor either.
+      * `complete` - every prefix-cacheable positional group AND every align group.
+      * `incomplete_state` - some attention, but a shape that cannot anchor (a missing
+        align group, as the walk demands ALL of them at the run's end, or a missing
+        second positional group on a geometry that has one).
+    `spans` counts every span classified, so `spans == complete + incomplete_state +
+    incomplete_attention` holds on every call.
+    """
+    tally = {"spans": 0, "complete": 0, "incomplete_state": 0,
+             "incomplete_attention": 0, "ignored_pairs": 0}
+    if not isinstance(shapes, dict) or not shapes.get("ok"):
+        return tally
+    align = {int(group) for group in (shapes.get("align_group_ids") or ())}
+    positional = {int(group) for group in (shapes.get("positional_group_ids") or ())}
+    seen: dict = {}
+    for pair in pairs or ():
+        try:
+            key = pair[1]
+        except (TypeError, IndexError, KeyError):
+            tally["ignored_pairs"] += 1
+            continue
+        if not isinstance(key, str):
+            tally["ignored_pairs"] += 1
+            continue
+        split = disk_layout.split_block_key(key)
+        if not split.get("ok"):
+            tally["ignored_pairs"] += 1
+            continue
+        group = int(split["group_id"])
+        if group not in align and group not in positional:
+            # A parked group (the QSA ring) or one this table does not have: a file
+            # no restore will ever ask for, so it is not evidence about a span.
+            tally["ignored_pairs"] += 1
+            continue
+        entry = seen.setdefault(split["key16"], (set(), set()))
+        (entry[1] if group in align else entry[0]).add(group)
+    for present_positional, present_align in seen.values():
+        tally["spans"] += 1
+        if not present_positional:
+            tally["incomplete_attention"] += 1
+        elif (present_positional == positional and present_align == align):
+            tally["complete"] += 1
+        else:
+            tally["incomplete_state"] += 1
+    return tally
+
+
+def _note_span_shapes(tally) -> dict:
+    """Add one hand-off's tally to the boot counters. Nothing else - no policy."""
+    for state_key, tally_key in (("spill_spans_classified", "spans"),
+                                 ("spill_spans_complete", "complete"),
+                                 ("spill_incomplete_state", "incomplete_state"),
+                                 ("spill_incomplete_attention",
+                                  "incomplete_attention"),
+                                 ("span_shape_pairs_ignored", "ignored_pairs")):
+        _state[state_key] = int(_state[state_key]) + int(tally.get(tally_key) or 0)
+    return {"classified": int(tally.get("spans") or 0),
+            "complete": int(tally.get("complete") or 0),
+            "incomplete_state": int(tally.get("incomplete_state") or 0),
+            "incomplete_attention": int(tally.get("incomplete_attention") or 0)}
+
+
+def _tally_span_shapes(handler, pairs) -> dict:
+    """One hand-off, classified and added to the boot counters. Returns the per-hand-off
+    numbers so the caller can put them in its own report.
+
+    A geometry this module cannot read contributes NOTHING: no counter moves, and the
+    `span_shapes` block carries the reason. That is the whole fail-open contract of
+    this witness - a boot whose group table is unreadable reports zeros it can explain,
+    never zeros that look like a healthy tier.
+    """
+    shapes = _span_shapes_for(handler)
+    if not shapes.get("ok"):
+        return {"classified": 0, "complete": 0, "incomplete_state": 0,
+                "incomplete_attention": 0}
+    return _note_span_shapes(classify_handoff(pairs, shapes))
+
+
+def span_shape_view() -> dict:
+    """The tally's surroundings: what was classified, and on what authority.
+
+    Built on every path, so a payload from a boot that could not read its group table
+    has the same keys as one that could - and `classified: 0` beside a `reason` is a
+    different fact from `classified: 0` beside a healthy basis.
+    """
+    cached = _span_shape_cache["shapes"] or {}
+    return {"basis": cached.get("basis"),
+            "reason": cached.get("reason"),
+            "align_group_ids": list(cached.get("align_group_ids") or ()),
+            "positional_group_ids": list(cached.get("positional_group_ids") or ()),
+            "prefix_cacheable_group_ids": list(
+                cached.get("prefix_cacheable_group_ids") or ()),
+            "classified": int(_state["spill_spans_classified"]),
+            "pairs_ignored": int(_state["span_shape_pairs_ignored"]),
+            "note": ("a span is COMPLETE when it holds every prefix-cacheable "
+                     "positional group and every align-mode group; "
+                     "`spill_incomplete_state` spans can never anchor a run end and "
+                     "`spill_incomplete_attention` spans can never be walked over, so "
+                     "their bytes are written and never served")}
+
+
 def completed_snapshot(handler):
     """The keys of `_completed_store_events`, or None when we must not bother.
 
@@ -1231,7 +1513,9 @@ def on_store_completed(handler, before) -> dict:
     """
     if before is None:
         return _ok(spilled=0, reason="no completion diff was taken")
-    report = {"ok": True, "reason": None, "events": [], "spilled": 0, "queued": 0}
+    report = {"ok": True, "reason": None, "events": [], "spilled": 0, "queued": 0,
+              "spans": {"classified": 0, "complete": 0, "incomplete_state": 0,
+                        "incomplete_attention": 0}}
     try:
         completed = getattr(handler, "_completed_store_events", None)
         if not isinstance(completed, dict):
@@ -1259,6 +1543,22 @@ def on_store_completed(handler, before) -> dict:
                 report["events"].append({"event": event, "spilled": 0,
                                          "reason_kind": "unretained_event"})
                 continue
+            # THE COMPLETENESS TALLY, taken over the WHOLE hand-off before the tick
+            # cap can truncate it: the span's shape is a fact about what the fork
+            # completed, not about how much of it this step agreed to write. Contained
+            # twice over - `classify_handoff` and `span_shape_state` refuse rather than
+            # raise, and this guard is the belt to that braces - because a witness that
+            # faults the step thread is not a witness. It changes nothing about the
+            # spills below: no gate reads a tally, and an incomplete span is spilled
+            # exactly like a complete one.
+            try:
+                tallied = _tally_span_shapes(handler, record["pairs"])
+                for field, value in tallied.items():
+                    report["spans"][field] = int(report["spans"][field]) + value
+            except Exception as exc:  # noqa: BLE001 - a tally never faults a step
+                snapshot._error(exc, "disk_store span shape")
+                _state["errors"] = int(_state["errors"]) + 1
+                _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
             spilled_here = 0
             for slot, key in record["pairs"]:
                 if handed >= MAX_SLOTS_PER_TICK:
@@ -1971,6 +2271,20 @@ RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
                       # clock is actually moving (`recency_promotions`).
                       ("journal_removals", ("disk", "journal_removals"), "files"),
                       ("drops", ("disk", "drops"), "jobs"),
+                      # THE COMPLETENESS OF THE SPILLS (0.2.63). Three classes of span
+                      # and their denominator, summed across the ranks that wrote them.
+                      # The orphan rate is `spill_incomplete_state / classified` - the
+                      # spans whose bytes are on the SSD and can never anchor a run end
+                      # - and it is published as counts, not a percentage, because four
+                      # ranks with different volumes do not average into one rate.
+                      ("spill_spans_classified",
+                       ("disk", "spill_spans_classified"), "spans"),
+                      ("spill_spans_complete",
+                       ("disk", "spill_spans_complete"), "spans"),
+                      ("spill_incomplete_state",
+                       ("disk", "spill_incomplete_state"), "spans"),
+                      ("spill_incomplete_attention",
+                       ("disk", "spill_incomplete_attention"), "spans"),
                       ("recency_promotions",
                        ("disk_restore", "readers", "recency_promotions"), "reads"),
                       ("recency_promotions_throttled",
@@ -2019,6 +2333,25 @@ RANK_ROLLUP_MEANINGS = {
     "drops": "spills this rank's tier REFUSED to queue (queue full, byte cap, arm "
              "off): a spill that never became a file, so `spilled` alone cannot see "
              "it",
+    "spill_spans_classified": "spans this hand-off layer could classify (every "
+                              "attention spill, every align-state spill, counted once "
+                              "per store hand-off): the DENOMINATOR of the two rates "
+                              "beside it, never a rate on its own",
+    "spill_spans_complete": "spans that arrived with EVERY group a restore asks for - "
+                            "each one is a span that can be walked over and can end a "
+                            "run",
+    "spill_incomplete_state": "spans that arrived with the attention block and NOT "
+                              "with the boundary-state anchor every align-mode group "
+                              "needs at the run's end. Their bytes are written and "
+                              "counted against the ceiling, and no offer can use them: "
+                              "this is the `no_boundary_anchor` refusal, seen at spill "
+                              "time instead of at the lookup that fails. Summed, "
+                              "divided by `spill_spans_classified`, this is the "
+                              "orphan rate the journals measured at 20.0%",
+    "spill_incomplete_attention": "spans that arrived with align-state groups and NO "
+                                  "positional file, so no contiguous run can include "
+                                  "them at all - the mirror of the orphan above, and "
+                                  "equally unservable",
     "recency_promotions": "reads that moved a file's eviction clock "
                           "(disk_read.promote_recency): if this is not moving, the "
                           "tier is running a write-ordered LRU and shedding what it "
@@ -3664,6 +3997,15 @@ def worker_report() -> dict:
                   "completions": int(_state["completions"]),
                   "slots_offered": int(_state["slots_offered"]),
                   "spill_queued": int(_state["spill_queued"]),
+                  # THE COMPLETENESS OF THIS RANK'S SPILLS, so the fleet's rate is a
+                  # sum of four honest per-rank counters rather than the answering
+                  # process's own view of a job it did not do (the 2026-10-05 "every
+                  # number zero" failure, which is the reason this file exists).
+                  "spill_spans_classified": int(_state["spill_spans_classified"]),
+                  "spill_spans_complete": int(_state["spill_spans_complete"]),
+                  "spill_incomplete_state": int(_state["spill_incomplete_state"]),
+                  "spill_incomplete_attention": int(
+                      _state["spill_incomplete_attention"]),
                   "retained_events": int(len(_retained)),
                   "refused": _nonzero_refusals(),
                   "refusals_total": int(_state["refusals_total"]),
@@ -4173,6 +4515,17 @@ def hook_section(include_fingerprint: bool = True) -> dict:
             "delegated_refusals": int(_state["delegated_refusals"]),
             "slots_capped": int(_state["slots_capped"]),
             "scan_skipped": int(_state["scan_skipped"]),
+            # HOW MUCH OF WHAT THIS PROCESS SPILLED CAN EVER BE SERVED. The live form
+            # of a number that took four journals and a Python session to produce
+            # (20.0% of attention spans arriving without the align state that would let
+            # them anchor a run); `span_shapes` says what authority the split was read
+            # under, so a zero here is either "nothing orphaned" or "could not tell",
+            # and the payload says which.
+            "spill_spans_classified": int(_state["spill_spans_classified"]),
+            "spill_spans_complete": int(_state["spill_spans_complete"]),
+            "spill_incomplete_state": int(_state["spill_incomplete_state"]),
+            "spill_incomplete_attention": int(_state["spill_incomplete_attention"]),
+            "span_shapes": span_shape_view(),
             "refused": dict(_state["refused"]),
             "refusal_reasons": list(REFUSAL_REASONS),
             "fallbacks": int(_state["fallbacks"]), "errors": int(_state["errors"]),
@@ -4250,6 +4603,13 @@ def section() -> dict:
             "spill_queued": int(_state["spill_queued"]),
             "delegated_refusals": int(_state["delegated_refusals"]),
             "slots_capped": int(_state["slots_capped"]),
+            # The completeness tally, again (see `hook_section`): three classes and
+            # their denominator, so a snapshot and an `op:status` answer the same
+            # question with the same numbers.
+            "spill_spans_classified": int(_state["spill_spans_classified"]),
+            "spill_spans_complete": int(_state["spill_spans_complete"]),
+            "spill_incomplete_state": int(_state["spill_incomplete_state"]),
+            "spill_incomplete_attention": int(_state["spill_incomplete_attention"]),
             "refused": dict(_state["refused"]),
             "refusal_reasons": list(REFUSAL_REASONS),
             "fallbacks": int(_state["fallbacks"]),
