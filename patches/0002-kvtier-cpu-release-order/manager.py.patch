@@ -1,0 +1,64 @@
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 383adf7..3a0b745 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -1109,8 +1109,16 @@ class SimpleCPUOffloadScheduler:
+                         )
+                     )
+ 
+-        # Free CPU and GPU blocks' ref counts to turn them into prefix cache
+-        self.cpu_block_pool.free_blocks(cpu_blocks)
++        # Free CPU and GPU blocks' ref counts to turn them into prefix cache.
++        # Tail-first: `BlockPool.free_blocks(ordered_blocks)` puts the FIRST block
++        # nearest the eviction front, and `cpu_blocks` is prefix-first within each
++        # group run, so releasing it as-is parks every chain root-first. A chain
++        # that is only partly reclaimed then loses the root that every surviving
++        # block of it hashes against (chained hashes: a missing block implies every
++        # later block misses too), which makes the survivor unhit-able while it
++        # still holds a slot and an index key. This is the CPU mirror of
++        # KVCacheCoordinator.pop_blocks_for_free() on the GPU side.
++        self.cpu_block_pool.free_blocks(reversed(cpu_blocks))
+         self._gpu_block_pool.free_blocks(
+             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+         )
+@@ -1118,7 +1126,11 @@ class SimpleCPUOffloadScheduler:
+     def _release_transfer_refs(self, transfer: TransferMeta) -> None:
+         """Release transfer refs without making copied data cacheable."""
+         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids]
+-        self.cpu_block_pool.free_blocks(cpu_blocks)
++        # Same tail-first convention as the completion path. These blocks are never
++        # registered in the CPU prefix cache, so they take the unhashed "evict
++        # first" branch and the order is neutral today; reversing keeps every CPU
++        # release on the one eviction-priority contract.
++        self.cpu_block_pool.free_blocks(reversed(cpu_blocks))
+         assert self._gpu_block_pool is not None
+         self._gpu_block_pool.free_blocks(
+             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
+@@ -1265,8 +1277,11 @@ class SimpleCPUOffloadScheduler:
+     ) -> None:
+         """Release the temporary CPU block pin taken in get_num_new_matched_tokens()."""
+         cpu_hit_blocks, _hit_length, _num_computed_tokens = pending
++        # Tail-first WITHIN each group, groups kept in order - the exact idiom of
++        # KVCacheCoordinator.pop_blocks_for_free(). Releasing a hit root-first lets
++        # the root be evicted before the deeper blocks it was just pinned for.
+         blocks_to_free = [
+-            blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
++            blk for grp in cpu_hit_blocks for blk in reversed(grp) if not blk.is_null
+         ]
+         if blocks_to_free:
+             self.cpu_block_pool.free_blocks(blocks_to_free)
+@@ -1293,10 +1308,12 @@ class SimpleCPUOffloadScheduler:
+                     self._load_event_to_reqs.pop(state.load_event, None)
+ 
+         if state.transfer_meta is not None:
+-            # Free CPU touch refs
++            # Free CPU touch refs, tail-first within each group run: cpu_block_ids
++            # is the per-group prefix order written by update_state_after_alloc()
++            # (see _process_store_completion for why order is eviction priority).
+             self.cpu_block_pool.free_blocks(
+                 self.cpu_block_pool.blocks[bid]
+-                for bid in state.transfer_meta.cpu_block_ids
++                for bid in reversed(state.transfer_meta.cpu_block_ids)
+             )
+             # Free GPU touch refs
+             assert self._gpu_block_pool is not None

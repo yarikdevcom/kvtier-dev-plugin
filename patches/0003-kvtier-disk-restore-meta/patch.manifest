@@ -1,0 +1,142 @@
+# CANONICAL HOME of these bytes: this repo's `patches/` directory (see
+# patches/README.md for the base commit, the 58-patch packaging series and the
+# tree hashes). TWO consumers, one set of bytes: `patches/apply-kvtier-patches.sh`
+# applies them to a LOCAL vLLM checkout, and llm-api's `config/box/kvtier-patch.sh`
+# carries them to the GPU box over SSH (it resolves this directory from
+# KVTIER_PLUGIN_REPO and holds no copy of its own). Edit here, never there.
+# Tracked metadata for the patch in this directory. SOURCED by kvtier-patch.sh -
+# keep it shell-parseable (KEY=value, no command substitution, no trailing spaces)
+# and keep it byte-honest: every hash here is what `verify` compares the box
+# against, so a wrong value fails closed (the tool refuses) rather than open.
+#
+# Invoke as:  config/box/kvtier-patch.sh kvtier-disk-restore-meta <status|diff|verify|apply|...>
+# This is the FIRST half of the SSD-tier change; kvtier-disk-restore/ is the second.
+# Apply THIS one first - see APPLY ORDER in that manifest.
+
+patch_id=disk-restore-meta
+title="SSD KV tier, part 1/2 (data shape): declare store_keys, store_fingerprint and load_paths on the metadata object"
+upstream_issue="none (fork-local; the SSD tier is this project's, not upstream's)"
+upstream_pr="none (fork-local)"
+symptom="The SSD tier needs to tell the WORKER which block a spilled file is, and the metadata object crossing the EngineCore->worker boundary carries only integers and request-id strings. An undeclared attribute does not survive that boundary: the object is transported as builtins and rebuilt with msgspec.convert(result, result_type, ...) (v1/serial_utils.py:387), which can only populate DECLARED dataclass fields. So a key the scheduler sets but metadata.py does not declare simply does not exist on the worker's copy. Declaring the three fields is the whole point of this patch."
+
+# ---- WHAT THIS PATCH DOES ---------------------------------------------------
+# Purely additive, +22/-0, two hunks, three fields on SimpleCPUOffloadMetadata,
+# every one of them WITH A DEFAULT so an object written by a peer that lacks the
+# field still decodes (msgspec fills defaults for absent keys, and every existing
+# field keeps its position - these are inserted among other defaulted fields, so
+# no defaulted field ever moves behind a non-defaulted one):
+#   * store_keys: list[str] = [] - hex of the engine's BlockHashWithGroupId,
+#     index-aligned one-to-one and in the same order with store_cpu_blocks. "" for
+#     an entry with no hash; the length ALWAYS equals len(store_cpu_blocks).
+#     Filled by kvtier-disk-restore in build_connector_meta.
+#   * store_fingerprint: str = "" - the geometry digest whose name-space spilled
+#     files live in. Owned by the plugin's disk_layout.fingerprint_digest, never
+#     computed by the engine, "" until the plugin publishes one (see the
+#     kvtier-disk-restore manifest for why a scheduler cannot derive a per-rank
+#     digest). Handing it through here is what keeps the two sides agreeing by
+#     construction instead of by luck.
+#   * load_paths: list[str] = [] - absolute spill paths aligned with
+#     load_cpu_blocks; empty entry = today's behaviour. DECLARED ONLY in this
+#     milestone: nothing fills it and nothing consumes it yet. It is declared now
+#     because adding a field later is a second cross-boundary data-shape change,
+#     and the point of doing them together is that they are the expensive kind.
+# Why a field and not a side channel: the plugin cannot monkeypatch its way to
+# this. A wrapper can replace a method body, but it cannot make msgspec carry an
+# attribute the receiving class does not declare - that is a property of the
+# serialised shape, not of any code that runs.
+
+# ---- APPLY ORDER ------------------------------------------------------------
+# This file's pre-image is PRISTINE: on 2026-10-05 the installed metadata.py's
+# sha256 equals the committed HEAD blob of that path in the box's own checkout,
+# and `git status --porcelain` reports it CLEAN (only manager.py is modified, by
+# the two older patches). Neither kvtier-pr56810 nor kvtier-cpu-release-order
+# touches this file, so there is no older patch to chain behind and no older
+# manifest starts reporting PARTIAL because of this one.
+#   1. config/box/kvtier-patch.sh kvtier-disk-restore-meta apply   # THIS one
+#   2. config/box/kvtier-patch.sh kvtier-disk-restore apply        # fills the fields
+#   3. the operator boots the engine (this tool never does)
+# The order is a correctness requirement, not a preference: step 2 passes
+# store_keys=/store_fingerprint= as constructor kwargs and a dataclass rejects an
+# unexpected keyword, so 2-before-1 raises TypeError at the first store of the
+# next boot. Roll back in reverse order, this file last:
+#   config/box/kvtier-patch.sh kvtier-disk-restore rollback
+#   config/box/kvtier-patch.sh kvtier-disk-restore-meta rollback
+
+# ---- what is patched, and where (absolute: it lives in an EDITABLE install) --
+target_abs=/home/user/vllm-38-next/vllm-workspace/vllm/v1/simple_kv_offload/metadata.py
+target_mode=664
+module=vllm.v1.simple_kv_offload.metadata
+
+# WHY klass IS NOT THE CLASS THIS PATCH EDITS, read this before "fixing" it.
+# The fields go on SimpleCPUOffloadMetadata, which is a pure field-declaring
+# dataclass with NO methods at all. kvtier-patch.sh's verifier reads the target
+# with `ast`, hashes the named method bodies, and treats ANY method it cannot
+# place as `unrecognised` - so a manifest with no methods, or one naming a method
+# the class does not have, makes `verify` FAIL CLOSED on a perfectly good file.
+# Hence one real method from the same module, as a canary that this is the file
+# this patch was made for: SimpleCPUOffloadWorkerMetadata.aggregate, which this
+# patch does NOT touch, so its pre and post fingerprints are the same value by
+# design and the pair can only ever report "the file is the file".
+klass=SimpleCPUOffloadWorkerMetadata
+
+git_root=/home/user/vllm-38-next/vllm-workspace
+git_rel=vllm/v1/simple_kv_offload/metadata.py
+fork_version=0.30.0
+# Observed checkout HEAD on 2026-10-05, matching the other two manifests.
+fork_pin_head=9c27ca9a0657338852c7d3e59561d424fc036fde
+
+# The interpreter the engine itself runs on; every apply-time check uses it.
+engine_python=/home/user/vllm-38-next/venv/bin/python
+
+# ---- the patch itself -------------------------------------------------------
+patch_file=metadata.py.patch
+patch_sha256=51b2643b63fef97887d45a1c60c65c9a0ae5782cf966d8a1901606c91ece07cc
+patch_hunks=2
+patch_added=22
+patch_removed=0
+
+# ---- whole-file fingerprints -----------------------------------------------
+# file_sha_pre was computed ON THE BOX (sha256sum of the installed metadata.py,
+# 2026-10-05); it also equals the committed HEAD blob, i.e. the pristine fork file.
+# file_sha_post was produced by the tool's own build path: `git apply --check -p1`
+# then `git apply -p1` at ZERO offset on a fetched copy of those bytes, sha256 of
+# the result, and py_compile with CPython.
+file_sha_pre=6fd003219f3746e848bd8f93c5bb570c5d3b1564a5eb18c847c7c50bc1fb8bac
+file_sha_post=4b4b8dddede1df9feb46930463ec3880723a4c65d6723f604e5b226acc3759e6
+file_bytes_pre=2331
+file_bytes_post=3883
+file_lines_pre=60
+file_lines_post=82
+
+# ---- per-method fingerprints, order-aligned, space-separated ----------------
+# `aggregate` is NOT modified by this patch, so pre == post. It is a canary for
+# "the file is the file this patch was made for", which is the only thing a
+# method fingerprint can mean when the patched class has no methods. Disjoint
+# from all three other patches' methods (they are all in manager.py).
+methods="aggregate"
+methods_pre_sha256="8ba497eda8189e93318bc21f5736ba8208f8775083a4348899d3f91d72247412"
+methods_post_sha256="8ba497eda8189e93318bc21f5736ba8208f8775083a4348899d3f91d72247412"
+
+# ---- where the tool records what it did, and where backups live -------------
+# Its OWN backup_dir, for the same reason kvtier-cpu-release-order has its own:
+# `rollback`/`history` pick the newest backup in the directory without asking
+# which patch made it.
+#
+# A TOOLING LIMITATION THAT APPLIES TO THIS DIRECTORY, and no other: the backup
+# FILENAME pattern is hardcoded to 'manager.py.*.bak' (in cmd_apply's `bak=` path
+# and in newest_backup's `find -name`). Consequences on a metadata.py target:
+#   * `apply` still backs up correctly, but writes the metadata bytes into a file
+#     NAMED manager.py.<ts>-<tag>.bak. The bytes are right; the name is a lie.
+#   * `history` reports "(none - this tool has never patched ...)" and bare
+#     `rollback` refuses with "no backups", because it looks for that pattern in
+#     THIS directory and finds its own backups only by that misleading name.
+#   * Therefore: to undo this patch, name the backup explicitly -
+#       config/box/kvtier-patch.sh kvtier-disk-restore-meta rollback --backup \
+#         ~/.kvtier-patch-backups-disk-restore-meta/<the .bak you want>
+#     ...and do NOT let that file's name tempt anyone into restoring it onto
+#     manager.py. Keeping this directory private is what makes the mix-up
+#     impossible rather than merely unlikely. Fixing the pattern (derive the
+#     basename from target_abs) is a change to kvtier-patch.sh and its own test
+#     file, deliberately not smuggled into this change set.
+state_dir=.kvtier-patch
+backup_dir=kvtier-patch-backups-disk-restore-meta

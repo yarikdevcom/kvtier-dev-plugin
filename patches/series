@@ -1,0 +1,21 @@
+# The vLLM patch series, in the order it must be applied. One directory per
+# line, relative to this file; blank lines and '#' comments are ignored.
+#
+# ORDER IS A DEPENDENCY, NOT A PREFERENCE. Each patch's `file_sha_pre` is the
+# `file_sha_post` of the patch before it on the SAME file, so applying them out
+# of order is not "still fine, probably" - the second one's pre-image simply
+# does not exist yet and `apply` refuses, naming both hashes. Two rules the
+# numbering encodes:
+#
+#   manager.py  0001 -> 0002 -> 0004   (a hash chain: each pre is the previous post)
+#   0003 (metadata.py) must precede 0004, which passes the fields 0003 declares
+#   on the metadata object as constructor arguments - a semantic dependency the
+#   hash chain alone cannot express, because they are different files.
+#
+# `apply-kvtier-patches.sh` reads this file and walks it in order; it also
+# refuses if a numbered patch directory exists here and is NOT listed below (a
+# silently-skipped patch is how a half-patched engine happens).
+0001-kvtier-pr56810
+0002-kvtier-cpu-release-order
+0003-kvtier-disk-restore-meta
+0004-kvtier-disk-restore

@@ -1,0 +1,140 @@
+# CANONICAL HOME of these bytes: this repo's `patches/` directory (see
+# patches/README.md for the base commit, the 58-patch packaging series and the
+# tree hashes). TWO consumers, one set of bytes: `patches/apply-kvtier-patches.sh`
+# applies them to a LOCAL vLLM checkout, and llm-api's `config/box/kvtier-patch.sh`
+# carries them to the GPU box over SSH (it resolves this directory from
+# KVTIER_PLUGIN_REPO and holds no copy of its own). Edit here, never there.
+# Tracked metadata for the patch in this directory. SOURCED by kvtier-patch.sh -
+# keep it shell-parseable (KEY=value, no command substitution, no trailing spaces)
+# and keep it byte-honest: every hash here is what `verify` compares the box
+# against, so a wrong value fails closed (the tool refuses) rather than open.
+#
+# Invoke as:  config/box/kvtier-patch.sh cpu-release-order <status|diff|verify|apply|rollback|history>
+# (the leading argument selects THIS directory; the verb follows it).
+
+patch_id=cpu-release-order
+title="CPU offload tier: release CPU blocks tail-first, so a partly-reclaimed chain keeps its root"
+upstream_issue="none (fork-local defect; no upstream issue filed)"
+upstream_pr="none (follows vllm's own GPU-side convention, see WHY below)"
+symptom="No crash and no error line. The host-RAM tier parks blocks and evicts them root-first, so a chain that is only partly reclaimed loses the block every surviving block of it hashes against - the survivor stays pinned in the arena and in cpu_hash_index while being unhit-able forever."
+
+# ---- WHY THIS PATCH EXISTS (the audit, and the honest limit of it) ----------
+# The RAM tier is an ordinary BlockPool + FreeKVCacheBlockQueue (manager.py
+# cpu_block_pool = cpu_coordinator.block_pool, enable_caching=True), so eviction
+# priority IS queue position and queue position IS the argument order of
+# BlockPool.free_blocks(ordered_blocks), whose own docstring says "the first block
+# will be evicted first" (v1/core/block_pool.py:770-798: hashed blocks -> append_n
+# at the back "FIFO reuse ... for LRU eviction behavior", unhashed -> prepend_n at
+# the front; get_new_blocks takes them with popleft_n from the FRONT, :664-686).
+# The GPU side exploits that: KVCacheCoordinator.pop_blocks_for_free reverses
+# WITHIN EACH GROUP before concatenating (v1/core/kv_cache_coordinator.py:391-413,
+# whose comment warns that reversing the flat list "would emit whole groups in the
+# wrong order"), and KVCacheManager.free documents "we free the blocks in reverse
+# order so that the tail blocks are evicted first" (v1/core/kv_cache_manager.py:603-609).
+# manager.py contained ZERO reversed() calls and passed every CPU release
+# prefix-first. Prefix lookup is a strict prefix walk - "a missing block implies
+# every later block misses too (chained hashes)"
+# (v1/core/single_type_kv_cache_manager.py:806-810) - so root-first ordering turns
+# a PARTIAL eviction into the loss of a whole chain, and does it at the earliest
+# possible moment for that chain.
+# WHAT THIS PATCH DOES: the four CPU release sites free tail-first. Sites 1113 and
+# 1297 take a flat per-group-concatenated prefix list, so reversing it reverses
+# every group's subsequence too (reversal commutes with filtering) - chain
+# integrity is exactly what free_blocks re-derives, and only cross-group AGING
+# order differs from the coordinator's idiom. Site 1272 has the per-group lists in
+# hand and reverses within each group, groups kept in order - the coordinator's
+# idiom literally. The GPU releases at :1114/:1123/:1303 are deliberately NOT
+# touched: they are the same class of issue, but this patch is scoped to the CPU
+# tier it was audited for.
+# NOT ESTABLISHED (do not promise a number): nobody has shown this defect causes
+# the low load count of the boot under audit. The justification is parity with the
+# GPU coordinator plus the prefix-chain argument, not a measured gain. A
+# post-restart null result is a real outcome - the pre-declared pass/fail lives in
+# the change-set report; read it before calling this a win or a failure.
+# BASELINE, same boot (engine started 2026-10-04 19:15:04 CEST; plugin says boots=1,
+# so every one of these is a per-boot counter still running):
+#   earlier reading  load_event_counter 24 / store_event_counter 2840 / evictions_total 5712
+#                              cpu_hash_index entries 1374 (54,960 tokens upper bound)
+#   2026-10-04 22:29  load_event_counter 35 / store_event_counter 3506 / evictions_total 7426
+#                              cpu_hash_index entries 1390 (55,600 tokens), cpu_pool
+#                              free_blocks 1330 of 1331, gpu joint_hashed_blocks_min 26,
+#                              external_prefix_cache hits 2,717,280 of 6,187,759 queries (43.9%)
+#   uncached prompt-token share (llm_requests.db, has_response=1 AND
+#     exclude_from_statistics=0, 1 - sum(min(cached,prompt))/sum(prompt)):
+#     Oct 2 5.45%, Oct 3 8.87%, Oct 4 (partial) 3.89%
+# Counters reset at every engine boot; llm_requests.db rows do not. Re-read ALL of
+# these at T0 immediately before the restart - a stale reading is a fake floor.
+
+# ---- what is patched, and where (absolute: it lives in an EDITABLE install) --
+# Same target as kvtier-pr56810: vllm is `pip install -e`, so this edits a git
+# working tree on the box and kvtier-patch.sh prints that divergence from git.
+target_abs=/home/user/vllm-38-next/vllm-workspace/vllm/v1/simple_kv_offload/manager.py
+target_mode=664
+module=vllm.v1.simple_kv_offload.manager
+klass=SimpleCPUOffloadScheduler
+
+git_root=/home/user/vllm-38-next/vllm-workspace
+git_rel=vllm/v1/simple_kv_offload/manager.py
+fork_version=0.30.0
+# Observed checkout HEAD on 2026-10-04 ("executor: detect a fail-closed fault or
+# death on any rank"). Note: kvtier-pr56810/patch.manifest records
+# fork_pin_head=10b8e073321f22113da977856b5d5593ab6fa5d5, and `git cat-file -t`
+# says that object does not exist in THIS checkout - its pin never described this
+# tree. Recorded here as an observation, not fixed: that manifest is not this
+# change's to edit.
+fork_pin_head=9c27ca9a0657338852c7d3e59561d424fc036fde
+
+# The interpreter the engine itself runs on; every apply-time check uses it.
+engine_python=/home/user/vllm-38-next/venv/bin/python
+
+# ---- APPLY ORDER (a hard dependency, not a suggestion) ----------------------
+# file_sha_pre below IS kvtier-pr56810's file_sha_post: this patch was built from
+# the box's CURRENT bytes, which already carry the #56810 backport. So:
+#   1. config/box/kvtier-patch.sh kvtier-pr56810 status     # must say PATCHED_BY_US
+#   2. config/box/kvtier-patch.sh cpu-release-order apply
+#   3. the operator boots the engine (this tool never does)
+# After step 2, the PR56810 MANIFEST DESCRIBES A FILE THAT NO LONGER EXISTS: its
+# `status` reports PARTIAL (all four of ITS methods still carry the #56810 text -
+# this patch touches four OTHER methods) and its `verify` refuses with "neither the
+# pre-image nor the post-image". Both are EXPECTED, not damage. This manifest is
+# the one that describes reality afterwards.
+# Roll back THIS patch alone (leaving #56810 in place):
+#   config/box/kvtier-patch.sh cpu-release-order rollback
+# backups for this patch live in a directory of their own (backup_dir below):
+# kvtier-patch.sh's `rollback`/`history` pick "the newest manager.py.*.bak" without
+# asking which patch made it, so sharing one directory with pr56810 would let a
+# rollback of this patch silently restore a PRE-#56810 file.
+
+# ---- the patch itself -------------------------------------------------------
+patch_file=manager.py.patch
+patch_sha256=e50dfa39b613baef30656ef8ff5c8f3ba46b616fb9c01e912522705b275f5251
+patch_hunks=4
+patch_added=23
+patch_removed=6
+
+# ---- whole-file fingerprints -----------------------------------------------
+# file_sha_pre was computed ON THE BOX (sha256sum of the installed file, 2026-10-04)
+# and equals kvtier-pr56810's file_sha_post. file_sha_post was produced by the
+# tool's own build path: `git apply --check -p1` then `git apply -p1` at ZERO
+# offset on a copy of those bytes, and py_compile with CPython; the method
+# fingerprints below come from the same built file.
+file_sha_pre=e4b00291991cfd6fdcabb8a22379b119073fca63341d2f488954b280b4a996eb
+file_sha_post=b61ffcc336d28e5342ad145e45db1bd6dd542ea3d45141baaf7f3150a42d0f89
+file_bytes_pre=59197
+file_bytes_post=60631
+file_lines_pre=1376
+file_lines_post=1393
+
+# ---- per-method fingerprints, order-aligned, space-separated ----------------
+# The four CPU RELEASE sites (not pr56810's four construction/selection methods -
+# the two tracked patches are disjoint by design, which is what keeps a PARTIAL
+# reading of one from being mistaken for the other).
+methods="_process_store_completion _release_transfer_refs _free_pending_cpu_hit _cleanup_load_request"
+methods_pre_sha256="36713ed0f81a08235dcdf33a272ab32733079f77a1dd807e05feccc73dca69fb fe464dedc90d228cfaa652ef2db8a75d2626d6a69f5b98654571066accde5a63 752e2a6d9c20809043bf2d01e49cac36b5a2671b1c1a4910a31534f306af2a52 1068e0590581b2a076201cd3a8ef994caa35e4e2b7d140cb03a670c8a7b01c6b"
+methods_post_sha256="787a61446cfd5238a573f7a6273b4c194d1aba792022316b8fc35e89b28d2fa7 bcb59a8e0f1156b57723d44c81c6911ee2214ee5deb169f028b7a6a0504f8b25 243058f0a1b31ffeb6b8acdbedbe61fa47818958b89b814b2a59c49feee67f0f f7f26453339011e422242e23190f3926a838c4d8dfdab0180cdc97630380b6ab"
+
+# ---- where the tool records what it did, and where backups live -------------
+# state_dir is shared with pr56810 and harmless: the marker file is named
+# <patch_id>.state. backup_dir is deliberately NOT shared - see APPLY ORDER above.
+state_dir=.kvtier-patch
+backup_dir=kvtier-patch-backups-cpu-order

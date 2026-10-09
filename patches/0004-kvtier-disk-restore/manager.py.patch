@@ -1,0 +1,50 @@
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 3a0b745..9d3d49c 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -540,6 +540,36 @@ class SimpleCPUOffloadScheduler:
+                 self._reqs_to_load[req_id].load_event = load_event
+             self._load_event_to_reqs[load_event] = load_req_ids
+ 
++        # SSD tier: a spilled slot is found by its block hash, and the hash lives
++        # in THIS process while the bytes live in the worker. The metadata object
++        # is the only scheduler->worker channel, so the hash has to ride on it.
++        # One hex key per store entry, index-aligned with `store_cpu_blocks` (the
++        # two store lists are appended in lockstep by both prepare paths and by
++        # the pending-finished-store extension above, so entry i of one is entry i
++        # of the other). The value is the GPU pool's own `block_hash`, the same
++        # `BlockHashWithGroupId` that _classify_store_candidate admits on and that
++        # _process_store_completion publishes. An entry whose block carries no
++        # hash becomes "" rather than a dropped entry, so the length always equals
++        # len(store_cpu_blocks).
++        store_keys: list[str] = []
++        _store_key_pool = self._gpu_block_pool
++        for _i in range(len(store_cpu)):
++            _key = ""
++            if _store_key_pool is not None and _i < len(store_gpu):
++                _bhash = _store_key_pool.blocks[store_gpu[_i]].block_hash
++                if _bhash is not None:
++                    _key = _bhash.hex()
++            store_keys.append(_key)
++        # SSD tier: the geometry digest is the plugin's to compute, not the
++        # engine's: it covers per-rank facts the scheduler does not have (the slot
++        # width in bytes is a worker tensor stride, and it differs between the PP
++        # stages) and a `rank` field that is meaningless for the single scheduler
++        # object serving every rank. So hand through whatever the plugin published
++        # and stay "" when it published nothing; getattr keeps this read-only and
++        # lets the plugin own the attribute. `load_paths` is left at its default
++        # (declare-only in this milestone).
++        store_fingerprint = getattr(self, "_kvtier_store_fingerprint", "")
++
+         result = SimpleCPUOffloadMetadata(
+             load_event=load_event,
+             load_gpu_blocks=load_gpu,
+@@ -551,6 +581,8 @@ class SimpleCPUOffloadScheduler:
+             store_event=store_event,
+             store_gpu_blocks=store_gpu,
+             store_cpu_blocks=store_cpu,
++            store_keys=store_keys,
++            store_fingerprint=store_fingerprint,
+             need_flush=bool(scheduler_output.preempted_req_ids),
+         )
+         return result

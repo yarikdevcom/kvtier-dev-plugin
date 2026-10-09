@@ -1,0 +1,184 @@
+# CANONICAL HOME of these bytes: this repo's `patches/` directory (see
+# patches/README.md for the base commit, the 58-patch packaging series and the
+# tree hashes). TWO consumers, one set of bytes: `patches/apply-kvtier-patches.sh`
+# applies them to a LOCAL vLLM checkout, and llm-api's `config/box/kvtier-patch.sh`
+# carries them to the GPU box over SSH (it resolves this directory from
+# KVTIER_PLUGIN_REPO and holds no copy of its own). Edit here, never there.
+# Tracked metadata for the patch in this directory. SOURCED by kvtier-patch.sh -
+# keep it shell-parseable (KEY=value, no command substitution, no trailing spaces)
+# and keep it byte-honest: every hash here is what `verify` compares the box
+# against, so a wrong value fails closed (the tool refuses) rather than open.
+#
+# Invoke as:  config/box/kvtier-patch.sh kvtier-disk-restore <status|diff|verify|apply|rollback|history>
+# (the leading argument selects THIS directory; the verb follows it).
+
+patch_id=disk-restore
+title="SSD KV tier, part 1/2 (scheduler side): put the block hash on the metadata object the worker reads"
+upstream_issue="none (fork-local; the SSD tier is this project's, not upstream's)"
+upstream_pr="none (fork-local)"
+symptom="No crash and no error line - a silent functional wall. A tier hit is resolved by a hash lookup in block_pool.cached_block_hash_to_block and the only publisher into that index is scheduler-side store-completion, so hashes live in the Scheduler process while the bytes live in the Worker process. SimpleCPUOffloadMetadata carried ONLY integers and request-id strings, so a worker handed a spill file could not be told WHICH block it belongs to: a file-resident block is unaddressable. This patch puts the hash on the one scheduler->worker channel."
+
+# ---- WHAT THIS PATCH DOES, AND WHAT IT DELIBERATELY DOES NOT ----------------
+# One method, additive, +32/-0. In build_connector_meta(), immediately before the
+# SimpleCPUOffloadMetadata(...) it already constructs, it derives one hex key per
+# store entry and passes two new kwargs. Nothing else changes.
+#   * store_keys: for entry i, the GPU pool's own `block_hash` for
+#     store_gpu_blocks[i], as `.hex()`. `BlockHashWithGroupId` is `bytes`
+#     (v1/core/kv_cache_utils.py:66 - the block hash with the 4-byte big-endian
+#     group id appended by make_block_hash_with_group_id), so `.hex()` IS the
+#     string the plugin's disk_layout names a file after. The two store lists are
+#     index-parallel by construction (both prepare paths append them in lockstep:
+#     manager.py:712-713 and :764-765 in the pre-image; the pending-finished-store
+#     loop in build_connector_meta extends both) and the worker already consumes
+#     them positionally (worker.py launch_copy(store_gpu_blocks, store_cpu_blocks)),
+#     which is what makes index alignment a fact rather than a hope.
+#   * An entry whose block carries no hash becomes "" , NEVER a dropped entry, so
+#     len(store_keys) == len(store_cpu_blocks) ALWAYS. A short list would silently
+#     misalign every key after the gap, and a misaligned key means writing KV under
+#     the WRONG hash - the one failure mode this tier must not be able to have.
+#   * store_fingerprint is handed through from a plugin-owned attribute and is ""
+#     unless the plugin published one. The engine does NOT compute it - see the
+#     WHY THE ENGINE CANNOT COMPUTE store_fingerprint section below.
+# NOT TOUCHED, on purpose: store completion, publication, _insert_block_hash, the
+# free-order behaviour cpu-release-order changed, and the load path's semantics.
+# `load_paths` is DECLARED (its sibling patch) but not filled here: it stays at
+# its default empty list, which is exactly today's behaviour. Consuming it is a
+# later milestone. Inertness comes from the plugin's arm-gated wrappers, as always.
+
+# ---- APPLY ORDER (a hard dependency, not a suggestion) ----------------------
+# This patch has TWO directories, because kvtier-patch.sh verifies ONE target file
+# per directory (a single target_abs, a single file_sha_pre/post pair, and
+# build_expected_from stages only $git_rel into the tree it runs `git apply` in -
+# a two-file patch would fail there with "No such file or directory", and no
+# manifest could describe two files). So the contract is split:
+#   1. config/box/kvtier-patch.sh kvtier-pr56810 status        # must say PATCHED_BY_US
+#   2. config/box/kvtier-patch.sh cpu-release-order status     # must say PATCHED_BY_US
+#   3. config/box/kvtier-patch.sh kvtier-disk-restore-meta apply   # DECLARES the fields
+#   4. config/box/kvtier-patch.sh kvtier-disk-restore apply        # FILLS them (this manifest)
+#   5. the operator boots the engine (this tool never does)
+# Step 3 before step 4 is not cosmetic: step 4 passes store_keys= and
+# store_fingerprint= as constructor kwargs, and a dataclass REJECTS an unexpected
+# keyword argument, so applying this patch without its sibling is a TypeError at
+# the first build_connector_meta() call - i.e. at the first store of the next
+# boot. The pair is one change; deploy it as one change.
+#
+# THE PRE-IMAGE IS THE ALREADY-PATCHED FILE - SAY IT PLAINLY.
+# file_sha_pre below is NOT a pristine fork file: it is `file_sha_post` of
+# kvtier-cpu-release-order, the patch that is LIVE in production right now
+# (b61ffcc3..., verified 2026-10-05 against the box's installed manager.py).
+# This patch was built from the box's current bytes, which already carry #56810
+# AND the release-order change. Consequences, both expected, neither damage:
+#   * After step 4, kvtier-cpu-release-order's MANIFEST describes a file that no
+#     longer exists. Its `status` reports PARTIAL - all FOUR of its methods still
+#     carry the post-release-order text, so `M_POST > 0`, while the whole-file hash
+#     matches neither of its two states - and its `verify` refuses with "neither
+#     the pre-image nor the post-image". That is the SAME by-design report the
+#     release-order manifest already documented for pr56810, one level deeper.
+#   * kvtier-pr56810's status keeps reporting PARTIAL for the same reason it
+#     already does today.
+# THIS manifest is the one that describes reality afterwards.
+#
+# METHODS ARE DISJOINT ACROSS ALL FOUR PATCHES, which is what keeps one patch's
+# PARTIAL from being read as another's. This patch pins ONE method:
+#   build_connector_meta            <- this patch (kvtier-disk-restore)
+#   _process_store_completion, _release_transfer_refs, _free_pending_cpu_hit,
+#   _cleanup_load_request           <- kvtier-cpu-release-order
+#   __init__, _estimate_lazy_target_blocks, update_state_after_alloc,
+#   _select_eager_blocks_to_store   <- kvtier-pr56810
+#   aggregate                       <- kvtier-disk-restore-meta (different FILE)
+# No name appears twice. The concrete payoff: after step 4, cpu-release-order's
+# PARTIAL is provably about a file state, not about its own methods having been
+# rewritten under it - and if THIS patch is ever half-applied by hand, it is
+# build_connector_meta that says so, a name no other manifest can produce.
+# Roll back THIS patch alone (leaving everything older in place):
+#   config/box/kvtier-patch.sh kvtier-disk-restore rollback
+
+# ---- what is patched, and where (absolute: it lives in an EDITABLE install) --
+# Same file as kvtier-pr56810 and kvtier-cpu-release-order. vllm is `pip install
+# -e`, so this edits a git working tree and kvtier-patch.sh prints that divergence
+# from git. Note the file's real home: the CONNECTOR class is
+# distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py, but the
+# scheduler, worker and metadata for that connector live under v1/simple_kv_offload/.
+target_abs=/home/user/vllm-38-next/vllm-workspace/vllm/v1/simple_kv_offload/manager.py
+target_mode=664
+module=vllm.v1.simple_kv_offload.manager
+klass=SimpleCPUOffloadScheduler
+
+git_root=/home/user/vllm-38-next/vllm-workspace
+git_rel=vllm/v1/simple_kv_offload/manager.py
+fork_version=0.30.0
+# Observed checkout HEAD on 2026-10-05 (`git -C <root> rev-parse HEAD`), the same
+# HEAD kvtier-cpu-release-order recorded. kvtier-pr56810's fork_pin_head names an
+# object this checkout does not contain; that is documented over there and is not
+# this manifest's to edit.
+fork_pin_head=9c27ca9a0657338852c7d3e59561d424fc036fde
+
+# The interpreter the engine itself runs on; every apply-time check uses it.
+engine_python=/home/user/vllm-38-next/venv/bin/python
+
+# ---- the patch itself -------------------------------------------------------
+patch_file=manager.py.patch
+patch_sha256=1c014dd9a998da92649f4ebedf399eea7875897d05ab9cb19d112e4c29ac92c5
+patch_hunks=2
+patch_added=32
+patch_removed=0
+
+# ---- whole-file fingerprints -----------------------------------------------
+# file_sha_pre was computed ON THE BOX (sha256sum of the installed manager.py,
+# 2026-10-05) and EQUALS kvtier-cpu-release-order's file_sha_post - see APPLY
+# ORDER. file_sha_post was produced by the tool's own build path: `git apply
+# --check -p1` then `git apply -p1` at ZERO offset on a fetched copy of those
+# bytes, sha256 of the result, and py_compile with CPython. The method
+# fingerprints below come from that same built file.
+file_sha_pre=b61ffcc336d28e5342ad145e45db1bd6dd542ea3d45141baaf7f3150a42d0f89
+file_sha_post=b5756c45e327c2bd33750b5b609f25ac563f79a9a0f04728e10fe51b081c0f34
+file_bytes_pre=60631
+file_bytes_post=62653
+file_lines_pre=1393
+file_lines_post=1425
+
+# ---- per-method fingerprints, order-aligned, space-separated ----------------
+# One method. Quoted because this file is SOURCED by the tool: an unquoted
+# multi-word value is a command name to the shell.
+methods="build_connector_meta"
+methods_pre_sha256="7addf1e77638810c108669aaf26f91097736b399fc7c23955cc912ecc844292e"
+methods_post_sha256="c185ec7cc3bb21691d922f56fd445aa9db5b26d9e98301b91fec44632a014847"
+
+# ---- WHY THE ENGINE CANNOT COMPUTE store_fingerprint ------------------------
+# kvtier_dev_plugin/disk_layout.py owns the digest: fingerprint_digest() ->
+# validate_fingerprint() then compute_geometry_digest() = sha256 over
+# canonical_fingerprint(), truncated to 12 hex chars, over FINGERPRINT_FIELDS.
+# Importing it from the engine is NOT the blocker (it is installed in the engine
+# venv and imports with the engine interpreter). The blocker is that four of its
+# required fields are not facts a scheduler process has:
+#   * total_bytes_per_block - "bytes for ONE slot ON ONE RANK", computed from the
+#     worker's region tensor stride(0) * element_size(). It is 11,468,800 B on the
+#     PP0 ranks and 12,902,400 B on the PP1 ranks: the two pipeline stages
+#     genuinely differ, and disk_layout's own docstring says that is why the width
+#     is a fingerprint FIELD and never a constant.
+#   * rank - "PP<n>_TP<m>", validated by name. There is ONE
+#     SimpleCPUOffloadScheduler per EngineCore serving all four ranks (PP2xTP2),
+#     so this object has no single rank to report.
+#   * dtype - the worker's tensor dtype, and cache_dtype, which the plugin keeps as
+#     two separate fields.
+#   * world_size / dcp_world_size / cp_world_size - available scheduler-side, but
+#     irrelevant next to the two above.
+# The consequence is structural, not a missing import: the digest is PER RANK by
+# construction, while store_fingerprint is ONE value broadcast to every worker in
+# the step. No single scheduler-computed digest can equal all four ranks'
+# geodigest12, and a near-miss reimplementation in engine code would make every
+# written file permanently un-findable. So the engine HANDS THROUGH
+# `getattr(self, "_kvtier_store_fingerprint", "")`: whatever the plugin published
+# travels, and "" means no digest was negotiated. getattr rather than a real
+# attribute is also what keeps this patch off __init__, which pr56810 owns - a
+# method this manifest must not fingerprint.
+
+# ---- where the tool records what it did, and where backups live -------------
+# state_dir is shared with the other patches and harmless: the marker file is named
+# <patch_id>.state. backup_dir is deliberately NOT shared: kvtier-patch.sh's
+# `rollback`/`history` pick "the newest manager.py.*.bak" WITHOUT asking which patch
+# made it, so a shared directory would let a rollback of this patch restore a
+# pre-release-order or even pre-#56810 file. Same rule kvtier-cpu-release-order
+# documented for itself, one level further along the chain.
+state_dir=.kvtier-patch
+backup_dir=kvtier-patch-backups-disk-restore

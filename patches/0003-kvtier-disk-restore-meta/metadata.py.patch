@@ -1,0 +1,40 @@
+diff --git a/vllm/v1/simple_kv_offload/metadata.py b/vllm/v1/simple_kv_offload/metadata.py
+index 8c8d451..152cab8 100644
+--- a/vllm/v1/simple_kv_offload/metadata.py
++++ b/vllm/v1/simple_kv_offload/metadata.py
+@@ -26,6 +26,13 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
+     load_event: int = INVALID_JOB_ID
+     load_gpu_blocks: list[int] = field(default_factory=list)
+     load_cpu_blocks: list[int] = field(default_factory=list)
++    # SSD tier: absolute path of the spill file each load slot's bytes come from,
++    # index-aligned one-to-one with `load_cpu_blocks`. An empty entry means "no
++    # file for this slot", i.e. exactly today's behaviour, so a list that is all
++    # empty (the default) is indistinguishable from a build without this field.
++    # Declared here so the field survives the scheduler->worker msgspec boundary;
++    # consuming it is a later milestone.
++    load_paths: list[str] = field(default_factory=list)
+     # Reverse map: load_event->req_ids, for tracking requests with finished load events
+     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
+ 
+@@ -33,6 +40,21 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
+     store_event: int = INVALID_JOB_ID
+     store_gpu_blocks: list[int] = field(default_factory=list)
+     store_cpu_blocks: list[int] = field(default_factory=list)
++    # SSD tier: hex of the engine's `BlockHashWithGroupId` for each store entry,
++    # index-aligned one-to-one and in the same order with `store_cpu_blocks`. A
++    # spilled file is named after this hash, and the hash exists only in the
++    # scheduler process while the bytes exist only in the worker - so without it
++    # on this object a file-resident block cannot be addressed from the worker.
++    # An entry with no hash is the EMPTY STRING, never a skipped entry: the length
++    # must always equal `len(store_cpu_blocks)`, because a short list silently
++    # misaligns every key after the gap.
++    store_keys: list[str] = field(default_factory=list)
++    # SSD tier: the geometry digest whose name-space spilled files live in, i.e.
++    # the identity of "what these bytes mean". Owned by the plugin (its
++    # `disk_layout.fingerprint_digest`), NOT computed by the engine, and ""
++    # whenever no digest has been negotiated. See the manager's build_connector_meta
++    # for why the scheduler cannot derive it.
++    store_fingerprint: str = ""
+ 
+     # Whether any requests were preempted this step and need flush pending transfers.
+     need_flush: bool = False

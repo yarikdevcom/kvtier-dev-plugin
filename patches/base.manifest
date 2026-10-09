@@ -1,0 +1,40 @@
+# What these four hunks sit ON. Shell-sourced by apply-kvtier-patches.sh and
+# read by tests/test_patch_series.py - keep it KEY=value, no command
+# substitution. Where the four patches themselves are, and in what order, is in
+# `series`; the human-readable story with every hash spelled out is in README.md.
+#
+# Every value below was read out of a git object, not written from memory: the
+# base commit and tree exist in the public vLLM clone and in the packaging repo,
+# and base_tree is the tree hash the box's own checkout reports at HEAD.
+base_repo=vllm-project/vllm
+base_commit=ced6857afa0ea7b2e3f0846a62e1394e90f15607
+base_version=0.30.0
+
+# The delta bundle that turns the base commit into the tree the engine runs.
+series_repo=halt95/qwen38-flash-next-3090s
+series_repo_url=https://github.com/halt95/qwen38-flash-next-3090s.git
+series_patches=58
+series_dir=release/v2.2/patches
+series_builder=scripts/build-v2.2.sh
+
+# base_tree is what `git rev-parse HEAD^{tree}` answers for the built tree, and
+# so is the only base identity that survives re-packing: two clones of the same
+# content with different commit hashes share it. `apply` prints a loud warning
+# when the checkout's HEAD tree is not this hash, because then the per-file
+# fingerprints are the only gate left - which is weaker, and you should know.
+base_tree=eebcd6480dba463294e9ca34f24eb770a45e11fe
+
+# The tree the series produces: base_tree with the four hunks on top. This is
+# the GPU box's HEAD tree as it runs today, so
+#     apply-kvtier-patches.sh <checkout> apply --expect-tree <live_tree>
+# is the check that a local reconstruction IS the box. Verified 2026-10-11 on
+# /home/user/Source/experiment/vllm-live-repro: branch `built` (tree base_tree)
+# + this series reproduces branch `live` byte-for-byte.
+live_tree=ed5e079fe945de96b09c01c4559f0952fcf809f1
+
+# The reference reconstruction, for the acceptance test. Not required to apply
+# the series to your own checkout; tests/test_patch_series.py skips (loudly, with
+# the reason) when it or its branches are absent rather than faking the check.
+reference_clone=/home/user/Source/experiment/vllm-live-repro
+reference_base_branch=built
+reference_live_branch=live
