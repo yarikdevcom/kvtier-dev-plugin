@@ -2157,6 +2157,16 @@ def _rank_file_rollup_row(path, name: str) -> tuple:
     # rather than four files opened by hand.
     row["ceiling_share_bytes"] = _rank_rollup_int(
         section.get("ceiling_share_bytes"))
+    # THE SAME SHARE, COUNTED IN BLOCKS (0.2.58). NOT summed, for the same reason the
+    # byte share is not: it is a budget. Read across the four rows it is the equality a
+    # restore depends on - a block is only servable when it is present on EVERY rank, so
+    # four equal `ceiling_share_bytes` over four UNEQUAL `ceiling_share_blocks` is the
+    # signature of a tier withholding capacity it cannot serve.
+    row["ceiling_share_blocks"] = _rank_rollup_int(
+        section.get("ceiling_share_blocks"))
+    basis_share = section.get("share_basis")
+    row["share_basis"] = (_clip(basis_share, 24)
+                          if isinstance(basis_share, str) else None)
     row["share_divisor"] = _rank_rollup_int(section.get("ceiling_divisor"))
     row["declined_because_already_under"] = _rank_rollup_int(
         section.get("ceiling_passes_declined"))
@@ -2630,6 +2640,11 @@ def _disk_fill_row_entry(row: dict) -> dict:
     # The fair-share verdict, per rank: what budget this rank thought it owned, over how
     # many ranks, and how many times it declined because a sibling got there first.
     entry["ceiling_share_bytes"] = row.get("ceiling_share_bytes")
+    # The share in the currency a restore spends, and the arithmetic that produced it
+    # (0.2.58): `block_equal` means the ranks' budgets were made equal by width, so the
+    # block counts below are comparable rather than merely coincident.
+    entry["ceiling_share_blocks"] = row.get("ceiling_share_blocks")
+    entry["share_basis"] = row.get("share_basis")
     entry["share_divisor"] = row.get("share_divisor")
     entry["declined_because_already_under"] = row.get(
         "declined_because_already_under")
@@ -2653,6 +2668,14 @@ def _disk_fill_verdict(rows: list, ceilings: list, shares: list,
     evicting the same bytes with no declines is the signature of it not.
     """
     counted = [row for row in rows if isinstance(row, dict)]
+    # THE BLOCK COMPARISON (0.2.58). Bytes are the budget's currency; blocks are the
+    # SERVICABLE one, because a restore needs the block on every rank. Distinct values
+    # here is the defect, and one value is the fix - readable from one polled block
+    # rather than by dividing four files by four geometries.
+    blocks = sorted({int(row["ceiling_share_blocks"]) for row in counted
+                     if row.get("ceiling_share_blocks") is not None})
+    bases = sorted({str(row["share_basis"]) for row in counted
+                    if isinstance(row.get("share_basis"), str)})
     with_evictions = [row for row in counted
                       if (row.get("evictions") or 0) > 0]
     declining = [row for row in counted
@@ -2665,18 +2688,34 @@ def _disk_fill_verdict(rows: list, ceilings: list, shares: list,
                 "declines_total": 0,
                 "note": ("no fresh rank file reported, so no claim is made about the "
                          "fleet: this is not evidence that the ranks agree")}
-    if len(shares) > 1 or len(ceilings) > 1:
+    # DO THE RANKS AGREE? In BLOCKS, since 0.2.58 - and the change of currency here is
+    # not cosmetic. A block-equal split gives a WIDE rank MORE bytes than a narrow one
+    # by design (same depth, wider block), so a rule that flags "different share bytes"
+    # would call every healthy mixed-geometry boot a disagreement and teach an operator
+    # to ignore the verdict. Bytes are still the currency when NO rank published a block
+    # count, which is the mixed-version / pre-0.2.58 case the old rule was written for.
+    if len(ceilings) > 1 or (blocks and (len(blocks) > 1 or len(bases) > 1)) \
+            or (not blocks and len(shares) > 1):
         return {"verdict": "ranks_disagree_on_the_share",
                 "ranks_with_evictions": len(with_evictions),
                 "ranks_declining": len(declining),
                 "declines_total": int(declines),
                 "share_bytes_values": sorted(shares),
+                "share_blocks_values": blocks,
+                "share_basis_values": bases,
                 "ceiling_bytes_values": sorted(ceilings),
-                "note": ("the ranks report DIFFERENT shares (or ceilings) for what "
-                         "should be one store: at least one rank is running a "
-                         "different build or a different ceiling, and a shared store "
-                         "with two budgets is the state where one rank keeps writing "
-                         "while another evicts")}
+                "blocks_equal": bool(len(blocks) <= 1),
+                "note": (("the ranks report DIFFERENT BLOCK COUNTS for one store, or "
+                          "ranks that split it with different arithmetic: a shared "
+                          "store whose ranks hold different depths is the state where "
+                          "a restore finds the block on three ranks and not the "
+                          "fourth")
+                         if blocks else
+                         ("the ranks report DIFFERENT shares (or ceilings) for what "
+                          "should be one store: at least one rank is running a "
+                          "different build or a different ceiling, and a shared store "
+                          "with two budgets is the state where one rank keeps writing "
+                          "while another evicts"))}
     solo = bool(divisors) and max(divisors) <= 1
     n_effective = max(divisors) if divisors else None
     if solo:
@@ -2686,7 +2725,9 @@ def _disk_fill_verdict(rows: list, ceilings: list, shares: list,
     elif declining and len(with_evictions) <= max(1, len(counted) // 2):
         note = (f"the ceiling is split {n_effective} ways, one rank's pass did the "
                 f"work and {len(declining)} declined because the store was already "
-                f"under their share - the 0.2.30 fix visible in the counters")
+                f"under their share - the 0.2.30 fix visible in the counters"
+                + (f"; every rank holds the same {blocks[0]} blocks"
+                   if len(blocks) == 1 else ""))
     else:
         note = (f"the ceiling is split {n_effective} ways and "
                 f"{len(with_evictions)} of {len(counted)} ranks are over their own "
@@ -2694,12 +2735,28 @@ def _disk_fill_verdict(rows: list, ceilings: list, shares: list,
                 "had ALL of them over the WHOLE ceiling and zero declines)")
     return {"verdict": ("single_rank_share" if solo else "shared_share"),
             "ranks_with_evictions": len(with_evictions),
+            # EQUAL IN BLOCKS, NOT BYTES (0.2.58): one distinct block count across the
+            # ranks that published one, and the arithmetic they used. `blocks_equal`
+            # false alongside `share_basis_values: ["block_equal"]` would mean the
+            # widths lied;
+            # `equal_bytes` means at least one rank could not see a width, which costs
+            # capacity and not correctness.
+            "share_blocks": blocks[0] if len(blocks) == 1 else None,
+            "share_blocks_values": blocks,
+            "blocks_equal": bool(len(blocks) <= 1),
+            "share_basis": bases[0] if len(bases) == 1 else None,
+            "share_basis_values": bases,
             "ranks_declining": len(declining),
             "ranks_acting": [row["rank"] for row in with_evictions][:8],
             "ranks_declining_names": [row["rank"] for row
                                       in declining][:8],
             "declines_total": int(declines),
-            "share_bytes": shares[0] if shares else None,
+            # `share_bytes` is only ONE NUMBER when the ranks agree on it; with the
+            # block-equal split a mixed-geometry boot legitimately has two (same depth,
+            # different widths), and naming the smaller one "the share" would be a lie.
+            # The values are published either way, so the reader never guesses.
+            "share_bytes": shares[0] if len(shares) == 1 else None,
+            "share_bytes_values": sorted(shares),
             "n_effective": n_effective,
             "note": _clip(note, 400),
             }
@@ -3501,6 +3558,16 @@ def worker_report() -> dict:
                   # value, and the one an operator must be able to spot from the door.
                   "ceiling_share_bytes": (int(state["share_bytes"])
                                           if state.get("share_bytes") else None),
+                  # THE SHARE IN THE CURRENCY A RESTORE SPENDS (0.2.58): how many whole
+                  # blocks that budget holds on THIS rank. Four ranks whose
+                  # `ceiling_share_bytes` agree but whose `ceiling_share_blocks` do not
+                  # are four ranks whose surplus can never be served, because a restore
+                  # needs the block on every one of them. Null when this rank has no
+                  # measured block width (a fingerprint-less process), never 0.
+                  "ceiling_share_blocks": (int(state["share_blocks"])
+                                           if state.get("share_blocks") else None),
+                  "share_basis": (str(state.get("share_basis"))[:24]
+                                  if state.get("share_basis") else None),
                   "ceiling_divisor": (int(state["share_divisor"])
                                       if state.get("share_divisor") else None),
                   "ceiling_passes_declined": int(

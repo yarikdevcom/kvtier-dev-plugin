@@ -491,6 +491,11 @@ MAX_PEER_RANK_FILES = 8              # RANK FILES probed (disk_restore's own bou
 MAX_PEER_RANK_FILE_BYTES = 256 * 1024  # BYTES one rank file may reach
 PEER_IDENTITY_CACHE_SECONDS = 1.0    # SECONDS one identity read stands for
 MAX_PEER_DIGEST_CHARS = 64           # CHARS of a published digest accepted from a file
+# UPPER BOUND on a peer's published block width, read from ITS OWN rank file
+# (`arena.bytes_per_block`) and used to weight a shared ceiling. A block wider than
+# this is a corrupt or hostile file, not a wide model: refusing it costs the block-
+# equal share and falls back to the equal-byte one, which is the pre-0.2.58 shape.
+MAX_PEER_WIDTH_BYTES = 1 << 30       # BYTES (1 GiB) one rank's block may be
 
 # THE FAIR SHARE: ONE CEILING IS NOT FOUR CEILINGS (0.2.30)
 # -----------------------------------------------------------------------------
@@ -542,6 +547,17 @@ MAX_PEER_DIGEST_CHARS = 64           # CHARS of a published digest accepted from
 SHARE_SOURCE_PEERS = "peers_learned"       # n_effective = 1 + live peers
 SHARE_SOURCE_NO_PEERS = "no_live_peer_seen"  # n_effective = 1: today's behaviour
 SHARE_SOURCE_NO_DIGEST = "no_geometry_digest"  # cannot attribute: whole ceiling
+
+# HOW A SHARE WAS SIZED (0.2.58). A share equal in BYTES is not a share equal in BLOCKS
+# when the ranks' block widths differ - and on the live box they do: PP0 ranks spill
+# 11,468,800-byte blocks and PP1 ranks 12,902,400-byte ones, so one byte budget handed
+# the PP0 ranks 4,493 blocks against the PP1 ranks' 3,994. A restore needs a block on
+# EVERY rank, so those 499 surplus PP0 blocks are disk space holding something that can
+# never be served. `block_equal` says the width-weighted arithmetic ran; `equal_bytes`
+# says a width was missing (no fingerprint yet, or a live sibling whose rank file
+# publishes none) and the old equal-byte split was used instead of a guessed width.
+SHARE_BASIS_BLOCK_EQUAL = "block_equal"      # shares sized by width, blocks equal
+SHARE_BASIS_EQUAL_BYTES = "equal_bytes"      # pre-0.2.58 arithmetic: bytes equal
 
 # The group-collision witness: which group ids this process has seen spill each
 # `key16`. Three caps, because this is a witness and not a database. The map is
@@ -795,6 +811,21 @@ _state: dict = {
     # which is the eager direction and the fail-safe one.
     "bytes_attributed": False,
     "share_bytes": None,
+    # HOW MANY BLOCKS `share_bytes` can actually hold on THIS rank, and the width that
+    # derived it (0.2.58). A restore needs one block on EVERY rank, so a share that is
+    # equal in BYTES across ranks of unequal width is a share that is unequal in the
+    # only currency a restore spends. `share_blocks` is None when no width is known.
+    "share_blocks": None,
+    "share_own_width": None,
+    # HOW MANY of the live peers this rank had a published width for when it sized the
+    # share. `share_divisor - 1` is the number it needed: fewer, and the sum of widths
+    # is a guess, so the arithmetic falls back to equal bytes and this field is the
+    # reason an operator can read instead of infer.
+    "share_width_peers": None,
+    # `block_equal` when the shares were weighted by width, `equal_bytes` when a width
+    # was missing and the pre-0.2.58 arithmetic was used - the honest way to say "this
+    # rank's budget is not known to be block-comparable to its siblings'".
+    "share_basis": SHARE_BASIS_EQUAL_BYTES,
     "share_divisor": None,
     "share_source": None,
     "share_target_bytes": None,
@@ -930,6 +961,9 @@ def reset_state_for_tests() -> None:
         "estimated_own_bytes": 0, "estimated_foreign_dead_bytes": 0,
         "estimated_peer_live_bytes": 0, "estimated_unattributed_bytes": 0,
         "bytes_attributed": False, "share_bytes": None,
+        "share_blocks": None, "share_own_width": None,
+        "share_width_peers": None,
+        "share_basis": SHARE_BASIS_EQUAL_BYTES,
         "share_divisor": None, "share_source": None,
         "share_target_bytes": None, "ceiling_passes_declined": 0,
         "ceiling_declined_accountable_bytes": None,
@@ -2162,9 +2196,17 @@ def _maybe_seed_estimate() -> None:
     # That ordering is the whole reason the fail-safe direction is cheap: by the time a
     # pass is expensive enough to matter, this rank has already walked the store once.
     attribution = _attribute_walk_bytes(walk, *_peer_liveness())
+    # THE WIDTH-WEIGHTED SHARE (0.2.58). This is the first decision of a boot, and the
+    # widths needed to make it block-equal are already in hand: this rank's from its own
+    # fingerprint, each live sibling's from the rank file the identity view opened a few
+    # lines above. No width, no weighting - see `_share_of_ceiling`.
     _apply_attribution(attribution, int(walk["estimated_total_bytes"]),
-                       _share_of_ceiling(int(ceiling), attribution["divisor"],
-                                         attribution["source"]))
+                       _share_of_ceiling(
+                           int(ceiling), attribution["divisor"],
+                           attribution["source"],
+                           own_width=_slot_width_bytes(),
+                           peer_widths=_peer_widths_for_share(
+                               attribution["peers"])))
 
 
 # --- the live peer ranks: learning which foreign digests are somebody's data ---
@@ -2335,10 +2377,40 @@ def _published_digest(document) -> str | None:
         return None
 
 
+def _published_width(document) -> int | None:
+    """The block width one rank document says ITS spill files have, or None.
+
+    `worker_diag.build_document` publishes it as `arena.bytes_per_block` - the width
+    measured off that rank's own region tensors, the same figure `disk_spill`
+    fingerprints into its geometry digest and `disk_read` reads back. It lives in the
+    `arena` section, NOT the `disk` one: the disk section publishes no width at all, so
+    a reader that asks for `disk.bytes_per_block` reads a None and concludes the box has
+    no widths to sum.
+
+    Untrusted input, so the bounds are the point: a non-int, a bool, a zero, a negative
+    or an absurd width is refused, and refusing it is NOT a failure - it costs the
+    block-equal share and the caller falls back to the equal-byte split it shipped with
+    before 0.2.58.
+    """
+    try:
+        section = document.get("arena")
+        if not isinstance(section, dict):
+            return None
+        width = section.get("bytes_per_block")
+        if isinstance(width, bool) or not isinstance(width, int):
+            return None
+        if width <= 0 or width > MAX_PEER_WIDTH_BYTES:
+            return None
+        return int(width)
+    except Exception:  # noqa: BLE001 - an unreadable width is an absence, not a fault
+        return None
+
+
 def _peer_identity_view(*, force: bool = False) -> dict:
     """WHO IS ALIVE and what digest each live rank writes under, from the rank files.
 
-    Returns `{"available": bool, "known": bool, "digests": tuple, "own_published": bool,
+    Returns `{"available": bool, "known": bool, "digests": tuple, "peer_widths":
+    {digest: bytes}, "own_published": bool,
     "files_read": n, "files_unnamed": n, "files_stale": n, "files_unreadable": n,
     "reason": str}`. Bounded by `MAX_PEER_RANK_FILES` x `MAX_PEER_RANK_FILE_BYTES`,
     cached
@@ -2381,10 +2453,12 @@ def _peer_identity_view(*, force: bool = False) -> dict:
     own = _state["geometry_digest"]
     own_text = own.lower() if isinstance(own, str) else None
     view = {"available": False, "known": False, "digests": (),
+            "peer_widths": {},
             "own_published": False, "files_read": 0, "files_unnamed": 0,
             "files_stale": 0, "files_unreadable": 0, "files_missing_ts": 0,
             "reason": None}
     live: set = set()
+    widths: dict = {}
     wall_now = time.time()
     paths = _peer_rank_files()
     for path in paths:
@@ -2424,7 +2498,14 @@ def _peer_identity_view(*, force: bool = False) -> dict:
             view["own_published"] = True
             continue
         live.add(digest)
+        # THE WIDTH THAT RANK SPILLS AT, from the same file already in memory: no extra
+        # open, no extra read, and the same freshness rule as its digest, so a width can
+        # never be read from a rank file too stale to vouch for the rank.
+        width = _published_width(document)
+        if width is not None:
+            widths[digest] = width
     view["digests"] = tuple(sorted(live))
+    view["peer_widths"] = {digest: widths[digest] for digest in sorted(widths)}
     if view["available"]:
         view["known"] = view["files_unnamed"] == 0
         view["reason"] = (
@@ -2605,7 +2686,49 @@ def _attribute_walk_bytes(walk: dict, peers, peers_known: bool = True) -> dict:
                                                     scaled_total)}
 
 
-def _share_of_ceiling(ceiling, divisor: int, source: str) -> dict:
+def _usable_width(value) -> int | None:
+    """A block width this module is willing to do arithmetic with, or None.
+
+    One rule for a rank's own width and a peer's, so the two can never be held to
+    different standards by the same function. None means "unknown", never "zero": a
+    zero width would make `share / width` a division by nothing and a weighted share
+    a division by an under-count.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value <= 0 or value > MAX_PEER_WIDTH_BYTES:
+        return None
+    return int(value)
+
+
+def _peer_widths_for_share(peers):
+    """EVERY live peer's published block width, in peer order; None if one is missing.
+
+    Reads the identity view this pass has already taken (`_peer_liveness()` calls it a
+    few lines above, and it is cached for `PEER_IDENTITY_CACHE_SECONDS`), so this costs
+    no extra file I/O - it is a dictionary lookup into documents this rank already
+    opened and parsed.
+
+    The all-or-nothing return is the whole design: a sum of widths that is missing a
+    rank is SMALLER than the true sum, which makes every rank's share too BIG - the one
+    direction that over-evicts a shared store. So a missing width does not buy an
+    estimate, it buys the pre-0.2.58 equal-byte split and a `share_basis` that says so.
+    """
+    live = [str(digest).strip().lower() for digest in (peers or ())]
+    if not live:
+        return ()
+    published = _peer_identity_view().get("peer_widths") or {}
+    out = []
+    for digest in live:
+        width = _usable_width(published.get(digest))
+        if width is None:
+            return None
+        out.append(width)
+    return tuple(out)
+
+
+def _share_of_ceiling(ceiling, divisor: int, source: str,
+                      own_width=None, peer_widths=None) -> dict:
     """This rank's slice of a ceiling that `divisor` ranks share. Pure: pinnable.
 
     `divisor == 1` returns the ceiling and the target UNCHANGED, byte for byte, which is
@@ -2613,16 +2736,70 @@ def _share_of_ceiling(ceiling, divisor: int, source: str) -> dict:
     sibling) identical to every release before this one. The floor division is
     deliberate: a share rounded UP would hand N ranks a combined budget larger than the
     ceiling they were configured with.
+
+    EQUAL IN BLOCKS, NOT IN BYTES (0.2.58). With `own_width` and one width per live peer
+    supplied, the split is done in blocks first:
+
+        blocks    = ceiling // sum(widths)          # whole blocks EVERY rank can hold
+        share_i   = blocks * width_i                # that many of MY blocks, in bytes
+
+    which is the width-weighted form `ceiling * width_i / sum(widths)` with the floor
+    taken ONCE, on the shared block count, so the four shares are the same number of
+    blocks by construction and `sum(share_i) <= ceiling` still holds. Why bytes are the
+    wrong currency: a restore is only servable when the block is present on EVERY rank,
+    so the tier's useful capacity is MIN blocks across ranks, and an equal-byte split on
+    the live box's widths (PP0 11,468,800 B, PP1 12,902,400 B) gave the PP0 ranks 4,493
+    blocks against PP1's 3,994 - 499 PP0 blocks per rank that occupy disk and can never
+    be served. Measured retention-vs-claims was PP0 0.886 / PP1 0.776, which is that
+    3,994/4,493 ratio to within a rounding error.
+
+    WITHOUT the widths (`own_width` missing, or any live peer's width unpublished) this
+    returns EXACTLY the equal-byte share it always did, with `share_blocks` derived from
+    the width where one is known and `share_basis` saying `equal_bytes`. Guessing a
+    missing width would size a share from a number nobody measured, and a sum that is
+    missing a rank makes every share too big - the over-eviction direction.
     """
     safe = max(1, int(divisor))
-    share = int(int(ceiling) // safe)
-    if share <= 0:
-        # A ceiling smaller than the rank count is a misconfiguration, not a licence to
-        # evict everything: 1 byte is a budget, 0 means "delete the store".
-        share = 1
+    ceiling = int(ceiling)
+    width = _usable_width(own_width)
+    widths = None
+    if width is not None and safe >= 2 and peer_widths is not None:
+        peers = [_usable_width(item) for item in peer_widths]
+        if len(peers) == safe - 1 and all(item is not None for item in peers):
+            widths = [item for item in peers if item is not None]
+    blocks = None
+    basis = SHARE_BASIS_EQUAL_BYTES
+    share = 0
+    if widths is not None:
+        total = width + sum(widths)
+        whole = ceiling // total
+        if whole >= 1:
+            # One floor, taken on the quantity every rank must agree on.
+            share = whole * width
+            blocks = whole
+            basis = SHARE_BASIS_BLOCK_EQUAL
+    if blocks is None:
+        share = int(ceiling // safe)
+        if share <= 0:
+            # A ceiling smaller than the rank count is a misconfiguration, not a licence
+            # to evict everything: 1 byte is a budget, 0 means "delete the store". The
+            # same rule keeps a ceiling narrower than one block from yielding a 0-byte
+            # share, and keeps the block-equal path from ever being entered at all.
+            share = 1
+        elif width is not None:
+            # DERIVED, not promised: what this byte budget can actually hold. Read
+            # together with `share_basis`, this is the field that shows the asymmetry
+            # the fix removes (4,493 / 4,493 / 3,994 / 3,994 before, 3,994 x 4 after).
+            blocks = share // width
     return {"ceiling_bytes": int(ceiling), "divisor": safe,
             "share_bytes": share,
-            "target_bytes": int(share * EVICT_TARGET_FRACTION), "source": source}
+            "target_bytes": int(share * EVICT_TARGET_FRACTION),
+            # HOW MANY WHOLE BLOCKS `share_bytes` is worth on this rank (None when no
+            # width is known here), the width that priced it, how many live peers
+            # published one, and which arithmetic produced the budget.
+            "share_blocks": blocks, "own_width_bytes": width,
+            "peer_widths_known": len(widths) if widths is not None else 0,
+            "share_basis": basis, "source": source}
 
 
 def _apply_attribution(attribution: dict, decision_bytes: int,
@@ -2640,6 +2817,14 @@ def _apply_attribution(attribution: dict, decision_bytes: int,
     _state["estimated_peer_live_bytes"] = int(attribution["peer_bytes"])
     _state["estimated_unattributed_bytes"] = int(attribution["unattributed_bytes"])
     _state["share_bytes"] = int(share["share_bytes"])
+    # THE SHARE'S SHAPE, not just its size (0.2.58): the block count, the width that
+    # priced it and the basis, so a reader can check four ranks for block-equality
+    # without knowing any of their geometries.
+    _state["share_blocks"] = share.get("share_blocks")
+    _state["share_own_width"] = share.get("own_width_bytes")
+    _state["share_width_peers"] = int(share.get("peer_widths_known") or 0)
+    _state["share_basis"] = str(share.get("share_basis")
+                                or SHARE_BASIS_EQUAL_BYTES)
     _state["share_divisor"] = int(share["divisor"])
     _state["share_source"] = str(share["source"])
     _state["share_target_bytes"] = int(share["target_bytes"])
@@ -3230,8 +3415,17 @@ def _run_ceiling_pass(root, ceiling: int, deadline, budget: dict) -> None:
     # This is the half the 2026-10-22 over-eviction was missing: four ranks, one
     # directory, one store-wide number each read as its own problem.
     attribution = _attribute_walk_bytes(walk, peers, peers_known)
+    # EQUAL IN BLOCKS, NOT BYTES (0.2.58): the same ceiling, split so that every rank
+    # can hold the SAME number of blocks. A restore needs a block on all four ranks, so
+    # the surplus blocks an equal-byte split hands a narrow-rank box are disk space
+    # holding data that can never be served. The peer widths come from the rank files
+    # this pass has already opened for their digests, and a missing one falls back to
+    # the equal-byte share rather than a guessed width.
     share = _share_of_ceiling(int(ceiling), attribution["divisor"],
-                              attribution["source"])
+                              attribution["source"],
+                              own_width=_slot_width_bytes(),
+                              peer_widths=_peer_widths_for_share(
+                                  attribution["peers"]))
     accountable = int(attribution["accountable_bytes"])
     target = int(share["target_bytes"])
     _state["ceiling_checks"] = int(_state["ceiling_checks"]) + 1
@@ -4264,14 +4458,30 @@ def section() -> dict:
         # that is broken is to see the share each rank believes it owns.
         "ceiling_share": {
             # The bytes this rank is accountable for, and the budget they are measured
-            # against. `share_bytes` is `ceiling / n_effective`; `target_bytes` is that
-            # share times `EVICT_TARGET_FRACTION`, which is what a pass sheds toward.
+            # against. Since 0.2.58 `share_bytes` is the width-weighted share - the
+            # whole ceiling divided by the SUM of the ranks' block widths, times this
+            # rank's
+            # own width - so every rank holds the same NUMBER of blocks (see
+            # `share_blocks`/`share_basis` below); with no width known it is the older
+            # `ceiling / n_effective`. `target_bytes` is the share times
+            # `EVICT_TARGET_FRACTION`, which is what a pass sheds toward.
             "accountable_bytes": _accountable_bytes(),
             "own_bytes": int(_state["estimated_own_bytes"]),
             "dead_bytes": int(_state["estimated_foreign_dead_bytes"]),
             "peer_live_bytes": int(_state["estimated_peer_live_bytes"]),
             "unattributed_bytes": int(_state["estimated_unattributed_bytes"]),
             "share_bytes": _state["share_bytes"],
+            # EQUAL IN BLOCKS, NOT BYTES (0.2.58). `share_blocks` is the number this
+            # rank's budget can actually hold; `share_basis` says whether the widths
+            # made that number EQUAL ACROSS RANKS by construction (`block_equal`) or
+            # merely
+            # derived from a byte budget (`equal_bytes`). This is the pair an operator
+            # reads to answer "does a block exist on all four ranks at the same depth?"
+            # without knowing any rank's geometry.
+            "share_blocks": _state["share_blocks"],
+            "own_width_bytes": _state["share_own_width"],
+            "peer_widths_known": _state["share_width_peers"],
+            "share_basis": _state["share_basis"],
             "target_bytes": _state["share_target_bytes"],
             "share_divisor": _state["share_divisor"],
             # 1 + live peers, which is the ONLY honest rank count this module can get
@@ -4310,6 +4520,8 @@ def section() -> dict:
             "units": disk_layout._units("accountable_bytes", "own_bytes",
                                         "dead_bytes", "peer_live_bytes",
                                         "unattributed_bytes", "share_bytes",
+                                        "share_blocks", "own_width_bytes",
+                                        "peer_widths_known", "share_basis",
                                         "target_bytes", "share_divisor",
                                         "n_effective", "passes_declined",
                                         "declined_accountable_bytes",

@@ -2602,7 +2602,7 @@ the submission, releasing bytes, marking itself, and re-running to convergence w
 deleting anything twice; the pool at 1 and 4 shedding the same files and never handing a
 path to two workers).
 
-### Four ranks, one ceiling: the fair share, and `disk_fill` (0.2.30)
+### Four ranks, one ceiling: the fair share, and `disk_fill` (0.2.30, block-equal since 0.2.58)
 
 **What the operator measured**: a four-rank boot sharing one spill root wrote 92 files
 per rank and evicted **2,106 / 2,106 / 1,872 / 1,872** files - **7,956 files, 156 GiB
@@ -2639,12 +2639,36 @@ floor (`MIN_FREE_BYTES`, refusal `no_free_space`).
 
 **The witnesses.** `disk_spill.section().ceiling_share` publishes `accountable_bytes`,
 `own_bytes`, `dead_bytes`, `peer_live_bytes`, `unattributed_bytes`, `share_bytes`,
-`target_bytes`, `share_divisor`/`n_effective`, `share_source`, and
+`target_bytes`, `share_divisor`/`n_effective`, `share_source`,
+**`share_blocks`/`share_basis`/`own_width_bytes`/`peer_widths_known`** (0.2.58, below) and
 **`passes_declined`** - the count of passes that walked, found their accountable bytes
 already inside their share, and shed nothing. That is the "one rank did the work and
 three declined" signature, counted rather than logged, because the pass runs on the
 spill writer thread. `passes_nothing_sheddable` is the different fact: over its share and
 nothing it is allowed to shed (where the filesystem floor is the control).
+
+**Equal in BLOCKS, not in bytes (0.2.58).** `ceiling / n_effective` split the store
+equally in a currency a restore cannot spend. The ranks' block widths differ - on the
+live box the PP0 ranks spill `11,468,800`-byte blocks and the PP1 ranks `12,902,400`-byte
+ones - so one byte budget was a different cache depth per rank: under a
+`206,158,430,208`-byte ceiling every rank was handed `51,539,607,552` bytes, which holds
+**4,493** blocks on PP0 and **3,994** on PP1. A disk restore is servable only when the
+block is present on EVERY rank, so the store's useful depth is the MINIMUM across ranks
+and the 499 surplus PP0 blocks per rank were disk space holding something that could
+never be served. The share is therefore taken in blocks first:
+`blocks = ceiling // sum(widths)`, `share_i = blocks * width_i` - the floor taken once, on
+the quantity every rank must agree on, so `sum(shares) <= ceiling` still holds and the
+same ceiling buys **4,229** blocks of servable depth per rank instead of 3,994. The
+widths come from this rank's own fingerprint and each live sibling's `arena.bytes_per_block`
+in the rank file its identity read already opened; **a missing width is never guessed**,
+and the split falls back to the equal-byte arithmetic with `share_basis: "equal_bytes"`
+(the pre-0.2.58 shape) rather than sum a set of widths that is missing a rank - an
+under-counted sum makes every share too big, which is the over-eviction direction.
+Consequence to expect on a mixed-geometry boot: the ranks' `ceiling_share_bytes` now
+legitimately DIFFER (same depth, wider block costs more), so `cross_process_verdict`
+judges agreement in blocks - `blocks_equal`, `share_blocks`, `share_blocks_values`,
+`share_basis` - and `share_bytes` there is `null` when the ranks hold equal depth at
+different widths.
 
 **`disk_fill`: one block that answers "how full is the SSD tier, and is that a
 problem"**, at the top level of `GET|POST /plugins/kvtier/snapshot` and `GET
@@ -2661,9 +2685,9 @@ should write against:
 | `read_basis` / `ceiling_basis` | how complete the READ was / whose ceiling this is (`ranks_agree`, `ranks_disagree`, `this_process_env_only`) |
 | `used_bytes_source`, `used_bytes_spread_bytes` | which rank the number came from, and how far the ranks' views were apart |
 | `ranks_expected`, `ranks_reported`, `missing_ranks` | fleet coverage. `ranks_expected`/`missing_ranks` are **null, not `[]`**, when this process cannot know the rank set |
-| `per_rank[]` | `rank`, `file_age_seconds`, `files_written`/`spilled`, `bytes_written`, `evictions`, `journal_removals`, `drops`, `queue_depth`, `recency_promotions`, `recency_promotions_throttled`, `ceiling_share_bytes`, `share_divisor`, `declined_because_already_under`, `estimated_bytes`, `walk_basis`, `writer_thread_alive` |
+| `per_rank[]` | `rank`, `file_age_seconds`, `files_written`/`spilled`, `bytes_written`, `evictions`, `journal_removals`, `drops`, `queue_depth`, `recency_promotions`, `recency_promotions_throttled`, `ceiling_share_bytes`, **`ceiling_share_blocks`**, **`share_basis`**, `share_divisor`, `declined_because_already_under`, `estimated_bytes`, `walk_basis`, `writer_thread_alive` |
 | `totals`, `totals_are_lower_bound`, `lower_bound_reason` | the fleet sum over FRESH ranks only, with the ranks it could not see named |
-| `cross_process_verdict` | `shared_share` / `single_rank_share` / `ranks_disagree_on_the_share` / `no_ranks_reported`, with `ranks_acting`, `ranks_declining_names`, `declines_total`, `n_effective` |
+| `cross_process_verdict` | `shared_share` / `single_rank_share` / `ranks_disagree_on_the_share` / `no_ranks_reported`, with `ranks_acting`, `ranks_declining_names`, `declines_total`, `n_effective`, and (0.2.58) `blocks_equal`, `share_blocks`, `share_blocks_values`, `share_basis`/`share_basis_values` - agreement is judged on BLOCKS, because equal bytes across ranks of unequal width is the withheld-capacity state, not the healthy one |
 | `per_process_note` | the sentence that says the flat `disk_spill` / `disk_store` counters beside it are THIS process's own and read zero on the API process |
 
 `used_bytes` is the FRESHEST rank's estimate and NEVER a sum: four ranks measuring one

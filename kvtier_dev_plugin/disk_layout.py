@@ -429,6 +429,12 @@ UNITS_BY_NAME = {
     "share_bytes": "bytes",
     "share_divisor": "ranks",
     "share_target_bytes": "bytes",
+    # THE BLOCK-EQUAL SHARE (0.2.58): what the byte budget is WORTH in blocks, the width
+    # that priced it, how many live peers published a width, and which arithmetic ran.
+    "share_blocks": "blocks",
+    "own_width_bytes": "bytes per block",
+    "peer_widths_known": "ranks",
+    "share_basis": "how the share was sized",
     "n_effective": "ranks",
     "store_estimate_bytes": "bytes",
     "used_fraction": "fraction of the ceiling",
