@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvtier-dev-plugin"
-version = "0.2.63"
+version = "0.2.64"
 description = "Development plugin for a live vLLM host-RAM KV-cache tier: loopback-or-allowlist scheduler-side diagnostics (token-gated off-box) and hot reload of a local policy module."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,7 +56,14 @@ ignore = []
 # compares against), so the line length is not editable. S102 likewise: these
 # files exec the fork's own captured text to rebuild a class for tests.
 "tests/fixtures_pr56810.py" = ["E501", "S102"]
+# The same argument for the SECOND target's fixture: generated from the fork, one
+# byte-exact method literal whose SHA-256 IS the fingerprint `mamba_anchor.py`
+# compares against, exec'd to rebuild `MambaManager` for the suite.
+"tests/fixtures_mamba.py" = ["E501", "S102"]
 "kvtier_dev_plugin/pr56810_sources.py" = ["E501"]
 # A build-time verifier whose assertions ARE its product: it refuses to write a
-# fixture that drifted from the fork.
-"tools/*" = ["S101", "S102"]
+# fixture that drifted from the fork. S603/S607: `tools/gen_mamba_fixture.py` shells
+# out to `git show` with a ref from argv on a hardcoded repository path; S324: it
+# reports the file's md5 because that is the digest the three trees were compared
+# with, and it is an identity, never a security claim.
+"tools/*" = ["S101", "S102", "S603", "S607", "S324"]

@@ -33,6 +33,7 @@ from kvtier_dev_plugin import (  # noqa: E402
     evictions,
     guard_mode,
     lookup_ledger,
+    mamba_anchor,
     snapshot,
     step_trace,
     trace_ring,
@@ -146,7 +147,16 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # it would have the prune removing destinations inside tests that assert the
             # step is what the scheduler shipped, which is the one failure mode this
             # package cannot afford to test by accident.
-            config.ENV_DISK_GPU_WRITE_DELIVERY)
+            config.ENV_DISK_GPU_WRITE_DELIVERY,
+            # THE RUN-END ANCHOR PATCH (0.2.64). Its DEFAULT IS ON, and ON is a claim
+            # every test of this release makes about the boot: a suite that inherited
+            # `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH=0` from a developer's shell would be
+            # testing an UNPATCHED install while believing it tested the shipped one -
+            # and the reverse leak (the variable set to `1` for one experiment) is
+            # invisible, because ON is also the default. Deleting it makes 'unset = the
+            # shipped default' the fact every test measures, and the tests that want
+            # the other value name it.
+            config.ENV_MAMBA_ANCHOR_PATCH)
 
 
 def _isolate(state: dict) -> dict:
@@ -259,6 +269,11 @@ def reset_dev_state():
              # test that armed it must not hand a live writer - or rows allocated
              # against a fake worker about to be garbage-collected - to the next.
              "disk_gpu_write": _isolate(disk_gpu_write._state),
+             # THE SECOND RUNTIME-PATCH TARGET (0.2.64): its boot verdict, its install
+             # counters and its mask counters are all process-wide, and a leaked
+             # `mamba_patch_installed: True` would make the next test's refusal
+             # assertion pass on a state it never set.
+             "mamba_anchor": _isolate(mamba_anchor._state),
              "lookups": _isolate(lookup_ledger._state)}
     trace_ring.reset_state_for_tests()
     step_trace.reset_state_for_tests()
@@ -270,6 +285,10 @@ def reset_dev_state():
     # every later `section()`/`capability()` claim) reporting `armed_and_ready`.
     blockdump.reset_state_for_tests()
     evictions.reset_state_for_tests()
+    # THE SECOND RUNTIME-PATCH TARGET. Rebuilt from its own `_initial_state()`, so the
+    # next test starts at `MAMBA_ANCHOR[disabled]` with zero marks whatever the
+    # previous test installed - and no test inherits an install it did not perform.
+    mamba_anchor.reset_state_for_tests()
     lookup_ledger.reset_state_for_tests()
     # The SSD spill tier holds an arm, a queue and a THREAD. Dropping the queue
     # reference is what keeps a spilled job from one test landing in the next.

@@ -111,6 +111,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_GPU_WRITE_DELIVERY_TIMEOUT_SECONDS` | **THE ONE BOUND ON A DELIVERY STEP, in seconds (0.2.57). Unset, or anything that is not a finite number above 0 = `disk_gpu_write.DELIVERY_APPLY_TIMEOUT_SECONDS` = 10 s.** A delivery copy's source is the fork's **pageable** `cpu_kv_caches` (`v1/simple_kv_offload/worker.py:232`, no `pin_memory`), so `copy_(non_blocking=True)` does **not** return early: the whole step's bytes are synchronous PCIe on the engine's step thread, which is how a 198,400-token restore on 2026-10-09 parked a worker for minutes and EngineCore died on `RPC call to sample_tokens timed out`. **This is deliberately ONE generous wall-clock timeout and not a per-entry budget**: 0.2.56 shipped a 0.25 s step budget *and* a 64 MiB byte budget, and both are gone - the tier's house rule (learned on the disk read/write path) is one generous timeout instead of fine-grained caps, and a 0.25 s cap would defer ~57 of a normal 62-block restore, which turns the prune this mode exists to feed into a no-op. A guard that disables the feature is not a safety feature. Why 10 s: the engine's `No available shared memory broadcast block found in 60 seconds` is a WARNING CADENCE (`VLLM_RINGBUFFER_WARNING_INTERVAL`, `vllm/envs.py:20`) and the reader never gives up, while the deadline that actually ends the process is `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` = **300 s** (`vllm/envs.py:242`, passed by `sample_tokens`) - so 10 s sits ~30x inside the only real threshold and ~60x above the ~0.15 s a full 735 MB restore measured. When it expires the rest of the step's entries are DEFERRED (`delivery_deferred_entries` / `delivery_deferred_steps`) and stay out of `written_indices`, so the prune cannot remove them and the fork's copy delivers them: **a stop costs a missed optimization and never a hole**. `delivery_refused_entry_too_wide` (0.2.56's byte-budget refusal) is **REMOVED**, not left at zero. Read PER APPLY POINT, so a drop-in takes effect without a restart; clamped at `DELIVERY_APPLY_TIMEOUT_MAX` = 60 s and says so (`delivery_mode.timeout_clamped`), because past the engine's own warning cadence the number describes nothing real; `0` is refused rather than honoured (it would defer every entry of every step and read as "configured"). The value in force is published at `delivery_mode.timeout_seconds`, and whether the bound has ever bitten is `delivery_mode.step_seconds_peak` read beside it. See *Delivering the window ourselves (0.2.52)*. |
 | `VLLM_E2_TIER_DEV_BOOT_INERT` | **the boot opt-out.** Unset (the default) = the boot brings the tier up *working*: at connector creation it installs the backport, arms guard mode, and arms the tier. Set (`1`/`true`/`yes`/`on`) = the old posture: patch, then stay disarmed and unguarded until a verb says otherwise. Same falsy set as `VLLM_E2_TIER_DEV`. It is the only env var that touches either facility, and it can only turn arming **off**. |
 | `KVTIER_DISK_BOOT_ENABLE` | **the SSD tier's boot default (0.2.33), and it is ON by default.** Unset (or `1`/`true`/`yes`/`on`) = the boot that arms the RAM tier also **arms the disk spill tier (as a latch since 0.2.35: no expiry) and raises this boot's serve posture**, so the engine comes up `serving_as=disk_authority` with no POST at all. `0`/`false`/`off`/`no` = the posture of every release through 0.2.32: disarmed, `serving_as=off`, and the two `/disk` POSTs are the only lever. It is a **disable switch**, the same shape as `VLLM_E2_TIER_DEV_BOOT_INERT`: it can only take a boot back to manual, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all) outranks it. The decision is computed fresh from this variable at connector creation and from **nothing else** - it reads no arm file and no state an earlier boot wrote, so a `disk-spill-arm.json` surviving from a previous boot still arms nobody. **Since 0.2.35 there is nothing to renew and nothing to expire**: the arm is a latch, so what the boot raises stays raised until a human disarms it - and a human's `{"op":"disarm"}` (or `{"op":"authority","enabled":false}`) latches a veto that even a SECOND boot inside the same process cannot arm over. One line at boot prints the value, where it came from and how to switch it off (`KVTIER disk boot default=...`); `disk_restore.boot_default` is the payload. See *The SSD tier's boot default*. |
+| `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH` | **THE RUN-END ANCHOR PATCH (0.2.64), ON by default, and the SECOND runtime-patch target.** Unset (or `1`/`true`/`yes`/`on`) = the boot wraps `MambaManager.reachable_block_mask` (`single_type_kv_cache_manager.py:1610-1669`, a pure classmethod) so a cached range's LAST block is marked reachable: `if mask and not mask[-1]: mask[-1] = True`. That one mark is what carries an align-mode group's boundary state into the hash → offer → spill pipeline at the end of a run, which is the difference between a run that can be anchored from NVMe and the `no_boundary_anchor` refusal the spill-side counters measured at a 20.0% orphan rate. `0`/`false`/`off`/`no` = **`env-refused`**: nothing is fitted, no half-patch state exists, and the mask answers exactly as the fork's own body does. The grammar is `KVTIER_DISK_BOOT_ENABLE`'s (default ON, and a value in neither vocabulary stays ON and reports `recognised: false`). Like the #56810 backport it is **fingerprint-pinned**: the live body's `inspect.getsource()` SHA-256 is pinned from the live-tree reconstruction (`vllm-live-repro@live`, file md5 `52a3c5ad…`, identical on `built` and in `vllm-dev`), and a stale fingerprint is a REFUSAL naming both hashes and the pin's source, never a guess. **This target is spill-side only**: it can add data to the store and has no door to an arm, a serving posture or a request path – pinned twice, behaviourally and against this package's own AST, beside the AST-pinned serve-switch tests. The boot line carries the verdict as one token so an installed boot and a silently-absent one cannot be confused: `MAMBA_ANCHOR[patched|refused|disabled|env-refused]` (`disabled` = this process is not the scheduler, which is normal in a worker). Counters: `mamba_anchor.anchor_offers_total` (the marks the patch made, in the snapshot's `disk_store` section), `disk_store.anchor_spills_completed` (the anchor files the ranks stored, in the cross-rank rollup) and `disk_restore.restore_anchor_hits_total` (run ends found anchorable on a patched boot). The three are the two ends of one pipe and are deliberately NOT a per-block causal chain: a spill hand-off carries `(slot, block-hash)` pairs and no token position, so the per-block join from the mask to a file does not exist in-process. See *The run-end anchor patch (`mamba_anchor.py`, 0.2.64)*. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
@@ -5629,6 +5630,111 @@ a per-block SKIP inside a live tier; `guard_mode` turns an exception into a
 decline (development only, masks bugs); the kill switch stops the connector
 scheduling ANY store or load. Only the last one is a kill switch.
 
+## The run-end anchor patch (`mamba_anchor.py`, 0.2.64)
+
+**THE SECOND RUNTIME-PATCH TARGET, and the shape is not a new framework.**
+`backport.py` established the discipline for patching a live vLLM from a plugin -
+target constants, per-method `inspect.getsource()` fingerprint pins, a stale
+fingerprint as a REFUSAL and never a guess, installs that cannot raise into a boot,
+foreign ownership markers refused rather than overwritten, `BaseException`
+propagating, refusals logged once per episode and surfaced in both the payload and
+the boot line. `mamba_anchor.py` copies that shape for one more target and invents
+nothing else: no registry, no decorator, no second patching API. One module per
+target, each carrying the same discipline, exactly as `backport.py`,
+`guard_mode.py` and `disk_restore.py` each carry their own layers.
+
+**THE BUG, and the three lines.** An align-mode (`mamba_cache_mode == "align"`)
+group is the group a restore must find its boundary-state ANCHOR in, and the fork
+decides which of its state blocks survive `cache_full_blocks` in one pure
+classmethod: `MambaManager.reachable_block_mask`
+(`single_type_kv_cache_manager.py:1610-1669`). It marks segment-boundary states and
+reachable-boundary states and nothing else, so a cached range whose LAST block is
+neither returns `mask[-1] is False`. That block is never published, so it is never
+hashed, so the align group has no file at the run's end - which is precisely the
+`no_boundary_anchor` refusal (`disk_restore._disk_run`: "the positional groups have
+the whole run and NO run end has a boundary-state file in every align-mode group")
+and the 20.0% orphan rate the 0.2.63 spill-side counters were added to see. The
+whole effective change is
+
+    if mask and not mask[-1]:
+        mask[-1] = True
+
+A `None` mask is the fork's dense verdict and is returned untouched; an EMPTY mask is
+untouched too (writing `mask[-1]` into one would address a block the caller never
+asked a mask for); a mask that already ends True is untouched and, deliberately, NOT
+counted - counting the fork's own boundaries would make the counter measure the
+retention interval instead of the patch.
+
+**WHY THIS ONE IS SAFE TO ATTEMPT, AND WHAT IT MAY NEVER DO.** The patch sits on the
+scheduler's prefix-cache RETENTION decision: a pure function of
+`(start_block, end_block, alignment, spec, retention, boundaries)` returning
+`list[bool] | None`. It is spill-side only - it can add data to the store, and it has
+no door to an arm, a serving posture or a request path. That claim is pinned twice,
+and both pins are in the suite: behaviourally (`test_nothing_about_serving_posture_changed`:
+every posture and arm identical before and after an install plus a mark) and
+structurally (`test_the_modules_source_names_no_posture_or_arm_writer`: no identifier,
+attribute or code string in `mamba_anchor.py` names the serve switch, the offer
+switch or an arm, and the module reads no `os.environ` of its own). The AST-pinned
+serve-switch tests (`test_disk_authority_switch.py:95/:191/:251`) keep passing
+unchanged, and their owner lists did not grow. **If one of those ever fails, the
+patch has grown a door: stop, do not relax the test.**
+
+**FINGERPRINTS, AND WHERE THEY CAME FROM.** `ORIG_SHA256` is pinned from the live-tree
+reconstruction `/home/user/Source/experiment/vllm-live-repro`, branch **`live`**
+(= `built` = clean upstream v0.30.0 + the 58-patch series, plus our four kvtier hunks,
+byte-identical to what the engine imports). That branch's
+`vllm/v1/core/single_type_kv_cache_manager.py` has md5
+`52a3c5ad0fc4e6911c69bb554b2d914a`, and so do branch `built` and
+`/home/user/Source/experiment/vllm-dev` - the three trees are identical FOR THIS FILE,
+which is what makes the pin a fact about the engine rather than about one checkout.
+This is deliberately NOT true of `simple_kv_offload/manager.py`, whose live copy
+(`91a3aa65`) differs from the dev copy (`26097a02`) because our own runtime hunks live
+there: no fingerprint for this target came from that file, and none may.
+`tests/fixtures_mamba.py` carries the same method text, generated by
+`tools/gen_mamba_fixture.py`, and the suite ties pin, fixture and file md5 together.
+The extraction difference between "read the file" and "`inspect.getsource()`" is
+measured, not assumed: the same AST line-span extraction reproduces all four shipped
+#56810 fingerprints, which were captured with real `inspect.getsource()` under the
+venv (`test_the_extraction_method_reproduces_the_inspect_fingerprints`).
+
+**WHERE IT LANDS.** At connector creation, in `_after_connector_created`, before
+`boot_from_connector` - the first instant the EngineCore process provably has a tier
+manager, with `vllm/v1/engine/core.py:60` having already imported
+`single_type_kv_cache_manager`, so the class is resolvable through `sys.modules`
+without this plugin importing it. Not in `register()`: `general_plugins` loads in
+workers and arg-parsing processes too, and the mask runs in the scheduler and nowhere
+else, so a boot with no tier connector gets no anchor patch and says so.
+`backport.ensure_installed()` retries it for the one case the hook cannot reach.
+
+**ENABLE, ROLLBACK, AND THE BOOT TOKEN.** `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH`,
+default ON, grammar identical to `KVTIER_DISK_BOOT_ENABLE` (`0`/`false`/`off`/`no`
+disables; an unrecognised value stays ON and reports `recognised: false`). `0` is a
+clean rollback: `install()` returns before it resolves the class at all, so there is
+no state in which a wrapper is half-fitted. The boot line carries the verdict as
+`MAMBA_ANCHOR[patched|refused|disabled|env-refused]` - bracketed and with no `=`, so
+the llm-api restart verifier's `grep -oE "tier=[A-Za-z_]+" | tail -1` cannot land on
+it, and so that "installed" and "silently absent" are one glance apart.
+
+**THE FOUR COUNTERS, and the honest limits of the attribution.**
+
+| counter | unit | door |
+|---|---|---|
+| `mamba_patch_installed` | bool, this process | `backport.section()`'s `mamba_anchor` block, and the `MAMBA_ANCHOR[...]` token |
+| `anchor_offers_total` | run-end blocks the patch additionally marked | `snapshot.dev_state_sections()`'s `disk_store` section (via `disk_store.section()`, `hook_section()` and the `/disk` verb) |
+| `anchor_spills_completed` | align-mode anchor files a rank wrote | `disk_store.rank_rollup()` totals - so it had to join BOTH the writer (`worker_report()`) and the reader's whitelist (`RANK_ROLLUP_FIELDS`, which `_rank_file_rollup_row()` walks) |
+| `restore_anchor_hits_total` | run ends anchored on a patched boot | `disk_restore.counters()` (+`units`), `scheduler_section()`, and the rank file's `disk_restore` section |
+
+The three spill/restore-side counters are the two ENDS of one pipe, and they are
+deliberately not a per-block causal chain. A store hand-off is a list of
+`(slot, block-hash)` pairs (`disk_store._remember_event`) with no token position and
+no request id, and `reachable_block_mask` is a pure classmethod with no request
+either - so "did THIS file exist because the patch marked THIS block" has no answer
+in-process, and no counter here pretends otherwise. The restore-side counter is
+therefore gated on the patch being live (zero by construction when the flag is off),
+and the spill-side one is not gated at all (the workers spill, the scheduler patches -
+a local gate would read zero forever). The patch's real effect is read as the RATE of
+the second against `spill_incomplete_state` MOVING when the flag flips.
+
 ## Operator runbook: the KV tier is misbehaving, right now
 
 Terse commands for standing at the box while something is wrong. Everything
@@ -6390,6 +6496,7 @@ The debugger verbs add six files:
 | `tests/test_idle_worker_proof_stays_alive_and_legible.py` | 24 | THE 0.2.47 SUITE, driven from `engine_side.register()` plus the handshake hook exactly as a worker walks them (the plugin-load install must DECLINE there, the handshake must land it), with zero engine steps and the READER's clock moved so a test can wait fifteen minutes: the gate stays open across two idle spells nearly the length of the window and still closes on a beat that stopped, on a future-stamped file, and on a file whose `disk_restore` section is gone; a contributor wedged for three budgets cannot stop the rank file moving; a beat raising `SystemExit` cannot kill the supervisor; a `SystemExit` contributor costs its own section only; the in-flight bound says `jammed` instead of leaking threads; `writer.heartbeat` in all five states with one key set inside its byte budget; `GATE AT BOOT` / `GATE CLOSED` / `GATE OPEN again` once per flip, naming the reason, the per-file counts and the freshest file's age AND wall clock, and distinguishing `stale=` from `sectionless=`; the refusal that never started is said once at WARNING; the shipped cadence is pinned against the UNPATCHED default |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
+| `tests/test_mamba_anchor_patch.py` | 28 | THE 0.2.64 TARGET SPEC, on the fork's own unpatched `reachable_block_mask` text in `fixtures_mamba.py`: the mask marks a run end only under the patch, a dense `None` and an EMPTY mask pass through UNTOUCHED, a mask already ending True is not recounted (the anti-vacuity control that keeps the counter measuring the patch and not the retention interval), a call's other arguments and return identity survive; a mutated body REFUSES with both hashes named and the unpatched answer intact (the shipped fingerprint is re-derived from the fixture in the test, so editing the pin cannot fix a red test); a `staticmethod`, a subclass hiding the classmethod, an unknown class and an already-foreign-patched class all refuse and leave `mamba_patch_installed` False while the test's own class stays exactly the object it was; the wrapper's OWN body is `except BaseException: raise` (AST-pinned, like the connector's kill-switch wrappers), and a raising original costs the counter; the env flag reads `KVTIER_DISK_BOOT_ENABLE`'s grammar from `config.py` and `env-refused` is counted as enabled + a reason in the payload; the boot token is bracketed so the restart verifier's `tier=` grep cannot match it; the counter doors each fail independently (the spill counter reaches the cross-rank rollup via `RANK_ROLLUP_FIELDS` alone; the restore counter moves for an anchored run and NOT for a run with no anchor, same walk, same boot); and nothing about serving posture changed - behaviourally AND as an AST fact about this module's own source, with the restore layer's only reach into the patch pinned to the one read-only liveness call |
 
 The store-policy hook (`tests/test_store_hook.py`, 55 of them) runs against a
 stub built by `exec`ing a source string into a real module object, so the

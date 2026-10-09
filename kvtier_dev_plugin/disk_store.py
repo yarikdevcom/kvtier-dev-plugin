@@ -191,6 +191,7 @@ from . import (
     disk_layout,
     disk_shadow,
     disk_spill,
+    mamba_anchor,
     snapshot,
 )
 
@@ -415,6 +416,23 @@ _state: dict = {
     "spill_spans_complete": 0,
     "spill_incomplete_state": 0,
     "spill_incomplete_attention": 0,
+    # THE ANCHORS THAT REACHED THE STORE (0.2.64). One per ALIGN-MODE pair a hand-off
+    # carried: an align-mode group appears in a hand-off only at a block the fork's
+    # mask let survive, and those are exactly the boundary-state ANCHOR files a run end
+    # is priced with. This is the store-side landing count of the blocks
+    # `mamba_anchor`'s `anchor_offers_total` marked reachable at the mask - the two
+    # ends of the same pipe, each measured where it is observable.
+    #
+    # WHY IT IS NOT FILTERED BY "DID THE PATCH MARK THIS ONE". A hand-off carries
+    # `(slot, block-hash)` pairs and nothing else (`_remember_event`): no token
+    # position, no request id, so no per-block causal join from the mask to a file
+    # exists in-process. The patch's own effect is therefore read as this counter's
+    # RATE against `spill_incomplete_state` MOVING when
+    # `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH` flips - the A/B the box has to measure.
+    # The counter is also unconditional in THIS process for a second, sharper reason:
+    # the workers do the spilling and the patch is fitted in the scheduler, so a worker
+    # that gated on a local install flag would report zero forever.
+    "anchor_spills_completed": 0,
     # Pairs this module could not read (no group suffix, not a key, a group the table
     # does not have). They are IGNORED, never a span of their own, and published so an
     # all-zero tally can be told apart from a classifier being fed garbage.
@@ -477,6 +495,7 @@ def reset_state_for_tests() -> None:
         "slots_capped": 0, "scan_skipped": 0,
         "spill_spans_classified": 0, "spill_spans_complete": 0,
         "spill_incomplete_state": 0, "spill_incomplete_attention": 0,
+        "anchor_spills_completed": 0,
         "span_shape_pairs_ignored": 0,
         "refused": {reason: 0 for reason in REFUSAL_REASONS},
         "refusals_total": 0, "last_refusal": None, "boot_line": None,
@@ -1388,7 +1407,8 @@ def classify_handoff(pairs, shapes) -> dict:
     incomplete_attention` holds on every call.
     """
     tally = {"spans": 0, "complete": 0, "incomplete_state": 0,
-             "incomplete_attention": 0, "ignored_pairs": 0}
+             "incomplete_attention": 0, "ignored_pairs": 0,
+             "align_anchor_pairs": 0}
     if not isinstance(shapes, dict) or not shapes.get("ok"):
         return tally
     align = {int(group) for group in (shapes.get("align_group_ids") or ())}
@@ -1414,6 +1434,14 @@ def classify_handoff(pairs, shapes) -> dict:
             tally["ignored_pairs"] += 1
             continue
         entry = seen.setdefault(split["key16"], (set(), set()))
+        if group in align:
+            # ONE ANCHOR, counted where it is PROVEN: an align-mode file for a span is
+            # the boundary state a run end is priced with (`_disk_run`'s anchor test
+            # asks for exactly this file and nothing else from that group), so a pair
+            # in an align group IS an anchor reaching the store. Counted per pair, not
+            # per span, because a run end needs one per align group and a span with two
+            # of four is two anchors and an unanchored run.
+            tally["align_anchor_pairs"] += 1
         (entry[1] if group in align else entry[0]).add(group)
     for present_positional, present_align in seen.values():
         tally["spans"] += 1
@@ -1433,6 +1461,7 @@ def _note_span_shapes(tally) -> dict:
                                  ("spill_incomplete_state", "incomplete_state"),
                                  ("spill_incomplete_attention",
                                   "incomplete_attention"),
+                                 ("anchor_spills_completed", "align_anchor_pairs"),
                                  ("span_shape_pairs_ignored", "ignored_pairs")):
         _state[state_key] = int(_state[state_key]) + int(tally.get(tally_key) or 0)
     return {"classified": int(tally.get("spans") or 0),
@@ -2285,6 +2314,15 @@ RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
                        ("disk", "spill_incomplete_state"), "spans"),
                       ("spill_incomplete_attention",
                        ("disk", "spill_incomplete_attention"), "spans"),
+                      # THE STORE-END OF THE RUN-END ANCHOR PIPE (0.2.64), summed
+                      # across the ranks that wrote them: boundary-state files that
+                      # reached the store. Compare with the scheduler's
+                      # `mamba_anchor.anchor_offers_total` (published by
+                      # `disk_store.section()`, not by a rank file - a worker never
+                      # runs the mask), and read the pair as the two ends of one pipe
+                      # rather than as a per-block cause and its effect.
+                      ("anchor_spills_completed",
+                       ("disk", "anchor_spills_completed"), "anchor files"),
                       ("recency_promotions",
                        ("disk_restore", "readers", "recency_promotions"), "reads"),
                       ("recency_promotions_throttled",
@@ -2352,6 +2390,18 @@ RANK_ROLLUP_MEANINGS = {
                                   "positional file, so no contiguous run can include "
                                   "them at all - the mirror of the orphan above, and "
                                   "equally unservable",
+    "anchor_spills_completed": "boundary-state ANCHOR files this rank's hand-offs "
+                              "wrote: one per align-mode pair, which is the block a "
+                              "run end is priced with (`_disk_run` asks that group for "
+                              "nothing else). Summed, this is how many anchors the "
+                              "fleet actually stored - the store-side half of the "
+                              "0.2.64 mask patch, to be read beside the scheduler's "
+                              "`mamba_anchor.anchor_offers_total`. It is NOT filtered "
+                              "by whether the patch marked the individual block: a "
+                              "hand-off carries `(slot, block-hash)` pairs only, so no "
+                              "per-block join exists, and the patch's effect is the "
+                              "rate this moves at against `spill_incomplete_state` "
+                              "when the env flag flips",
     "recency_promotions": "reads that moved a file's eviction clock "
                           "(disk_read.promote_recency): if this is not moving, the "
                           "tier is running a write-ordered LRU and shedding what it "
@@ -4006,6 +4056,13 @@ def worker_report() -> dict:
                   "spill_incomplete_state": int(_state["spill_incomplete_state"]),
                   "spill_incomplete_attention": int(
                       _state["spill_incomplete_attention"]),
+                  # THE STORE-END OF THE 0.2.64 PIPE: boundary-state anchor files this
+                  # rank's hand-offs actually wrote. `mamba_anchor` cannot travel in
+                  # this file because the patch is fitted in the scheduler and the
+                  # mask never runs in a worker, so the scheduler's own mark count is
+                  # published by `disk_store.section()`, not by a rank file.
+                  "anchor_spills_completed": int(
+                      _state["anchor_spills_completed"]),
                   "retained_events": int(len(_retained)),
                   "refused": _nonzero_refusals(),
                   "refusals_total": int(_state["refusals_total"]),
@@ -4525,6 +4582,12 @@ def hook_section(include_fingerprint: bool = True) -> dict:
             "spill_spans_complete": int(_state["spill_spans_complete"]),
             "spill_incomplete_state": int(_state["spill_incomplete_state"]),
             "spill_incomplete_attention": int(_state["spill_incomplete_attention"]),
+            # THE OTHER END OF THE 0.2.64 PIPE: what reached the store, against what
+            # the scheduler's mask patch marked reachable (`mamba_anchor` below). Read
+            # the two together, and never as a per-block cause-and-effect ratio - the
+            # counter's own comment in `_state` says why the join is not representable.
+            "anchor_spills_completed": int(_state["anchor_spills_completed"]),
+            "mamba_anchor": mamba_anchor.section(),
             "span_shapes": span_shape_view(),
             "refused": dict(_state["refused"]),
             "refusal_reasons": list(REFUSAL_REASONS),
@@ -4610,6 +4673,12 @@ def section() -> dict:
             "spill_spans_complete": int(_state["spill_spans_complete"]),
             "spill_incomplete_state": int(_state["spill_incomplete_state"]),
             "spill_incomplete_attention": int(_state["spill_incomplete_attention"]),
+            # THE OTHER END OF THE 0.2.64 PIPE, in the door a dashboard polls: what
+            # reached the store against what the scheduler's mask marked reachable
+            # (`mamba_anchor` below). Same keys in both doors, so a verb and a
+            # snapshot cannot disagree about a counter.
+            "anchor_spills_completed": int(_state["anchor_spills_completed"]),
+            "mamba_anchor": mamba_anchor.section(),
             "refused": dict(_state["refused"]),
             "refusal_reasons": list(REFUSAL_REASONS),
             "fallbacks": int(_state["fallbacks"]),

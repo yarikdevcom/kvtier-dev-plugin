@@ -2062,6 +2062,18 @@ _state: dict = {
     # scheduler-side ledger
     "lookups": 0, "offers": 0, "offered_tokens": 0, "blocks_offered": 0,
     "adopted": 0, "adopted_tokens": 0, "restorations": 0,
+    # THE RUN ENDS THIS BOOT FOUND AN ANCHOR AT, while the 0.2.64 run-end anchor patch
+    # is live in this process (`mamba_anchor`). `_disk_run` is the only place that
+    # knows a run end is anchorable - "some length exists whose end block every
+    # align-mode group can name" - and the patch exists to make more of those lengths
+    # exist. WHY THE GATE IS THE PATCH AND NOT THE BLOCK: the run's end block is a
+    # position, and `mamba_anchor`'s marks are made for a range the mask never sees an
+    # identity for (a pure classmethod: no request, no id), so "was THIS end marked by
+    # the patch or by the fork's own segment boundary?" is not answerable in-process -
+    # `mask_already_anchored` is the patch's own answer for the mask side. With
+    # `VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH=0` this counter stays 0 by construction, so
+    # a non-zero total always means "a patched boot found an anchor at a run end".
+    "restore_anchor_hits_total": 0,
     # THE ADOPTION RING'S OWN ACCOUNTING (0.2.61). `adoptions` counts records EVER
     # written (and is the ring's `seq` source, so a reader can tell a gap from a
     # contiguous stretch); `adoptions_dropped` counts the rows the cap recycled. The
@@ -2906,6 +2918,7 @@ def reset_state_for_tests() -> None:
             "install_refusal_line": None, "install_deferral_line": None,
             "lookups": 0, "offers": 0, "offered_tokens": 0,
             "blocks_offered": 0, "adopted": 0, "adopted_tokens": 0,
+            "restore_anchor_hits_total": 0,
             "adoptions": 0, "adoptions_dropped": 0, "adoption_record_errors": 0,
             "adoption_rank": None, "adoption_rank_source": None,
             "restorations": 0, "refusals_total": 0, "last_refusal": None,
@@ -3360,6 +3373,20 @@ def counters() -> dict:
 
 def counters_view(out: dict) -> dict:
     out["units"] = {
+        # THE RUN-END ANCHOR (0.2.64): the count, its unit, and the two things a
+        # reader must not infer from it. Neighbours are `offers`/`restorations`, and
+        # the difference is the point: those count the OFFER and the APPLIED READ,
+        # this counts the moment a run end was found to be ANCHORABLE.
+        "restore_anchor_hits_total": "run ends THIS process found an anchor for "
+                                     "(unit: runs whose end block every align-mode "
+                                     "group could name in `_disk_run`), counted ONLY "
+                                     "while the run-end anchor patch is live here. Not "
+                                     "offers (`offers`), not applied reads "
+                                     "(`restorations`), and not a per-block claim that "
+                                     "the patch marked THIS end - the mask sees no "
+                                     "request identity, so that join is not "
+                                     "representable; with "
+                                     f"{config.ENV_MAMBA_ANCHOR_PATCH}=0 this stays 0",
         # THE ADOPTION RING (0.2.61): the three counts, and the two caps a reader
         # needs to interpret them. `adoptions` is a RECORD count, never a token count
         # - the tokens a boot adopted are `adopted_tokens`, and a reader that confuses
@@ -5705,6 +5732,23 @@ def _stop_detail(resolved: dict, index: int, positional: list, helpers: dict,
     return None
 
 
+def _mamba_anchor_live() -> bool:
+    """Is the 0.2.64 run-end anchor patch fitted in THIS process? Cheap, never raises.
+
+    A lazy import for the same reason `backport._layer_kinds()` reads its sibling
+    layers lazily: this is one attribute read on a hot path and the dependency
+    direction stays one-way (`mamba_anchor` knows nothing about the restore layer).
+    A failure to answer is False - "not patched" is the only safe reading of a
+    question this module asks purely to LABEL a counter.
+    """
+    try:
+        from . import mamba_anchor  # noqa: PLC0415 - one-way lazy, see above
+        return bool(mamba_anchor.is_installed())
+    except Exception as exc:  # noqa: BLE001 - a counter's label never breaks an offer
+        snapshot._error(exc, "mamba_anchor liveness read")
+        return False
+
+
 def _disk_run(request, start_block: int, groups: list, block_size: int,
               hash_block_size: int, helpers: dict, contracts: dict | None = None,
               max_blocks: int | None = None, ranks: tuple | None = None) -> dict:
@@ -5860,6 +5904,13 @@ def _disk_run(request, start_block: int, groups: list, block_size: int,
                                 if stop_index is not None else None),
                    ranks_expected=ranks_expected,
                    ranks_expected_source=ranks_expected_source)
+    # THE ANCHOR LANDING (0.2.64). `anchors` non-empty with a boundary group present
+    # means THIS run end is anchorable: every align-mode group names a boundary-state
+    # file at the end block, which is precisely the property the mask patch exists to
+    # supply. Counted only while the patch is live, so a zero never claims an anchor
+    # the patch did not add - see `_state["restore_anchor_hits_total"]`.
+    if boundary and anchors and _mamba_anchor_live():
+        _state["restore_anchor_hits_total"] += 1
     # THE TWO VIEWS, and the difference is a bug that was actually shipped once in this
     # change: `keys` is the run AS OFFERED (the last span carrying the boundary-state
     # pairs too), while `positional_keys` is the walk before that merge. A clamp that
@@ -11124,6 +11175,15 @@ def worker_report() -> dict:
                   "armed_reason": _clip(service.get("reason"), 100),
                   "binds": int(_state["binds"]),
                   "disk_binds": int(_state["disk_binds"]),
+                  # THE RUN-END ANCHOR LANDINGS (0.2.64). A worker never runs the mask
+                  # or the run walk, so this is 0 in every rank file on a healthy box -
+                  # and it is listed anyway because the RANK FILE IS THE ONLY DOOR A
+                  # RANK HAS, and a reader comparing four rank files against the
+                  # scheduler's own section must be able to see that this field belongs
+                  # to the other process rather than infer a fault from a zero. Its
+                  # unit lives in `counters_view`'s `units`, beside the neighbours.
+                  "restore_anchor_hits_total": int(
+                      _state["restore_anchor_hits_total"]),
                   "reads_started": int(_state["reads_started"]),
                   "reads_applied": int(_state["reads_applied"]),
                   "bytes_applied": int(_state["bytes_applied"]),
@@ -12767,6 +12827,12 @@ def scheduler_section() -> dict:
         # since aged out and a hundred of them both read as `suppressed_requests=0`.
         "suppressions": int(tally["suppressions"]),
         "offers": offers,
+        # THE RUN-END ANCHOR LANDINGS (0.2.64), in the SAME door the offers are in,
+        # because the two are read together: `offers` is how many runs this process
+        # claimed and this is how many of its run ends it found an align-mode anchor
+        # for while the mask patch was live. A patched boot with `offers > 0` and this
+        # at 0 on a geometry that HAS align-mode groups is the patch not doing its job.
+        "restore_anchor_hits_total": int(state["restore_anchor_hits_total"]),
         "tokens_offered": int(state["offered_tokens"]),
         "blocks_offered": int(state["blocks_offered"]),
         "slots_allocated": int(state["slots_allocated"]),
@@ -13005,6 +13071,18 @@ def scheduler_section() -> dict:
             "blocks_offered": "scheduler blocks offered from disk",
             "slots_allocated": "CPU slots allocated as disk destinations",
             "restorations": "loads that reported disk bytes back",
+            # THE RUN-END ANCHOR (0.2.64), stated here so this door cannot carry a
+            # bare number: the same counter `counters_view` describes, in the words a
+            # reader of THIS section needs.
+            "restore_anchor_hits_total": "run ends this process found an align-mode "
+                                         "anchor for, counted only while the run-end "
+                                         "anchor patch is live here (unit: runs whose "
+                                         "end block every align-mode group named in "
+                                         "`_disk_run`). Read beside `offers`, and with "
+                                         "the patch's own `mamba_anchor` block in the "
+                                         "disk-store section: 0 here with `offers > 0` "
+                                         "on a geometry that has align-mode groups is "
+                                         "the patch not doing its job",
             "adopted": "requests whose disk slots reached a worker",
             "adopted_tokens": "tokens the scheduler adopted from disk",
             # THE PER-REQUEST WINDOW (0.2.61): the counts beside `recent_adoptions`,

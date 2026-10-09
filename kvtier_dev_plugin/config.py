@@ -712,6 +712,23 @@ ENV_DISK_BOOT_ENABLE = "KVTIER_DISK_BOOT_ENABLE"
 _DISK_BOOT_OFF_WORDS = frozenset({"0", "false", "off", "no"})
 _DISK_BOOT_ON_WORDS = frozenset({"1", "true", "yes", "on"})
 
+# THE RUN-END ANCHOR PATCH (`mamba_anchor.py`, 0.2.64): the SECOND runtime-patch
+# target. `MambaManager.reachable_block_mask` is the fork's sparse retention decision
+# for an align-mode (Mamba) group, and a run's LAST block is normally False in it - so
+# the last block of a cached range is never published, never hashed, never offered and
+# never spilled, and the run it ends cannot be anchored from NVMe. The patch is three
+# lines at the end of that classmethod: `if mask and not mask[-1]: mask[-1] = True`.
+# DEFAULT ON, and the grammar is `disk_boot_enable()`'s: unset is on, a disable word is
+# off, and a value outside both vocabularies stays ON and is reported as unrecognised,
+# because a typo must not silently produce the posture an operator did not ask for.
+# What the flag can and cannot do is the whole safety story, and it is written at the
+# length in `mamba_anchor.py`: the patch sits on the SPILL side of the fork, so it can
+# add data to the store and it can never raise a serving posture, arm a tier or serve a
+# request. `0` disables the install outright - reason `env-refused`, nothing fitted,
+# never a half-patch - and the boot line says which of the two the reader is looking at
+# (`MAMBA_ANCHOR[patched]` versus `MAMBA_ANCHOR[env-refused]`).
+ENV_MAMBA_ANCHOR_PATCH = "VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH"
+
 ENV_MISS_LOG = "VLLM_E2_TIER_MISS_LOG"
 
 logger = logging.getLogger("kvtier_dev_plugin.config")
@@ -974,6 +991,33 @@ def disk_prune_restored_loads() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
+
+
+def mamba_anchor_patch() -> dict:
+    """The run-end anchor patch's boot posture, read by `mamba_anchor.py`. The SAME
+    grammar as `disk_boot_enable()`, including the default: UNSET is ENABLED.
+
+    WHY ON IS THE DEFAULT HERE AND OFF IS THE DEFAULT FOR THE PRUNE: this one only
+    ever ADDS a block to a mask the fork already computed, and therefore can only add
+    data to the store. It has no door to a posture, an arm or a request path - the
+    claim `mamba_anchor.py`'s docstring and `tests/test_mamba_anchor_patch.py` pin -
+    so the useful direction is the one that runs, and `0` is the rollback.
+
+    A value in neither vocabulary stays ENABLED and reports `recognised: False`, for
+    the reason `disk_boot_enable()` gives: the reader must see that the value he wrote
+    is not a disable word, rather than being handed a payload that reads as intent.
+    """
+    raw = os.environ.get(ENV_MAMBA_ANCHOR_PATCH, "").strip()
+    if not raw:
+        return {"enabled": True, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_MAMBA_ANCHOR_PATCH}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_OFF_WORDS:
+        return {"enabled": False, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_MAMBA_ANCHOR_PATCH}
+    return {"enabled": True, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_ON_WORDS,
+            "env_var": ENV_MAMBA_ANCHOR_PATCH}
 
 
 def disk_gpu_write_delivery() -> dict:

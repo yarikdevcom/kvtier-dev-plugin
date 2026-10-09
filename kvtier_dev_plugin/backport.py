@@ -312,7 +312,7 @@ import logging
 import sys
 import textwrap
 
-from . import config, pr56810_sources, snapshot
+from . import config, mamba_anchor, pr56810_sources, snapshot
 
 logger = logging.getLogger("kvtier_dev_plugin.backport")
 
@@ -1575,6 +1575,13 @@ def ensure_installed(engine) -> dict:
             # here: once fitted it is a marker check, and re-fitting re-binds the
             # fork's own function, so this can never nest a second hook.
             install_connector_hook()
+        # THE SECOND TARGET, retried here. The boot fits it at connector creation;
+        # this covers the one case that hook cannot reach - a process that imported
+        # `single_type_kv_cache_manager` only after plugin load. `ensure_installed`
+        # is the verb path, so a `/tier` contact settles the verdict without a
+        # restart. Contained by `mamba_anchor.install()`'s own contract (it never
+        # raises), and it is a marker check once the class carries our wrapper.
+        mamba_anchor.ensure_installed()
         manager = manager_of(engine)
     except Exception as exc:  # noqa: BLE001 - a manager we cannot reach is data
         _state["fallbacks"] += 1
@@ -2319,6 +2326,16 @@ def boot_line(boot: dict) -> str:
     # what the boot default decided about it. A REFUSED/INERT/OFF token next to a
     # `disk_tier=DISARMED` is the boot doing exactly what its flag said.
     parts.append("disk_boot={}".format(_disk_boot_field(boot)))
+    # THE SECOND RUNTIME-PATCH TARGET'S VERDICT, in one bracketed token: `patched`,
+    # `refused`, `env-refused` or `disabled`. It is a TOKEN and not a `key=value`
+    # field on purpose (see `mamba_anchor.boot_token`): the restart verifier in the
+    # llm-api repo pulls the PASS criterion with `grep -oE "tier=[A-Za-z_]+" |
+    # tail -1`, and a token with no `=` can never become a candidate match. Its job
+    # is the one-glance question "did this boot fit the run-end anchor patch, or is
+    # it silently absent?" - the same reason `backport=` and `restore=` are on this
+    # line, and the reason a bare absence is not acceptable: a target that installs
+    # nothing has to SAY so.
+    parts.append(mamba_anchor.boot_token())
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2492,6 +2509,26 @@ def _after_connector_created(connector) -> None:
                            "wrappers fitted, so BOTH routes to the divisibility "
                            "assert are gated and arming is refused",
                            _state["hook_last"])
+        # THE SECOND RUNTIME-PATCH TARGET, fitted at the SAME moment and for the
+        # SAME reason: this is the first instant the EngineCore process provably has
+        # the tier's manager, and `vllm/v1/engine/core.py:60` has already imported
+        # `single_type_kv_cache_manager`, so `MambaManager` is resolvable here
+        # without this plugin importing it. It runs BEFORE `boot_from_connector` so
+        # the BOOT line can carry `MAMBA_ANCHOR[...]`: an operator must be able to
+        # tell "fitted" from "silently absent" in one glance.
+        #
+        # WHY HERE AND NOT IN `register()`: the mask decides which align-mode state
+        # blocks survive into the store, so it only has a purpose on a boot that has
+        # a tier at all - and `register()` runs in worker and arg-parsing processes
+        # too, where patching a scheduler-side cache class would be a side effect
+        # nothing asked for. A boot with no tier connector gets no anchor patch, and
+        # says so with `MAMBA_ANCHOR[disabled]`.
+        mamba = mamba_anchor.install()
+        logger.warning(
+            "kvtier-dev-plugin: run-end anchor patch at CONNECTOR CREATION: %s%s",
+            mamba.get("verdict"),
+            "" if mamba.get("installed")
+            else ": %s" % str(mamba.get("reason") or "no reason given"))
         # THE BOOT SEQUENCE: guard wrappers (armed, composed over the layers just
         # fitted), then the tier arm - and the arm only if the install verified.
         # After the install verdict lines above, so the BOOT line is the last
@@ -3056,6 +3093,11 @@ def _fields(**overrides) -> dict:
         # WHERE THE PATCH LANDED: the answer to "was this engine patched before
         # its first request, or only after somebody curled a verb?".
         "connector_hook": connector_hook_section(),
+        # THE SECOND RUNTIME-PATCH TARGET, in the same section as the first because
+        # an operator reads them together: "is this engine patched?" now has two
+        # answers, and `mamba_anchor.installed` is the field a payload reader checks
+        # beside the `MAMBA_ANCHOR[...]` token on the boot line.
+        "mamba_anchor": mamba_anchor.section(),
         "patched_before_first_request": bool(_state["hook_tier_connectors"]
                                              and _state["hook_installs"]),
         "geometry": _state["geometry"],
