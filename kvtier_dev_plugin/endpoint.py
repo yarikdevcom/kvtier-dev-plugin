@@ -414,7 +414,19 @@ ARG_SPECS: dict[str, dict] = {
                                           "ls", "contains", "identities", "offers",
                                           "authority", "failures", "shadow",
                                           "gpu-shadow", "restore-verify",
-                                          "gpu-write")},
+                                          "gpu-write", "restore-source")},
+                        # `op=restore-source` (0.2.59): where a restore's destination
+                        # rows come from, and how many of them may be in flight. A
+                        # three-word enum: two postures (`arena`, `bounded`) and one
+                        # DEPRECATED ALIAS (`bounce`, which resolves to `bounded` and
+                        # says so in the posture payload's `alias` field). A typo is
+                        # still a 400 that never reaches the engine and cannot mutate
+                        # the posture, while a caller still using the superseded word
+                        # gets a truthful answer rather than a rejection that reads as a
+                        # bug. The setter refuses it a second time for a caller that
+                        # arrives by some other door.
+                        "source": {"kind": "enum",
+                                   "values": ("arena", "bounded", "bounce")},
                         "slot": {"kind": "int", "min": 0, "max": 2 ** 31 - 1},
                         "key": {"kind": "str", "max_chars": 64},
                         # `op=identities` (0.2.46): the paged, digest-only enumeration

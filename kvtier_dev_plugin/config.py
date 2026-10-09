@@ -593,6 +593,71 @@ ENV_DISK_GPU_WRITE_DELIVERY_TIMEOUT = (
 # 64", which is a silently different machine.
 ENV_DISK_CPU_SLOT_RESERVE = "VLLM_E2_TIER_DISK_CPU_SLOT_RESERVE"
 
+# STEP 3 OF SHRINKING THE ARENA: HOW BIG A RESTORE'S STAGING MAY BE (`disk_restore.py`)
+# ---------------------------------------------------------------------------------
+# A RESTORED SPAN HAS TWO HOST-STOPS TODAY: the read lands in a bounce buffer, and the
+# apply point memmoves it out of that buffer into a CPU ARENA SLOT, which the fork's own
+# `start_load_kv` then DMAs into the GPU block named beside it. The slot is the reason
+# the pinned arena cannot be small: a whole-prompt restore costs one slot PER SPAN (82
+# spans + 4 boundary states = 86 slots) and the arena must be sized permanently for the
+# worst offer, on a box where `LimitMEMLOCK` pages are the scarce resource, not disk
+# bytes.
+#
+# WHAT ACTUALLY CHANGES THAT, MEASURED. The first design of this step had the plugin
+# reserve its own staging rows at boot so a restore would stop asking the arena for
+# them. That is impossible: the fork frees EVERY CPU row in a load's transfer when the
+# load ends (`manager.py:1346`), so a row the plugin allocated once nets ref_cnt 0 and
+# goes back on the pool's free list - which is correct for the arena and fatal for a
+# private owner, because the row then sits on two free lists at once and two consumers
+# share its bytes. Wrong output, no exception. So there is no private row set, and the
+# two postures differ only in what SIZES an offer:
+#
+#   `arena`  - the shipped default. An offer is sized by what the arena's free list can
+#              pay for after the CPU-slot reserve and the boundary states, CLIPPED to
+#              it. This clipping has existed since 0.2.38, which is why shrinking the
+#              arena is already survivable; what floats is the offer's length.
+#   `bounded` - an offer is sized by a CAP on staging rows in flight (`..._STAGING_ROWS`
+#              below), so the arena can be planned as `cap + reserve` instead of as
+#              however much RAM happens to be free. The rows still come from the arena.
+#
+# THE GRAMMAR IS TWO WORDS LONG, AND AN UNRECOGNISED VALUE FALLS BACK TO `arena` AND
+# SAYS SO (`disk_restore.restore_source_verdict()` publishes `raw`, `recognised` and
+# `reason`, and logs once). A typo must not silently move a serving box onto a new
+# delivery path, and it must not silently stay on the old one either. `bounce` is
+# accepted as a deprecated alias of `bounded`, naming the boot-time reservation it used
+# to mean; the verdict publishes `alias: "bounce"` so a grep for the typed word finds
+# the word in force.
+#
+# THIS IS THE BOOT DEFAULT ONLY. The same posture is flipped at runtime by
+# `POST /plugins/kvtier/disk {"op":"restore-source","source":"bounded"}`, which does not
+# persist: a restart hands the decision back to this variable. A request already in
+# flight keeps the posture its OFFER chose - the pricing decision is made once per offer
+# and its cap credit is returned by that load, not by the next one - so flipping the
+# posture mid-traffic cannot re-price a run that is already staging.
+ENV_DISK_RESTORE_SOURCE = "VLLM_E2_TIER_DISK_RESTORE_SOURCE"
+
+# HOW MANY STAGING ROWS A RESTORE MAY HOLD IN FLIGHT (`disk_restore.py`, 0.2.59).
+# This is an ADMISSION CAP, not a reservation: it bounds how many rows the restore tier
+# may have charged against the arena at one moment. The sizing claim it buys is the
+# whole point - `arena rows >= cap + cpu_slot_reserve` becomes arithmetic an operator
+# can check, instead of a guess about the worst prompt. The arithmetic for this default:
+# 32 rows x 12,902,400 B (the WIDEST rank window on the live 4-GPU box, PP1) = 412.9 MiB
+# per rank = 1.61 GiB across four ranks, inside the operator's 2 GiB ceiling, with 8
+# rows available to each of four concurrent sequences.
+#
+# 0 IS A REAL POSTURE AND IS HONOURED: a zero cap means "no offer can be staged", so
+# `bounded` refuses every offer up front with `no_staging_rows` - the safe direction for
+# a bound whose whole job is to make offers smaller (the same reasoning
+# `cpu_slot_reserve_env` gives for honouring 0). A negative value, a float, or anything
+# not a number is refused as a grammar error, falls back to 32 and is announced once in
+# the engine log.
+#
+# THE OLD NAME STILL WORKS. `VLLM_E2_TIER_DISK_RESTORE_RING_SLOTS` was this variable's
+# name while the rows were meant to be owned; it is read when the new name is unset and
+# the verdict says which of the two won.
+ENV_DISK_RESTORE_STAGING_ROWS = "VLLM_E2_TIER_DISK_RESTORE_STAGING_ROWS"
+ENV_DISK_RESTORE_RING_SLOTS = "VLLM_E2_TIER_DISK_RESTORE_RING_SLOTS"
+
 # STEP 2 OF RETIRING THE ARENA: STOP THE FORK COPYING WHAT THE RESTORE DELIVERS
 # (`disk_restore.py`, 0.2.49) -------------------------------------------------
 # TODAY A DISK RESTORE IS CARRIED BY THE ARENA TWICE OVER. The read lands in a CPU
@@ -1370,6 +1435,92 @@ def delivery_timeout_env() -> dict:
             else:
                 seconds = value
     return {"seconds": seconds, "problems": problems}
+
+
+def disk_restore_staging_rows_env() -> dict:
+    """How many staging rows a restore may hold in flight, parsed and NOT judged.
+
+    Grammar only, the `cpu_slot_reserve_env` split again: `rows=None` means the operator
+    said nothing and the consumer answers with its own constant. 0 is honoured (a cap
+    that can stage nothing); negative, fractional and non-numeric are `problems`.
+
+    BOTH NAMES ARE READ. `VLLM_E2_TIER_DISK_RESTORE_STAGING_ROWS` is the canonical
+    variable; `VLLM_E2_TIER_DISK_RESTORE_RING_SLOTS` was its name while the rows were
+    meant to be owned by the plugin, and it is honoured when the new name is unset, with
+    `legacy_env_var` naming the door the number came in through. A value on BOTH is not
+    a tie to break silently: the new name wins and the old one is reported as a problem,
+    because two numbers for one bound is a box whose sizing claim is a coin flip.
+    """
+    out = {"rows": None, "raw_value": None, "problems": [],
+           "env_var": ENV_DISK_RESTORE_STAGING_ROWS,
+           "legacy_env_var": None}
+    new = os.environ.get(ENV_DISK_RESTORE_STAGING_ROWS)
+    legacy = os.environ.get(ENV_DISK_RESTORE_RING_SLOTS)
+    raw, source_var = ((new, ENV_DISK_RESTORE_STAGING_ROWS) if new is not None
+                       else ((legacy, ENV_DISK_RESTORE_RING_SLOTS)
+                             if legacy is not None else (None, None)))
+    if new is not None and legacy is not None and new.strip() != legacy.strip():
+        out["problems"].append(
+            f"{ENV_DISK_RESTORE_RING_SLOTS}={legacy!r} is ignored because "
+            f"{ENV_DISK_RESTORE_STAGING_ROWS}={new!r} is also set; the new name wins "
+            "and the old one should be deleted from the drop-in")
+    if raw is None:
+        return out
+    if source_var == ENV_DISK_RESTORE_RING_SLOTS:
+        out["legacy_env_var"] = ENV_DISK_RESTORE_RING_SLOTS
+    out["raw_value"] = raw
+    text = str(raw).strip()
+    try:
+        rows = int(text)
+    except (TypeError, ValueError):
+        out["problems"].append(f"{source_var}={raw!r} is not an integer number of "
+                                "staging rows and was ignored")
+        return out
+    if rows < 0:
+        out["problems"].append(f"{source_var}={raw!r} is negative; a restore cannot "
+                                "hold fewer than zero staging rows in flight")
+        return out
+    out["rows"] = rows
+    return out
+
+
+def disk_restore_source_env() -> dict:
+    """The restore posture the operator asked for at boot, parsed and NOT judged.
+
+    Grammar only, the same split as `cpu_slot_reserve_env`: this answers "what did the
+    environment say" and `disk_restore.restore_source_verdict()` spends the answer.
+    `source=None` means the variable is UNSET, which is not the same fact as
+    "the operator wrote `arena`" and is reported differently (the default and a written
+    default look identical in a payload and are not identical in an incident).
+
+    `bounce` resolves to `bounded` and says so in `alias`, because the posture it named
+    (a boot-time reservation of staging rows) was removed before it ever shipped: the
+    fork releases a load's destination rows, so a plugin cannot own them. The alias is
+    the word, not a third posture.
+
+    NO CLAMPING, no case-folding, no prefix matching: an unrecognised value is returned
+    as written, with a complaint in `problems`, so the consumer can name what the
+    operator actually typed when it says the value was ignored.
+    """
+    out = {"source": None, "raw_value": None, "problems": [], "alias": None,
+           "env_var": ENV_DISK_RESTORE_SOURCE}
+    raw = os.environ.get(ENV_DISK_RESTORE_SOURCE)
+    if raw is None:
+        return out
+    text = str(raw).strip()
+    if text == "arena":
+        out["source"] = text
+        out["raw_value"] = raw
+        return out
+    if text in ("bounded", "bounce"):
+        out["source"] = "bounded"
+        out["raw_value"] = raw
+        out["alias"] = text if text == "bounce" else None
+        return out
+    out["raw_value"] = raw
+    out["problems"].append(f"{ENV_DISK_RESTORE_SOURCE}={raw!r} is neither 'arena' nor "
+                           "'bounded' (nor the deprecated 'bounce') and was ignored")
+    return out
 
 
 def cpu_slot_reserve_env() -> dict:

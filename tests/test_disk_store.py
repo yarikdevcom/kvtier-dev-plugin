@@ -58,6 +58,7 @@ from kvtier_dev_plugin import (  # noqa: E402 - the module under test
     blockdump,
     config,
     disk_layout,
+    disk_restore,
     disk_spill,
     disk_store,
     engine_side,
@@ -1026,6 +1027,48 @@ def test_an_event_is_spilled_once_even_while_the_fork_has_not_drained_its_dict(t
     assert first["queued"] == 2
     assert second["spilled"] == 0
     assert disk_store.counters()["spill_queued"] == 2
+
+
+def test_the_restore_source_posture_does_not_touch_the_spill_path(tier):
+    """GPU -> CPU ARENA -> NVMe is how the disk fills AT ALL, and the 0.2.59 staging cap
+    lives on the READ side only.
+
+    Both callers of `disk_spill.request_spill` hand it a CPU ARENA slot, so if the
+    restore posture changed anything about the store's completion path the cache would
+    quietly stop filling: a missed file, forever, with no error raised. The same step is
+    run twice - once on the boot's default `arena` posture and once on `bounded` - and
+    the two reports are compared, because "unchanged" has to mean the same numbers, not
+    the absence of a new failure.
+    """
+    def spill_a_step(event):
+        with metadata_shape(True):
+            step = metadata(store_cpu_blocks=[6, 7],
+                            store_keys=[LONG_KEY, OTHER_KEY], store_event=event)
+            role = handler()
+            disk_store.observe_bind(role, step)
+            role._completed_store_events = {step.store_event: 1}
+            return disk_store.on_store_completed(role, [])
+
+    try:
+        arena = spill_a_step(3)
+        assert disk_restore.set_restore_source("bounded")["ok"] is True
+        bounded = spill_a_step(4)
+    finally:
+        disk_restore.set_restore_source(None)
+
+    assert arena["ok"] is True and bounded["ok"] is True
+    assert arena["queued"] == arena["spilled"] == 2, arena
+    assert bounded["queued"] == bounded["spilled"] == 2, bounded
+    assert [item["spilled"] for item in arena["events"]] == \
+        [item["spilled"] for item in bounded["events"]]
+    assert disk_store.counters()["spill_queued"] == 4
+    # The spill path never consulted the cap: it spills ARENA slots, and the cap is a
+    # restore-side budget. A non-zero here means the two got tangled.
+    counters = disk_restore.counters()
+    assert counters["staging_rows_admitted"] == 0
+    assert counters["bounded_staged_spans"] == 0
+    assert counters["offers_staged_bounded"] == 0
+    assert disk_spill.is_armed() is True, "the store stayed armed throughout"
 
 
 def test_a_completed_map_too_big_to_scan_is_skipped_and_counted(tier, monkeypatch):

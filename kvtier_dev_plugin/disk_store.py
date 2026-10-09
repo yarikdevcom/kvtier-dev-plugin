@@ -303,9 +303,9 @@ MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "identities",
              "offers", "authority", "failures", "shadow", "gpu-shadow",
-             "restore-verify", "gpu-write")
+             "restore-verify", "gpu-write", "restore-source")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
-                     "gpu-shadow", "restore-verify", "gpu-write")
+                     "gpu-shadow", "restore-verify", "gpu-write", "restore-source")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -3122,6 +3122,54 @@ def _op_offers(body: dict) -> dict:
     return _apply_switch(body, "offers_enabled", disk_restore.set_offer_switch)
 
 
+def _op_restore_source(body: dict) -> dict:
+    """WHAT SIZES A RESTORE'S DESTINATION ROWS: the arena's free list, or a cap.
+
+    `{"op":"restore-source"}` reads the posture; `{"op":"restore-source",
+    "source":"bounded"}` prices every restore of this boot against the staging cap, and
+    `{"op":"restore-source","source":"arena"}` puts the pricing back on the arena's free
+    list exactly as before. `{"op":"restore-source","source":null}` clears the runtime
+    choice and hands the decision back to the boot default
+    (`VLLM_E2_TIER_DISK_RESTORE_SOURCE`).
+
+    BOTH POSTURES TAKE THEIR ROWS FROM THE ARENA. That is the honest shape of this verb,
+    and it is not what the first version of it promised: the fork releases a load's CPU
+    rows when the load ends, so the plugin cannot own a private set of them (the
+    reference audit in `disk_restore.py` names the line). `bounded` bounds how MANY rows
+    may be in flight, which is what lets the arena be sized from the cap; it does not
+    move WHERE a row comes from, because nothing can.
+
+    PER BOOT, AND NOT PERSISTED - the same lifetime rule as `op:authority`: a restart
+    returns the posture to the environment variable, so this verb is a lever you can
+    pull on a serving box and a restart undoes. That is the point: an operator can size
+    the pinned arena at roughly `cap + reserve` instead of at the worst prompt, and roll
+    back in one POST if the cap turns out to be the constraint.
+
+    A REQUEST ALREADY IN FLIGHT KEEPS THE POSTURE ITS OFFER CHOSE. The posture is read
+    once per offer and stored on the ledger record, so flipping this verb between the
+    offer and the copy cannot price a run one way and return its cap credit the other -
+    an accounting fault that would look like a leak forever, and it is unrepresentable
+    here rather than merely unlikely.
+
+    A value that is neither word (nor the deprecated alias `bounce`) is refused and
+    changes NOTHING, reported with the vocabulary so a typo in a curl cannot move a
+    serving box in either direction.
+    """
+    from . import disk_restore  # noqa: PLC0415 - it imports this module
+    out = {"ok": True, "posture": disk_restore.restore_source_verdict(),
+           "staging_cap": disk_restore.restore_staging_state(),
+           "per_boot": True, "survives_restart": False}
+    if "source" in body:
+        verdict = disk_restore.set_restore_source(body["source"])
+        out["restore_source"] = verdict
+        if not verdict.get("ok"):
+            out["ok"] = False
+            out["reason"] = f"restore_source: {verdict.get('reason')}"
+        out["posture"] = disk_restore.restore_source_verdict()
+        out["staging_cap"] = disk_restore.restore_staging_state()
+    return out
+
+
 def _op_authority(body: dict) -> dict:
     """THE global disk-authority switch: the disk decides EVERY request's prefix.
 
@@ -3434,7 +3482,13 @@ _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "failures": _op_failures, "shadow": _op_shadow,
              "gpu-shadow": _op_gpu_shadow,
              "restore-verify": _op_restore_verify,
-             "gpu-write": _op_gpu_write}
+             # LAST, to match `DISK_OPS`: the status route advertises that tuple and a
+             # test asserts the tuple and this table are the same list IN ORDER, so an
+             # op
+             # inserted mid-table is a route advertising an order it does not dispatch
+             # in.
+             "gpu-write": _op_gpu_write,
+             "restore-source": _op_restore_source}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring

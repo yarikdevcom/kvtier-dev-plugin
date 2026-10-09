@@ -441,6 +441,98 @@ MAX_INVALID_BLOCKS = 4096            # GPU block ids awaiting one report
 MAX_STRING_CHARS = 160
 MAX_BOOT_LINE_CHARS = 160
 CPU_SLOT_RESERVE = 64                # THE DEFAULT: CPU slots an offer leaves free
+RESTORE_SOURCE_ARENA = "arena"       # destinations come from the arena's free list
+RESTORE_SOURCE_BOUNDED = "bounded"   # ...the SAME pool, under an ADMISSION CAP
+RESTORE_SOURCE_BOUNCE = "bounce"     # DEPRECATED ALIAS of `bounded`; reports `bounded`
+# What a caller's word means. `bounce` was this posture's FIRST name, from when the
+# staging rows were going to be a private ring the plugin OWNED. The reference audit
+# below ("WHO RELEASES A LOAD'S DESTINATION ROWS") proves that design cannot hold a row
+# for a whole load, and what survived it is a cap - so the value is called `bounded`.
+# The alias exists so a drop-in written against the earlier name still boots and reads
+# the truth (`effective: "bounded"`, `alias: "bounce"`, one log line) instead of getting
+# a 400 for a word that used to work. It is not a second posture and never will be.
+RESTORE_SOURCE_ALIASES = {RESTORE_SOURCE_BOUNCE: RESTORE_SOURCE_BOUNDED}
+RESTORE_SOURCES = (RESTORE_SOURCE_ARENA, RESTORE_SOURCE_BOUNDED)
+RESTORE_STAGING_ROWS = 32            # THE DEFAULT: staging rows in flight at once
+"""HOW MANY STAGING ROWS A RESTORE MAY HOLD AT ONCE (0.2.59) - an ADMISSION CAP.
+
+WHY THE CAP EXISTS. The arena had to be sized for the WORST PROMPT, permanently, because
+an offer allocates one CPU row per restored span out of `cpu_block_pool` and a
+whole-prompt restore is 82 spans + 4 boundary states = 86 rows. On a RAM-constrained box
+that pinned (`LimitMEMLOCK`) 8 GiB is not a preference, it is a wall that stops the
+engine booting.
+
+WHAT ACTUALLY FIXES THAT - AND WHAT DOES NOT. The first version of this posture fixed it
+by reserving 32 rows at boot and handing those out instead of pool rows. That was wrong
+in a way that would have surfaced in week two on an unattended box (see the audit
+below), and once the ownership is removed there is almost nothing left to fix, because
+the arena path has CLIPPED since 0.2.38: `cpu_slot_affordance()` answers "how many spans
+can `free - reserve - boundary` pay for" and a longer offer is shortened, not refused.
+So shrinking `KV_OFFLOAD_SIZE` from 8 GiB to ~2 GiB already produces adaptive restores.
+The cap's irreducible contribution is that the offer stops being sized by however much
+free RAM the RAM tier happens to have left: `bounded` declares the budget instead of
+scavenging it, and the sizing claim becomes arithmetic (`arena rows >= cap + reserve`)
+rather than a hope. Say it plainly: **the deliverable is "the restore path adapts to a
+small arena", not "restores no longer need arena rows".** A `bounded` restore still
+ takes `spans * per_span + boundary` rows out of the pool per offer. A box with ZERO
+ free CPU
+rows cannot restore anything in either posture - a destination that does not exist is
+not a smaller destination.
+
+WHAT `bounded` DOES. Exactly what `arena` does, plus a counter. The offer is priced
+against `cap - in_use_rows` (an upper bound, so a big restore is CLIPPED to it,
+`bounded_by: ["staging_rows"]`, and one that cannot pay its boundary states is REFUSED
+up front with `no_staging_rows` - never waited for, because a wait in the step thread is
+what killed the engine) and then allocates those rows from the pool and releases them
+back to the pool exactly as `arena` has since 0.2.20. There is NO boot-time reservation,
+NO private free list, NO private row identity and NO synthetic reference count anywhere
+in this module. A cap that miscounts costs restores or costs headroom; it cannot cost
+correctness, and that asymmetry is the entire reason to prefer it.
+
+WHO RELEASES A LOAD'S DESTINATION ROWS: THE AUDIT (measured on the live box, 2026-10-13,
+against the DEPLOYED fork at `/home/user/vllm-38-next/vllm-workspace/vllm/v1/`, md5 of
+`simple_kv_offload/manager.py` = 91a3aa6566710cb10e38af65fa33f318). For one load of N
+rows, every reference the CPU rows gain and lose:
+  +1  `manager.py:370`  `cpu_block_pool.touch(pin_blocks)` - the lookup pin taken by
+      `get_num_new_matched_tokens()`, for every non-null block it found.
+  +1  `manager.py:479`  `cpu_block_pool.touch(cpu_blocks_to_touch)` - taken inside
+      `update_state_after_alloc()` for every block the load actually uses.
+  -1  `manager.py:481` -> `manager.py:1319` `_free_pending_cpu_hit()` - releases the
+      lookup pin. Balanced against `manager.py:370`, never against an allocation.
+  -1  `manager.py:1346` `_cleanup_load_request()` - releases the transfer refs, reached
+      from `request_finished()` (`manager.py:1200`) and from the report path.
+  (0) `_release_transfer_refs()` (`manager.py:1158`) is the STORE release, not the load
+      release; it never sees a restore's rows.
+  `BlockPool.get_new_blocks` takes +1 (`core/block_pool.py:688`), `touch` +1
+  (`block_pool.py:762`) and `free_blocks` -1 (`block_pool.py:786`), and a row at
+  ref_cnt 0 goes ONTO the pool's free list (`block_pool.py:787-798`).
+So a row the plugin allocated once and never touched again nets **0**: 1 (allocation)
++1 (479) -1 (481) -1 (1346) = 0, and it lands on the pool's free list at the end of its
+load. That is CORRECT for the arena - a parked row reaching ref_cnt 0 is precisely what
+makes it a hit-able, LRU-evictable cache entry, which is the whole point of parking it.
+It is fatal for a "ring": the fork's release is unconditional, so a row the plugin also
+kept on its own free list sits on TWO free lists at once, and the next
+`get_new_blocks()` hands the same bytes to a second consumer while the plugin is about
+to hand them to another restore. Two entries aliasing one row is wrong output with no
+exception. The docstring that used to sit here blamed `_free_pending_cpu_hit` for eating
+the plugin's allocation reference; the arithmetic above says it does not (it is balanced
+against `manager.py:370`) and the blame belongs to `manager.py:1346` - the conclusion
+was right, the mechanism was not, which is why it is recorded here instead of being
+guessed at again by the next reader.
+
+WHEN THE CAP'S CREDIT COMES BACK. When its load ENDS, whichever way it ended, and every
+path that ends one goes through the one door (`_drop_load`), which is what makes the cap
+leak-proof rather than leaky-slowly. A POSITIVE report (`finished_recving` naming the
+request) counts `returned_rows`; a load terminal WITHOUT one - a load error, an abort
+the fork released under us, an expired ledger, a cap eviction - counts
+`recovered_rows`. Both return the credit, and the split exists because "the cap is
+healthy" and "loads keep failing but the cap survives them" are different facts an
+operator must tell apart.
+What is deliberately absent is a TIMER, an age-based reclaim or a schedule: nothing
+here needs one, because a credit is not a row and the row it describes is already the
+pool's.
+"""
+
 """CPU slots an offer must leave FREE in the arena's CPU block pool - THE SHIPPED
 DEFAULT, and since 0.2.38 NOT necessarily the number in force.
 
@@ -522,6 +614,521 @@ def cpu_slot_reserve() -> int:
     reporting this function's answer.
     """
     return int(cpu_slot_reserve_verdict()["cpu_slot_reserve"])
+
+
+# THE RUNTIME POSTURE, and the STAGING CAP it spends. Both are per-process and neither
+# is persisted: a restart returns the source to `VLLM_E2_TIER_DISK_RESTORE_SOURCE` and
+# the cap to its environment, which is the same lifetime rule as the disk authority
+# switch (`op:authority`).
+#
+# `_staging["held"]` maps a request id to the number of staging rows CHARGED to it - an
+# `int`, deliberately, and not a list of rows. That one type is the whole redesign: this
+# module owns a budget, `cpu_block_pool` owns the rows, and the fork's own load release
+# returns them (see the reference audit above the posture constants), so there is no row
+# identity here that could disagree with the pool's free list.
+_runtime_restore_source: dict = {"value": None, "raw": None, "alias": None, "flips": 0,
+                                 "rejected": 0, "last_reason": None}
+_staging: dict = {"held": {}, "in_use_rows": 0, "peak": 0, "admissions": 0,
+                  "rows_admitted": 0, "clipped": 0, "refused": 0, "returned": 0,
+                  "recovered": 0, "unadmitted": 0, "unreturned": 0, "over_cap": 0}
+
+
+def restore_source_verdict() -> dict:
+    """THE RESTORE'S DESTINATION SOURCE, resolved, with its origin beside it.
+
+    Three doors can name the posture and a reader must be able to tell them apart from
+    one payload: the shipped default (nothing set), the boot environment
+    (`VLLM_E2_TIER_DISK_RESTORE_SOURCE`), and this boot's runtime route
+    (`POST /plugins/kvtier/disk {"op":"restore-source","source":...}`, which does NOT
+    persist - a restart hands the decision back to the environment, exactly like
+    `op:authority`). `source` names which of the three is in force; `raw` carries what
+    the winning door actually said; `recognised` is False when a door SAID something the
+    grammar could not read, and then `reason` says so and the shipped default stands.
+
+    NEVER RAISES: this is an offer-path input, and no offer-size question is worth a
+    fault on the step path.
+    """
+    out = {"requested": None, "effective": RESTORE_SOURCE_ARENA,
+           "raw": None, "recognised": True, "reason": None,
+           "source": "default",
+           "default": RESTORE_SOURCE_ARENA,
+           "env_var": config.ENV_DISK_RESTORE_SOURCE,
+           "env_value": None, "runtime_value": None, "route_op": "restore-source",
+           # `alias` names the deprecated word a door used, when the winning door said
+           # `bounce` and got `bounded`. It is published rather than swallowed because a
+           # reader who greps the log for the word they typed must be able to see that
+           # the word they typed is not the word in force.
+           "alias": None,
+           "survives_restart": False}
+    try:
+        env = config.disk_restore_source_env()
+    except Exception as exc:  # noqa: BLE001 - a posture read is never worth a fault
+        snapshot._error(exc, "disk_restore restore source")
+        return out
+    out["env_value"] = env.get("source")
+    runtime = _runtime_restore_source.get("value")
+    out["runtime_value"] = runtime
+    problems = [str(problem) for problem in (env.get("problems") or [])]
+    if runtime in RESTORE_SOURCES:
+        out["requested"] = runtime
+        out["effective"] = runtime
+        out["raw"] = _runtime_restore_source.get("raw")
+        out["alias"] = _runtime_restore_source.get("alias")
+        out["source"] = "route"
+    elif env.get("source") in RESTORE_SOURCES:
+        out["requested"] = env.get("source")
+        out["effective"] = env.get("source")
+        out["raw"] = env.get("raw_value")
+        out["alias"] = env.get("alias")
+        out["source"] = "env"
+    elif problems:
+        # The environment spoke and the grammar refused it: the DEFAULT is in force, and
+        # a reader has to be able to see that this boot is not the boot the operator
+        # asked for. Logged once per distinct complaint, because an offer runs on the
+        # request path.
+        out["requested"] = env.get("raw_value")
+        out["raw"] = env.get("raw_value")
+        out["recognised"] = False
+        out["reason"] = "; ".join(problems)[:240]
+        out["source"] = "default"
+        notice_once(f"restore-source-{';'.join(problems)[:96]}",
+                    f"DISK[source] IGNORED: {out['reason']}; the shipped default "
+                    f"{RESTORE_SOURCE_ARENA!r} stands")
+    return out
+
+
+def effective_restore_source() -> str:
+    """The source one OFFER must use, as a bare word. Reads the verdict above."""
+    return str(restore_source_verdict()["effective"])
+
+
+def set_restore_source(value) -> dict:
+    """Move this boot's restore source, from the runtime route. Never persists.
+
+    A value that is not one of the two words is REFUSED and changes nothing - the same
+    discipline as every other boot switch here: a typo in a curl must not move a serving
+    box onto a different delivery path in either direction. `None` clears the runtime
+    value, which hands the decision back to the boot environment.
+
+    `bounce` is accepted as a DEPRECATED ALIAS of `bounded` and says so three ways: in
+    the return (`posture.alias`), in a one-time log line, and in `raw`, which keeps the
+    word the caller used. It is not a third posture and there is no code path behind it.
+    """
+    if value is None:
+        previous = _runtime_restore_source.get("value")
+        _runtime_restore_source["value"] = None
+        _runtime_restore_source["raw"] = None
+        _runtime_restore_source["alias"] = None
+        _runtime_restore_source["flips"] += 1
+        return {"ok": True, "changed": previous is not None,
+                "cleared": True, "reason": None,
+                "posture": restore_source_verdict()}
+    word = str(value).strip().lower()
+    alias = RESTORE_SOURCE_ALIASES.get(word)
+    text = alias or word
+    if alias is not None:
+        notice_once(f"restore-source-alias-{word}",
+                    f"DISK[source] {word!r} is a DEPRECATED ALIAS of {alias!r}: the "
+                    "boot-time reservation it named was removed in 0.2.59 (the fork "
+                    "releases a load's destination rows, so the plugin cannot own "
+                    "them), and what stands now is an admission cap. The posture "
+                    f"{alias!r} is in force.")
+    if text not in RESTORE_SOURCES:
+        _runtime_restore_source["rejected"] += 1
+        line = (f"{value!r} is not one of {list(RESTORE_SOURCES)}")
+        _runtime_restore_source["last_reason"] = line
+        return {"ok": False, "changed": False, "cleared": False, "reason": line,
+                "posture": restore_source_verdict()}
+    previous = _runtime_restore_source.get("value")
+    _runtime_restore_source["value"] = text
+    _runtime_restore_source["raw"] = str(value)
+    # The deprecated WORD the caller used, when it used one: `alias: "bounce"` is what a
+    # reader greps for, so it records the word typed, not the word resolved.
+    _runtime_restore_source["alias"] = word if alias is not None else None
+    _runtime_restore_source["flips"] += 1
+    _state["restore_source_flips"] += 1
+    _note(f"restore source is now {text!r} for this boot (per-boot; a restart returns "
+          f"to {config.ENV_DISK_RESTORE_SOURCE})")
+    return {"ok": True, "changed": previous != text, "cleared": False, "reason": None,
+            "posture": restore_source_verdict()}
+
+
+def staging_rows_verdict() -> dict:
+    """The STAGING CAP in force, resolved against the environment, with its origin.
+
+    Same three-door discipline as `restore_source_verdict()`: the shipped default, the
+    boot environment, and nothing else (the cap has no runtime route - a cap an offer is
+    being priced against cannot move between the pricing and the allocation without the
+    two disagreeing, which is the half-admitted offer this module already refuses
+    elsewhere). `source` says which door won; a value the grammar refused is reported
+    with its complaint and the default stands.
+    """
+    out = {"rows": int(RESTORE_STAGING_ROWS),
+           "default_rows": int(RESTORE_STAGING_ROWS),
+           "env_var": config.ENV_DISK_RESTORE_STAGING_ROWS,
+           "legacy_env_var": config.ENV_DISK_RESTORE_RING_SLOTS,
+           "raw_value": None, "source": "default", "problems": []}
+    try:
+        env = config.disk_restore_staging_rows_env()
+    except Exception as exc:  # noqa: BLE001 - a cap read is never worth a fault
+        snapshot._error(exc, "disk_restore staging rows")
+        return out
+    out["raw_value"] = env.get("raw_value")
+    out["problems"] = [str(problem) for problem in (env.get("problems") or [])]
+    if env.get("rows") is not None:
+        out["rows"] = int(env["rows"])
+        out["source"] = "env"
+    elif out["problems"]:
+        out["source"] = "ignored"
+        notice_once(f"staging-cap-{';'.join(out['problems'])[:96]}",
+                    f"DISK[cap] IGNORED: {'; '.join(out['problems'])[:240]}; the "
+                    f"shipped default {RESTORE_STAGING_ROWS} rows stand")
+    return out
+
+
+def staging_row_cap() -> int:
+    """The staging cap as a bare number. Read the verdict, not the constant."""
+    return int(staging_rows_verdict()["rows"])
+
+
+def _cap_binds() -> int:
+    """Times the CAP was the bound: an offer it shortened plus an offer it refused."""
+    return int(_staging["clipped"]) + int(_staging["refused"])
+
+
+def _pool_refusals() -> int:
+    """Times a READ-SIDE capacity bound was the bound, for the `binding` comparison."""
+    refused = _state["refused"]
+    return (int(refused.get("no_pool_budget") or 0)
+            + int(refused.get("no_read_queue") or 0)
+            + int(refused.get("no_cpu_slots") or 0))
+
+
+def restore_staging_state() -> dict:
+    """THE STAGING CAP'S PRESSURE, so a live box can say whether the cap binds or not.
+
+    A STABLE KEY SET in every state, including "never used": `used: false` with every
+    count at 0 is a different claim from "this build has no cap". `binding` answers the
+    one question that decides whether to grow or shrink it: the cap refused or shortened
+    an offer more often than the read pool did.
+
+    NOTHING HERE IS AN OWNERSHIP CLAIM. These are a budget and its spend. The rows
+    themselves belong to `cpu_block_pool` from the moment `get_new_blocks` hands them
+    over until the fork's release path puts them back (see the audit above the posture
+    constants), and this module deliberately cannot name a single one of them.
+    """
+    cap = staging_row_cap()
+    in_use = int(_staging["in_use_rows"])
+    return {
+        "cap_rows": cap,
+        "cap_source": staging_rows_verdict()["source"],
+        "credit_rows": max(0, cap - in_use),
+        "in_use_rows": in_use,
+        "in_use_requests": len(_staging["held"]),
+        "peak_in_use_rows": int(_staging["peak"]),
+        "used": int(_staging["admissions"]) > 0,
+        "admissions": int(_staging["admissions"]),
+        "rows_admitted": int(_staging["rows_admitted"]),
+        "clipped_offers": int(_staging["clipped"]),
+        "refused_offers": int(_staging["refused"]),
+        "returned_rows": int(_staging["returned"]),
+        "recovered_rows": int(_staging["recovered"]),
+        "unadmitted_rows": int(_staging["unadmitted"]),
+        "unreturned_rows": int(_staging["unreturned"]),
+        "over_cap_grants": int(_staging["over_cap"]),
+        "binding": ("staging_rows" if _cap_binds() > _pool_refusals() else
+                    ("read_pool" if _pool_refusals() > 0 else "neither_yet")),
+        "note": ("a staging row is a POOL row: allocated per offer and released by the "
+                 "fork's own load path, exactly as under `arena`. This block is a "
+                 "counter, not a set of rows, so `in_use_rows` counts credit owed and "
+                 "never a row identity. Credit returns when the load ends - on a "
+                 "positive report (`returned_rows`) or because the load is terminal "
+                 "without one (`recovered_rows`) - and `unreturned_rows` is the count "
+                 "that must stay 0. A cap that binds costs restores; that is the trade "
+                 "this block exists to make visible."),
+    }
+
+
+def _admit_staging(request_id: str, rows: int) -> dict:
+    """Charge `rows` against the cap for one offer. NEVER WAITS, NEVER ALLOCATES.
+
+    The cap is an ADMISSION decision and nothing else: it answers "may this offer take
+    this many staging rows" and hands back no row. The rows themselves come from
+    `_allocate()` on the pool, at the call site, exactly as under `arena`. So the worst
+    a
+    bug in this function can do is admit one offer too many (a bigger arena spend than
+    planned, still bounded by the pool's own free list) or too few (a refused restore) -
+    never alias two loads.
+
+    A wait here would be a wait in the scheduler's allocation path, which is the step
+    thread; the engine has already died once this week from a step thread that waited on
+    an asynchronous copy. So the cap either has the credit or the offer is shorter or
+    refused.
+    """
+    if rows <= 0:
+        return _ok(rows=0)
+    cap = staging_row_cap()
+    held = _staging["held"]
+    previous = int(held.get(request_id) or 0)
+    if int(_staging["in_use_rows"]) - previous + rows > cap:
+        _staging["over_cap"] += 1
+        return _fail(f"the staging cap is {cap} row(s), "
+                     f"{int(_staging['in_use_rows'])} are already charged to "
+                     f"{len(held)} load(s) and this offer needs {rows}, so it cannot "
+                     "be staged", reason_kind="no_staging_rows")
+    delta = rows - previous
+    held[request_id] = rows
+    _staging["in_use_rows"] = int(_staging["in_use_rows"]) + delta
+    if previous:
+        # A re-offer for a request the cap already charges. Adjusting the DELTA
+        # (rather than charging the rows twice and orphaning the first charge) is what
+        # keeps the accounting identity true for a request that was offered, withdrawn
+        # and offered again; see `_unadmit_staging` for the identity itself.
+        _staging["rows_admitted"] += max(0, delta)
+    else:
+        _staging["admissions"] += 1
+        _staging["rows_admitted"] += rows
+    if int(_staging["in_use_rows"]) > int(_staging["peak"]):
+        _staging["peak"] = int(_staging["in_use_rows"])
+    _state["staging_rows_admitted"] += rows
+    return _ok(rows=rows)
+
+
+def _credit_staging(request_id: str, reported: bool = True) -> int:
+    """Give a load's cap credit back. THE CREDIT, NOT THE ROWS - the rows are the
+    pool's.
+
+    `reported=True` is the positive report: the engine named this request in
+    `finished_recving`, the one fact in this process that says its copies landed.
+    `reported=False` is a load that will NEVER report, and its credit comes back too -
+    called from `_drop_load`, the single door out of the load ledger, so "every terminal
+    path returns its credit" is true by construction rather than by every caller
+    remembering.
+
+    WHY A RECOVERY IS TRIVIAL NOW, and it is worth saying because it is the whole point
+    of
+    the redesign: there is no "reusing a row whose DMA has not landed" hazard to reason
+    about, because this module does not reuse rows. It returns a number, and the row's
+    next owner is the pool's allocator - which is the same code path `arena` has used
+    since 0.2.20, with the fork's own release in front of it.
+
+    THE COUNTERS STAY SPLIT ON PURPOSE: a boot that recovers constantly is a boot whose
+    loads are failing, and that has to be readable rather than inferred from a total.
+    """
+    held = _staging["held"].pop(request_id, None)
+    if not held:
+        return 0
+    rows = int(held)
+    _staging["in_use_rows"] = max(0, int(_staging["in_use_rows"]) - rows)
+    if reported:
+        _staging["returned"] += rows
+        _state["staging_rows_returned"] += rows
+    else:
+        _staging["recovered"] += rows
+        _state["staging_rows_recovered"] += rows
+    return rows
+
+
+def _unadmit_staging(request_id: str) -> int:
+    """Give a FAILED offer's credit straight back.
+
+    Distinct from `_credit_staging` in what justifies it, which is worth naming because
+    the two would be identical if you squinted: a credit is the return of a charge whose
+    load reached a terminal state, and an unadmit is the return of a charge whose offer
+    was never issued at all - it fell apart before the fork held the tuple, so there is
+    no copy, no readback and no DMA in flight anywhere. If this is ever called after a
+    bind, it is a bug in the caller.
+    """
+    held = _staging["held"].pop(request_id, None)
+    if not held:
+        return 0
+    rows = int(held)
+    _staging["in_use_rows"] = max(0, int(_staging["in_use_rows"]) - rows)
+    # Counted, not returned: `rows_admitted == returned + recovered + unadmitted
+    # + in_use` is the cap's whole accounting proof, and an unadmit that moved nothing
+    # made that identity quietly false for every refused offer.
+    _staging["unadmitted"] += rows
+    _state["staging_rows_unadmitted"] += rows
+    return rows
+
+
+def _staging_reclaim(request_id: str, record: dict,
+                     reported: bool = False) -> None:
+    """THE LEAK FIX: a load leaving the ledger gives its cap credit back.
+
+    Called from `_drop_load` and therefore from EVERY door out of `_loads` - the
+    positive
+    report, `failed_recving`, the `invalid_block_ids` shape, the fork's own stale-pin
+    release, the deadline expiry, the ledger's cap eviction and the group-take
+    truncation
+    gate. A ledger entry cannot leave without this running, and no ledger entry survives
+    its deadline, so the cap cannot drain permanently: the worst a run of failures can
+    do
+    is hold credit until each load's own terminal path runs, which is minutes at worst
+    and
+    one step in the normal case.
+
+    It returns credit only for a record the OFFER charged to the cap, and never raises:
+    a
+    reclaim that broke a step would trade a leak for an outage.
+    """
+    if not record.get("staging_bounded"):
+        return
+    try:
+        if _staging["held"].get(request_id):
+            _credit_staging(request_id, reported=reported)
+        else:
+            # A cap-charged load with nothing charged: something released its credit
+            # without going through this door. That is the accounting fault
+            # `unreturned_rows` exists to name, and it stays a counted tripwire rather
+            # than a silent return - a permanent 0 here would be indistinguishable from
+            # a fix.
+            _staging["unreturned"] += 1
+            notice_once(f"staging-cap-lost-{request_id[:24]}",
+                        "DISK[cap] a cap-charged load left the ledger with no credit "
+                        "charged under its id: something returned credit without going "
+                        "through `_drop_load`. Counted in "
+                        "`staging_cap.unreturned_rows`.")
+    except Exception as exc:  # noqa: BLE001 - a reclaim is never worth a step
+        _state["errors"] += 1
+        snapshot._error(exc, "disk_restore staging reclaim")
+
+
+def _release_staging(pool, blocks, bounded: bool, request_id: str) -> None:
+    """Give destinations back when an offer falls apart BEFORE the fork holds them.
+
+    Both postures give them to the POOL, which is their only owner: the rows came from
+    `get_new_blocks` a few lines above and the fork has never seen them, so the fork's
+    release path (`manager.py:1346`) will not run for them and this is the only door
+    out.
+    A `bounded` offer additionally gives its cap credit back, because an offer that
+    never
+    reached the fork can never be reported and would otherwise hold that credit until
+    its
+    (never created) ledger entry expired.
+
+    THE ORDERING THAT MATTERS: this is reachable ONLY from the two failure paths between
+    the allocation and the `_pending_cpu_hits` write. Once the fork holds the tuple, the
+    rows are the fork's to release and calling `_release()` on them would be a double
+    free - the refcount going negative, the row landing on the pool's free list TWICE,
+    and two later owners sharing one row. That is the same silent wrong-answer failure
+    the
+    removed reservation used to create by accident; it stays unreachable by
+    construction.
+    """
+    _release(pool, blocks)
+    if bounded:
+        _unadmit_staging(request_id)
+
+
+def _price_against_arena(pool, blocks: int, per_span: int, boundary_slots: int,
+                        bounds: list) -> dict:
+    """How many DESTINATIONS the ARENA can pay for, with its arithmetic reported.
+
+    This is the pre-0.2.59 offer pricing moved verbatim - same free-count refusals, same
+    reserve, same `cpu_slot_affordance`, same `bounded_by` label - because `arena` is
+    the posture a serving box boots with and the one an operator falls back to. It is a
+    function now so that the ring's pricing sits BESIDE it and the two can be read
+    against each other.
+    """
+    free = None
+    try:
+        free = _int(pool.get_num_free_blocks())
+    except Exception as exc:  # noqa: BLE001 - an unreadable pool is a refusal
+        snapshot._error(exc, "disk_restore get_num_free_blocks")
+        return _fail(f"the CPU pool's free count is unreadable: "
+                     f"{type(exc).__name__}", reason_kind="no_cpu_slots")
+    if free is None:
+        return _fail("the CPU pool exposes no get_num_free_blocks()",
+                     reason_kind="no_cpu_slots")
+    reserve = cpu_slot_reserve_verdict()
+    affordability = cpu_slot_affordance(free, per_span, boundary_slots,
+                                        reserve["cpu_slot_reserve"])
+    affordable = affordability["spans_affordable"]
+    if affordable <= 0:
+        return _fail(f"the CPU pool has {free} free blocks, "
+                     f"{reserve['cpu_slot_reserve']} are reserved "
+                     f"({reserve['source']}) and "
+                     f"{boundary_slots} go to boundary states, so not "
+                     "even one span can be given a destination",
+                     reason_kind="no_cpu_slots")
+    clipped = affordable < blocks
+    if clipped:
+        blocks = affordable
+        bounds.append("cpu_slots")
+    return _ok(blocks=int(blocks), source=RESTORE_SOURCE_ARENA, clipped=clipped,
+               detail={"free_blocks": int(free),
+                       "cpu_slot_reserve": int(reserve["cpu_slot_reserve"]),
+                       "spans_affordable": int(affordable)})
+
+
+def _pool_free_rows(pool):
+    """The CPU pool's free count, for the PAYLOAD only: never a bound, never a refusal.
+
+    Under `bounded` the pool does not decide an offer's size, so its free count is
+    reported beside the cap's for the one question an operator does ask - "is my arena
+    smaller than my cap?" - and a pool that cannot answer is `null` rather than a
+    refused offer.
+    """
+    try:
+        return _int(pool.get_num_free_blocks())
+    except Exception as exc:  # noqa: BLE001 - a reported number is never worth a fault
+        snapshot._error(exc, "disk_restore pool free rows")
+        return None
+
+
+def _price_against_cap(pool, blocks: int, per_span: int, boundary_slots: int,
+                       bounds: list) -> dict:
+    """How many DESTINATIONS THE CAP can pay for - the whole point of `bounded`.
+
+    A `bounded` offer stops being priced against `cpu_slots_free`. That is the sentence
+    this module has been working toward since 0.2.49, and the honest version of it is
+    narrower than the first draft: the arena stops being the thing that DECIDES an
+    offer's size, so the arena can be sized from the cap (`cap + reserve` rows) instead
+    of from the worst prompt, and `refused.no_cpu_slots` stops being the bound that
+    varies with what the RAM tier happens to be holding. The rows still come FROM the
+    arena - `cpu_block_pool` is the only source of a staging row that exists (see the
+    reference audit above the posture constants) - so a box with no free rows at all is
+    refused at the allocation below, by name, and that is the correct answer.
+
+    Boundary/state entries are priced here and NOT for free: an align-mode group's one
+    real state block is a row like any other, its GPU destination has to be named, and
+    pretending otherwise would aim a recurrent state at a block nobody allocated. So the
+    cap pays `blocks * per_span + boundary_slots` rows exactly as the arena did.
+
+    The pool is read for the PAYLOAD only (`pool_free_rows`), never for the arithmetic:
+    an operator comparing the cap against what the arena happens to have free is asking
+    the question that decides whether the arena is too small, and the answer must not be
+    a number that also decided the offer.
+    """
+    cap = staging_row_cap()
+    in_use = int(_staging["in_use_rows"])
+    free = max(0, cap - in_use)
+    if free <= 0:
+        return _fail(f"the staging cap is {cap} row(s) and all of them are charged to "
+                     f"{len(_staging['held'])} load(s) whose report has not arrived, "
+                     "so this request is refused rather than waited for",
+                     reason_kind="no_staging_rows")
+    clipped = False
+    ceiling = (free - boundary_slots) // max(1, per_span)
+    if ceiling < 0:
+        ceiling = 0
+    if ceiling < blocks:
+        blocks = int(ceiling)
+        clipped = True
+        bounds.append("staging_rows")
+        _staging["clipped"] += 1
+    if blocks <= 0:
+        return _fail(f"the staging cap has {free} row(s) of credit, "
+                     f"{boundary_slots} of which the boundary states need before any "
+                     "span can be staged, so not one span can be offered",
+                     reason_kind="no_staging_rows")
+    return _ok(blocks=int(blocks), source=RESTORE_SOURCE_BOUNDED, clipped=clipped,
+               detail={"cap_rows": int(cap),
+                       "cap_credit_rows": int(free),
+                       "cap_in_use_rows": int(in_use),
+                       "pool_free_rows": _pool_free_rows(pool),
+                       "spans_the_cap_can_carry": int(ceiling)})
 
 
 def cpu_slot_affordance(free_blocks, per_span: int = 1,
@@ -879,7 +1486,14 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   # refusal is what the plugin CAN do from outside the fork: withdraw
                   # its OWN restore for that request, so a claim the fork truncated is
                   # never a claim this tier delivered.
-                  "group_hit_truncated")
+                  "group_hit_truncated",
+                  # THE STAGING CAP (0.2.59): a `bounded` offer needs one staging row
+                  # per entry plus one per align-mode boundary state, and the cap had
+                  # too little credit left. Counted as a refusal and NOT as a wait: the
+                  # engine computing a prompt normally is the correct answer to "the cap
+                  # is full", and a step thread that waits on an asynchronous copy is
+                  # the answer that killed the engine on 2026-10-12.
+                  "no_staging_rows")
 
 # --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
 #
@@ -1085,6 +1699,18 @@ OFFER_REFUSAL_WHY = {
                       "too. The reason carries the byte figures (pool budget, price "
                       "per job, jobs the offer needed) because publishing those is "
                       "the whole point: nobody could see them before",
+    "no_staging_rows": "the STAGING CAP (0.2.59) cannot pay for this offer: a "
+                       "`bounded` offer needs one staging row per entry plus one per "
+                       "align-mode boundary state, charged against a cap of "
+                       "`staging_cap.cap_rows` rows, and the credit left was too "
+                       "small. REFUSED, NEVER WAITED FOR: a wait here is a wait in the "
+                       "scheduler's allocation path, which is the step thread, and a "
+                       "step thread that waits on an asynchronous copy is the failure "
+                       "that killed the engine on 2026-10-12. The engine computing "
+                       "this prompt at full speed is the correct answer; the credit "
+                       "comes back when the load ends - on a positive report or "
+                       "because the load is terminal without one - and `staging_cap` "
+                       "publishes whether the cap is the binding constraint.",
     "no_read_queue": "the reader's job queue (disk_read.MAX_QUEUE_DEPTH) cannot carry "
                      "even ONE job of this offer's shape, so no offer is made at all. "
                      "The same fail-closed rule as `no_pool_budget`, from the other "
@@ -1401,6 +2027,22 @@ _state: dict = {
     "disk_gpu_blocks_released_unreported": 0,  # ...mapped for a disk span, released
                                                # by the ledger, never reported
     "refused": {r: 0 for r in OFFER_REFUSALS},
+    # THE RESTORE POSTURE AND ITS STAGING CAP (0.2.59). `arena_staging_spans` is the
+    # number this change exists to move: an offer's destinations are rows of the arena's
+    # `cpu_block_pool` in BOTH postures (the fork releases them; see the audit above the
+    # posture constants), so what `bounded` changes is not WHERE a row comes from but
+    # how many rows the restore tier may have charged at once - which is what lets the
+    # arena be sized from the cap instead of from the worst prompt.
+    # `bounded_refusal_reasons` counts the times a `bounded` offer could not be staged
+    # and names WHICH bound did it - a counted fallback with no name is how a dead path
+    # hides.
+    "restore_source_flips": 0,
+    "staging_rows_admitted": 0, "staging_rows_returned": 0,
+    "staging_rows_recovered": 0, "staging_rows_unadmitted": 0,
+    "arena_staging_spans": 0, "bounded_staged_spans": 0,
+    "offers_staged_arena": 0, "offers_staged_bounded": 0,
+    "bounded_refused_offers": 0,
+    "bounded_refusal_reasons": {"cap_full": 0, "pool_cannot_pay": 0},
     "refusals_total": 0, "last_refusal": None, "last_reason": None,
     "paths_emitted_steps": 0, "path_entries": 0, "path_entries_empty": 0,
     "path_length_violations": 0, "slots_allocated": 0, "stale_slots_dropped": 0,
@@ -2075,6 +2717,20 @@ def reset_state_for_tests() -> None:
     global _install_refusal_lines, _sched_cls_seen, _suppressed, _suppressed_spans
     global _offered_at, _burned, _aged_out, _load_failures, _failure_log_at
     global _race_reoffer
+    # THE STAGING CAP AND THE RUNTIME POSTURE ARE PER-PROCESS STATE TOO (0.2.59). The
+    # cap's credit is charged by an offer and returned by a load, so a reset that left
+    # credit charged would make every later test offer refuse with `no_staging_rows` for
+    # a reason that has nothing to do with what it is testing.
+    for key in ("held", "in_use_rows", "peak", "admissions", "rows_admitted",
+                "clipped", "refused", "returned", "recovered", "unadmitted",
+                "unreturned", "over_cap"):
+        _staging[key] = {} if key == "held" else 0
+    _runtime_restore_source["value"] = None
+    _runtime_restore_source["raw"] = None
+    _runtime_restore_source["alias"] = None
+    _runtime_restore_source["flips"] = 0
+    _runtime_restore_source["rejected"] = 0
+    _runtime_restore_source["last_reason"] = None
     _loads = {}
     _slot_paths = {}
     _wloads = {}
@@ -2183,11 +2839,22 @@ def reset_state_for_tests() -> None:
             "aged_out_loads": 0,
             "aged_out_with_applied_reads": 0, "late_finished_reports": 0,
             "restored_after_release": 0, "disk_gpu_blocks_dma_verified": 0,
-            "disk_gpu_blocks_released_unreported": 0}.items():
+            "disk_gpu_blocks_released_unreported": 0,
+            # THE STAGING CAP AND THE POSTURE (0.2.59). These were initialised and never
+            # reset, so a boot's cap counters leaked into the next test's `counters()` -
+            # and a counter that cannot be zeroed is a counter an accounting proof
+            # cannot assert an exact baseline on.
+            "restore_source_flips": 0,
+            "staging_rows_admitted": 0, "staging_rows_returned": 0,
+            "staging_rows_recovered": 0, "staging_rows_unadmitted": 0,
+            "arena_staging_spans": 0, "bounded_staged_spans": 0,
+            "offers_staged_arena": 0, "offers_staged_bounded": 0,
+            "bounded_refused_offers": 0}.items():
         _state[key] = value
     _state["refused"] = {name: 0 for name in OFFER_REFUSALS}
     _state["reads_failed"] = {name: 0 for name in WORKER_FAILURES}
     _state["prune_refused"] = {name: 0 for name in PRUNE_REFUSALS}
+    _state["bounded_refusal_reasons"] = {"cap_full": 0, "pool_cannot_pay": 0}
 
 
 def settle_budget(bytes_at_stake: int = 0,
@@ -2523,6 +3190,13 @@ def counters() -> dict:
     # different under `off` than under `disk_authority`, and the reader should not
     # have to combine two booleans to find out which.
     out["serving_as"] = serving_as()
+    # THE RESTORE SOURCE AND ITS STAGING CAP (0.2.59), in EVERY state including the
+    # state where neither has been consulted: `staging_cap.used: false` with zero counts
+    # is a different claim from "this build has no cap", and the key set must not move
+    # when an operator flips the posture on a live box and reloads a dashboard.
+    out["restore_source"] = restore_source_verdict()
+    out["staging_cap"] = restore_staging_state()
+    out["bounded_refusal_reasons"] = dict(_state["bounded_refusal_reasons"])
     out["tracked_loads"] = len(_loads)
     out["tracked_slots"] = len(_slot_paths)
     out["tracked_worker_loads"] = len(_wloads)
@@ -2553,6 +3227,63 @@ def counters_view(out: dict) -> dict:
                           "this process, one log line each (DISK[proof] GATE CLOSED)",
         "proof_openings": "times the worker-proof gate went from CLOSED to open in "
                           "this process, one log line each (DISK[proof] GATE OPEN)",
+        "restore_source_flips": "times THIS boot changed its restore destination "
+                                "source through `POST /plugins/kvtier/disk "
+                                "{\"op\":\"restore-source\"}`. Per boot: a restart "
+                                "returns the posture to "
+                                "VLLM_E2_TIER_DISK_RESTORE_SOURCE, so this is a count "
+                                "of operator levers pulled, not of engine events.",
+        "staging_rows_admitted": "staging rows CHARGED to the cap by an offer. A "
+                                 "credit, not a possession: the rows themselves are "
+                                 "allocated from `cpu_block_pool` at the offer and "
+                                 "released by the fork's own load path, so this module "
+                                 "never holds a row and cannot name one.",
+        "staging_rows_returned": "cap credit given back by a POSITIVE "
+                                 "`finished_recving` report - the one fact in this "
+                                 "process that means the copies landed. No timer is "
+                                 "involved on any path.",
+        "staging_rows_recovered": "cap credit given back by a terminal path that will "
+                                  "NEVER report: a load error, an abort the fork "
+                                  "released under us, an expired ledger, a cap "
+                                  "eviction. A count growing here says the LOADS are "
+                                  "failing, not the cap - and it is the difference "
+                                  "between 'restores work but are failing' and 'this "
+                                  "box stopped restoring'.",
+        "staging_rows_unadmitted": "cap credit given back by an offer that fell apart "
+                                   "BEFORE the fork ever held it (a refused merge, an "
+                                   "unwritable `_pending_cpu_hits`, a pool that could "
+                                   "not pay). Nothing was issued for it, so its return "
+                                   "needs no report; counted so "
+                                   "`staging_rows_admitted` equals returned + "
+                                   "recovered + unadmitted + the rows still charged.",
+        "arena_staging_spans": "spans whose destination was paid for by the ARENA's "
+                               "own arithmetic - `free - reserve - boundary` - with "
+                               "the cap not consulted. Under `bounded` the cap decides "
+                               "an offer's size and this stays 0; it is the number "
+                               "that says a restore is being sized by however much RAM "
+                               "the RAM tier happens to have left.",
+        "bounded_staged_spans": "spans whose destination was paid for under the "
+                                "staging cap. Per-OFFER rows are `spans * groups + "
+                                "boundary states`, so this and `staging_rows_admitted` "
+                                "agree up to the boundary states.",
+        "offers_staged_arena": "offers sized by the arena's free list (the shipped "
+                               "default, and the reversible fallback posture).",
+        "offers_staged_bounded": "offers sized by the staging cap. Per-OFFER, not per "
+                                 "request: the posture is pinned once per offer, so a "
+                                 "mid-boot flip cannot split one run.",
+        "bounded_refused_offers": "`bounded` offers refused UP FRONT because the cap "
+                                  "could not pay for even one span. Costs one slow "
+                                  "request; the alternative (waiting in the step "
+                                  "thread) costs the engine, so a growing count here "
+                                  "is a sizing signal and not an error. A CLIPPED "
+                                  "offer is NOT counted here - clipping is the cap "
+                                  "working, and it is published on the offer's "
+                                  "`bounded_by` list instead.",
+        "bounded_refusal_reasons": "which bound refused a `bounded` offer: `cap_full` "
+                                   "when no credit was left (or none survived the "
+                                   "boundary states), `pool_cannot_pay` when the cap "
+                                   "allowed the offer and `cpu_block_pool` could not "
+                                   "actually supply the rows.",
         "lookups": "lookups reaching the restore path",
         "offers": "requests a disk offer was made for",
         "offered_tokens": "tokens offered beyond the host-RAM hit",
@@ -5657,40 +6388,61 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                 f"{MAX_SLOTS_PER_OFFER}")
         return ram_result
     pool = getattr(manager, "cpu_block_pool", None)
-    free = None
-    try:
-        free = _int(pool.get_num_free_blocks())
-    except Exception as exc:  # noqa: BLE001 - an unreadable pool is a refusal
-        snapshot._error(exc, "disk_restore get_num_free_blocks")
-        _refuse("no_cpu_slots", f"the CPU pool's free count is unreadable: "
-                                f"{type(exc).__name__}")
+    # THE RESTORE POSTURE IS PINNED HERE, ONCE PER OFFER (0.2.59), and the pin is the
+    # offer's for its whole life: `_loads[request_id]["restore_source"]` carries it, the
+    # pricing below is done against it, and the cap credit is returned to the same place
+    # it was charged from. A later flip of the runtime posture therefore cannot re-price
+    # a run that is already staging - which is the only way a mid-flight change of
+    # posture is safe at all.
+    source = effective_restore_source()
+    bounded = source == RESTORE_SOURCE_BOUNDED
+    if bounded:
+        priced = _price_against_cap(pool, blocks, per_span, boundary_slots, bounds)
+        # The cap decided the offer's size, but the ARENA is still where the rows come
+        # from, so its free count is published as the number it is - a measurement
+        # of the pool that is about to be asked for these rows. (It was a null in the
+        # first draft of this posture, when the rows were meant to come from elsewhere.)
+        free = priced.get("detail", {}).get("pool_free_rows")
+        affordable = int(priced.get("detail", {}).get("spans_the_cap_can_carry")
+                         or priced.get("blocks") or 0)
+    else:
+        priced = _price_against_arena(pool, blocks, per_span, boundary_slots,
+                                      bounds)
+        free = priced.get("detail", {}).get("free_blocks")
+        affordable = int(priced.get("detail", {}).get("spans_affordable") or 0)
+    reserve = cpu_slot_reserve_verdict()
+    if not priced["ok"]:
+        kind = priced.get("reason_kind") or "no_cpu_slots"
+        if bounded:
+            # A `bounded` offer the cap cannot pay for is REFUSED here, not silently
+            # re-priced against the arena: an offer that quietly fell back would be a
+            # slow way to re-create the sizing wall this posture exists to remove, and
+            # the two pricings disagree about what the offer's size IS. The reason and
+            # the sub-map name which of the two conditions bit.
+            _state["bounded_refused_offers"] += 1
+            _state["bounded_refusal_reasons"]["cap_full"] += 1
+            _staging["refused"] += 1
+            notice_once(f"bounded-refused-{kind}",
+                        f"DISK[cap] refused an offer up front ({kind}): "
+                        f"{priced['reason']}. The engine computes this prompt "
+                        "normally; a refused restore costs one slow request and a "
+                        "waited-for one would cost the step thread.")
+        _refuse(kind, priced["reason"])
         return ram_result
-    if free is None:
-        _refuse("no_cpu_slots", "the CPU pool exposes no get_num_free_blocks()")
-        return ram_result
+    if priced["blocks"] != blocks:
+        blocks = int(priced["blocks"])
+        needed = blocks * per_span + boundary_slots
+        disk_tokens = blocks * block_size
     # THE ARENA'S SHARE, RESOLVED AND PUBLISHED, NOT ASSUMED (0.2.38). The reserve was
     # a constant when this line was written, which meant a 64-slot reservation sized for
     # a 64 GiB arena silently decided the size of every offer on an 8 GiB one - 41% of
     # the 166 free slots on the live wide rank, and nothing in the payload said so. Now
     # the terms of the arithmetic travel WITH the arithmetic (`cpu_slot_affordance`), so
     # "why is my offer only 98 spans?" is answered by the payload instead of by reading
-    # this function.
-    reserve = cpu_slot_reserve_verdict()
-    affordability = cpu_slot_affordance(free, per_span, boundary_slots,
-                                        reserve["cpu_slot_reserve"])
-    affordable = affordability["spans_affordable"]
-    if affordable <= 0:
-        _refuse("no_cpu_slots", f"the CPU pool has {free} free blocks, "
-                                f"{reserve['cpu_slot_reserve']} are reserved "
-                                f"({reserve['source']}) and "
-                                f"{boundary_slots} go to boundary states, so not "
-                                "even one span can be given a destination")
-        return ram_result
-    if affordable < blocks:
-        blocks = affordable
-        needed = blocks * per_span + boundary_slots
-        disk_tokens = blocks * block_size
-        bounds.append("cpu_slots")
+    # this function. Under `bounce` the arena did not decide ANYTHING and `free` is null
+    # to say so; the reserve is still reported, because it is still in force for every
+    # other user of that pool.
+
     # THE BOUNCE-BUFFER BILL, PRICED BEFORE THE OFFER EXISTS (0.2.31). Every clamp
     # above asks how many DESTINATIONS the offer can have; none of them asked how many
     # READS the process can carry. A read lands in a host-RAM bounce buffer taken at
@@ -5770,7 +6522,13 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                     "cpu_slot_reserve": int(reserve["cpu_slot_reserve"]),
                     "cpu_slot_reserve_source": str(reserve["source"]),
                     "cpu_slot_reserve_env_var": _clip(reserve["env_var"], 160),
-                    "cpu_slots_free": int(free),
+                    # The pool's free count as measured. Under `bounded` the cap decided
+                    # this offer's size and the arena still supplied the rows, so the
+                    # number is published as what it is. (The first draft of this
+                    # posture published null here, on the theory that the arena had not
+                    # been consulted; that theory died with the reservation.)
+                    "cpu_slots_free": (int(free) if free is not None else None),
+                    "restore_source": _clip(str(source), 16),
                     "spans_the_cpu_slots_can_carry": int(affordable),
                     # THE PER-OFFER BOUND THAT STOOD WHEN THIS OFFER WAS PRICED, beside
                     # the pool arithmetic `bounded_by` names it next to (0.2.32): a
@@ -5880,8 +6638,30 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                  "be built and their one state block would land on "
                                  "the run's first GPU block instead of its last")
         return ram_result
+    # THE DESTINATIONS. Both postures allocate them from the pool's free list exactly as
+    # `arena` has since 0.2.20 - `get_new_blocks` is the ONLY way a staging row enters
+    # this module, and the fork's own load release is the only way it leaves (see the
+    # reference audit above the posture constants). A `bounded` offer first charges its
+    # rows against the cap, and never waits: `_admit_staging` fails when the credit is
+    # not there and the offer is refused up front.
+    if bounded:
+        admitted = _admit_staging(request_id, needed)
+        if not admitted["ok"]:
+            _state["bounded_refused_offers"] += 1
+            _state["bounded_refusal_reasons"]["cap_full"] += 1
+            _staging["refused"] += 1
+            _refuse("no_staging_rows", admitted["reason"])
+            return ram_result
     allocated = _allocate(pool, needed)
     if not allocated["ok"]:
+        # The cap allowed this offer and the arena could not pay for it. That is a real
+        # signal - the arena is smaller than the cap plus the reserve - so it is counted
+        # in the cap's own sub-map as well as refused by name, and the credit is given
+        # back here because no ledger entry exists to give it back later.
+        if bounded:
+            _state["bounded_refused_offers"] += 1
+            _state["bounded_refusal_reasons"]["pool_cannot_pay"] += 1
+            _unadmit_staging(request_id)
         _refuse("alloc_refused", allocated["reason"])
         return ram_result
     merged = _merge_into_pending(manager, request_id, ram_tokens, computed,
@@ -5890,7 +6670,7 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                                  keys, opened["root"], contracts=contracts,
                                  null_block=null_block)
     if not merged["ok"]:
-        _release(pool, allocated["blocks"])
+        _release_staging(pool, allocated["blocks"], bounded, request_id)
         _refuse(merged.get("reason_kind") or "ram_shape", merged["reason"])
         return ram_result
     # THE MERGE IS HANDED TO THE FORK: it pops this tuple in
@@ -5899,7 +6679,7 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
     try:
         manager._pending_cpu_hits[request_id] = merged["pending"]
     except Exception as exc:  # noqa: BLE001 - a manager we cannot write is a no-op
-        _release(pool, allocated["blocks"])
+        _release_staging(pool, allocated["blocks"], bounded, request_id)
         snapshot._error(exc, "disk_restore pending_cpu_hits")
         _refuse("ram_shape", f"_pending_cpu_hits could not be written: "
                              f"{type(exc).__name__}")
@@ -5938,6 +6718,21 @@ def _offer(manager, request, num_computed_tokens, ram_result) -> dict | tuple:
                         request_id[:48], ram_tokens_reported, computed,
                         computed // block_size, disk_tokens, blocks)
     _register_load(request_id, merged, disk_tokens, span=span)
+    # THE PIN, written where the offer becomes a fact. Everything downstream - whether
+    # this load owes the cap a credit on release, the counters, the payload's per-offer
+    # view - reads THIS and never the live posture again, so flipping the runtime switch
+    # while a run is staging cannot re-price it. A load whose credit was charged under
+    # one posture and returned under the other is the accounting fault this assignment
+    # exists to make unrepresentable.
+    if request_id in _loads:
+        _loads[request_id]["restore_source"] = str(source)
+        _loads[request_id]["staging_bounded"] = bool(bounded)
+    if bounded:
+        _state["offers_staged_bounded"] += 1
+        _state["bounded_staged_spans"] += blocks * per_span
+    else:
+        _state["offers_staged_arena"] += 1
+        _state["arena_staging_spans"] += blocks * per_span
     # Remember where this offer left the request, so a re-ask at the SAME point can
     # be recognised as a reschedule rather than progress (see the loop fuse below).
     _offered_at[request_id] = computed
@@ -6396,7 +7191,18 @@ def _evict_oldest_load() -> None:
     _drop_load(oldest, "the ledger is at its cap")
 
 
-def _drop_load(request_id: str, why: str) -> None:
+def _drop_load(request_id: str, why: str, reported: bool = False) -> None:
+    """THE single door out of the load ledger - and therefore out of the staging cap.
+
+    `reported` says whether THIS exit is the engine's positive `finished_recving`
+    report. Exactly one caller passes True, and the split is what lets the payload
+    still tell "credit came back because the copies landed" from "credit came back
+    because the load is terminal and never will report".
+
+    Every terminal path runs through here, which is why the cap's reclaim lives HERE and
+    not at the call sites: a path that exits the ledger without returning its credit is
+    not reachable. See `_staging_reclaim`.
+    """
     record = _loads.pop(request_id, None)
     if record is None:
         return
@@ -6405,6 +7211,7 @@ def _drop_load(request_id: str, why: str) -> None:
         if held is not None and held[0] == request_id:
             _slot_paths.pop(int(cpu_block_id), None)
     _state["loads_released"] += 1
+    _staging_reclaim(request_id, record, reported=reported)
     _note(f"{request_id[:48]}: {why}")
 
 
@@ -6928,7 +7735,14 @@ def note_reported(manager, connector_output) -> dict:
             # it, only an adopted load reported complete can.
             _state["disk_gpu_blocks_dma_verified"] += len(
                 record.get("gpu_block_ids") or ())
-            _drop_load(request_id, "the worker reported its load finished")
+            # THE RING GETS ITS ROWS BACK THROUGH THE DOOR BELOW, with `reported=True`
+            # saying WHICH door this is: the engine named the request in
+            # `finished_recving`, so this is the one exit whose rows are returned on the
+            # strength of a fact about the bytes rather than a fact about the ledger.
+            # Every other exit returns them too (a load that never reports must not cost
+            # the boot a row forever) and counts `recovered_rows` instead.
+            _drop_load(request_id, "the worker reported its load finished",
+                       reported=True)
             out["released"] += 1
         _sweep_loads(manager)
         if out["restorations"] or out["failures"]:
@@ -11034,6 +11848,12 @@ def section() -> dict:
     # state where the flag has never been consulted - `prune_switch` is then null and
     # every count is 0, which is a different claim from "this build has no prune".
     view["load_prune"] = prune_state()
+    # THE POSTURE AND THE STAGING CAP (0.2.59), next to the prune they explain:
+    # `load_prune` says the fork stopped copying what we delivered, and these two say
+    # what priced the offer and whether the cap was the bound. Same key set in every
+    # state, so a dashboard opened across a posture flip does not change shape.
+    view["restore_source"] = restore_source_verdict()
+    view["staging_cap"] = restore_staging_state()
     view["load_prune_reasons"] = list(PRUNE_REFUSALS)
     # THE WINDOW AND THE WAIT, next to the read latency they are measured against:
     # `waited_ms` without `read_seconds` beside it is a number with no unit of

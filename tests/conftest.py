@@ -104,6 +104,18 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # "unset = off" the fact every test measures, and tests that want it on name
             # it out loud.
             config.ENV_DISK_RESTORE_VERIFY,
+            # THE RESTORE POSTURE AND ITS STAGING CAP (0.2.59). Listed because the
+            # shipped default is `arena` and a cap of 32 rows, and a suite that
+            # inherited `VLLM_E2_TIER_DISK_RESTORE_SOURCE=bounded` from a developer's
+            # shell would be measuring the NEW pricing path while every suite believed
+            # it was measuring the one that has served every restore since 0.2.20 - the
+            # exact posture inversion this variable exists to make deliberate. The cap
+            # belongs in the list for the same reason: a test that inherited `=0` would
+            # be asserting refusals against a cap no boot ships. Both names of the cap
+            # are cleared - the canonical one and the superseded `..._RING_SLOTS`.
+            config.ENV_DISK_RESTORE_SOURCE,
+            config.ENV_DISK_RESTORE_STAGING_ROWS,
+            config.ENV_DISK_RESTORE_RING_SLOTS,
             # THE GPU-DIRECT WRITE (0.2.43). The sharpest case in this list: this one
             # ISSUES A HOST->DEVICE COPY INTO A LIVE KV WINDOW from the apply point, on
             # the step thread. A suite that inherited
