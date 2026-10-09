@@ -615,6 +615,64 @@ MAX_SPANS_REPORT = 16                # PARTIAL SPANS one shape report may name
 # `last_prune`); and everything, when the flag is off.
 MAX_PRUNE_ENTRIES_PER_STEP = MAX_SLOTS_PER_OFFER   # 256: one offer's slots is the cap
 MAX_PRUNE_REASON_CHARS = 200
+# WHY THE ALLOC GATE COULD NOT LOOK (0.2.55). A CLOSED VOCABULARY, for the reason every
+# other closed vocabulary here exists: `group_take_unavailable` went live on 0.2.54,
+# read 1 on a healthy box within five minutes, and NOTHING said which condition produced
+# it - three attributes and two table states all collapsed into one number, on the alloc
+# path where a line per sighting is not affordable. So the blindness names itself here.
+# Every name is one DISTINCT condition inside `_take_gate` or in the pending-hit lookup
+# beside it, and the counts sum to `group_take_unavailable` exactly: this is a BREAKDOWN
+# of that total, never a second tally of the same event under a second name.
+# THE READING THAT MATTERS: the names split into "the take invariant is UNWATCHED" (all
+# but one) and "this request simply had no host-RAM hit, which is what an ordinary alloc
+# looks like" (`no_pending_hit_for_request`). A non-zero total is a finding only under
+# the first set; under the second it is the cache-miss allocs counted honestly. That
+# judgement is exactly what `unavailable: 1` could not support.
+TAKE_GATE_UNAVAILABLE_REASONS = (
+    "no_group_block_sizes",        # no/empty `group_block_sizes` on the manager
+    "no_cacheable_group_set",      # sizes, but neither `prefix_cacheable_group_ids`
+                                   # nor `block_ids`: no set of groups to audit
+    "gate_read_failed",            # reading the gate raised (logged by snapshot._error)
+    "no_pending_hit_table",        # manager has no `_pending_cpu_hits` dict at all
+    "empty_request_id",            # the request carried no id, so no lookup could run
+    "no_pending_hit_for_request",  # the table answered for no such request: nothing
+                                   # to pair (the benign, ordinary case)
+    "pending_hit_wrong_shape",     # an entry exists and is not the fork's tuple
+)
+# THE SENTENCE EACH REASON CARRIES, in the log line and nowhere else. Six of these say
+# "a plugin invariant is unmet" and one says "this request had no host-RAM hit"; a
+# reader must be able to make that judgement from one line.
+TAKE_GATE_UNAVAILABLE_WHY = {
+    "no_group_block_sizes":
+        "THE UNAUDITED CASE: the object has no `group_block_sizes`, so it is"
+        " either not the host-offload manager or one whose geometry was never"
+        " built - the take invariant is unwatched while this stands.",
+    "no_cacheable_group_set":
+        "THE UNAUDITED CASE: `group_block_sizes` exists but neither"
+        " `prefix_cacheable_group_ids` nor `block_ids` does, so there is no set"
+        " of groups to audit and the take invariant is unwatched here.",
+    "gate_read_failed":
+        "THE UNAUDITED CASE: reading the fork's gate raised, and the exception"
+        " is in the log as `[KVTIER_DEV] disk_restore _take_gate failed` - the"
+        " take invariant is unwatched while this stands.",
+    "no_pending_hit_table":
+        "THE UNAUDITED CASE: the manager carries no `_pending_cpu_hits` dict at"
+        " all, so this is not the manager whose pairing this module offers into.",
+    "empty_request_id":
+        "THE UNAUDITED CASE: the request carried no readable `request_id`, so"
+        " the pending-hit lookup could not be attempted - a request worth"
+        " chasing, since the fork could not pop its own entry either.",
+    "no_pending_hit_for_request":
+        "THE ORDINARY CASE: the table answered and there is NO entry for this"
+        " request, because `get_num_new_matched_tokens` records a pending CPU"
+        " hit only for a request that HAD one. An alloc for a request with no"
+        " host-RAM hit is blind this way BY CONSTRUCTION, so this count tracks"
+        " the cache-miss allocs and is not a defect signal.",
+    "pending_hit_wrong_shape":
+        "THE UNAUDITED CASE: the table has an entry for this request and it is"
+        " not the fork's `(blocks, hit_length, num_computed)` tuple, so the"
+        " geometry this gate assumes about the fork has moved under it.",
+}
 # THE CLOSED VOCABULARY OF REFUSALS. A stable key set, all published always, for the
 # reason every other section gives: an operator diffing two payloads must be able to
 # tell "this never happened" from "this build does not report it".
@@ -1471,6 +1529,14 @@ _state: dict = {
     "group_take_refusals": 0,
     "group_take_unavailable": 0,
     "last_group_take_gap": None,
+    # WHY each blind look was blind (0.2.55). `..._reasons` is the breakdown of
+    # `group_take_unavailable` over `TAKE_GATE_UNAVAILABLE_REASONS`, all names always
+    # present, so the counter that climbed in silence carries its own diagnosis; the
+    # per-condition counts SUM to that counter and are not a second tally of it. The
+    # total stays the total because a reader who wants one number should get one number.
+    "group_take_unavailable_reasons": {name: 0
+                                       for name in TAKE_GATE_UNAVAILABLE_REASONS},
+    "last_group_take_unavailable_reason": None,
     # ONE LINE PER EPISODE, the settle-window-refusal idiom. This runs on the alloc
     # path, once per scheduled request per step; a line per sighting would bury the
     # finding in exactly the noise that makes a counter unreadable. Cleared by a
@@ -2085,6 +2151,9 @@ def reset_state_for_tests() -> None:
             "group_take_dropped_entries": 0, "group_take_unbacked_groups": 0,
             "group_take_refusals": 0,
             "group_take_unavailable": 0, "last_group_take_gap": None,
+            "group_take_unavailable_reasons": {
+                name: 0 for name in TAKE_GATE_UNAVAILABLE_REASONS},
+            "last_group_take_unavailable_reason": None,
             "take_gap_episode": False,
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
@@ -2748,8 +2817,26 @@ def counters_view(out: dict) -> dict:
                                   "`prefix_cacheable_group_ids`, no "
                                   "`group_block_sizes`, a hit list that is not a "
                                   "sequence. Counted separately so a silent gate is a "
-                                  "reading and not an absence (unit: alloc "
-                                  "observations)",
+                                  "reading and not an absence. ITS CAUSE IS NAMED from "
+                                  "0.2.55 in `group_take_unavailable_reasons`; a "
+                                  "non-zero total with no cause read is an older build,"
+                                  "not a mystery (unit: alloc observations)",
+        "group_take_unavailable_reasons": (
+            "the breakdown of `group_take_unavailable` by condition, all names always"
+            " present. What it MEASURES is which attribute or lookup was missing on the"
+            " object the alloc handed the gate; what it does NOT measure is how many"
+            " looks were blind (that is the total, and these sum to it, so a reader"
+            " must never add the two). THE READING THAT MATTERS: every name but"
+            " never add the two). THE READING THAT MATTERS: every name but"
+            " `no_pending_hit_for_request` means the take invariant is UNWATCHED, and"
+            " that one means this request had no host-RAM hit, which is what an"
+            " cache-miss alloc looks like (unit: blind alloc observations, by reason)"),
+        "last_group_take_unavailable_reason": (
+            "the most recent blind look: the reason, the TYPE of the object handed to"
+            " `update_state_after_alloc` (how a foreign manager is told apart from the"
+            " host-offload one), the request, and when - or NULL when no look has ever"
+            " been blind. Null means 'never blind', not 'the gate is off' (unit: the"
+            " last blind look's record, or null)"),
         "last_group_take_gap": "the arithmetic of the most recent sighting or refusal: "
                                "the request, the group, that group's "
                                "`group_block_sizes` entry, `num_external_tokens`, the "
@@ -7968,7 +8055,35 @@ _PRUNE_TAKE_GATE_UNITS = {
                               "tells 'a gate that saw nothing' apart from 'a fork with "
                               "nothing to see', and a boot where this is EVERY "
                               "observation has an unaudited take invariant wearing six "
-                              "clean zeros (unit: alloc observations)",
+                              "clean zeros. SINCE 0.2.55 IT NAMES ITS CAUSE: read "
+                              "`group_take_unavailable_reasons` beside it, the same "
+                              "events told apart by condition"
+                              " (unit: alloc observations)",
+    # THE BREAKDOWN OF THE LINE ABOVE (0.2.55), and the reason it exists: the total went
+    # live, read 1 on a healthy box within minutes, and NOTHING - log or payload - said
+    # which condition produced it, because three attributes and two table states
+    # collapsed into one number. These names are those conditions, and they PARTITION
+    # the total: `sum(reasons.values()) == group_take_unavailable`, always.
+    # THE READING THAT MATTERS: every name but `no_pending_hit_for_request` means the
+    # take invariant is UNWATCHED, while that one means the request simply had no host-
+    # RAM hit - which is what an ordinary alloc looks like. So `unavailable: 3` is a
+    # finding or is noise depending only on WHICH name moved, and before 0.2.55 those
+    # were one number.
+    "group_take_unavailable_reasons": (
+        "the breakdown of `group_take_unavailable` by condition, all names always"
+        " present. What it MEASURES is which attribute or lookup was missing on the"
+        " object the alloc handed the gate; what it does NOT measure is how MANY looks"
+        " were blind - that is `group_take_unavailable`, and these sum to it, so a"
+        " reader must never add the two together. Every name but"
+        " `no_pending_hit_for_request` says the take invariant is UNWATCHED; that one"
+        " says this request had no host-RAM hit, which is the ordinary cache-miss alloc"
+        " and not a fault (unit: blind alloc observations, by reason)"),
+    "last_group_take_unavailable_reason": (
+        "the most recent blind look: which reason, the TYPE of the object handed to"
+        " `update_state_after_alloc` (which is how a foreign manager is told apart from"
+        " the host-offload one), the request, and when - or NULL when no look has ever"
+        " been blind. Null means 'never blind', NOT 'the gate is off'; for that read"
+        " `group_take_observations` (unit: the last blind look's record, or null)"),
     "last_group_take_gap": "the arithmetic of the most recent sighting - the request, "
                            "the group, that group's `group_block_sizes` entry, "
                            "`num_external_tokens`, the `n_take_g` the fork's cdiv "
@@ -8061,6 +8176,20 @@ def prune_state() -> dict:
             "group_take_unbacked_groups": int(
                 _state["group_take_unbacked_groups"]),
             "group_take_unavailable": int(_state["group_take_unavailable"]),
+            # THE CAUSE OF THAT TOTAL (0.2.55), as pass-throughs of `_state` like every
+            # key above them. THE WHOLE POINT: a total readable without its breakdown is
+            # the artifact that shipped on 0.2.54 and went blind on a healthy boot five
+            # minutes later, so these live in the SAME document as the total and not in
+            # a section a reader has to know to open. `refused` and `refusals_total`
+            # already pair this way here - a total and its by-condition breakdown, one
+            # event counted once, named once.
+            "group_take_unavailable_reasons": {
+                name: int((_state["group_take_unavailable_reasons"] or {}).get(name)
+                          or 0)
+                for name in TAKE_GATE_UNAVAILABLE_REASONS},
+            "last_group_take_unavailable_reason": (
+                dict(_state["last_group_take_unavailable_reason"])
+                if _state["last_group_take_unavailable_reason"] else None),
             "last_group_take_gap": (dict(_state["last_group_take_gap"])
                                     if _state["last_group_take_gap"] else None),
             "units": {"steps": "apply points where the switch was consulted (unit: "
@@ -9909,6 +10038,15 @@ def observe_group_take_truncation(manager, request, blocks,
         the second kind is refused; a gate that refused every gap would refuse the
         trims that are the fork spending its token budget, and would be turned off
         within a day.
+      * counts a look it COULD NOT MAKE as `group_take_unavailable` and, since 0.2.55,
+        NAMES its cause: `group_take_unavailable_reasons` breaks that total down over
+        `TAKE_GATE_UNAVAILABLE_REASONS`, and
+        `last_group_take_unavailable_reason` carries the last one with the object's type
+        and the request, and one INFO line per reason per episode says it out loud. The
+        bare total was the bug: it went live, read 1 on a healthy boot five
+        minutes later,
+        and no artifact that boot produced could say
+        which of six conditions it was.
       * logs ONCE PER EPISODE (`take_gap_episode`), not once per alloc. This is the
         alloc path, once per scheduled request per step; a line per sighting is how a
         finding becomes noise. A clean observation closes the episode, so
@@ -9931,21 +10069,34 @@ def observe_group_take_truncation(manager, request, blocks,
     try:
         request_id = str(getattr(request, "request_id", "") or "")[:256]
         _state["group_take_observations"] += 1
-        gate = _take_gate(manager)
+        gate, reason = _take_gate(manager)
         if gate is None:
-            _state["group_take_unavailable"] += 1
+            _note_take_gate_blind(reason, manager, request_id)
             return status
         sizes, cacheable = gate
-        pending = None
         table = getattr(manager, "_pending_cpu_hits", None)
-        if isinstance(table, dict) and request_id:
-            pending = table.get(request_id)
-        if not isinstance(pending, tuple) or len(pending) < 1 \
-                or not isinstance(pending[0], (list, tuple)):
-            # No pending hit means the fork has nothing to pair for this request,
-            # so there is no slice to audit. Counted, never guessed at.
-            _state["group_take_unavailable"] += 1
+        if not isinstance(table, dict):
+            _note_take_gate_blind("no_pending_hit_table", manager, request_id)
             return status
+        if not request_id:
+            _note_take_gate_blind("empty_request_id", manager, request_id)
+            return status
+        pending = table.get(request_id)
+        if pending is None:
+            # No pending hit means the fork has nothing to pair for this request, so
+            # there is no slice to audit. Counted, never guessed at - and NAMED, because
+            # this one is the reason a healthy live boot's `unavailable` is not zero: a
+            # request with no host-RAM hit never gets a pending tuple written.
+            _note_take_gate_blind("no_pending_hit_for_request", manager, request_id)
+            return status
+        if (not isinstance(pending, tuple) or len(pending) < 1
+                or not isinstance(pending[0], (list, tuple))):
+            _note_take_gate_blind("pending_hit_wrong_shape", manager, request_id)
+            return status
+        # THE LOOK MEASURED, so every blindness before it was an episode and not a
+        # state, and the next one gets its own line. The clean-alloc rule the gap logger
+        # already uses, applied to the blindness logger.
+        _clear_take_gate_blindness()
         violations = group_take_gap(pending[0], sizes, cacheable,
                                     num_external_tokens)
         if not violations:
@@ -10041,28 +10192,113 @@ def observe_group_take_truncation(manager, request, blocks,
 def _take_gate(manager):
     """The fork's OWN per-group gate, read the way `manager.py:437-445` reads it.
 
-    Returns `(group_block_sizes, cacheable)` - `cacheable` a list of `(group, None)`
-    pairs in the shape `group_take_gap` takes - or None when the fork exposes neither
-    spelling of the gate. Counting that separately is the point: a gate that silently
-    saw nothing must be distinguishable from a gate that saw nothing.
+    Returns `(gate, reason)`, EXACTLY ONE of which is None. `gate` is
+    `(group_block_sizes, cacheable)`, `cacheable` a list of `(group, None)` pairs in the
+    shape `group_take_gap` takes; `reason` is a name from
+    `TAKE_GATE_UNAVAILABLE_REASONS`.
+
+    THE REASON IS THE 0.2.55 CHANGE. The None-only contract is what made
+    `group_take_unavailable` unanswerable on the live box: three names
+    (`group_block_sizes`, `prefix_cacheable_group_ids`, `block_ids`) and two table
+    states
+    collapsed into one counter, so "this manager is not the host-offload manager", "this
+    boot has not built its geometry yet" and "the attribute is there but empty" were the
+    SAME reading - and the log, which must stay quiet on the alloc path, could not be
+    asked to settle it either. So the condition is decided HERE, next to the
+    attribute it
+    is about, while it is still known, rather than guessed at afterwards.
+
+    Never raises: for a wrong-typed manager the exception is `gate_read_failed`, counted
+    and named like any other blindness.
     """
     try:
         sizes = getattr(manager, "group_block_sizes", None)
+        if sizes is None:
+            return None, "no_group_block_sizes"
+        sizes = list(sizes)      # a non-iterable raises: that is `gate_read_failed`
         if not sizes:
-            return None
-        sizes = list(sizes)
+            return None, "no_group_block_sizes"
         named = getattr(manager, "prefix_cacheable_group_ids", None)
         if named is not None:
-            return sizes, [(int(g), None) for g in named]
+            return (sizes, [(int(g), None) for g in named]), None
         block_ids = getattr(manager, "block_ids", None)
         if block_ids is not None:
             # The pre-guard fork: every group that owns blocks was cacheable, which
             # is the same set this module offers into.
-            return sizes, [(g, None) for g in range(len(list(block_ids)))]
-        return None
+            return (sizes, [(g, None) for g in range(len(list(block_ids)))]), None
+        return None, "no_cacheable_group_set"
     except Exception as exc:  # noqa: BLE001
         snapshot._error(exc, "disk_restore _take_gate")
-        return None
+        return None, "gate_read_failed"
+
+
+def _note_take_gate_blind(reason: str, manager, request_id: str) -> None:
+    """Count a blind alloc observation AND say, once per reason, which condition it was.
+
+    THE FIX FOR A COUNTER THAT CLIMBED IN SILENCE. `group_take_unavailable` went live on
+    0.2.54 and read 1 on a healthy boot minutes later, with nothing in the log or the
+    payload to explain it - the failure class this package keeps paying for: a number
+    with no explanation, found only when someone notices it is not zero.
+
+    ONE LINE PER REASON PER EPISODE, the `take_gap_episode` idiom. This runs on the
+    alloc
+    path, once per scheduled request per step, and an ordinary request with no host-RAM
+    hit is BLIND by construction - so a line per observation would be a line per
+    request,
+    the flood that idiom exists to prevent. An episode here is a reason rather than a
+    sighting: the line says which condition, the object it looked at
+    (`type(manager).__name__`, how a foreign manager is told apart) and the request, and
+    the per-condition counter keeps counting after the line. A measured look closes the
+    episodes (`_clear_take_gate_blindness`), so "blind, then working, then blind
+    again" is
+    two lines and not one.
+
+    Never raises, never blocks, and allocates only two small dicts and one string: this
+    is the alloc path.
+    """
+    try:
+        if reason not in TAKE_GATE_UNAVAILABLE_REASONS:
+            reason = "gate_read_failed"
+        _state["group_take_unavailable"] += 1
+        reasons = _state["group_take_unavailable_reasons"]
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
+        _state["last_group_take_unavailable_reason"] = {
+            "reason": reason,
+            "manager": type(manager).__name__[:64],
+            "request_id": request_id[:48],
+            "at": round(time.time(), 3),
+        }
+        notice_once(
+            f"take_gate_blind:{reason}",
+            f"TRUNCATION GATE: an alloc observation could not be measured (reason"
+            f" `{reason}`, {int(reasons[reason])} of"
+            f" {int(_state['group_take_unavailable'])} blind look(s) so far): the"
+            f" object handed to `update_state_after_alloc` is"
+            f" `{type(manager).__name__}` and the request is"
+            f" {request_id[:48] or '(no request id)'}. Counts and what each"
+            f" name means: load_prune.group_take_unavailable_reasons. One line"
+            f" per reason per episode."
+            # THE POINTER TO THE PAYLOAD COMES BEFORE THE SENTENCE, because
+            # `notice_once` truncates at 640 characters and the tail is the part an
+            # operator acts on: a line that lost "where the counts live" would name
+            # the cause and hide the cure.
+            f" {TAKE_GATE_UNAVAILABLE_WHY.get(reason, '')}",
+            level="info")
+    except Exception as exc:  # noqa: BLE001 - a diagnostic cannot break a step
+        snapshot._error(exc, "disk_restore take gate blindness note")
+
+
+def _clear_take_gate_blindness() -> None:
+    """A look that MEASURED closes the blindness episodes - the clean-alloc rule.
+
+    Without this, `notice_once`'s per-process key would cap the line at one per reason
+    per BOOT, and "it was blind at boot and then it was fine" would read the same as "it
+    is blind now". Only this module's prefixed keys are dropped, so the other notices
+    (waits, binds) keep their own dedup.
+    """
+    for key in [key for key in _notices
+                if isinstance(key, str) and key.startswith("take_gate_blind:")]:
+        _notices.discard(key)
 
 
 def _report_dropped_gpu_blocks(blocks, request, violations) -> None:

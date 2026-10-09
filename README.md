@@ -4400,8 +4400,8 @@ The refusal reason is in the existing taxonomy: `group_hit_truncated` is a membe
 `OFFER_REFUSALS` with an `OFFER_REFUSAL_WHY` entry, so `refused[group_hit_truncated]` and
 `last_refusal` carry it without a new payload key.
 
-**Tests.** `tests/test_disk_take_truncation_gate.py` (20 tests, 0.2.53 + 0.2.54) opens with the
-pure
+**Tests.** `tests/test_disk_take_truncation_gate.py` (28 tests, 0.2.53 + 0.2.54 + 0.2.55) opens
+with the pure
 predicate - exact take, shorter list, one entry longer, a tail of nulls, an unmeasurable
 geometry - and then the door itself. The test to read first is
 `test_the_mutated_padding_line_moves_the_truncation_counter`: it does not hand the gate a
@@ -4463,13 +4463,76 @@ that same `0` on a box that has served traffic all day, and that is the expected
 
 **A zero there is a measurement of "the gate never fired", not of "the gate is working."** The
 proof it is working is the denominator beside it: `group_take_observations` must be climbing (it
-moves once per alloc that reaches `update_state_after_alloc` with an external load) and
-`group_take_unavailable` must stay 0 - a boot where every observation is `unavailable` has an
-unaudited take invariant and six pretty zeros. And a zero in an answer from a process that never
-allocs means "this process is not the one that takes": the gate runs on the scheduler-side alloc
-path, which is why the numbers are published where they move (`load_prune` in the route's and the
-verb's answer) and NOT in a worker rank file, where they could only ever be permanent zeros in a
-byte-capped file.
+moves once per alloc that reaches `update_state_after_alloc`), and the blind looks must be
+attributable - see the next section, because 0.2.54's instruction to keep `unavailable` at 0 was
+wrong. And a zero in an answer from a process that never allocs means "this process is not the
+one that takes": the gate runs on the scheduler-side alloc path, which is why the numbers are
+published where they move (`load_prune` in the route's and the verb's answer) and NOT in a worker
+rank file, where they could only ever be permanent zeros in a byte-capped file.
+
+### What `unavailable` means, now that it names its cause (`load_prune.group_take_unavailable_reasons`, 0.2.55)
+
+0.2.54 shipped the total and nothing else, and it went blind on a healthy boot five minutes after
+the deploy: `group_take_observations: 2`, `group_take_unavailable: 1`, `last_group_take_gap:
+null`, and no line in the engine log. The cause was not recoverable from any artifact the boot
+produced, because the code counted the blindness and threw away the reason - `_take_gate()`
+returned a bare `None`, and the pending-hit branch beside it incremented **the same counter**.
+
+There are **seven** distinct ways an alloc observation goes blind, and they are not the same
+finding:
+
+| reason | what it means |
+|---|---|
+| `no_group_block_sizes` | the object has no `group_block_sizes` - **unaudited** |
+| `no_cacheable_group_set` | sizes, but no `prefix_cacheable_group_ids` and no `block_ids` - **unaudited** |
+| `gate_read_failed` | reading the fork's gate raised (the exception is in the log) - **unaudited** |
+| `no_pending_hit_table` | the manager has no `_pending_cpu_hits` at all - **unaudited** |
+| `empty_request_id` | the request carried no id, so no lookup could run - **unaudited** |
+| `pending_hit_wrong_shape` | the table's entry is not the fork's tuple - **unaudited** |
+| `no_pending_hit_for_request` | **the ordinary case**: this request had no host-RAM hit, so the fork had nothing to pair |
+
+`sum(group_take_unavailable_reasons.values()) == group_take_unavailable` always: the breakdown is
+a partition of the total, so **never add the two**. And the reading that the total alone could not
+support is now the first thing the payload says - `unavailable: 3` with all three named
+`no_pending_hit_for_request` is a healthy boot serving cache misses, while `unavailable: 3` with
+`no_group_block_sizes: 3` is a take invariant nobody is watching. That distinction is the whole
+change.
+
+One INFO line per reason per episode says it in the log (`TRUNCATION GATE: an alloc observation
+could not be measured (reason ...)`), naming the reason, the **type** of the object handed to
+`update_state_after_alloc` and the request. A look that measures closes the episode, so "blind at
+boot, then fine" and "fine, then blind again" are two lines - and the counter keeps climbing
+regardless, because dedup is a log rule and never a counting rule.
+
+```bash
+# READ-ONLY, on the same token-gated route. Shows the cause of every blind look.
+T=$(tr "\0" "\n" < /proc/$(systemctl show vllm-engine -p MainPID --value)/environ \
+     | sed -n "s/^VLLM_E2_TIER_DEV_TOKEN=//p" | head -1)
+ssh llm "curl -s -H 'x-kvtier-dev-token: $T' http://127.0.0.1:8000/plugins/kvtier/snapshot" \
+  | python3 -c 'import json,sys
+ d = json.load(sys.stdin).get("disk_restore") or {}
+ p = d.get("load_prune") or {}
+ print("observations", p.get("group_take_observations"),
+       "| blind", p.get("group_take_unavailable"))
+ r = p.get("group_take_unavailable_reasons")
+ if r is None:
+     print("this build predates 0.2.55: the total has no cause on the wire")
+ else:
+     for k, v in r.items():
+         if v: print(f"  {k:28} {v}")
+     print("last blind look:", p.get("last_group_take_unavailable_reason"))'
+```
+
+**What was actually observed on the live 0.2.54 box.** `observations: 15`, `unavailable: 3`, every
+other gate counter 0, `lookups: 13`, `offers: 2`, and no `_take_gate` line in the engine log. The
+cause is settled by that arithmetic rather than guessed: `_take_gate` returning `None` is a
+property of the manager object, so it would have blinded **all 15** observations, not 3 - and 15
+observations against 13 lookups means at least two allocs belonged to requests this module never
+looked up, which therefore cannot have a pending tuple. So the live `unavailable` is
+`no_pending_hit_for_request`: **benign**, and the counter's published meaning was the actual
+defect. What the numbers alone cannot settle is which of the two table-side names each of the
+three was, and `group_take_unavailable_reasons` is what settles it on the next boot - which is the
+same conclusion this change was built to make possible.
 
 **How to prove a counter increments without touching production.** You do not need a load, a
 request or a restart: `uv run pytest tests/test_disk_take_truncation_gate.py -k

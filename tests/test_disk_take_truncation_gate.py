@@ -815,3 +815,352 @@ def test_the_gate_counters_move_in_the_published_document_not_only_the_state(
     # module's own record of the sighting.
     gap["request_id"] = "scribbled"
     assert disk_restore._state["last_group_take_gap"]["request_id"] != "scribbled"
+
+
+# --- 6. WHY THE GATE WAS BLIND: the counter that must never climb in silence -----
+#
+# THE LIVE FINDING 0.2.55 EXISTS FOR. 0.2.54 published `group_take_unavailable`, it went
+# live, and within five minutes a HEALTHY boot read `unavailable: 1` - and neither the
+# log nor the payload could say which condition produced it, because `_take_gate`
+# returned a bare None and the pending-hit branch beside it incremented the SAME
+# counter. So the project's own `units` prose ("a boot where this is every observation
+# has an unaudited take invariant wearing six clean zeros") was readable while the fact
+# that decided it was not. These tests read the PUBLISHED DOCUMENT, for the reason
+# section 5 exists: a cause that lives only in `disk_restore._state` is a cause nobody
+# can read during an incident.
+
+# THE SEVEN WAYS AN OBSERVATION GOES BLIND, exactly as the module declares them. If a
+# new condition is added without a driver below, the last test in this section fails - a
+# vocabulary with an unreachable name is how a counter starts lying again.
+BLIND_PATHS = ("no_group_block_sizes", "no_cacheable_group_set", "gate_read_failed",
+               "no_pending_hit_table", "empty_request_id",
+               "no_pending_hit_for_request", "pending_hit_wrong_shape")
+
+
+def blind_manager(reason, request_id="req-blind"):
+    """A manager built to fail in EXACTLY one way, with the request id that hits it.
+
+    Each branch deletes or corrupts ONE attribute, so the reason the gate reports is the
+    condition the test named and not a neighbour that happened to be missing too.
+    Nothing here hands the gate a tuple it did not have to look up.
+    """
+    manager = hybrid()
+    if reason == "no_group_block_sizes":
+        manager.group_block_sizes = []            # present, but empty: no gate at all
+    elif reason == "no_cacheable_group_set":
+        del manager.prefix_cacheable_group_ids    # the fake has no `block_ids` either
+    elif reason == "gate_read_failed":
+        class Explodes:
+            def __iter__(self):
+                raise RuntimeError("the fork's group set is not iterable")
+        manager.prefix_cacheable_group_ids = Explodes()
+    elif reason == "no_pending_hit_table":
+        del manager._pending_cpu_hits             # not the manager we offer into
+    elif reason == "pending_hit_wrong_shape":
+        manager._pending_cpu_hits[request_id] = ["not", "the", "fork's", "tuple"]
+    elif reason == "no_pending_hit_for_request":
+        pass                                      # the table is there and empty
+    elif reason == "empty_request_id":
+        pass
+    else:  # pragma: no cover - a guard against a name added without a driver
+        raise AssertionError(f"no driver for blind reason {reason!r}")
+    return manager
+
+
+def re_armed() -> None:
+    """Raise the switch `reset_state_for_tests()` drops, so `live_offer` still offers.
+
+    The `armed` fixture raises DISK AUTHORITY as a call, not a patch, so a reset in the
+    middle of a test leaves the boot offering nothing and `live_offer` would fail for a
+    reason the test is not asserting. The existing suite makes the same note ("NOT
+    `reset_state_for_tests()` - that would also drop the switches").
+    """
+    disk_restore.set_disk_authority(True)
+
+
+def see_blind(reason, request_id="req-blind") -> dict:
+    """One alloc that must come back blind for the named reason."""
+    manager = blind_manager(reason, request_id=request_id)
+    request_id = "" if reason == "empty_request_id" else request_id
+    verdict = Alloc(manager, request_id).see()
+    assert verdict["ok"] is True, "a blind observation must never break the step"
+    return disk_restore.scheduler_section()["load_prune"]
+
+
+def test_every_blind_condition_names_itself_in_the_published_document(armed):
+    """THE FIX, ASSERTED ON THE WIRE: seven causes, seven distinct readings.
+
+    Before 0.2.55 these were ONE number. Each case below drives one condition on a fresh
+    module state and reads `scheduler_section()["load_prune"]` - the block the HTTP
+    route serves - because the lesson of 0.2.53/0.2.54 is that a counter or a cause
+    visible only in `_state` is a cause that can be entirely wrong while the suite is
+    green.
+    """
+    for reason in BLIND_PATHS:
+        disk_restore.reset_state_for_tests()
+        re_armed()
+        document = see_blind(reason)
+        assert document["group_take_observations"] == 1, reason
+        assert document["group_take_unavailable"] == 1, \
+            f"{reason} did not count its blind look"
+        counts = document["group_take_unavailable_reasons"]
+        assert counts[reason] == 1, f"{reason} is not the reason the document reports"
+        # ...and the OTHER names stayed zero: the cause is specific, not a catch-all
+        # that every path happens to share (the failure the bare None was).
+        assert sum(counts.values()) == document["group_take_unavailable"], \
+            f"{reason}: the breakdown is not a partition of the total"
+        last = document["last_group_take_unavailable_reason"]
+        assert isinstance(last, dict) and last["reason"] == reason
+        # THE OBJECT, because "some other manager type" is one of the candidate answers
+        # and the payload must be able to say it without reading the code.
+        assert last["manager"] == type(blind_manager(reason)).__name__
+        assert last["at"] > 0
+
+
+def test_the_benign_blindness_is_told_apart_from_the_unaudited_kind(armed):
+    """THE JUDGEMENT `unavailable: 1` COULD NOT SUPPORT, in the payload's own words.
+
+    A request with no host-RAM hit has no pending CPU hit by construction, so
+    `no_pending_hit_for_request` is what an ordinary alloc looks like; every other name
+    means the take invariant is unwatched. The two are opposite operational stories, and
+    collapsing them is why the live reading was undecidable - so the distinction is
+    pinned in the `units` prose and not only in a comment.
+    """
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    benign = see_blind("no_pending_hit_for_request")
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    unaudited = see_blind("no_group_block_sizes")
+    assert benign["group_take_unavailable"] == 1
+    assert unaudited["group_take_unavailable"] == 1
+    # Identical totals, opposite meanings: the total alone is NOT the reading.
+    assert benign["group_take_unavailable"] == unaudited["group_take_unavailable"]
+    assert benign["group_take_unavailable_reasons"]["no_pending_hit_for_request"] == 1
+    assert unaudited["group_take_unavailable_reasons"]["no_group_block_sizes"] == 1
+    for key in ("group_take_unavailable_reasons", "group_take_unavailable"):
+        unit = benign["units"][key]
+        assert "(unit:" in unit, f"{key} reaches the wire with no unit"
+    assert "no_pending_hit_for_request" in benign["units"][
+        "group_take_unavailable_reasons"]
+    assert "UNWATCHED" in benign["units"]["group_take_unavailable_reasons"]
+    # THE ORDINARY CASE MUST BE CALLED ORDINARY, or a healthy box reads as a sick one.
+    assert "ordinary cache-miss alloc" in benign["units"][
+        "group_take_unavailable_reasons"]
+
+
+def test_many_blind_looks_log_once_and_the_counter_still_climbs(armed, caplog):
+    """ONE LINE PER REASON PER EPISODE, with the count unaffected.
+
+    This is the alloc path: one call per scheduled request per step, and a request with
+    no host-RAM hit is blind by construction. A line per observation would print a line
+    per request - the flood the `take_gap_episode` idiom exists to prevent, and the
+    reason the 0.2.55 line could not simply be `logger.info` at the blind branch.
+
+    THE COUNTER STILL CLIMBS: dedup is a LOG rule, never a counting rule. A notice that
+    swallowed the count would be the same bug wearing a log line.
+    """
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    manager = blind_manager("no_pending_hit_for_request")
+    with caplog.at_level(logging.INFO):
+        for _ in range(25):
+            Alloc(manager, "req-blind").see()
+    document = disk_restore.scheduler_section()["load_prune"]
+    assert document["group_take_observations"] == 25
+    assert document["group_take_unavailable"] == 25, \
+        "the once-per-episode rule must not swallow the count"
+    assert document["group_take_unavailable_reasons"][
+        "no_pending_hit_for_request"] == 25
+    lines = [r for r in caplog.records if "TRUNCATION GATE" in r.getMessage()]
+    assert len(lines) == 1, \
+        f"25 blind looks produced {len(lines)} lines; the episode rule is gone"
+    line = lines[0].getMessage()
+    # THE LINE NAMES THE CAUSE AND THE OBJECT, which is the whole point of the change.
+    assert "no_pending_hit_for_request" in line
+    assert "Manager" in line
+    # THE LINE PRICES ITSELF AT THE MOMENT THE EPISODE OPENS (the payload carries the
+    # running total): the first blind look says "1 of 1", and that is honest, because
+    # the line is the episode's opening statement and not a status report.
+    assert "1 of 1 blind look(s)" in line, \
+        "the line must state its own count against the total"
+    # AND THE ACTIONABLE POINTER SURVIVES `notice_once`'s 640-char truncation.
+    assert "group_take_unavailable_reasons" in line
+
+
+def test_a_measured_look_reopens_the_episode_so_a_returning_blindness_is_said_again(
+        armed, caplog):
+    """`notice_once` alone would cap this at one line per BOOT.
+
+    "Blind at boot, then fine" and "fine, then blind" must not be the same reading, so a
+    look that MEASURED closes the episode and the next blindness gets its own line.
+    Pinned here because the dedup idiom, taken literally, would silently make the
+    payload's most important distinction - is it still happening? - unloggable.
+    """
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    blind = blind_manager("no_pending_hit_for_request")
+    with caplog.at_level(logging.INFO):
+        Alloc(blind, "req-blind").see()
+        Alloc(live_offer("req-clean"), "req-clean").see()   # a look that measured
+        Alloc(blind, "req-blind").see()
+    lines = [r for r in caplog.records if "TRUNCATION GATE" in r.getMessage()]
+    assert len(lines) == 2, \
+        "a blindness that came back must be said again, once"
+    document = disk_restore.scheduler_section()["load_prune"]
+    assert document["group_take_observations"] == 3
+    assert document["group_take_unavailable"] == 2
+
+
+def test_a_boot_that_never_looked_is_distinguishable_from_a_boot_blind_every_time(
+        armed):
+    """A LOOK IS NOT A MEASUREMENT, AND BOTH ARE NOT A BLIND LOOK.
+
+    Three states a reader must tell apart from the published document alone:
+
+      (a) never looked: `observations 0`, `unavailable 0` - the process is not the one
+          that takes (a worker, or a boot with no allocs), which is a ROLE reading.
+      (b) looked, all blind: `observations N`, `unavailable N` - it looked N times and
+          measured nothing. An unaudited take invariant, or N cache-miss allocs, told
+          apart by the reason names and by nothing else.
+      (c) looked, measured: `observations N`, `unavailable 0` - the only state where the
+          zeros below it are evidence of anything.
+
+    A document that could not separate these would let (b) wear (c)'s clean zeros, which
+    is the exact artifact the `units` prose warns about; and (a) must NOT read as
+    damage, because a worker process sits in it permanently.
+    """
+    never_looked = disk_restore.scheduler_section()["load_prune"]
+    assert never_looked["group_take_observations"] == 0
+    assert never_looked["group_take_unavailable"] == 0
+    assert sum(never_looked["group_take_unavailable_reasons"].values()) == 0
+    assert never_looked["last_group_take_unavailable_reason"] is None
+
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    blind = blind_manager("no_pending_hit_for_request")
+    for _ in range(3):
+        Alloc(blind, "req-blind").see()
+    all_blind = disk_restore.scheduler_section()["load_prune"]
+    assert all_blind["group_take_observations"] == 3
+    assert all_blind["group_take_unavailable"] == 3
+    assert all_blind["last_group_take_unavailable_reason"] is not None
+
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    Alloc(live_offer("req-clean"), "req-clean").see()
+    measured = disk_restore.scheduler_section()["load_prune"]
+    assert measured["group_take_observations"] == 1
+    assert measured["group_take_unavailable"] == 0
+    assert measured["last_group_take_unavailable_reason"] is None
+
+    # THE THREE READINGS ARE PAIRWISE DISTINCT ON THE WIRE.
+    assert (never_looked["group_take_observations"],
+            never_looked["group_take_unavailable"]) == (0, 0)
+    assert (all_blind["group_take_observations"],
+            all_blind["group_take_unavailable"]) == (3, 3)
+    assert (measured["group_take_observations"],
+            measured["group_take_unavailable"]) == (1, 0)
+    # A LOOK THAT MEASURED leaves no trace in the blind keys, so the two axes stay
+    # independent: `observations` counts looks, `unavailable` counts blind ones, and
+    # `observations - unavailable` is the only number that makes the zeros evidence.
+    assert measured["group_take_unavailable_reasons"] == {
+        name: 0 for name in BLIND_PATHS}
+
+
+def test_the_new_cause_keys_are_stable_in_every_state_and_pair_their_units(
+        armed, monkeypatch):
+    """THE KEY/UNITS PIN, EXTENDED FOR THE CAUSE KEYS (0.2.55).
+
+    The two render sites must carry the same keys (`snapshot.py` serves
+    `scheduler_section()`, the verb serves `section()`, and 0.2.53's gap was exactly
+    this pair disagreeing), and every key must reach the wire with a unit that states
+    it.
+    Checked in the order a boot visits these states: fresh, armed, disarmed, measured,
+    blind, and degraded.
+    """
+    cause_keys = ("group_take_unavailable_reasons",
+                  "last_group_take_unavailable_reason")
+    route = disk_restore.scheduler_section()["load_prune"]
+    verb = disk_restore.section()["load_prune"]
+    assert set(route) == set(verb), "the route and the verb disagree on the key set"
+    for key in cause_keys:
+        assert key in route and key in verb, f"{key} is not published by both sites"
+        assert "(unit:" in route["units"][key], f"{key} reaches the wire with no unit"
+        assert route["units"][key].strip()
+    # THE CLOSED VOCABULARY IS THE KEY SET OF THE BREAKDOWN, in every state.
+    assert set(disk_restore.TAKE_GATE_UNAVAILABLE_REASONS) == set(BLIND_PATHS)
+    assert set(route["group_take_unavailable_reasons"]) == set(BLIND_PATHS)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(disk_restore, "prune_switch",
+                      lambda: {"enabled": False, "raw": None,
+                               "recognised": True, "source": "test",
+                               "env_var":
+                               "VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS"})
+        disarmed = disk_restore.scheduler_section()["load_prune"]
+    assert disarmed["enabled"] is False
+    assert set(disarmed) == set(route)
+    assert set(disarmed["group_take_unavailable_reasons"]) == set(BLIND_PATHS)
+
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    Alloc(live_offer("req-clean"), "req-clean").see()
+    measured = disk_restore.scheduler_section()["load_prune"]
+    assert set(measured) == set(route)
+    assert set(measured["group_take_unavailable_reasons"]) == set(BLIND_PATHS)
+    assert measured["last_group_take_unavailable_reason"] is None
+
+    blind = see_blind("no_group_block_sizes")
+    assert set(blind) == set(route)
+    assert set(blind["group_take_unavailable_reasons"]) == set(BLIND_PATHS)
+    # THE DEGRADED VIEW: a process that fitted nothing still answers in full.
+    disk_restore.reset_state_for_tests()
+    re_armed()
+    empty = disk_restore.scheduler_section()["load_prune"]
+    assert set(empty) == set(route)
+    assert set(disk_restore.section()["load_prune"]) == set(route)
+    assert sum(empty["group_take_unavailable_reasons"].values()) == 0
+
+
+def test_the_refusal_and_the_blind_breakdown_do_not_double_count_one_event(armed):
+    """ONE EVENT, ONE NAME - the rule `group_take_refusals` follows, kept.
+
+    A blind look is counted twice on purpose exactly once: in the total
+    (`group_take_unavailable`) and in its cause (`..._reasons[name]`), which is why the
+    breakdown sums to the total rather than exceeding it. A measured look that turns
+    into a refusal must NOT touch the blind keys at all: it was not blind, and `refused
+    [group_hit_truncated]` already carries that event once.
+    """
+    fill(armed, blocks=RUN_BLOCKS, groups=HYBRID_CACHEABLE)
+    manager = live_offer("req-wire")
+    verdict = Alloc(manager, "req-wire").see()
+    document = disk_restore.scheduler_section()["load_prune"]
+    assert verdict["refused"] is False
+    assert document["group_take_unavailable"] == 0
+    assert sum(document["group_take_unavailable_reasons"].values()) == 0
+    assert document["group_take_observations"] == 1
+    # The look was MEASURED: the observations axis moved and the blind axis did not,
+    # which is the property that makes `dropped_groups: 0` evidence rather than silence.
+    assert document["group_take_dropped_groups"] == 0
+    assert "group_take_refusals" not in document, \
+        "one event, one name in one document"
+
+
+def test_every_reason_in_the_vocabulary_has_a_driver_and_an_explanation(armed):
+    """NO UNREACHABLE NAME IN A CLOSED VOCABULARY.
+
+    A reason with no driver is a name a future edit can add and never hit, and a name
+    with no sentence logs half a line - which is how a counter starts climbing in
+    silence again, this time with a label on it.
+    """
+    for reason in disk_restore.TAKE_GATE_UNAVAILABLE_REASONS:
+        assert reason in BLIND_PATHS, \
+            f"{reason} is in the vocabulary but no test can drive it"
+        sentence = disk_restore.TAKE_GATE_UNAVAILABLE_WHY.get(reason)
+        assert sentence and sentence.strip(), f"{reason} has no sentence for the log"
+        assert sentence.startswith(("THE UNAUDITED CASE", "THE ORDINARY CASE")), \
+            f"{reason} does not say whether the invariant is being watched"
