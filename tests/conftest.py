@@ -122,7 +122,19 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # kind of interference no assertion in those files would name. Deleting it
             # makes 'unset = off' the fact every test measures; the suites that want it
             # up raise it themselves and drop the module's cached switch with it.
-            config.ENV_DISK_PRUNE_RESTORED_LOADS)
+            config.ENV_DISK_PRUNE_RESTORED_LOADS,
+            # DELIVERY MODE (0.2.52), and it belongs in this list for a reason sharper
+            # than the two flags above it. Those two are individually inert-by-default;
+            # this one UN-THROTTLES a writer that is already permitted to copy into a
+            # live KV window, so an inherited `..._DELIVERY=1` would make EVERY
+            # apply-point test in the suite enqueue one host->device copy per applied
+            # entry instead of one per sixty-four - and it is the flag the STEP-2
+            # PRUNE'S OWN SAFETY GATE reads (`prune_adopted_restores` asks whether the
+            # writer is delivering before it removes anything). A suite that inherited
+            # it would have the prune removing destinations inside tests that assert the
+            # step is what the scheduler shipped, which is the one failure mode this
+            # package cannot afford to test by accident.
+            config.ENV_DISK_GPU_WRITE_DELIVERY)
 
 
 def _isolate(state: dict) -> dict:

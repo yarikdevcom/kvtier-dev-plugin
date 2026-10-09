@@ -1178,6 +1178,16 @@ def test_the_section_key_set_never_changes_and_fits_the_contribution_cap():
         "max_writes_per_step", "min_interval_seconds", "max_checks_per_pass",
         "job_max_age_seconds", "max_in_flight", "geometry", "pool", "thread_alive",
         "liveness", "order_rule", "meaning_rule", "section", "writer", "note",
+        # STEP 3 (0.2.52), added HERE because this list is the gate that makes a new
+        # published key a decision. `delivery_mode` answers "is this copy the delivery
+        # or a witness", `limits_in_force` is the three throttles AS THE STEP WILL APPLY
+        # THEM
+        # (a reader must be able to see all three moved together, because a sampler at 1
+        # with a step cap still at 1 is a delivery that writes one entry), and
+        # `kill_switch` is the latch a fired mismatch leaves behind. None of the three
+        # may be conditional on the mode being on: the scheduler process, which can
+        # never fire one, publishes the same keys as the worker that did.
+        "delivery_mode", "limits_in_force", "kill_switch",
         "trimmed"}
     disk_gpu_write._state["group_bytes"] = list(GROUP_WIDTHS)
     disk_gpu_write._state["window_bytes"] = WIDTH

@@ -110,6 +110,57 @@ def off(monkeypatch):
     disk_restore._state["prune_switch"] = None
 
 
+@pytest.fixture
+def delivered(monkeypatch):
+    """THE STEP 3 PRECONDITION (0.2.52): the writer covers this step's entries.
+
+    Since 0.2.52 the prune asks `disk_gpu_write.observe_apply` WHICH entries it put
+    bytes
+    into and prunes ONLY those. A test that raises the prune flag alone therefore prunes
+    NOTHING - correctly, and the point of the whole change - so a test that wants to
+    exercise the prune's GEOMETRY has to name a writer as well. That is what this
+    fixture
+    is: a stand-in for delivery mode at the one module boundary that needs one.
+
+    WHAT IT STANDS IN FOR, and why that is not a test cheating: the real
+    `disk_gpu_write.observe_apply` returns exactly this shape - `{"written": n,
+    "written_indices": {survivor ids}, ...}` - and a separate test in
+    `test_disk_gpu_write.py` proves the real function returns the ids of the entries it
+    enqueued. This stand-in reproduces the CONTRACT (every applied, un-failed survivor
+    is covered) without a CUDA context, a `load_stream` or a pinned pool, none of which
+    exist
+    in a unit test. It is the delivery-mode posture, and it is deliberately NOT the
+    witness-mode posture: witness mode covers one entry in sixty-four and the tests
+    below
+    are about what happens when the plugin owns the delivery.
+
+    A test that wants the OPPOSITE - "the prune flag is on and nothing was delivered" -
+    names no fixture and gets it, which is
+    `test_the_prune_flag_alone_prunes_nothing_...`.
+    """
+    calls: list = []
+
+    def stand_in(worker, batch, failed):
+        jobs = (batch or {}).get("jobs") or {}
+        survivors = [job_id for job_id in jobs if job_id not in set(failed or {})]
+        calls.append({"jobs": sorted(jobs), "survivors": sorted(survivors)})
+        return {"seen": len(survivors), "written": len(survivors),
+                "written_indices": set(survivors), "delivery_mode": True,
+                "reason": None, "cause": None}
+
+    monkeypatch.setattr(disk_restore.disk_gpu_write, "observe_apply", stand_in)
+    # THE KILL-SWITCH, off: these tests are about the prune's GEOMETRY, and a latch left
+    # fired by an earlier test in the same process would refuse every prune here and
+    # make a geometry failure read like a kill-switch. `delivered` asserts it is unfired
+    # so a leak from another file is caught here instead of in a confusing assertion
+    # below.
+    assert disk_restore.disk_gpu_write.kill_switch_engaged() is False, \
+        "a fired kill-switch in the environment means an earlier test leaked its latch"
+    monkeypatch.setattr(disk_restore.disk_gpu_write, "kill_switch_engaged",
+                        lambda: False)
+    yield calls
+
+
 # --- the harness: be the fork for one step -----------------------------------
 
 def hybrid(sizes=None, *, cacheable=HYBRID_CACHEABLE, **kwargs):
@@ -408,7 +459,8 @@ def test_a_group_whose_two_sides_do_not_agree_refuses_the_prune():
 
 # --- 3. both-sided is correct: the survivors keep their partners --------------
 
-def test_both_pruned_keeps_every_later_pair_with_its_own_source(pruning, armed):
+def test_both_pruned_keeps_every_later_pair_with_its_own_source(
+        pruning, delivered, armed):
     """THE POSITIVE CASE, asserted as a PAIRING and not as a length.
 
     The step is deliberately built with host-RAM destinations on BOTH sides of the disk
@@ -447,7 +499,7 @@ def test_both_pruned_keeps_every_later_pair_with_its_own_source(pruning, armed):
     assert state["emptied_steps"] == 0
 
 
-def test_the_prune_reports_the_groups_it_removed_by_name(pruning, armed):
+def test_the_prune_reports_the_groups_it_removed_by_name(pruning, delivered, armed):
     """`pruned_by_group` is the group id READ from the job, never inferred.
 
     With the live group set an entry's group is the fact the whole Gate-B argument
@@ -506,7 +558,7 @@ def test_a_cacheable_group_at_a_different_block_size_cannot_reach_the_prune(
 
 
 def test_a_boundary_group_keeps_its_own_entries_and_not_the_leading_ones(
-        pruning, armed):
+        pruning, delivered, armed):
     """GATE B, THE OPERATIONAL HALF, on the live geometry (a Qwen3-Next-shaped model).
 
     Groups 0-3 are `boundary_state`: a hit run of B blocks contributes
@@ -608,7 +660,7 @@ def test_the_pair_function_never_looks_at_a_block_size(pruning):
     assert verdict["group_deltas"] == {"0": 0, "1": 0}
 
 
-def test_the_prune_never_derives_an_index_from_tokens(pruning, armed):
+def test_the_prune_never_derives_an_index_from_tokens(pruning, delivered, armed):
     """A step whose GPU ids are meaningless still prunes the RIGHT entries.
 
     The identity of a disk entry is the path the scheduler named, and nothing else. If
@@ -632,7 +684,8 @@ def test_the_prune_never_derives_an_index_from_tokens(pruning, armed):
 
 # --- 5. adopted, not offered --------------------------------------------------
 
-def test_an_offer_the_scheduler_truncated_prunes_only_what_arrived(pruning, armed):
+def test_an_offer_the_scheduler_truncated_prunes_only_what_arrived(
+        pruning, delivered, armed):
     """OFFERED 3 BLOCKS, THE STEP CARRIES 1: the other two destinations stay.
 
     The fork takes `cdiv(num_external_tokens, group_block_sizes[g])` LEADING entries per
@@ -709,7 +762,7 @@ def _one_failed_read_step(root, request_id="req-1", event=11):
     return report, invalid, after, before, owners, disk_range
 
 
-def test_a_failed_restore_keeps_its_range_out_of_the_prune(pruning, armed):
+def test_a_failed_restore_keeps_its_range_out_of_the_prune(pruning, delivered, armed):
     """THE RECOMPUTE PROPERTY, with the flag ON, asserted where it actually lives.
 
     WHERE THE PROPERTY LIVES, because the naive reading of "never prune a failed range"
@@ -751,7 +804,7 @@ def test_a_failed_restore_keeps_its_range_out_of_the_prune(pruning, armed):
 
 
 def test_the_engine_is_told_to_recompute_the_same_blocks_flag_off_and_flag_on(
-        armed, monkeypatch):
+        armed, delivered, monkeypatch):
     """THE NON-NEGOTIABLE, AS A COMPARISON: the flag may not change the recompute set.
 
     A property asserted only on the new path can be satisfied by a new path that broke
@@ -850,42 +903,120 @@ def test_a_refused_prune_publishes_the_same_key_set_as_an_accepted_one(pruning,
         disk_restore.PRUNE_REFUSALS)
 
 
-def test_the_hazard_is_counted_and_said_once_per_episode(pruning, armed, caplog):
-    """`prune_unwitnessed_entries` is this flag's own hazard, priced; the log is per
-    episode, never per step.
+def test_the_prune_flag_alone_prunes_nothing_and_names_the_refusal(pruning, armed):
+    """STEP 3'S DEFAULT, AND THE TEST THE OLD HAZARD TEST USED TO BE.
 
-    The fork's copy is today the only thing that carries a restored block's bytes into
-    its GPU window (`disk_gpu_write` samples one entry in 64 and is a witness, not a
-    delivery), so a pruned entry has no route to the device. A flag whose hazard is a
-    wrong answer must COUNT that hazard, and say it once - a line per step on the engine
-    thread is how a diagnostic stops being read.
+    THIS TEST REPLACES `test_the_hazard_is_counted_and_said_once_per_episode`, and the
+    replacement is the point rather than a side effect. That test asserted that a pruned
+    entry with no plugin-side write behind it was COUNTED (`unwitnessed_entries ==
+    len(owners)`) and logged once per episode - it priced a hazard this flag walked into
+    with its eyes open, because `disk_gpu_write` sampled one entry in 64 and the fork's
+    copy was the only delivery. Step 3 removed the hazard instead of pricing it: the
+    prune's population is filtered by MEMBERSHIP in the writer's enqueued set, so the
+    scenario that test built (the prune flag on, no writer) now prunes NOTHING.
+    Asserting
+    the old numbers here would assert a behaviour the code no longer has.
+
+    So the flag-on-no-writer step is asserted to be INERT, and to say why in its own
+    name: `not_delivered`, not `nothing_adopted`. The distinction is what an operator
+    reads - "this step had three adopted, successfully-read entries and the writer did
+    not cover one of them" - and it is why the fork keeps every destination.
     """
     fill(armed, blocks=1)
     manager = Manager(reqs_to_load={"req-1": object()})
     offer(manager, Req(request_id="req-1", blocks=1))
     metadata, owners, _ = ship(manager)
+    before = (list(metadata.load_cpu_blocks), list(metadata.load_gpu_blocks))
     worker = worker_for(metadata)
-    assert disk_restore.worker_before_load(worker)["pruned"] == len(owners)
+    report = disk_restore.worker_before_load(worker)
+    assert report["pruned"] == 0, "nothing was delivered, so nothing may be pruned"
+    assert report["submitted"] is True, "the fork still copies all of them"
+    assert (list(metadata.load_cpu_blocks), list(metadata.load_gpu_blocks)) == before, \
+        "the step's lists are exactly what the scheduler shipped"
     state = disk_restore.prune_state()
-    assert state["last"]["direct_write_witnesses"] == 0
-    assert state["unwitnessed_entries"] == len(owners)
-    # A SECOND STEP in the same boot, with the state deliberately NOT reset: the counter
-    # accumulates and the notice does not repeat. `reset_state_for_tests()` here would
-    # clear `_notices` and make the assertion below vacuous.
-    second_manager = Manager(reqs_to_load={"req-2": object()})
-    assert offer(second_manager, Req(request_id="req-2", blocks=1)) == (BLOCK, True)
-    second, _owners, _range = ship(second_manager, request_id="req-2", event=12)
-    disk_restore.worker_before_load(worker_for(second))
-    lines = [line for line in caplog.records if "NO plugin-side GPU write"
-             in str(line.message)]
-    assert len(lines) == 1, f"the hazard was logged per step: {len(lines)} lines"
-    after = disk_restore.prune_state()
-    assert after["steps"] == 2, "two steps ran"
-    assert after["unwitnessed_entries"] == 2 * len(owners), \
+    assert state["entries"] == 0
+    # THE REFUSAL IS NAMED, and it is the new name and not the old one. A step with real
+    # adopted work and no delivery is a DIFFERENT operational story from a step with no
+    # disk work, and `_prune_refused` silently folds an unknown `reason_kind` into
+    # `nothing_adopted` - which is how a dead writer would hide behind a healthy zero.
+    assert state["refused"]["not_delivered"] == 1, state["refused"]
+    assert state["refused"]["nothing_adopted"] == 0
+    assert state["last"]["reason_kind"] == "not_delivered"
+    # THE INVARIANT, at this level: nothing was delivered, nothing was pruned, so the
+    # tripwire cannot have moved.
+    assert state["unwitnessed_entries"] == 0
+    # AND IT SAYS SO, in the refusal's own sentence, naming the count it did not prune.
+    assert "NONE was covered by a plugin-side GPU write" in state["last"]["reason"]
+    assert state["last"]["adopted_entries"] == len(owners)
+    assert state["last"]["uncovered_entries"] == len(owners)
+    assert state["last"]["covered_entries"] == 0
+
+
+def test_the_unwitnessed_hazard_is_now_unreachable_and_still_trips_a_broken_gate(
+        pruning, armed, monkeypatch, caplog):
+    """THE STRUCTURAL CLAIM, TESTED BOTH WAYS: `unwitnessed_entries` cannot move, and it
+    STILL moves if the gate is broken.
+
+    A test that only asserts `== 0` proves nothing, because 0 is also what a counter
+    says
+    when the code that was supposed to move it was deleted. So this runs the maximum-
+    damage scenario the previous release walked into (prune on, entries adopted and
+    read, a writer covering NONE of them) twice: once as shipped, where the counter must
+    stay 0, and once with `_delivered` switched to "always covered" - the narrowest
+    possible edit, the one line that is the whole safety argument - where the counter
+    MUST move, at ERROR
+    level.
+
+    THE SECOND READING IS WHAT MAKES THE FIRST ONE MEAN ANYTHING. Without it the
+    assertion would be indistinguishable from a tripwire nothing writes, which is the
+    recurring bug
+    class in this package: a number published in `units` and never incremented. It also
+    depends on the tripwire reading `covered_ids` DIRECTLY instead of calling the same
+    predicate - a tripwire that asks the predicate whether it passed would report 0 for
+    a
+    gate it was asked to bypass, and the mutation would pass as clean.
+    """
+    def step(event, request_id):
+        manager = Manager(reqs_to_load={request_id: object()})
+        assert offer(manager, Req(request_id=request_id, blocks=1)) == (BLOCK, True)
+        metadata, owners, _ = ship(manager, request_id=request_id, event=event)
+        disk_restore.worker_before_load(worker_for(metadata))
+        return owners
+
+    fill(armed, blocks=1)
+    step(11, "req-1")
+    state = disk_restore.prune_state()
+    assert state["entries"] == 0, "nothing delivered, so nothing pruned"
+    assert state["unwitnessed_entries"] == 0, "the gate holds, as it must"
+
+    # THE MUTATION. Everything else - the population, the geometry, the counters, the
+    # tripwire - is the shipped code, so the second reading tests the tripwire and not a
+    # fixture. `_delivered` is the ONE predicate the gate calls, and the tripwire does
+    # not.
+    monkeypatch.setattr(disk_restore, "_delivered", lambda index, covered: True)
+    disk_restore._notices.clear()          # a fresh episode, deliberately
+    broken = step(12, "req-2")
+    assert broken, "the scenario must still have adopted entries to prune"
+    state2 = disk_restore.prune_state()
+    assert state2["entries"] > 0, "the broken gate pruned, as a broken gate must"
+    assert state2["unwitnessed_entries"] == state2["entries"], \
+        "the tripwire did not count what the broken gate pruned"
+    errors = [line for line in caplog.records
+              if "NO plugin-side GPU write" in str(line.message)
+              and line.levelname == "ERROR"]
+    assert errors, "a broken gate must be said at ERROR, not warned about"
+    # ONE LINE, NOT ONE PER STEP: the counter accumulates, the log does not.
+    step(13, "req-3")
+    again = disk_restore.prune_state()
+    assert again["unwitnessed_entries"] > state2["unwitnessed_entries"], \
         "the counter counts entries, not episodes"
+    errors2 = [line for line in caplog.records
+               if "NO plugin-side GPU write" in str(line.message)
+               and line.levelname == "ERROR"]
+    assert len(errors2) == len(errors), "the line repeated per step"
 
 
-def test_a_step_left_with_nothing_to_copy_is_counted(pruning, armed):
+def test_a_step_left_with_nothing_to_copy_is_counted(pruning, delivered, armed):
     """`emptied_steps`: the fork is left with no submission, so the event is released.
 
     This is the sharpest shape of the flag - every entry the fork would have copied is
@@ -910,7 +1041,75 @@ def test_a_step_left_with_nothing_to_copy_is_counted(pruning, armed):
     assert disk_restore.counters()["phantom_guard_trips"] == 0
 
 
-def test_the_worker_report_and_the_snapshot_both_carry_the_numbers(pruning, armed):
+def test_a_fully_covered_step_keeps_its_last_entry_so_the_event_is_recorded(
+        pruning, delivered, armed, monkeypatch):
+    """THE EMPTIED-STEP GUARD, and the race it closes.
+
+    THE HAZARD, stated because it is invisible in every other test in this file. The
+    fork's `start_load_kv` submits a copy ONLY when `load_cpu_blocks` is non-empty, so a
+    step the prune emptied records NO load event at all. The apply point then takes its
+    existing release path - which is correct for the phantom bug it was written for, and
+    which reports the requests finished IMMEDIATELY. And there is no ordering edge from
+    the compute stream to `load_stream` anywhere in the fork's load path: loads never
+    pass
+    a `wait_event` (only stores do), so the next forward can read those KV windows while
+    the plugin's own copies are still in flight. Nothing raises, nothing logs, the
+    answer
+    is wrong.
+
+    The guard leaves the LAST covered entry in both lists. That entry makes the fork
+    submit, the fork's event is recorded on the SAME stream AFTER the plugin's copies
+    (CUDA streams are FIFO), and the event therefore witnesses them. The fork rewrites
+    bytes the plugin just wrote with the same bytes, which is what makes the extra copy
+    harmless rather than merely cheap.
+
+    WHY THE `delivered` FIXTURE IS NOT ENOUGH: the guard asks the writer whether IT is
+    delivering, and the stand-in fixture only reports coverage. So this test raises the
+    writer's own delivery flag for real, which is the only way to reach the guarded
+    state. THE GUARD IS ONLY FOR THAT STATE: the test next door runs the same
+    fully-covered step with delivery NOT in force and still asserts the emptied-step
+    release, because with no
+    plugin-side copy there is nothing for the event to witness and the old behaviour is
+    correct.
+    """
+    # BOTH writer flags: delivery mode is a LAYER on the writer, and with the writer off
+    # `effective_delivery_mode()` is False - so the guard would not apply and this test
+    # would be asserting the pre-0.2.52 emptied-step behaviour it is written to replace.
+    monkeypatch.setenv(config.ENV_DISK_GPU_DIRECT_WRITE, "1")
+    disk_gpu_write._state["env_resolved"] = False
+    monkeypatch.setenv(config.ENV_DISK_GPU_WRITE_DELIVERY, "1")
+    disk_gpu_write._state["delivery_resolved"] = False
+    assert disk_gpu_write.effective_delivery_mode() is True, \
+        "the guarded state requires BOTH the writer and the delivery flag"
+    fill(armed, blocks=1)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    offer(manager, Req(request_id="req-1", blocks=1))
+    metadata, owners, _ = ship(manager)
+    before = list(zip(metadata.load_cpu_blocks, metadata.load_gpu_blocks,
+                      strict=True))
+    worker = worker_for(metadata)
+    report = disk_restore.worker_before_load(worker)
+    # ONE ENTRY FEWER PRUNED THAN THERE WERE COVERED, and the step is NOT empty.
+    assert report["pruned"] == len(owners) - 1
+    assert len(metadata.load_cpu_blocks) == 1 and len(metadata.load_gpu_blocks) == 1
+    assert (metadata.load_cpu_blocks[0], metadata.load_gpu_blocks[0]) in before, \
+        "the kept entry must be a pair the scheduler actually formed"
+    assert report["submitted"] is True, "the fork must still copy, that is the point"
+    assert report["released"] == 0, "the event is recorded, so nothing is released"
+    state = disk_restore.prune_state()
+    assert state["emptied_steps"] == 0, "the guard exists to keep this at zero"
+    assert state["kept_last_entries"] == 1
+    assert state["unwitnessed_entries"] == 0
+    # THE KEPT PAIR IS STILL A PAIR: both lists lost the SAME indices, so the fork's
+    # positional pairing cannot shift for the entry it does copy. `kept == 1` and that
+    # one pair existing in the scheduler's own ordering is the whole claim.
+    assert len(metadata.load_cpu_blocks) == len(metadata.load_gpu_blocks) == 1
+    assert (metadata.load_cpu_blocks[0], metadata.load_gpu_blocks[0]) in before
+    assert disk_restore.counters()["phantom_guard_trips"] == 0
+
+
+def test_the_worker_report_and_the_snapshot_both_carry_the_numbers(
+        pruning, delivered, armed):
     """A rank file that does not mention the prune is a rank file that hides it.
 
     Only a WORKER prunes (it is the process that applies a restore), so the flag's
@@ -932,7 +1131,7 @@ def test_the_worker_report_and_the_snapshot_both_carry_the_numbers(pruning, arme
 
 
 def test_the_verifier_and_the_direct_writer_are_still_untouched_by_the_flag(
-        pruning, armed):
+        pruning, delivered, armed):
     """The prune is a THIRD thing at the apply point, not a change to the two witnesses.
 
     `disk_restore_verify` and `disk_gpu_write` both return early on their own

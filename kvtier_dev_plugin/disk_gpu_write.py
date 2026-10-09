@@ -239,6 +239,23 @@ MAX_ENTRIES_SCANNED = 64
 MAX_REGIONS = 16                            # mirrors disk_spill.MAX_REGIONS
 MAX_LEDGER_SCAN = 64                        # the `_load_events` witness's bound
 
+# DELIVERY MODE (`VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY`, 0.2.52): THE SAME
+# CEILING THE SCAN ALREADY IMPOSES, AND WHY THE NUMBER STAYS.
+# In delivery mode the per-step cap becomes the step's own survivor count, so this
+# constant - not a sample, not a floor - is the only thing left limiting how many copies
+# one apply point submits. It exists because "write every entry the step applied" is the
+# point of the mode and "an unbounded loop of submissions on the step thread" is not.
+# The bound can only ever cost a MISSED OPTIMIZATION: an entry it leaves un-written is
+# un-covered, and an un-covered entry is NOT pruned (`disk_restore
+# .prune_adopted_restores`' membership test), so the fork still copies it.
+MAX_WRITES_PER_STEP_DELIVERY = MAX_ENTRIES_SCANNED
+
+# The interval floor, in delivery mode, stated rather than implied: the floor is a
+# WRITE-RATE limit for a witness, and a delivery has to write every entry of the step or
+# the entries behind the floor are exactly the ones the prune would starve. Zero means
+# "no floor", and it is the value the mode documents.
+MIN_INTERVAL_SECONDS_DELIVERY = 0.0
+
 MAX_REASON_SAMPLES = 6
 MAX_REASON_CHARS = 120
 MAX_DIFF_SCAN_BYTES = 262_144               # chunked memcmp, `disk_shadow`'s rule
@@ -283,6 +300,23 @@ _COUNTER_KEYS = (
     "bytes_written",
     "regions_written",
     "readbacks_enqueued",
+    # --- DELIVERY MODE (0.2.52, `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY`)
+    # `delivery_writes` counts host->device copies enqueued while the mode was in force,
+    # and is the number the prune's membership test is made of. `delivered_unwitnessed`
+    # counts the delivery copies that carry NO readback behind them - the ordinary case
+    # in delivery mode, where the witness stays sampled and the delivery does not - and
+    # is the reason `writes` and `checked` are allowed to differ by a large factor.
+    # `delivery_steps` is the apply-point count, so `delivery_writes / delivery_steps`
+    # is the 1:1 claim an operator can check.
+    "delivery_writes",
+    "delivered_unwitnessed",
+    "delivery_steps",
+    # --- THE KILL-SWITCH. `kill_switch_fired` is 0 or 1 and never more, because the
+    # latch is one-shot; `kill_switch_declined` counts the mismatches that arrived AFTER
+    # it fired or that were NOT attributable to our own copy, so "the switch never fired
+    # although mismatches happened" is a readable state and not a missing counter.
+    "kill_switch_fired",
+    "kill_switch_declined",
     # --- the refusals, each of which writes NOTHING
     "width_mismatch",
     "row_too_wide",
@@ -359,6 +393,14 @@ def _fresh_state() -> dict:
         "env_enabled": False,
         "env_raw": None,
         "env_recognised": True,
+        # DELIVERY MODE (0.2.52), resolved ONCE per process exactly like the enablement.
+        "delivery_resolved": False,
+        "delivery_enabled": False,
+        "delivery_raw": None,
+        "delivery_recognised": True,
+        # THE KILL-SWITCH LATCH. None until a same-execution readback mismatch arrives;
+        # then the one-shot record of WHY, in the shape every state view publishes.
+        "kill_switch": None,
         "seq": 0,                # record ids
         "in_flight": {},         # {id: record}: rows held, awaiting the load watermark
         "pool": {},              # {(name, elems): [free pinned rows]}
@@ -519,6 +561,177 @@ def set_enabled(on: bool) -> dict:
                    "so arm the worker with the environment variable)",
                    level="info")
     return answer
+
+
+# --- DELIVERY MODE AND THE KILL-SWITCH (0.2.52) --------------------------------
+def _resolve_delivery_env() -> dict:
+    """Read `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY` ONCE per process, and say so.
+
+    Same one-read discipline as `_resolve_env`, for the same reason: a live boot's
+    environment does not change, and an `os.environ` lookup on the engine's step thread
+    buys no information. The mode is INERT unless the writer itself is enabled - a
+    delivery with no writer is a flag that writes nothing, and `delivery_state` says so
+    under `reason` rather than reporting a mode that cannot act.
+    """
+    if not _state["delivery_resolved"]:
+        read = config.disk_gpu_write_delivery()
+        _state["delivery_raw"] = read["raw"]
+        _state["delivery_enabled"] = bool(read["enabled"])
+        _state["delivery_recognised"] = bool(read["recognised"])
+        _state["delivery_resolved"] = True
+        if read["enabled"]:
+            _note_once("delivery-on",
+                       f"[disk_gpu_write] DELIVERY MODE requested by "
+                       f"{config.ENV_DISK_GPU_WRITE_DELIVERY}={read['raw']!r}: every "
+                       f"applied entry of the step gets its own host->device copy "
+                       f"(sample 1, per-step cap up to {MAX_WRITES_PER_STEP_DELIVERY}, "
+                       f"no {MIN_INTERVAL_SECONDS} s floor), so the entries the Step-2 "
+                       "prune may remove are a SUBSET of the entries this module "
+                       "enqueued. The readback stays sampled and is the kill-switch, "
+                       "not the gate.", level="info")
+        elif read["raw"] is not None and not _state["delivery_recognised"]:
+            _reason("delivery_value_unrecognised",
+                    f"{config.ENV_DISK_GPU_WRITE_DELIVERY}={read['raw']!r} is neither "
+                    "an on word nor an off word; delivery mode is OFF, the direction a "
+                    "typo never overrides")
+    return {"enabled": bool(_state["delivery_enabled"]),
+            "source": ("environment (read once at first use)"
+                       if _state["delivery_raw"] is not None else
+                       "default (off); the environment is read once at first use"),
+            "raw": _state["delivery_raw"],
+            "recognised": bool(_state["delivery_recognised"]),
+            "env_var": config.ENV_DISK_GPU_WRITE_DELIVERY}
+
+
+def delivery_state() -> dict:
+    """One stable-key answer to "is this writer DELIVERING, or only witnessing?".
+
+    `effective` is the only field a decision may be made on. It is False when the mode
+    was never asked for, when the writer itself is off (nothing writes, so nothing can
+    be delivered), and once the kill-switch has latched - which is the whole point of
+    the
+    latch: the throttles come back, so the fork's copy is the delivery again. `reason`
+    names which of those it is, because a rank file that says `effective: false` and
+    nothing else cannot be read.
+    """
+    env = _resolve_delivery_env()
+    writer = bool(effective_enabled())
+    with _lock:
+        latched = _state["kill_switch"] is not None
+    if not env["enabled"]:
+        reason = ("the delivery flag is unset, so this writer is a SAMPLED WITNESS "
+                  "(one entry in `sample_every_n_applied`, one per step, one floor)")
+    elif not writer:
+        reason = (f"the delivery flag is on but {config.ENV_DISK_GPU_DIRECT_WRITE} is "
+                  "not, so no copy is issued at all and there is nothing to deliver; "
+                  "the flag is inert until the writer is armed")
+    elif latched:
+        reason = ("the delivery flag is on but THE KILL-SWITCH HAS FIRED: a "
+                  "same-execution readback mismatch proved our own copy wrong, so the "
+                  "throttles are back and the fork's copy is the delivery again")
+    else:
+        reason = ("delivering: every applied entry of the step is written, and the "
+                  "prune may remove only entries this module enqueued")
+    return {"requested": bool(env["enabled"]),
+            "effective": bool(env["enabled"] and writer and not latched),
+            "writer_enabled": writer,
+            "kill_switch_latched": bool(latched),
+            "raw": env["raw"],
+            "recognised": bool(env["recognised"]),
+            "env_var": env["env_var"],
+            "reason": reason}
+
+
+def effective_delivery_mode() -> bool:
+    """The one question the apply point asks: un-throttle this step's writes or not."""
+    return bool(delivery_state()["effective"])
+
+
+def limits_in_force(survivors: int) -> dict:
+    """THE THREE THROTTLES AS THIS STEP WILL ACTUALLY APPLY THEM, in one read.
+
+    Lifting one and not the other is the trap this function exists to close: a writer
+    whose sampler is at 1 but whose step cap is still 1 writes one entry and then spends
+    the rest of the step counting `throttled_step`, which reads as "delivery on" in the
+    flag and "delivery did not happen" in the counters. Every caller reads this ONE dict
+    so the three cannot move independently.
+    """
+    delivery = effective_delivery_mode()
+    cap = (min(int(survivors), MAX_WRITES_PER_STEP_DELIVERY) if delivery
+           else int(MAX_WRITES_PER_STEP))
+    return {"delivery": delivery,
+            "sample_every_n_applied": 1 if delivery else int(SAMPLE_EVERY_N_APPLIED),
+            "max_writes_per_step": max(0, int(cap)),
+            "min_interval_seconds": (MIN_INTERVAL_SECONDS_DELIVERY if delivery
+                                     else float(MIN_INTERVAL_SECONDS))}
+
+
+def fire_kill_switch(reason: str, detail: str, *, category: str | None = None,
+                     evidence: dict | None = None) -> bool:
+    """THE KILL-SWITCH, and it is ONE-SHOT for the life of the process.
+
+    Called from the readback thread when a mismatch is attributable to THIS module's own
+    copy. Latching means: `delivery_state` goes not-effective (the three throttles come
+    back, so the fork's copy is the delivery again) and `disk_restore
+    .prune_adopted_restores` refuses every step from here on. The asymmetry is the whole
+    design: before a prune, a wrong address is a wrong WITNESS; after a prune, it is a
+    wrong ANSWER, and nothing downstream can tell the two apart. So the response to one
+    proven-bad copy is to give the fork's copy back for the rest of the boot.
+
+    ONE LOG LINE, EVER, because a mismatch that persists is a persistent condition and a
+    line per readback on a 10 s poller is how a diagnostic stops being read. A repeat
+    arrives, counts `kill_switch_declined`, and says nothing.
+    """
+    with _lock:
+        if _state["kill_switch"] is not None:
+            _count("kill_switch_declined")
+            return False
+        _state["kill_switch"] = {
+            "fired": True,
+            "reason": str(reason)[:MAX_REASON_CHARS],
+            "detail": str(detail)[:400],
+            "category": category,
+            "evidence": copy.deepcopy(evidence) if evidence else None,
+            "mono": round(float(time.monotonic()), 6),
+            "wall": round(float(time.time()), 6),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "effect": ("delivery mode OFF and the Step-2 prune REFUSED for every "
+                       "subsequent step: the fork's arena->GPU copy is the delivery "
+                       "again"),
+        }
+        _count("kill_switch_fired")
+    _note_once("kill-switch-fired",
+               f"[disk_gpu_write] KILL-SWITCH FIRED ({reason}): {detail} - delivery "
+               "mode is disarmed and `disk_restore` will REFUSE to prune from here on, "
+               "so the fork's own copy carries every restored block for the rest of "
+               "this boot. This is the safe side of the trade: a pruned entry whose "
+               "plugin-side write went to the wrong window is a wrong answer that "
+               "raises nothing and logs nothing. One line, ever.", level="error")
+    return True
+
+
+def kill_switch_view() -> dict:
+    """The latch, with a key set that NEVER changes: unfired, fired, or both.
+
+    Published from `disk_restore.prune_state()` as well, so a reader of the prune's view
+    does not have to know which module owns the fact.
+    """
+    with _lock:
+        record = copy.deepcopy(_state["kill_switch"]) if _state["kill_switch"] else None
+    return {"fired": bool(record is not None),
+            "reason": record["reason"] if record else None,
+            "detail": record["detail"] if record else None,
+            "category": record["category"] if record else None,
+            "evidence": record["evidence"] if record else None,
+            "at": record["at"] if record else None,
+            "wall": record["wall"] if record else None,
+            "effect": record["effect"] if record else None}
+
+
+def kill_switch_engaged() -> bool:
+    """The boolean the prune asks. Read-only; never latches anything."""
+    with _lock:
+        return _state["kill_switch"] is not None
 
 
 # --- THE THREE FACILITIES THAT NEED TORCH, NONE OF WHICH IMPORT IT -------------
@@ -1094,6 +1307,20 @@ def _check_record_inner(worker, record: dict) -> dict:
                 f"a mismatch arrived with an unreadable pre-copy readback "
                 f"({pre_side.get('reason')}), so it is reported unrechecked")
         _release_rows(record["rows"])
+        # THE KILL-SWITCH IS ASKED HERE TOO. It will not fire - an unattributable
+        # disagreement is not evidence about our copy, which is what
+        # `_kill_switch_verdict` exists to say - but the decline MUST be counted, or the
+        # published numbers do not add up: a boot with fifty unrechecked mismatches
+        # would read `readback_mismatch: 50, kill_switch_fired: 0, kill_switch_declined:
+        # 0`, and
+        # a reader cannot tell "the switch refused fifty times" from "the switch was
+        # never on this path at all". One decision site for all three categories, so the
+        # arithmetic `mismatch == fired + declined` is a property of the module.
+        fire, reason, detail = _kill_switch_verdict(
+            "readback_mismatch_unrechecked",
+            {"category": "readback_mismatch_unrechecked"})
+        if fire:
+            fire_kill_switch(reason, detail, category="readback_mismatch_unrechecked")
         return {"checked": True, "equal": False,
                 "category": "readback_mismatch_unrechecked"}
     pre = bytes(pre_side["bytes"])[:group_bytes]
@@ -1145,8 +1372,70 @@ def _check_record_inner(worker, record: dict) -> dict:
             0, len(_state["mismatch_samples"]) - MAX_MISMATCH_SAMPLES)]
         _state["last_verdict"] = sample
     _release_rows(record["rows"])
+    # THE KILL-SWITCH, decided here and nowhere else, on the daemon thread, and on the
+    # record's OWN delivery flag rather than on the mode the process happens to be in
+    # when the verdict lands: the write being judged is the one this record describes.
+    # A stable mismatch fires it once for the life of the process; every later mismatch,
+    # of any class, is counted and stays quiet.
+    fire, reason, detail = _kill_switch_verdict(category, sample)
+    if fire:
+        fire_kill_switch(reason, detail or "", category=category,
+                         evidence=dict(sample, delivery=bool(record.get("delivery"))))
     return {"checked": True, "equal": False, "category": category,
-            "first_difference": offset, "scanned_bytes": scanned}
+            "first_difference": offset, "scanned_bytes": scanned,
+            "kill_switch_fired": bool(fire)}
+
+
+def _kill_switch_verdict(category: str, sample: dict) -> tuple:
+    """Is THIS mismatch a fault of OURS, in THIS execution? `(fire, reason, detail)`.
+
+    THE TRAP THIS FUNCTION EXISTS TO AVOID, stated because it is the difference between
+    a kill-switch and a feature-killer: not every difference is a fault. 0.2.48 learned
+    it in `disk_gpu_shadow`, where a shadow from one execution paired with a store file
+    from another legitimately differs (two fp8 recomputations of one key are not
+    bit-identical) and every such pair used to be logged as corruption. The same trap
+    exists here in two different guises, and only one of them is ours.
+
+    THE ASYMMETRY IS THE OPPOSITE OF `disk_gpu_shadow._attribute_pair`'s, and
+    deliberately
+    so. There the ambiguous case goes to `unattributed` and never to the benign bucket,
+    because being wrong about "benign" costs a missed bug report. Here being wrong about
+    "fault" costs the FEATURE - the prune is refused for the rest of the boot - so
+    anything not attributable to our own copy is DECLINED, counted in
+    `kill_switch_declined`, and says nothing twice. The one class that fires is the one
+    this module can prove about itself.
+
+    * `readback_mismatch_stable` - SAME EXECUTION, OURS. Both readbacks were enqueued on
+      our own stream around our own copy inside one `start_load_kv`, and the file side
+      is
+      the file THIS restore read into the slot THIS copy read from. There is no second
+      execution in the comparison and no recomputation in it: the after-state is what it
+      was before we touched it (or ours up to an offset and the old bytes from there),
+      so
+      our copy landed somewhere other than the window it addressed. That is the wrong
+      `gpu_block_id` / wrong-width failure the kill-switch was built for.
+    * `readback_mismatch_gpu_changed_on_recheck` - NOT OURS. The after-state is neither
+      ours nor the before-state, which requires work on ANOTHER stream. It says nothing
+      about where our copy went, and the module's own `MEANING_RULE` already tells the
+      reader to never act on it. Firing here would disable the prune because a compute
+      kernel touched a block - a race this package expects and does not act on.
+    * `readback_mismatch_unrechecked` - NOT ATTRIBUTABLE. No before-state, so the
+      disagreement cannot be pinned on our copy or on the world.
+    """
+    if category != "readback_mismatch_stable":
+        with _lock:
+            _count("kill_switch_declined")
+        return False, None, None
+    return (True, "readback_mismatch_stable",
+            f"a same-execution readback proved our own copy landed in the wrong "
+            f"window: "
+            f"shape {sample.get('shape')}, gpu_block {sample.get('gpu_block')}, "
+            f"group {sample.get('group')}, key16 {sample.get('key16') or '-'}, first "
+            f"difference at byte {sample.get('first_difference')} of "
+            f"{sample.get('compared_bytes')} compared, the window "
+            + ("is EXACTLY what it was before the copy" if
+               sample.get("window_matched_pre_copy") else
+               "holds our bytes only up to the first difference"))
 
 
 def run_pass(worker=None) -> dict:
@@ -1224,13 +1513,33 @@ def observe_apply(worker, batch, failed) -> dict:
     path is inside a `try` that turns a raise into a counter. The fork's copy still runs
     afterwards on the same stream and has the last word on every byte, which is what
     makes an addressing mistake here a WRONG WITNESS rather than a wrong answer.
+
+    THE ANSWER'S `written_indices` IS THE PRUNE'S GATE (0.2.52). The set is the ids
+    whose host->device copy this call ENQUEUED - a fact that is true or false
+    synchronously, at
+    the apply point, with no thread and no waiting involved - and `disk_restore
+    .prune_adopted_restores` may remove an entry from the fork's load lists only if its
+    index is in it. That is what makes `prune_unwitnessed_entries` zero by construction
+    instead of by hope: a synchronous decision cannot be gated on the readback verdict,
+    which is decided on the daemon thread up to `JOB_MAX_AGE_SECONDS` later, in a step
+    that has long since been submitted. The readback is the KILL-SWITCH
+    (`fire_kill_switch`
+    ), not the gate.
+
+    In DELIVERY MODE (`limits_in_force`) the sample, the per-step cap and the interval
+    floor are read from ONE dict so all three move together. With the mode off the three
+    are the module's shipped constants and the loop below is the 0.2.51 loop, entry for
+    entry.
     """
     try:
         if not effective_enabled():
-            return {"seen": 0, "written": 0, "reason": "disabled"}
+            return {"seen": 0, "written": 0, "written_indices": set(),
+                    "delivery_mode": False, "reason": "disabled"}
         jobs = (batch or {}).get("jobs") or {}
         if not jobs:
-            return {"seen": 0, "written": 0, "reason": "no entries"}
+            return {"seen": 0, "written": 0, "written_indices": set(),
+                    "delivery_mode": effective_delivery_mode(),
+                    "reason": "no entries"}
         event = _int_or_none((batch or {}).get("event"))
         failed_ids = set(failed or {})
         # THE UNSETTLED ONES, counted before anything else: an entry whose read had not
@@ -1252,9 +1561,23 @@ def observe_apply(worker, batch, failed) -> dict:
                 _count("unsettled_entries", unsettled)
                 _count("read_not_settled", unsettled)
         if not survivors:
-            return {"seen": 0, "written": 0, "reason": "nothing applied"}
+            return {"seen": 0, "written": 0, "written_indices": set(),
+                    "delivery_mode": effective_delivery_mode(),
+                    "reason": "nothing applied"}
+        # THE THREE THROTTLES, read ONCE for this step. In delivery mode
+        # `sample_every_n` is 1, `cap` is the step's own survivor count and the floor is
+        # gone; with the mode off they are the shipped constants.
+        limits = limits_in_force(len(survivors))
+        sample_every = int(limits["sample_every_n_applied"])
+        cap = int(limits["max_writes_per_step"])
+        floor = float(limits["min_interval_seconds"])
+        delivery = bool(limits["delivery"])
+        if delivery:
+            with _lock:
+                _count("delivery_steps")
         if not _refresh_geometry(worker):
             return {"seen": len(survivors), "written": 0,
+                    "written_indices": set(), "delivery_mode": delivery,
                     "reason": "group widths unreadable"}
         ledger = _load_event_state(worker, event)
         if ledger == "no_ledger":
@@ -1264,12 +1587,22 @@ def observe_apply(worker, batch, failed) -> dict:
                     "this worker exposes no `_load_events`, so the ordering premise "
                     "(the fork has not submitted this load's copy yet) cannot be "
                     "checked and nothing is written")
-            return {"seen": len(survivors), "written": 0, "reason": "no_event_ledger"}
+            return {"seen": len(survivors), "written": 0,
+                    "written_indices": set(), "delivery_mode": delivery,
+                    "reason": "no_event_ledger"}
         if ledger != "unsubmitted":
             # THE ORDERING CLAIM HAS FAILED. Either the hook moved after the original,
             # or this event's copy is already submitted - and writing now would put our
             # copy AFTER the fork's, which turns our readback into a witness of the
             # fork's bytes and our write into a racing overwrite. So: refuse, loudly.
+            #
+            # IN DELIVERY MODE THIS REFUSAL IS LOAD-BEARING RATHER THAN TIDY. The
+            # covered set stays EMPTY here, and an empty covered set means the prune
+            # removes nothing on this step: the fork's copy, which has already been
+            # submitted, is the only delivery. A hook that has slipped behind the fork
+            # therefore writes nothing AND prunes nothing, and the mode degrades to
+            # "exactly the release before this one" rather than to a race for the same
+            # destination.
             with _lock:
                 _count("event_already_submitted", len(survivors))
                 _count("readback_enqueued_after_original", len(survivors))
@@ -1278,9 +1611,11 @@ def observe_apply(worker, batch, failed) -> dict:
                     "stream, so this hook is no longer running before the fork's "
                     "copy; nothing is written")
             return {"seen": len(survivors), "written": 0,
+                    "written_indices": set(), "delivery_mode": delivery,
                     "reason": "event_already_submitted"}
         written = 0
         seen = 0
+        written_indices: set = set()
         refusal = None
         refusal_cause = None
         for _job_id, job in survivors:
@@ -1295,24 +1630,29 @@ def observe_apply(worker, batch, failed) -> dict:
                 _count("applies_seen")
                 cursor = int(_state["sample_cursor"])
                 _state["sample_cursor"] = cursor + 1
-                selected = (cursor % max(1, SAMPLE_EVERY_N_APPLIED)) == 0
+                selected = (cursor % max(1, sample_every)) == 0
             if not selected:
                 with _lock:
                     _count("sampled_out")
                 continue
-            if written >= MAX_WRITES_PER_STEP:
+            if written >= cap:
                 with _lock:
                     _count("throttled_step")
                 continue
             with _lock:
                 last = _state["last_write_mono"]
-                if last is not None and (time.monotonic() - float(last)) \
-                        < MIN_INTERVAL_SECONDS:
+                if floor > 0.0 and last is not None \
+                        and (time.monotonic() - float(last)) < floor:
                     _count("throttled_interval")
                     continue
-            outcome = _write_one(worker, job, event)
+            outcome = _write_one(worker, job, event, delivery=delivery)
             if outcome.get("written"):
                 written += 1
+                # THE MEMBERSHIP, not the count: `job_id` is the index into this step's
+                # `load_cpu_blocks`/`load_gpu_blocks`, which is the same index space
+                # `prune_adopted_restores` names. A count cannot say WHICH entries the
+                # fork may stop copying, and the whole point of the gate is that it can.
+                written_indices.add(_job_id)
                 with _lock:
                     _state["last_write_mono"] = time.monotonic()
             elif refusal is None:
@@ -1328,13 +1668,15 @@ def observe_apply(worker, batch, failed) -> dict:
                 refusal = outcome.get("reason")
                 refusal_cause = outcome.get("cause")
         return {"seen": seen, "written": written,
+                "written_indices": written_indices, "delivery_mode": delivery,
                 "reason": (None if written else refusal),
                 "cause": refusal_cause}
     except Exception as exc:  # noqa: BLE001 - never into the engine's step path
         with _lock:
             _count("errors")
         _reason("observe_apply", f"the apply-point writer raised {type(exc).__name__}")
-        return {"seen": 0, "written": 0, "reason": f"error_{type(exc).__name__}"}
+        return {"seen": 0, "written": 0, "written_indices": set(),
+                "delivery_mode": False, "reason": f"error_{type(exc).__name__}"}
 
 
 def _refuse(kind: str, detail: str, seen: int = 1, cause: str | None = None) -> dict:
@@ -1390,12 +1732,26 @@ def _refuse_pinned() -> dict:
             "cause": ("pool_never_filled" if cold else "pool_drained")}
 
 
-def _write_one(worker, job: dict, event) -> dict:
+def _write_one(worker, job: dict, event, delivery: bool = False) -> dict:
     """One entry: plan, take rows, enqueue copy + two readbacks, hold the rows.
 
     NOTHING HERE WAITS. The copies are `non_blocking=True` on the tier's load stream,
     the rows came from a pool that was filled on another thread, and the only CUDA-ish
     call is making that stream current for the duration of four method calls.
+
+    `delivery=True` changes ONE thing and it is the thing the mode exists for: the
+    host->device COPY is the delivery, and the readback is an optional witness that must
+    never be allowed to refuse it. THE PINNED POOL IS THE FOURTH LIMIT, and the only one
+    of the four that is not a throttle with a counter in its name: the pool holds
+    `MAX_PINNED_ROWS_PER_REGION` (2) rows per region and a witnessed write holds one row
+    per lane, so the pool admits EXACTLY ONE in-flight record. Un-lifting the three
+    named throttles and leaving this one alone would produce a writer that still writes
+    one entry per step and refuses the rest with `no_pinned_buffer` - a missing delivery
+    that reads as a memory shortage. So in delivery mode an unavailable row (no pool,
+    cold pool, in-flight cap) costs the WITNESS and not the WRITE: the copy is enqueued,
+    counted in `delivery_writes`, counted again in `delivered_unwitnessed`, and nothing
+    is held. With `delivery=False` every one of those paths is the shipped refusal, byte
+    for byte.
     """
     width = _int_or_none(job.get("bytes"))
     if not width or width <= 0:
@@ -1433,26 +1789,72 @@ def _write_one(worker, job: dict, event) -> dict:
     # unreachable and so was every later one. Asking here means the very first armed
     # apply at least STARTS the writer; the refusal is still a refusal, because an
     # allocation on this thread is a `cudaHostAlloc` inside `start_load_kv`.
-    if not _ensure_thread():
+    #
+    # IN DELIVERY MODE THE THREAD EXISTS ONLY TO PRODUCE ROWS, and a delivery copy needs
+    # no row, so a thread that cannot start costs the witness and not the write. The
+    # refusal name still moves (`refused_thread_unavailable` is counted only when the
+    # write was refused), and `delivered_unwitnessed` is what says why no readback
+    # followed.
+    thread_ok = _ensure_thread()
+    witness = bool(thread_ok)
+    if not thread_ok and not delivery:
         return _refuse("refused_thread_unavailable",
                        "this module's thread could not be started, so no write is "
                        "attempted: an unwitnessed write is worse than no write, and "
                        "the pinned rows this write needs are allocated on that thread")
-    with _lock:
-        if len(_state["in_flight"]) >= MAX_IN_FLIGHT:
-            _count("in_flight_dropped")
-            full = True
-        else:
-            full = False
-    if full:
-        return _refuse("no_pinned_buffer",
-                       f"{MAX_IN_FLIGHT} records are already in flight waiting for "
-                       "their load events; the write is skipped rather than queued",
-                       cause="in_flight_cap")
-    taken = _take_rows(plan)
-    if taken is None:
-        return _refuse_pinned()
+    if witness:
+        with _lock:
+            full = len(_state["in_flight"]) >= MAX_IN_FLIGHT
+        if full:
+            if not delivery:
+                return _refuse("no_pinned_buffer",
+                               f"{MAX_IN_FLIGHT} records are already in flight waiting "
+                               "for their load events; the write is skipped rather "
+                               "than queued",
+                               cause="in_flight_cap")
+            # A delivery is not queued and not skipped for want of a witness slot; it
+            # goes without one. `in_flight_dropped` stays the refusal's counter and does
+            # NOT move here, or a reader would see a delivery counted as a drop.
+            witness = False
+    taken = _take_rows(plan) if witness else None
+    if witness and taken is None:
+        if not delivery:
+            return _refuse_pinned()
+        # THE FOURTH LIMIT, and the reason `delivered_unwitnessed` exists: the pool is
+        # the binding constraint on WITNESSES, never on the delivery.
+        witness = False
+        taken = None
     names = [region["name"] for region in plan["regions"]]
+    if not witness:
+        # THE DELIVERY-ONLY PATH: the copies, and nothing else. No pre-readback, no
+        # post-readback, no rows held, nothing for the thread to wait on - which is also
+        # why one apply point can deliver a whole step without touching the pool.
+        try:
+            with context:
+                for region in plan["regions"]:
+                    _copy_host_to_device(region["gpu"], plan["gpu_block"],
+                                         region["cpu"], plan["cpu_block"])
+        except Exception as exc:  # noqa: BLE001 - a failed copy is a refusal, not an outage
+            snapshot._error(exc, "disk_gpu_write delivery enqueue")
+            return _refuse("write_failed",
+                           f"enqueuing the delivery copy raised "
+                           f"{type(exc).__name__}; nothing was written to the "
+                           "destination and no rows were taken")
+        with _lock:
+            _count("writes")
+            _count("delivery_writes")
+            _count("delivered_unwitnessed")
+            _count("bytes_written", int(width))
+            _count("regions_written", len(names))
+        return {"written": True, "witnessed": False, "reason": None}
+    # No re-test of `MAX_IN_FLIGHT` here, and that is a fact rather than an oversight:
+    # the ONLY writer of `_state["in_flight"]` is this (step) thread, and the module's
+    # own thread only removes records from it, so the capacity tested above cannot be
+    # taken
+    # between the test and the insertion below. A second test would also have had to
+    # drop the rows it had already taken, and rows that were never handed to a stream
+    # are safe to RECYCLE - leaking them would have made `buffers_leaked` mean something
+    # it does not mean.
     try:
         with context:
             # THE PRE-COPY READBACK, enqueued FIRST, so on this stream it reads the
@@ -1493,9 +1895,18 @@ def _write_one(worker, job: dict, event) -> dict:
                   "group": group, "group_bytes": int(group_bytes),
                   "gpu_block": int(plan["gpu_block"]),
                   "cpu_block": int(plan["cpu_block"]),
-                  "bytes": int(width), "names": list(names), "rows": taken}
+                  "bytes": int(width), "names": list(names), "rows": taken,
+                  # THE MODE THIS COPY WAS MADE IN, carried on the record because the
+                  # readback that decides the kill-switch runs up to
+                  # `JOB_MAX_AGE_SECONDS` later, on another thread, long after the apply
+                  # point that enqueued it. A mismatch is judged against the posture of
+                  # its OWN write, never against the mode the process happens to be in
+                  # when the verdict arrives.
+                  "delivery": bool(delivery)}
         _state["in_flight"][record["id"]] = record
         _count("writes")
+        if delivery:
+            _count("delivery_writes")
         _count("bytes_written", int(width))
         _count("regions_written", len(names))
         _count("readbacks_enqueued", 2 * len(names))
@@ -1504,7 +1915,8 @@ def _write_one(worker, job: dict, event) -> dict:
         # submitted this load's copy. If the hook is ever moved after `original()`,
         # `event_already_submitted` starts moving and THIS one stops.
         _count("readback_enqueued_before_original")
-    return {"written": True, "bytes": int(width), "regions": len(names)}
+    return {"written": True, "bytes": int(width), "regions": len(names),
+            "witnessed": True, "delivery": bool(delivery)}
 
 
 # --- THE VIEW ------------------------------------------------------------------
@@ -1566,6 +1978,28 @@ def _fit(out: dict) -> dict:
         if isinstance(out.get(key), str) and len(out[key]) > TRIM_REASON_CHARS:
             out[key] = out[key][:TRIM_REASON_CHARS]
     trimmed.append(f"prose:{TRIM_REASON_CHARS}")
+    if _dump_size(out) <= MAX_SECTION_BYTES:
+        return _counted_trim(out)
+    # THE NESTED PROSE (0.2.52), and it is in the ladder because the delivery mode's
+    # `reason` and the kill-switch's `detail`/`effect`/`evidence` are SENTENCES, and a
+    # section that gained three untrimmable sentences gained three ways to vanish: the
+    # failure mode of an over-fat section is not a clipped field, it is the whole
+    # `disk_gpu_write` key missing from the rank file on the boot that fired the
+    # kill-switch - which is precisely the boot someone needs it on. The BOOLEANS next
+    # to each of these (`effective`, `fired`, the counters) are never shed: the
+    # `note`/`reason` sentence moves, the fact does not.
+    for key in ("reason",):
+        if isinstance(out.get("delivery_mode", {}).get(key), str) \
+                and len(out["delivery_mode"][key]) > TRIM_REASON_CHARS:
+            out["delivery_mode"][key] = out["delivery_mode"][key][:TRIM_REASON_CHARS]
+    ks = out.get("kill_switch") or {}
+    for key in ("reason", "detail", "effect"):
+        if isinstance(ks.get(key), str) and len(ks[key]) > TRIM_REASON_CHARS:
+            ks[key] = ks[key][:TRIM_REASON_CHARS]
+    if ks.get("evidence"):
+        ks["evidence"] = None
+        trimmed.append("kill_switch_evidence")
+    trimmed.append(f"nested_prose:{TRIM_REASON_CHARS}")
     if _dump_size(out) <= MAX_SECTION_BYTES:
         return _counted_trim(out)
     out["reasons"] = []
@@ -1696,6 +2130,16 @@ def section() -> dict:
     out["sample_every_n_applied"] = int(SAMPLE_EVERY_N_APPLIED)
     out["max_writes_per_step"] = int(MAX_WRITES_PER_STEP)
     out["min_interval_seconds"] = float(MIN_INTERVAL_SECONDS)
+    # DELIVERY MODE (0.2.52): THE THREE LIMITS AS THIS PROCESS WILL ACTUALLY APPLY THEM,
+    # plus the mode's own view and the kill-switch latch. `limits_in_force(0)` is the
+    # step-independent half (a per-step survivor count is not a process fact), and
+    # `limits_in_force` is published so a reader can see the three numbers moved
+    # TOGETHER
+    # or did not move at all - which is the difference between "delivery is on" and
+    # "delivery is on except for the cap, so it writes one entry a step".
+    out["delivery_mode"] = delivery_state()
+    out["limits_in_force"] = limits_in_force(0)
+    out["kill_switch"] = kill_switch_view()
     out["max_checks_per_pass"] = int(MAX_CHECKS_PER_PASS)
     out["job_max_age_seconds"] = float(JOB_MAX_AGE_SECONDS)
     out["max_in_flight"] = int(MAX_IN_FLIGHT)
@@ -1710,6 +2154,21 @@ def section() -> dict:
     out["writer"] = OWNER_TAG
     out["note"] = ("a second writer for the destination, not a replacement: the "
                    "fork's own copy runs after ours on the same stream and wins")
+    if out["delivery_mode"]["effective"]:
+        # THE NOTE MOVES WITH THE MODE, because the sentence above is the witness
+        # posture's and it is FALSE in delivery mode with the prune on: there the fork's
+        # copy is removed for the pruned entries and ours is the only one. Stating the
+        # false thing in the one configuration where it stopped being true is the kind
+        # of stale comment this package keeps tripping over.
+        out["note"] = ("DELIVERING: with `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` on, "
+                       "the fork's copy is REMOVED for the entries this module wrote, "
+                       "so "
+                       "for those this copy is the delivery and not a second opinion; "
+                       "the readback is the kill-switch")
+    elif out["kill_switch"]["fired"]:
+        out["note"] = ("KILL-SWITCH FIRED: the throttles are back, the prune is "
+                       "refused for every later step, and the fork's copy is the "
+                       "delivery again")
     return _fit(out)
 
 

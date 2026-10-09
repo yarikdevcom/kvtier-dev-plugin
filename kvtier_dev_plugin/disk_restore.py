@@ -621,7 +621,24 @@ MAX_PRUNE_REASON_CHARS = 200
 PRUNE_REFUSALS = ("lists_not_in_step", "length_mismatch", "one_sided_prune",
                   "bad_index", "duplicate_index", "out_of_range", "over_cap",
                   "group_delta_mismatch", "destination_drift", "no_batch",
-                  "nothing_adopted")
+                  "nothing_adopted",
+                  # THE KILL-SWITCH (0.2.52). Not a geometry refusal like the names
+                  # above it: this one means a readback proved the plugin's OWN GPU
+                  # write wrong, so the fork's copy is the delivery again for every
+                  # later step. It is in the closed vocabulary rather than a separate
+                  # field so a reader that only diffs `refused` still sees it, in every
+                  # process, in every state.
+                  "kill_switch_fired",
+                  # "THE STEP HAD PRUNABLE WORK AND THE WRITER DID NOT COVER IT"
+                  # (0.2.52).
+                  # It MUST be a name of its own and not fold into `nothing_adopted`:
+                  # `_prune_refused` routes every unrecognised `reason_kind` there, and
+                  # the two readings are opposite operational stories - "no disk work
+                  # this step" (nothing to do) versus "disk work this step and a writer
+                  # that is off, cold, throttled or refusing" (something to do and not
+                  # done). Collapsing them is how a dead writer hides behind a
+                  # healthy-looking zero.
+                  "not_delivered")
 
 # --- what an offer costs the bounce-buffer pool (0.2.31) ---------------------
 #
@@ -1376,6 +1393,26 @@ _state: dict = {
     "prune_skipped_failed_entries": 0,
     "prune_unwitnessed_entries": 0,
     "prune_emptied_steps": 0,
+    # STEP 3 OF RETIRING THE ARENA (0.2.52): THE COVERAGE GATE'S OWN NUMBERS.
+    # `prune_adopted_entries` is the population the Step-2 predicate named (adopted,
+    # read successfully, destination re-verified) and `prune_entries` is what it pruned;
+    # the gap between them is `prune_uncovered_entries`, which is the fork still doing
+    # the copy because the plugin did not. `prune_direct_writes` is the writer's own
+    # enqueued count summed over the steps the prune looked at, kept here so the ratio
+    # an operator wants (`prune_entries / prune_direct_writes`) is one payload read and
+    # not a diff across two rank sections. `prune_unwitnessed_entries` keeps its 0.2.49
+    # name and has changed meaning: since the gate it is a TRIPWIRE that cannot move,
+    # and a non-zero reading is a bug report rather than a condition.
+    "prune_adopted_entries": 0,
+    "prune_uncovered_entries": 0,
+    "prune_direct_writes": 0,
+    # THE EMPTIED-STEP GUARD (0.2.52). When the plugin's OWN copy is the delivery, the
+    # LAST candidate of a step that the prune would otherwise empty is LEFT in the
+    # fork's lists, because that one entry is what makes the fork record a load event -
+    # and the event is the only thing that can prove the plugin's copies landed. Counted
+    # per entry deliberately kept. See `_worker_before_load`'s release path and the note
+    # in `prune_adopted_restores`.
+    "prune_kept_last_entries": 0,
     "last_prune": None,
     # THE OFFER'S PRICE IN BOUNCE BUFFERS (0.2.31). `offer_pool_capped` counts offers
     # SHORTENED to what the pool can carry and `offer_pool_refused` the lookups given
@@ -1486,13 +1523,19 @@ _apply_samples: dict = {"bind_to_apply_ms": [], "apply_elapsed_ms": [],
 _notices: set = set()
 
 
-def notice_once(key: str, message: str) -> bool:
+def notice_once(key: str, message: str, level: str = "warning") -> bool:
     """Log `message` at most once per key per process. Bounded, never raises.
 
     The repo's own idiom (`disk_index.notice_once`, `miss_attribution.notice_once`):
     a line on the engine path is printed once per episode, because the alternative -
     one line per step - is how a diagnostic stops being read. Returns True when it
     actually logged, so the caller can count the episode and not the call.
+
+    `level` exists for the ONE message in this module that is not an episode an operator
+    should merely hear about once but a broken invariant: a step-thread ERROR that
+    repeats
+    every step is the same unreadable log this idiom exists to prevent, so the dedup and
+    the severity are independent knobs rather than two functions.
     """
     try:
         if key in _notices:
@@ -1500,7 +1543,8 @@ def notice_once(key: str, message: str) -> bool:
         if len(_notices) >= 64:
             _notices.clear()
         _notices.add(key)
-        _logger.warning("kvtier-dev-plugin: %s", str(message)[:640])
+        getattr(_logger, level if level in ("warning", "error", "info") else "warning")(
+            "kvtier-dev-plugin: %s", str(message)[:640])
         return True
     except Exception as exc:  # noqa: BLE001 - a log line is never worth a fault
         snapshot._error(exc, "disk_restore notice")
@@ -1971,6 +2015,8 @@ def reset_state_for_tests() -> None:
             "prune_switch": None, "prune_steps": 0, "prune_entries": 0,
             "prune_refusals_total": 0, "prune_skipped_failed_entries": 0,
             "prune_unwitnessed_entries": 0, "prune_emptied_steps": 0,
+            "prune_adopted_entries": 0, "prune_uncovered_entries": 0,
+            "prune_direct_writes": 0, "prune_kept_last_entries": 0,
             "last_prune": None,
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
@@ -2526,12 +2572,51 @@ def counters_view(out: dict) -> dict:
                                      "the engine recomputes those tokens - the prune "
                                      "changes neither (unit: entries)",
         "prune_unwitnessed_entries": "pruned entries with NO plugin-side GPU write "
-                                     "behind them. Today the fork's copy is the only "
-                                     "delivery of a restored block's bytes, so this "
-                                     "count IS the Step-2 flag's hazard, priced: it "
-                                     "must "
-                                     "stay 0 until a plugin-side write is the delivery "
-                                     "(Step 3) (unit: entries)",
+                                     "behind them. SINCE 0.2.52 THIS IS A TRIPWIRE AND "
+                                     "NOT A HAZARD METER: the prune's candidate set is "
+                                     "filtered by MEMBERSHIP in the writer's enqueued "
+                                     "set before anything is removed, so an entry "
+                                     "cannot "
+                                     "reach the prune without having been written and "
+                                     "this count cannot move. A NON-ZERO reading means "
+                                     "the membership test was broken, and every entry "
+                                     "it "
+                                     "names is being served from uninitialised KV. (In "
+                                     "0.2.49/0.2.50 this was arithmetic on a COUNT - "
+                                     "`witnesses < candidates` - and a boot with three "
+                                     "sampled writes and thirty adopted entries looked "
+                                     "clean while the gap was twenty-seven) "
+                                     "(unit: entries)",
+        "prune_adopted_entries": "entries the STEP-2 predicate named prunable: bound, "
+                                 "read successfully, destination re-verified. The "
+                                 "population BEFORE the coverage gate, so "
+                                 "`prune_entries` plus `prune_uncovered_entries` "
+                                 "equals "
+                                 "it (unit: entries)",
+        "prune_uncovered_entries": "candidates the plugin did NOT write into the GPU, "
+                                   "left in the fork's lists for the fork to copy. THE "
+                                   "MISSED OPTIMIZATION, COUNTED: in delivery mode a "
+                                   "growing count here beside a flat "
+                                   "`gpu_write.writes` "
+                                   "names a writer that is refusing, not a step with "
+                                   "no "
+                                   "disk work (unit: entries)",
+        "prune_kept_last_entries": "covered entries DELIBERATELY left in both lists so "
+                                   "the fork still submits a copy and records the load "
+                                   "event that witnesses the plugin's own copies on "
+                                   "`load_stream`. An emptied step records no event at "
+                                   "all, and with no event the apply point releases "
+                                   "the requests immediately while the copies are "
+                                   "still in flight - so this counter is the price of "
+                                   "the "
+                                   "ordering edge, one entry per fully-covered step "
+                                   "(unit: entries)",
+        "prune_direct_writes": "what `disk_gpu_write.observe_apply` reported it "
+                               "ENQUEUED, summed over the steps this module decided. A "
+                               "step that pruned nothing still contributes what the "
+                               "writer reported, which is how a dead writer shows up "
+                               "as "
+                               "0 while `prune_adopted_entries` climbs (unit: writes)",
         "prune_emptied_steps": "prunes that left a step with nothing for the fork to "
                                "submit, so its load event was released rather than "
                                "recorded (unit: steps)",
@@ -2539,7 +2624,9 @@ def counters_view(out: dict) -> dict:
                       "disk entries the step actually carried, how many jobs were "
                       "bound, how many entries stayed because their read failed, the "
                       "per-group counts and the per-group deltas that prove the two "
-                      "sides left in step, and the direct-write witness count",
+                      "sides left in step, the direct-write witness count, and the "
+                      "Step-3 split of the candidate set into covered and uncovered "
+                      "(0.2.52)",
         "witness_kind": "the stable name of the last verdict: the emission key is "
                        "(verdict, kind) and never the sentence, because the sentence "
                        "quotes counters. AS OF THE LAST EMISSION, NOT NOW: it is the "
@@ -7082,6 +7169,12 @@ def abandon_disk_entries(worker, why: str) -> dict:
 _PRUNE_SHAPE = ("attempted", "ok", "reason_kind", "reason", "pruned", "kept",
                 "entries", "indices", "pruned_by_group", "group_deltas",
                 "entries_in_step", "jobs_bound", "direct_write_witnesses",
+                # STEP 3'S THREE FIELDS (0.2.52). `covered_entries` is how many of this
+                # step's candidates were in the writer's enqueued set (and therefore
+                # pruned), `adopted_entries` how many the Step-2 predicate named, and
+                # `uncovered_entries` the difference: adopted, read, and left to the
+                # fork because no plugin-side write covered them.
+                "covered_entries", "adopted_entries", "uncovered_entries",
                 "prune_only", "also_dropped_failed", "cpu", "gpu")
 
 
@@ -7096,6 +7189,7 @@ def _prune_answer(**fields) -> dict:
            "pruned": 0, "kept": 0, "entries": 0, "indices": [],
            "pruned_by_group": {}, "group_deltas": {}, "entries_in_step": 0,
            "jobs_bound": 0, "direct_write_witnesses": 0, "prune_only": 0,
+           "covered_entries": 0, "adopted_entries": 0, "uncovered_entries": 0,
            "also_dropped_failed": 0, "cpu": None, "gpu": None}
     out.update({key: value for key, value in fields.items() if key in _PRUNE_SHAPE})
     return out
@@ -7120,18 +7214,32 @@ def prune_switch() -> dict:
                                   "source": read["source"],
                                   "env_var": read["env_var"]}
         if read["enabled"]:
+            # THE SENTENCE THIS FLAG TOLD ITSELF IN 0.2.49 WAS A WARNING ABOUT ITSELF
+            # ("the fork's copy is the only delivery, so a pruned entry has no route to
+            # the device"), and it was TRUE then: with a writer sampling one entry in
+            # 64,
+            # turning this flag on pruned thirty entries and delivered none of them.
+            # Since 0.2.52 the gate is MEMBERSHIP in the writer's enqueued set, so the
+            # hazard that sentence described cannot recur - which changes what the line
+            # has to tell an operator: not "this is dangerous" but "this does nothing
+            # unless the writer is delivering". A warning nobody can act on is worse
+            # than no warning, and the actionable reading is the delivery flag's name.
             notice_once(
                 "prune-on",
                 f"DISK[prune] ENABLED by {read['env_var']}={read['raw']!r}: an adopted "
                 f"disk restore whose read succeeded is REMOVED from both load lists at "
                 f"the apply point (up to {MAX_PRUNE_ENTRIES_PER_STEP} entries per "
-                "step), so the fork no longer DMAs those arena slots to the GPU. THE "
-                "FORK'S COPY IS TODAY THE ONLY DELIVERY of a restored block's bytes - "
-                "`disk_gpu_write` writes one sampled entry in "
-                f"{disk_gpu_write.SAMPLE_EVERY_N_APPLIED} and is a witness, not the "
-                "delivery - so with this flag on a pruned entry has no route to the "
-                "device. Watch `prune_unwitnessed_entries` and "
-                "`disk_restore_verify.mismatch_stable`.",
+                "step), so the fork no longer DMAs those slots to the GPU and the "
+                "plugin's OWN host->device copy is what delivers their bytes. It "
+                "prunes "
+                f"ONLY entries `disk_gpu_write` reported as ENQUEUED, so with "
+                f"{disk_gpu_write.config.ENV_DISK_GPU_WRITE_DELIVERY} unset it prunes "
+                "NOTHING and refuses each step as `not_delivered` - the safe "
+                "direction, "
+                "and the reason this flag needs BOTH switches to do anything. Watch "
+                "`prune_uncovered_entries` (the fork still copying), "
+                "`prune_unwitnessed_entries` (a broken gate: must stay 0) and "
+                "`gpu_write.kill_switch` (a proven-bad copy retires this flag).",
             )
         elif read["raw"] is not None and not read["recognised"]:
             notice_once("prune-unrecognised",
@@ -7374,11 +7482,36 @@ def _prune_step_view(answer: dict, *, step_entries_before: int = 0,
         "group_deltas": {key: int(value) for key, value
                          in (answer.get("group_deltas") or {}).items()},
         "direct_write_witnesses": int(_int(answer.get("direct_write_witnesses")) or 0),
+        # STEP 3 (0.2.52), on EVERY path: a refusal carries them as what it measured (a
+        # refusal that knew nothing about coverage would make an accepted step's fields
+        # look like a different shape in the one state a reader is most interested in).
+        "covered_entries": int(_int(answer.get("covered_entries")) or 0),
+        "adopted_entries": int(_int(answer.get("adopted_entries")) or 0),
+        "uncovered_entries": int(_int(answer.get("uncovered_entries")) or 0),
     }
 
 
+def _delivered(index: int, covered_ids: set) -> bool:
+    """THE COVERAGE GATE (0.2.52), as a name: did a plugin-side copy go into THIS index?
+
+    One membership test, extracted so it is a thing a reader finds and a test can break.
+    It is the whole of Step 3's safety argument, and `disk_restore`'s own doctrine
+    ("refuse with a reason, or do not touch the lists") makes it the difference between
+    a
+    prune that removes bytes nobody delivered and a prune that cannot.
+
+    WHY THE ENQUEUE AND NOT THE READBACK: a readback verdict is produced on
+    `disk_gpu_write`'s daemon thread up to `JOB_MAX_AGE_SECONDS` (30 s) after the
+    enqueue, while the prune runs SYNCHRONOUSLY inside `start_load_kv` and its answer is
+    applied in the same step. A synchronous decision cannot be gated on asynchronous
+    evidence, so the
+    enqueue gates and the readback is the kill-switch that retires the gate later.
+    """
+    return index in covered_ids
+
+
 def prune_adopted_restores(metadata, batch, drop_set,
-                         direct_witnesses: int = 0) -> dict:
+                         direct_witnesses: int = 0, covered=None) -> dict:
     """Decide, and verify, the Step-2 prune of THIS step. Never raises.
 
     The candidate set is the batch's JOB IDS minus the entries whose read failed. That
@@ -7389,6 +7522,32 @@ def prune_adopted_restores(metadata, batch, drop_set,
     `last_prune` is `pruned <= entries_in_step <= jobs_bound <= offered`. Deriving the
     set from a token count instead would be the Gate-B mistake this function exists not
     to make.
+
+    STEP 3: A SECOND, MEMBERSHIP TEST (`covered`). `direct_witnesses` is a COUNT, and a
+    count cannot say WHICH entries another module put bytes into - so since 0.2.52 the
+    writer's `written_indices` travels beside it and an entry is a candidate only if its
+    index is IN that set. The set is the ids whose host->device copy was ENQUEUED at
+    this
+    apply point, a synchronous fact, and that is what makes
+    `prune_unwitnessed_entries` structurally zero instead of luckily zero: the prune's
+    population is a subset of the writer's by construction, so the difference the
+    counter
+    measures is empty by the shape of the code and not by the behaviour of a sampler.
+
+    WHY THE GATE CANNOT BE THE READBACK, which is the one thing a reader is tempted to
+    "obviously" improve: a readback verdict is produced on this module's daemon thread
+    up to `disk_gpu_write.JOB_MAX_AGE_SECONDS` (30 s) AFTER the enqueue, while this
+    function runs synchronously inside `start_load_kv` and its answer is applied in the
+    same step.
+    A synchronous decision cannot be gated on asynchronous evidence; there is nothing to
+    wait for without delaying the step. So the gate is the enqueue and the readback is
+    the
+    KILL-SWITCH (`disk_gpu_write.fire_kill_switch`), checked here on every call: once a
+    same-execution readback has proved our own copy wrong, every later step is refused
+    and
+    the fork's copy comes back. `covered=None` (the pre-0.2.52 call) therefore means
+    "nothing is covered" and prunes NOTHING - the safe direction, and the reason this is
+    not a flag-day for the existing callers.
     """
     try:
         if not prune_restored_loads_enabled():
@@ -7396,6 +7555,26 @@ def prune_adopted_restores(metadata, batch, drop_set,
                                  reason="the Step-2 flag is off, so the step's lists "
                                         "are exactly what the scheduler shipped")
         _state["prune_steps"] += 1
+        # THE KILL-SWITCH, checked before anything else: one proven-bad copy retires the
+        # feature for the rest of the boot, so the step keeps every destination it had
+        # and the fork's copy carries all of them. Counted as a refusal (it IS one)
+        # under its own name, and said once per episode by `_prune_refused`.
+        if disk_gpu_write.kill_switch_engaged():
+            view = disk_gpu_write.kill_switch_view()
+            return _prune_refused(_prune_answer(
+                reason_kind="kill_switch_fired", entries=0, jobs_bound=0,
+                reason=(f"disk_gpu_write's readback proved its own copy wrong "
+                        f"({view.get('reason') or 'no reason recorded'} at "
+                        f"{view.get('at') or 'an unknown time'}), so the plugin-side "
+                        "write is not trustworthy and the fork's copy must run")))
+        # THE COVERED SET, normalised to ints. Anything that is not a usable id is
+        # dropped rather than guessed at, and an unusable entry simply stays uncovered -
+        # which means it stays in the fork's lists.
+        covered_ids: set = set()
+        for value in (covered or ()):
+            number = _int(value)
+            if number is not None and number >= 0:
+                covered_ids.add(number)
         cpu_blocks = list(getattr(metadata, FIELD_LOAD_CPU, None) or [])
         gpu_blocks = list(getattr(metadata, FIELD_LOAD_GPU, None) or [])
         paths = _metadata_paths(metadata)
@@ -7428,6 +7607,14 @@ def prune_adopted_restores(metadata, batch, drop_set,
         expected: dict = {}
         kept_failed = 0
         drifted = 0
+        # THE POPULATION BEFORE THE COVERAGE GATE, counted separately because the
+        # difference between the two numbers IS the report: "how many entries did the
+        # restore adopt, and of those, how many did the plugin actually write into the
+        # GPU?" An entry that was adopted but not covered is not a lost optimization to
+        # be shrugged at - it is the fork still doing the copy - so it gets its own
+        # counter and its own field rather than being inferred from two totals.
+        adopted: list = []
+        uncovered: list = []
         for job_id, job in jobs.items():
             index = _int(job_id)
             if index is None or not 0 <= index < len(cpu_blocks):
@@ -7453,45 +7640,144 @@ def prune_adopted_restores(metadata, batch, drop_set,
                     or (want_gpu is not None and gpu_blocks[index] != want_gpu):
                 drifted += 1
                 continue
+            adopted.append(index)
+            # THE COVERAGE GATE (0.2.52), and it is a MEMBERSHIP test, not a comparison
+            # of counts. Everything above this line is the Step-2 predicate unchanged;
+            # this one line is the whole of Step 3's safety argument. An entry that was
+            # adopted, read successfully and re-verified is still NOT prunable unless
+            # `disk_gpu_write` reported its host->device copy as ENQUEUED for this very
+            # index. Remove this line and `prune_unwitnessed_entries` stops being zero,
+            # which is what the invariant test is built to catch.
+            if not _delivered(index, covered_ids):
+                uncovered.append(index)
+                continue
             candidates.append(index)
             if job.get("group") is not None:
                 groups[index] = int(job["group"])
             expected[index] = (want_cpu, want_gpu)
         _state["prune_skipped_failed_entries"] += kept_failed
+        _state["prune_adopted_entries"] += len(adopted)
+        _state["prune_uncovered_entries"] += len(uncovered)
+        _state["prune_direct_writes"] += int(direct_witnesses or 0)
         if not candidates:
             answer = _prune_answer(
-                reason_kind="nothing_adopted" if not drifted
-                else "destination_drift",
-                entries=len(cpu_blocks), entries_in_step=0, jobs_bound=len(jobs),
+                reason_kind="destination_drift" if drifted else (
+                    # THE NAME A READER ACTS ON. "Nothing adopted" means the step had no
+                    # disk work; "not_delivered" means it had adopted, successfully read
+                    # work and the writer did not cover it - the writer off, or
+                    # throttled, or refusing, or cold. Those are different operational
+                    # stories and collapsing them is how a dead writer hides behind a
+                    # healthy-looking zero.
+                    "nothing_adopted" if not adopted else "not_delivered"),
+                entries=len(cpu_blocks), entries_in_step=len(adopted),
+                jobs_bound=len(jobs),
                 also_dropped_failed=len(drop & set(range(len(cpu_blocks)))),
                 direct_write_witnesses=int(direct_witnesses),
+                covered_entries=0, adopted_entries=len(adopted),
+                uncovered_entries=len(uncovered),
                 reason=(f"{len(jobs)} job(s) were bound, {kept_failed} had failed "
-                        f"reads and {drifted} named ids the step no longer holds, "
-                        "leaving no adopted, successfully-read entry to prune"))
+                        f"reads and {drifted} named ids the step no longer holds; "
+                        + (f"{len(adopted)} entr{'y' if len(adopted) == 1 else 'ies'} "
+                           f"w{'as' if len(adopted) == 1 else 'ere'} adopted and read "
+                           f"but NONE was covered by a plugin-side GPU write "
+                           f"(disk_gpu_write enqueued {int(direct_witnesses or 0)} "
+                           "write(s) this step), so the fork keeps every destination"
+                           if adopted else
+                           "no adopted, successfully-read entry was left to prune")))
             return decided(_prune_refused(answer), skipped=kept_failed, drift=drifted)
+        # THE EMPTIED-STEP GUARD (0.2.52), AND THE REASON IT IS NOT OPTIONAL. This is
+        # the one place Step 3's design had a HOLE, and it was found by reading the
+        # fork. The fork's `start_load_kv` (`worker.py:259`) submits a copy ONLY `if
+        # metadata. load_cpu_blocks` - an empty list means no `launch_copy`, no
+        # `copy_blocks`, and critically NO `event.record(stream)`
+        # (`copy_backend.py:129`). The plugin enqueues its own host->device copies on
+        # that same `load_stream` BEFORE the fork runs, so on a step the fork DOES
+        # submit, CUDA's FIFO stream order means the fork's event completes only after
+        # our copies - the load event is a real witness of our work. On a step the prune
+        # EMPTIED, no event is ever recorded, and the apply point's own release path
+        # reports the requests finished IMMEDIATELY (`release_event`, because leaving
+        # the index pending is the phantom bug). Meanwhile the compute stream has NO
+        # ordering edge to `load_stream` anywhere in the load path - there is no
+        # `wait_stream`/`wait_event` for loads in this fork at all (only stores pass a
+        # `wait_event`, `worker.py:301`) - so the next step's forward can read those KV
+        # windows BEFORE our copies land. The request is then answered from bytes that
+        # are in flight. Nothing raises and nothing logs. Under the pre-0.2.52 witness
+        # posture this was unreachable: the prune removed a sampled entry or two and the
+        # step always retained the fork's copy. With delivery mode the prune can
+        # legitimately cover a whole step, so the guard is required: leave the LAST
+        # candidate in both lists. It costs exactly ONE fork copy, the fork writes the
+        # same bytes the plugin just wrote (a same-value double write, which is why it
+        # is harmless), and the event it produces witnesses every copy on the stream
+        # including our own. One copy per step is not a performance argument against
+        # sound- ness; and when the plugin is NOT delivering, the guard does not apply
+        # at all.
+        if candidates and disk_gpu_write.effective_delivery_mode() \
+                and (drop | set(candidates)) >= set(range(len(cpu_blocks))):
+            kept_last = max(candidates)
+            candidates.remove(kept_last)
+            groups.pop(kept_last, None)
+            expected.pop(kept_last, None)
+            _state["prune_kept_last_entries"] += 1
+            notice_once(
+                "prune-kept-last",
+                "DISK[prune] kept the LAST covered entry (index "
+                f"{kept_last}) in both lists instead of emptying the step: with the "
+                "plugin's own copy as the delivery, an emptied step records NO load "
+                "event, and that event is the only proof the plugin's copies on "
+                "`load_stream` landed before the next forward reads the window. One "
+                "fork copy per step buys the ordering edge; `prune_kept_last_entries` "
+                "counts it.")
         verdict = prune_load_pairs(cpu_blocks, gpu_blocks,
                                    sorted(drop | set(candidates)), None,
                                    groups=groups, expected=expected)
         verdict["prune_only"] = len(candidates)
         verdict["also_dropped_failed"] = len(drop & set(range(len(cpu_blocks))))
-        verdict["entries_in_step"] = len(candidates)
+        verdict["entries_in_step"] = len(adopted)
         verdict["jobs_bound"] = len(jobs)
         verdict["direct_write_witnesses"] = int(direct_witnesses)
+        verdict["covered_entries"] = len(candidates)
+        verdict["adopted_entries"] = len(adopted)
+        verdict["uncovered_entries"] = len(uncovered)
         verdict["indices"] = sorted(candidates)[:MAX_PRUNE_ENTRIES_PER_STEP]
         if not verdict["ok"]:
             return decided(_prune_refused(verdict), skipped=kept_failed,
                            drift=drifted)
         _state["prune_entries"] += len(candidates)
-        if int(direct_witnesses) < len(candidates):
-            gap = len(candidates) - int(direct_witnesses)
+        # THE INVARIANT, computed as a SET DIFFERENCE and not as arithmetic on counts.
+        # `candidates` can only contain indices already tested with `index in
+        # covered_ids`, so this is empty for a reason that is visible in the code above
+        # rather than a hope about a sampler. It is kept as a real computation, in the
+        # real counter, with the real notice, because that is what makes it a tripwire:
+        # the day someone relaxes the membership test, this number moves and the test
+        # named `...unwitnessed...` stops being green. The 0.2.49 arithmetic
+        # (`witnesses < candidates`) could not do that job - it compared a COUNT to a
+        # SET and called the gap a hazard, which is why a boot with three sampled writes
+        # and three adopted entries looked clean while pruning thirty.
+        # THE TRIWIRE READS `covered_ids` DIRECTLY and not through `_delivered`, and
+        # that asymmetry is deliberate rather than a missed refactor: the predicate is
+        # the thing a mutation test switches off, and a tripwire that asks the predicate
+        # whether it passed would report 0 for a gate it was itself asked to bypass.
+        # This line is the second, independent reading of the same set, which is what
+        # makes it a witness.
+        pruned_uncovered = [index for index in candidates
+                            if index not in covered_ids]
+        if pruned_uncovered:
+            gap = len(pruned_uncovered)
             _state["prune_unwitnessed_entries"] += gap
+            # ERROR, because this is not an episode an operator should merely hear about
+            # once - it is a broken invariant that cannot happen by construction, and a
+            # WARNING is how it would be missed in a boot that was also logging the
+            # settle line. Once per episode still, because a step-thread line repeated
+            # every step is the unreadable log `notice_once` exists to prevent; the
+            # COUNTER is the thing that accumulates, and it is what the test reads.
             notice_once("prune-unwitnessed",
                         f"DISK[prune] {gap} pruned entr{'y' if gap == 1 else 'ies'} "
-                        "have NO plugin-side GPU write behind them: the step's own "
-                        f"direct-write witnesses are {int(direct_witnesses)} of "
-                        f"{len(candidates)}. Until a plugin-side write is the "
-                        "delivery (Step 3), a pruned entry's bytes reach no GPU window "
-                        "and the request is answered from uninitialised KV")
+                        f"have NO plugin-side GPU write behind them (indices "
+                        f"{sorted(pruned_uncovered)[:16]}): the coverage gate failed, "
+                        "which it cannot do by construction since 0.2.52. A pruned "
+                        "entry's bytes reach no GPU window and the request is answered "
+                        "from uninitialised KV. THIS IS A BUG, not the condition it "
+                        "used to describe", level="error")
         return decided(verdict, skipped=kept_failed, drift=drifted)
     except Exception as exc:  # noqa: BLE001 - a prune is never a step fault
         snapshot._error(exc, "disk_restore prune")
@@ -7503,9 +7789,25 @@ def prune_adopted_restores(metadata, batch, drop_set,
 
 
 def prune_state() -> dict:
-    """The Step-2 view: the switch, the totals, the closed vocabulary, the last one."""
+    """The Step-2/Step-3 view: the switch, the totals, the closed vocabulary, the last
+    one, AND the delivery mode and kill-switch this process made its decisions under.
+
+    EVERY KEY IS ALWAYS PRESENT, IN EVERY PROCESS. This view is read in the scheduler
+    process (where nothing ever writes a GPU window and the kill-switch can only ever be
+    unfired), in the worker process (where all of it moves), in a degraded worker and in
+    a
+    fresh boot that has never seen a restore. A key that appeared only in the armed case
+    would read as "this build does not report it" in exactly the states where a reader
+    is
+    trying to work out what is missing. The delivery and kill-switch facts are READ from
+    `disk_gpu_write` (which owns them) and not copied into this module's state, so the
+    two
+    views cannot disagree about a fact one module owns.
+    """
     refused = {name: int(_state["prune_refused"].get(name) or 0)
                for name in PRUNE_REFUSALS}
+    delivery = disk_gpu_write.delivery_state()
+    kill_switch = disk_gpu_write.kill_switch_view()
     return {"enabled": prune_switch()["enabled"],
             "switch": dict(_state["prune_switch"] or prune_switch()),
             "steps": int(_state["prune_steps"]),
@@ -7515,6 +7817,23 @@ def prune_state() -> dict:
             "skipped_failed_entries": int(_state["prune_skipped_failed_entries"]),
             "unwitnessed_entries": int(_state["prune_unwitnessed_entries"]),
             "emptied_steps": int(_state["prune_emptied_steps"]),
+            # STEP 3 (0.2.52). `candidates` is the population the STEP-2 predicate named
+            # and the three names below are what the coverage gate did with it, so a
+            # reader can tell "the writer never ran" from "the writer refused" from
+            # "the writer kept up" without a second payload. `covered_entries` is
+            # deliberately
+            # the same number as `entries`: the gate runs BEFORE the prune, so every
+            # entry that was pruned was covered, and a reader who expects two different
+            # numbers here is reading the wrong field for "what was adopted".
+            "candidates": int(_state["prune_adopted_entries"]),
+            "covered_entries": int(_state["prune_entries"]),
+            "uncovered_entries": int(_state["prune_uncovered_entries"]),
+            "kept_last_entries": int(_state["prune_kept_last_entries"]),
+            "direct_writes": int(_state["prune_direct_writes"]),
+            "delivery_mode": bool(delivery["effective"]),
+            "delivery": delivery,
+            "kill_switch_fired": bool(kill_switch["fired"]),
+            "kill_switch": kill_switch,
             "max_entries_per_step": int(MAX_PRUNE_ENTRIES_PER_STEP),
             "last": (dict(_state["last_prune"]) if _state["last_prune"] else None),
             "units": {"steps": "apply points where the switch was consulted (unit: "
@@ -7531,12 +7850,62 @@ def prune_state() -> dict:
                                              "their GPU block as a load error either "
                                              "way, so the engine can "
                                              "still recompute them (unit: entries)",
-                      "unwitnessed_entries": "pruned entries with no plugin-side "
-                                             "GPU write behind them - the flag's own "
-                                             "hazard, counted (unit: entries)",
+                      "unwitnessed_entries": "pruned entries with NO plugin-side GPU "
+                                             "write behind them. SINCE 0.2.52 THIS IS "
+                                             "A TRIPWIRE AND NOT A HAZARD METER: the "
+                                             "prune's population is a subset of the "
+                                             "writer's enqueued set by construction, "
+                                             "so a NON-ZERO reading means the "
+                                             "membership test was broken and every "
+                                             "entry it names is being served from "
+                                             "uninitialised KV "
+                                             "(unit: entries)",
                       "emptied_steps": "prunes that left the fork nothing to submit, "
                                        "so the load event was released rather than "
-                                       "recorded (unit: steps)"}}
+                                       "recorded. Since 0.2.52 this is a SECOND "
+                                       "TRIPWIRE: while the plugin is delivering, the "
+                                       "last covered entry of such a step is kept (see "
+                                       "`kept_last_entries`), so a step can only be "
+                                       "emptied by a prune that bypassed the coverage "
+                                       "gate. An emptied step records NO load event, "
+                                       "and with no event nothing proves the plugin's "
+                                       "copies landed before the next forward (unit: "
+                                       "steps)",
+                      "kept_last_entries": "covered entries DELIBERATELY LEFT in both "
+                                           "lists so the fork still submits a copy and "
+                                           "records the load event that witnesses the "
+                                           "plugin's own copies on `load_stream`. The "
+                                           "price of the ordering edge: one fork copy "
+                                           "per fully-covered step (unit: entries)",
+                      "candidates": "entries the STEP-2 predicate named prunable: "
+                                    "adopted, read successfully, destination "
+                                    "re-verified (unit: entries; the population BEFORE "
+                                    "the coverage gate)",
+                      "covered_entries": "entries that were ALSO in the writer's "
+                                         "enqueued set, and therefore the only ones "
+                                         "that could be pruned; the same number as "
+                                         "`entries`, because the gate runs before the "
+                                         "prune (unit: entries)",
+                      "uncovered_entries": "candidates the plugin did NOT write into "
+                                           "the GPU, left in the fork's lists for it "
+                                           "to copy: the missed optimization, counted "
+                                           "(unit: entries)",
+                      "direct_writes": "what disk_gpu_write reported it enqueued, "
+                                       "summed over the steps this module decided "
+                                       "(unit: "
+                                       "writes; a step that pruned nothing still adds "
+                                       "what the writer reported, which is how a dead "
+                                       "writer shows up as 0 while candidates climb)",
+                      "delivery_mode": "whether this process treats its own copy as "
+                                       "the DELIVERY (true: every applied entry is "
+                                       "written, "
+                                       "the three witness throttles are off, and the "
+                                       "prune has bytes behind it) or as a sampled "
+                                       "witness (false) (unit: boolean)",
+                      "kill_switch_fired": "whether a same-execution readback mismatch "
+                                           "has latched the kill-switch, which refuses "
+                                           "every later prune for the life of the "
+                                           "process (unit: boolean)"}}
 
 
 def worker_before_load(worker) -> dict:
@@ -8041,13 +8410,25 @@ def _worker_before_load(worker) -> dict:
     # is a name and leaves the entry entirely to the fork's copy. Default OFF: with
     # `VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE` unset it returns on the enablement test.
     direct = disk_gpu_write.observe_apply(worker, batch, failed)
-    # HOW MANY OF THIS STEP'S ENTRIES THE PLUGIN ITSELF WROTE INTO THE GPU. The count is
-    # read only to publish the flag's own hazard honestly: with Step 2 on, a pruned
-    # entry whose bytes no GPU-direct writer covered has NO route to the device left,
-    # because removing the pair removes the fork's copy that used to carry them. With
-    # the flag off nothing reads this number and the call above behaves exactly as it
-    # did, return value discarded, in every release before this one.
+    # HOW MANY OF THIS STEP'S ENTRIES THE PLUGIN ITSELF WROTE INTO THE GPU, AND WHICH
+    # ONES. The count is what 0.2.49 published and what the prune's `units` still
+    # reports; SINCE 0.2.52 the COUNT IS NOT THE GATE. A count cannot say which entries
+    # have bytes behind them, so a step with three sampled writes and three adopted
+    # entries looked clean while a prune removed thirty - the arithmetic (`witnesses <
+    # candidates`) said
+    # "gap of 27" and named nothing. `written_indices` is the set of STEP INDEXES whose
+    # host->device copy this call ENQUEUED, and it is what the prune's membership test
+    # runs on.
+    #
+    # WHY THE ENQUEUE AND NOT THE READBACK, because it is the obvious wrong improvement:
+    # a readback verdict lands on `disk_gpu_write`'s daemon thread up to
+    # `JOB_MAX_AGE_SECONDS` (30 s) after this line, while `prune_adopted_restores` below
+    # runs SYNCHRONOUSLY inside `start_load_kv` and its answer is applied in the same
+    # step. Waiting for it would delay the forward pass; gating on it would gate on a
+    # verdict that does not exist yet. So the enqueue gates and the readback is the
+    # KILL-SWITCH, consulted by every later prune.
     witnesses = _int(direct.get("written")) or 0
+    covered_indices = direct.get("written_indices") or set()
     drop_set = set(drop)
     already_counted = set(batch["failures"]) if batch else set()
     batch_jobs = batch.get("jobs") or {}
@@ -8093,7 +8474,8 @@ def _worker_before_load(worker) -> dict:
     # is byte-for-byte what every release before this one did. With the flag off it
     # returns `attempted: False` and no lists, so the default path IS that fallback.
     prune = prune_adopted_restores(metadata, batch, drop_set,
-                                   direct_witnesses=witnesses)
+                                   direct_witnesses=witnesses,
+                                   covered=covered_indices)
     pruned_here = int(prune["prune_only"]) if prune["ok"] else 0
     kept_cpu = None
     kept_gpu = None

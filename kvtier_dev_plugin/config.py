@@ -494,6 +494,34 @@ ENV_DISK_RESTORE_VERIFY = "VLLM_E2_TIER_DISK_RESTORE_VERIFY"
 # can actually write, and a worker is armed here.
 ENV_DISK_GPU_DIRECT_WRITE = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE"
 
+# STEP 3 OF RETIRING THE ARENA: THE SAME COPY AS THE DELIVERY, NOT AS A WITNESS
+# (`disk_gpu_write.py`, 0.2.52) ------------------------------------------------
+# `ENV_DISK_GPU_DIRECT_WRITE` makes the plugin's own host->device copy a SAMPLED
+# WITNESS: one applied entry in `SAMPLE_EVERY_N_APPLIED` (64), at most
+# `MAX_WRITES_PER_STEP` (1) per step, with a `MIN_INTERVAL_SECONDS` (0.5 s) floor
+# between writes. Three limits, and all three must be lifted together: a writer that
+# samples but still writes one entry per step is a MORE confusing failure than one that
+# writes nothing, because the counters then say "delivery" while the traffic says
+# "witness".
+#
+# WITH THIS ON (and the writer itself on), the writer is DELIVERING: every applied entry
+# of the step gets its own host->device copy, so the set of entries the writer ENQUEUED
+# is a superset of the set `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` is allowed to prune,
+# and `prune_unwitnessed_entries` is 0 BY CONSTRUCTION rather than by hope. The gate for
+# pruning is "the copy was ENQUEUED" - a synchronous, deterministic fact known at the
+# apply point - and the asynchronous readback stays what it always was: the KILL-SWITCH.
+# A same-execution readback mismatch disables the prune from the next step onward and
+# puts the fork's copy back, which is what converts "one silently wrong request" into
+# "the old path comes back".
+#
+# WHY OFF IS THE ONLY HONEST DEFAULT, in one line: with this ON and the prune ON, the
+# plugin's copy is the only thing standing between a restored entry and an uninitialised
+# GPU window, so a wrong `gpu_block_id` is a WRONG ANSWER and not a wrong witness. The
+# ordering guard (`disk_gpu_write.py`'s `unsubmitted` ledger check) is load-bearing for
+# exactly that reason, and it stays a hard refuse: no ledger verdict, no write, and no
+# prune either.
+ENV_DISK_GPU_WRITE_DELIVERY = "VLLM_E2_TIER_DISK_GPU_DIRECT_WRITE_DELIVERY"
+
 # HOW MANY CPU SLOTS AN OFFER MUST LEAVE FREE IN THE ARENA (`disk_restore.py`,
 # 0.2.38) ---------------------------------------------------------------
 # `disk_restore.CPU_SLOT_RESERVE` (64) was a constant, and it is a number that was
@@ -839,6 +867,41 @@ def disk_prune_restored_loads() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
+
+
+def disk_gpu_write_delivery() -> dict:
+    """DELIVERY MODE for the GPU-direct write, read by `disk_gpu_write.py`. The SAME
+    grammar as `disk_gpu_direct_write_enable()`: unset is OFF, an on word is ON, a
+    disable word is OFF said with `source: "env"`, and anything else is OFF *and*
+    reported as unrecognised.
+
+    WHAT IT CHANGES, precisely, and only when the writer itself is also on: the three
+    throttles that make that copy a witness stop applying to the entries a prune could
+    cover - the sampler becomes 1, the per-step cap becomes the step's own survivor
+    count, and the 0.5 s interval floor is dropped. Everything else about the write is
+    the same code, the same stream and the same ordering guard, and the guard stays a
+    hard refuse: a load event the worker already recorded means this hook is no longer
+    ahead of the fork's copy, so nothing is written and, because the prune's gate is
+    membership of the ENQUEUED set, nothing is pruned either.
+
+    WHY OFF IS THE ONLY HONEST DEFAULT: this flag is what makes
+    `VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS` safe to turn on, and on its own it makes
+    the plugin the writer of every restored window in the step. With the prune still off
+    that is a redundant copy the fork overwrites; with the prune on it is the delivery.
+    The direction a typo moves in is therefore the direction that copies LESS, which is
+    the correct direction for a flag whose failure mode is a wrong answer.
+    """
+    raw = os.environ.get(ENV_DISK_GPU_WRITE_DELIVERY, "").strip()
+    if not raw:
+        return {"enabled": False, "source": "default", "raw": None,
+                "recognised": True, "env_var": ENV_DISK_GPU_WRITE_DELIVERY}
+    lowered = raw.lower()
+    if lowered in _DISK_BOOT_ON_WORDS:
+        return {"enabled": True, "source": "env", "raw": raw,
+                "recognised": True, "env_var": ENV_DISK_GPU_WRITE_DELIVERY}
+    return {"enabled": False, "source": "env", "raw": raw,
+            "recognised": lowered in _DISK_BOOT_OFF_WORDS,
+            "env_var": ENV_DISK_GPU_WRITE_DELIVERY}
 
 
 def disk_gpu_shadow_writes() -> dict:
