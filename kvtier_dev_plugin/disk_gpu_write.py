@@ -256,6 +256,46 @@ MAX_WRITES_PER_STEP_DELIVERY = MAX_ENTRIES_SCANNED
 # "no floor", and it is the value the mode documents.
 MIN_INTERVAL_SECONDS_DELIVERY = 0.0
 
+# THE STEP-THREAD BUDGET DELIVERY MODE NEVER HAD (0.2.56, and this is the reason it
+# exists). The delivery copy's SOURCE is `worker.cpu_kv_caches`, and the running fork
+# allocates that arena with `torch.zeros(cpu_shape, dtype=..., device="cpu")`
+# (`v1/simple_kv_offload/worker.py:232`) - PAGEABLE, not page-locked. A host->device
+# `copy_(src, non_blocking=True)` out of pageable host memory is NOT asynchronous: the
+# runtime stages it through its own bounce buffer and returns only once the bytes have
+# left, so the call BLOCKS THE ENGINE STEP THREAD for the whole copy. This module states
+# that rule in the other direction at `_copy_device_to_host`: "a pageable destination
+# would have made it synchronous ON THE STEP THREAD, which is the single most expensive
+# mistake available here". The delivery branch broke the rule in the H2D direction, and
+# the mode lifted the other three guards at the same time - the sample (1-in-64 to 1),
+# the cap (1 per step to every survivor) and the 0.5 s floor - leaving
+# `MAX_ENTRIES_SCANNED = 64` as the only bound. That is a bound on ENTRIES, not on
+# BYTES: one entry is a whole rank window (11,468,800 B on the live box, see
+# MAX_PINNED_ROWS_PER_REGION's comment), so one apply point could put 64 x 11.5 MB
+# ~= 735 MB of host-synchronous PCIe in front of the worker's message loop.
+#
+# THAT IS HOW THE ENGINE DIED ON 2026-10-09 AT 14:19. With both flags up, the proxy's
+# 198,400-token conversation was adopted and its first delivery step never came back:
+# EngineCore logged `No available shared memory broadcast block found in 60 seconds`
+# and then `TimeoutError: RPC call to sample_tokens timed out`, which takes the process
+# down. This module's section in all four rank files still read `delivered=None`,
+# `direct_writes=None` and the prune reported `steps=0` with every refusal counter 0 -
+# NOT because the apply point never ran, but because the delivery branch counted itself
+# AFTER the copy loop and the step never left that loop.
+#
+# THE BUDGET IS TWO NUMBERS CHECKED BEFORE EACH ENTRY OF THE STEP, and stopping is a
+# `continue`, not a failure: an entry this module did not enqueue is absent from
+# `written_indices`, so `disk_restore.prune_adopted_restores` cannot remove it and the
+# FORK copies it. A budget stop therefore costs a MISSED OPTIMIZATION for the entries
+# after it and nothing else; no budget costs the engine. The clock is the guard against
+# a copy that is slow or stuck (a device behind on its queue, driver-lock contention
+# with this module's own pinned allocation); the byte total is what makes the worst case
+# a STATED number instead of an emergent one. The byte budget also bounds the FIRST
+# entry of a step, via `delivery_refused_entry_too_wide` below: a single
+# `cudaMemcpyAsync` cannot be interrupted from this thread, so the only honest bound on
+# it is to refuse one that is too wide to fit the step's own budget.
+DELIVERY_STEP_BUDGET_SECONDS = 0.25
+DELIVERY_STEP_BYTE_BUDGET = 64 * 1024 * 1024
+
 MAX_REASON_SAMPLES = 6
 MAX_REASON_CHARS = 120
 MAX_DIFF_SCAN_BYTES = 262_144               # chunked memcmp, `disk_shadow`'s rule
@@ -311,6 +351,21 @@ _COUNTER_KEYS = (
     "delivery_writes",
     "delivered_unwitnessed",
     "delivery_steps",
+    # --- THE STEP-THREAD BUDGET (0.2.56; see DELIVERY_STEP_BUDGET_SECONDS).
+    # `delivery_attempted` is counted BEFORE the copies of a delivered entry are
+    # enqueued, which is the entire point of it: every other delivery counter moved
+    # after the copy loop, so a boot that died inside its first delivery published
+    # `delivered=None` and was indistinguishable from a boot whose apply point was never
+    # reached. `delivery_attempted > 0` beside `writes == 0` names the difference, and
+    # it is the positive proof the operator asked for before re-enabling the flags.
+    # `delivery_deferred_entries` / `delivery_deferred_steps` count what the budget
+    # refused - the fork copies those, so this is a throttle with a name, not a fault -
+    # and `delivery_refused_entry_too_wide` an entry whose own window exceeds the whole
+    # step's byte budget, refused rather than copied.
+    "delivery_attempted",
+    "delivery_deferred_entries",
+    "delivery_deferred_steps",
+    "delivery_refused_entry_too_wide",
     # --- THE KILL-SWITCH. `kill_switch_fired` is 0 or 1 and never more, because the
     # latch is one-shot; `kill_switch_declined` counts the mismatches that arrived AFTER
     # it fired or that were NOT attributable to our own copy, so "the switch never fired
@@ -408,6 +463,14 @@ def _fresh_state() -> dict:
         "pinned_peak": 0,
         "sample_cursor": 0,
         "last_write_mono": None,
+        # THE STEP-THREAD TIME THE BUDGET SAW (0.2.56). `last` is this delivery step's
+        # wall clock as the apply point measured it, `peak` the worst since boot. Both
+        # are floats, not counters, because a counter is an int and an integer second
+        # budget would be a different, worse budget. `None` means no delivery step has
+        # finished since boot - which, after 0.2.56, means either that none started or
+        # that one started and never returned; `delivery_attempted` tells those apart.
+        "delivery_step_seconds_last": None,
+        "delivery_step_seconds_peak": 0.0,
         "last_pass_mono": None,
         "checks_used": 0,
         "worker": None,          # a weakref, see `_resolve_worker`
@@ -618,6 +681,8 @@ def delivery_state() -> dict:
     writer = bool(effective_enabled())
     with _lock:
         latched = _state["kill_switch"] is not None
+        step_last = _state["delivery_step_seconds_last"]
+        step_peak = float(_state["delivery_step_seconds_peak"])
     if not env["enabled"]:
         reason = ("the delivery flag is unset, so this writer is a SAMPLED WITNESS "
                   "(one entry in `sample_every_n_applied`, one per step, one floor)")
@@ -630,8 +695,9 @@ def delivery_state() -> dict:
                   "same-execution readback mismatch proved our own copy wrong, so the "
                   "throttles are back and the fork's copy is the delivery again")
     else:
-        reason = ("delivering: every applied entry of the step is written, and the "
-                  "prune may remove only entries this module enqueued")
+        reason = ("delivering: every applied entry of the step is written up to the "
+                  "step budget, and the prune may remove only entries this module "
+                  "enqueued")
     return {"requested": bool(env["enabled"]),
             "effective": bool(env["enabled"] and writer and not latched),
             "writer_enabled": writer,
@@ -639,7 +705,22 @@ def delivery_state() -> dict:
             "raw": env["raw"],
             "recognised": bool(env["recognised"]),
             "env_var": env["env_var"],
-            "reason": reason}
+            "reason": reason,
+            # THE STEP-THREAD TIME THE BUDGET SAW (0.2.56). THESE ARE THE TWO KEYS THAT
+            # ANSWER "DID THE APPLY POINT ACTUALLY RUN, AND HOW LONG DID THE ENGINE STEP
+            # WAIT FOR US" - the question the 2026-10-09 crash window could not answer,
+            # because every delivery counter lived after the copy loop. `last` is the
+            # step's wall clock in SECONDS (rounded to milliseconds: an unrounded
+            # `time.monotonic()` is 17 significant digits and this section has a byte
+            # budget the rank writer ENFORCES by refusing the whole section), `peak` the
+            # worst since boot. The budget itself is a build constant
+            # (`DELIVERY_STEP_BUDGET_SECONDS` / `DELIVERY_STEP_BYTE_BUDGET`) and is
+            # deliberately NOT published: the section is at its cap, and a constant is
+            # the cheapest thing to leave out when the choice is between it and the
+            # sentence that explains a fault.
+            "step_seconds_last": (None if step_last is None
+                                  else round(float(step_last), 3)),
+            "step_seconds_peak": round(step_peak, 3)}
 
 
 def effective_delivery_mode() -> bool:
@@ -1572,6 +1653,9 @@ def observe_apply(worker, batch, failed) -> dict:
         cap = int(limits["max_writes_per_step"])
         floor = float(limits["min_interval_seconds"])
         delivery = bool(limits["delivery"])
+        delivery_started = time.monotonic()
+        delivery_bytes = 0
+        deferred = 0
         if delivery:
             with _lock:
                 _count("delivery_steps")
@@ -1639,6 +1723,22 @@ def observe_apply(worker, batch, failed) -> dict:
                 with _lock:
                     _count("throttled_step")
                 continue
+            # THE STEP-THREAD BUDGET (0.2.56), and it is DELIVERY-ONLY on purpose: the
+            # witness posture already carries a 1-per-step cap and a 0.5 s floor, so it
+            # never reaches a volume this budget would bind on, and touching its loop
+            # would change the shipped path for no protection. A stop is a `continue`,
+            # not a `return` and not a refusal: the entries already copied stay covered,
+            # the ones after the stop stay uncovered, and an uncovered entry is a FORK
+            # copy rather than a hole. The clock is the guard (a stalled or slow
+            # synchronous copy, whatever the cause); the byte total makes the worst case
+            # a stated number. Both are checked BEFORE the entry, because the entry is
+            # the thing that can block this thread.
+            if delivery:
+                spent = time.monotonic() - delivery_started
+                if spent >= DELIVERY_STEP_BUDGET_SECONDS \
+                        or delivery_bytes >= DELIVERY_STEP_BYTE_BUDGET:
+                    deferred += 1
+                    continue
             with _lock:
                 last = _state["last_write_mono"]
                 if floor > 0.0 and last is not None \
@@ -1647,6 +1747,12 @@ def observe_apply(worker, batch, failed) -> dict:
                     continue
             outcome = _write_one(worker, job, event, delivery=delivery)
             if outcome.get("written"):
+                if delivery:
+                    # CHARGED TO THE STEP, AND ONLY FOR A COPY THAT WAS ENQUEUED: the
+                    # byte budget bounds the NEXT entry, and an entry that was refused
+                    # (too wide, no stream, a raised copy) put no bytes on the
+                    # wire, so charging it would let a refusing step starve itself.
+                    delivery_bytes += int(_int_or_none(job.get("bytes")) or 0)
                 written += 1
                 # THE MEMBERSHIP, not the count: `job_id` is the index into this step's
                 # `load_cpu_blocks`/`load_gpu_blocks`, which is the same index space
@@ -1667,6 +1773,20 @@ def observe_apply(worker, batch, failed) -> dict:
                 # cause and leaves this None.
                 refusal = outcome.get("reason")
                 refusal_cause = outcome.get("cause")
+        if delivery:
+            # THE STEP'S OWN WALL CLOCK, published (0.2.56). `step_seconds_last` is the
+            # one number in this section that says "the apply point ran AND how long the
+            # engine step waited for us", which is exactly what the 2026-10-09 crash
+            # window could not say: every delivery counter lived after the copy loop, so
+            # a step that never left it looked identical to a hook that never ran.
+            spent = time.monotonic() - delivery_started
+            with _lock:
+                if deferred:
+                    _count("delivery_deferred_entries", deferred)
+                    _count("delivery_deferred_steps")
+                _state["delivery_step_seconds_last"] = spent
+                if spent > float(_state["delivery_step_seconds_peak"]):
+                    _state["delivery_step_seconds_peak"] = spent
         return {"seen": seen, "written": written,
                 "written_indices": written_indices, "delivery_mode": delivery,
                 "reason": (None if written else refusal),
@@ -1825,6 +1945,27 @@ def _write_one(worker, job: dict, event, delivery: bool = False) -> dict:
         witness = False
         taken = None
     names = [region["name"] for region in plan["regions"]]
+    if delivery:
+        # THE ENTRY'S OWN BOUND (0.2.56). One `copy_` out of pageable host
+        # memory cannot be interrupted from this thread, so the only honest bound on
+        # the FIRST entry of a step is to refuse one whose window alone exceeds the
+        # step's byte budget: it
+        # is refused here rather than copied, so it is absent from `written_indices`, so
+        # the prune cannot remove it, so the fork copies it. Counted BEFORE the copies
+        # for the same reason: a delivery that dies inside its copy must still leave a
+        # trace, and `delivery_attempted > 0` with `writes == 0` is the signature of
+        # "the apply point ran and the copy is what did not come back" - the reading the
+        # 2026-10-09 rank files could not offer, where every delivery counter read None
+        # and an unarmed hook was indistinguishable from a fatal one.
+        if width > DELIVERY_STEP_BYTE_BUDGET:
+            return _refuse("delivery_refused_entry_too_wide",
+                           f"this entry's window is {width} B and the whole delivery "
+                           f"step's budget is {DELIVERY_STEP_BYTE_BUDGET} B: one "
+                           "host->device copy out of the fork's PAGEABLE CPU arena is "
+                           "synchronous on the step thread and cannot be interrupted, "
+                           "so it is refused and left to the fork's copy thread")
+        with _lock:
+            _count("delivery_attempted")
     if not witness:
         # THE DELIVERY-ONLY PATH: the copies, and nothing else. No pre-readback, no
         # post-readback, no rows held, nothing for the thread to wait on - which is also
