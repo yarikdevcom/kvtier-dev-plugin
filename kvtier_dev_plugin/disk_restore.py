@@ -807,7 +807,21 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "suppressed_after_failure",
                   "pin_release_unavailable", "incomplete_group_set",
                   "no_boundary_anchor", "no_null_block", "no_pool_budget",
-                  "no_read_queue")
+                  "no_read_queue",
+                  # THE TRUNCATION GATE (0.2.53). The alloc-time observer counts, for
+                  # EVERY prefix-cacheable group, `len(hit[g]) - n_take_g` — the number
+                  # of entries the fork's own `cpu_hit_blocks_full[g][:n_take_g]`
+                  # (`manager.py:454`) is about to DROP. In the running fork that number
+                  # is always zero (an align group's list is sized by the ACCEPTED
+                  # length, so the slice is a no-op and the group's ONE state entry —
+                  # its LAST element — survives), and nothing in the fork tests it. When
+                  # it is not zero the claimed range's boundary state is dropped while
+                  # `num_external_tokens` is still claimed as loaded: the 2026-10-06
+                  # 00:08 shape, wrong output rather than a slow correct answer. This
+                  # refusal is what the plugin CAN do from outside the fork: withdraw
+                  # its OWN restore for that request, so a claim the fork truncated is
+                  # never a claim this tier delivered.
+                  "group_hit_truncated")
 
 # --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
 #
@@ -1023,6 +1037,31 @@ OFFER_REFUSAL_WHY = {
                      "pool is a byte ceiling and the queue is a job ceiling; the offer "
                      "pays the smaller. Fixed by a deeper reader queue, NOT a bigger "
                      "pool, which is why it has its own name",
+    "group_hit_truncated": "THE TRUNCATION GATE (0.2.53). For at least one "
+                           "prefix-cacheable group the manager's per-group hit list is "
+                           "LONGER than the fork's own take, `n_take_g = "
+                           "cdiv(num_external_tokens, group_block_sizes[g])`, so the "
+                           "fork's `cpu_hit_blocks_full[g][:n_take_g]` "
+                           "(`manager.py:454`) is about to DROP trailing entries. In "
+                           "the running fork this cannot happen: "
+                           "`MambaManager.find_longest_cache_hit` sizes an align-mode "
+                           "group's list by the ACCEPTED length, so `n_take_g == "
+                           "len(list)` and the slice is a no-op. That equality is an "
+                           "emergent property of two files this repo does not own and "
+                           "no test pins. If it ever stops holding, the group's ONE "
+                           "state entry - its LAST element, `[null]*(n-1) + [state]` - "
+                           "is the entry dropped, while `num_external_tokens` is still "
+                           "claimed as loaded: a GDN/SSM recurrence resumed from a "
+                           "block nobody wrote, the 2026-10-06 00:08 finding, a wrong "
+                           "answer that raises nothing. The plugin cannot un-claim the "
+                           "fork's tokens from outside the fork, so it withdraws its "
+                           "OWN restore for that request: the fuse is pulled, the "
+                           "offer record is dropped, and every GPU block the fork "
+                           "would have trusted is reported through the load-error "
+                           "channel so the engine recomputes it. Refusing costs the "
+                           "disk tier one request; serving costs the answer. The "
+                           "refusal names the group, its `group_block_sizes` entry, "
+                           "the list length and `n_take_g`.",
 }
 WORKER_FAILURES = ("path_count_mismatch", "bad_path", "identity_disagreement",
                    "digest_disagreement", "fingerprint_incomplete", "no_channel",
@@ -1414,6 +1453,30 @@ _state: dict = {
     # in `prune_adopted_restores`.
     "prune_kept_last_entries": 0,
     "last_prune": None,
+    # THE TRUNCATION GATE (0.2.53). `group_take_observations` counts the alloc-time
+    # looks the gate took at the fork's own pairing inputs (the only denominator that
+    # makes `..._dropped_groups = 0` mean "audited and clean" rather than "never
+    # looked"); `..._dropped_groups` counts the GROUP observations where
+    # `len(cpu_hit_blocks_full[g]) - n_take_g > 0`; `..._dropped_entries` is the SUM of
+    # that difference over those groups, because a one-entry gap (the align group's
+    # single state entry) and a twenty-entry gap are the same finding at different
+    # sizes and an operator prices them differently; `..._refusals` counts the offers
+    # the gate refused at the door, where refusing is free. `last_group_take_gap` is
+    # the arithmetic of the most recent sighting, in every field the fork's own line
+    # uses, so the payload can be checked without reading the fork.
+    "group_take_observations": 0,
+    "group_take_dropped_groups": 0,
+    "group_take_dropped_entries": 0,
+    "group_take_unbacked_groups": 0,
+    "group_take_refusals": 0,
+    "group_take_unavailable": 0,
+    "last_group_take_gap": None,
+    # ONE LINE PER EPISODE, the settle-window-refusal idiom. This runs on the alloc
+    # path, once per scheduled request per step; a line per sighting would bury the
+    # finding in exactly the noise that makes a counter unreadable. Cleared by a
+    # clean observation, so "it happened, then it stopped, then it came back" logs
+    # three lines and not one.
+    "take_gap_episode": False,
     # THE OFFER'S PRICE IN BOUNCE BUFFERS (0.2.31). `offer_pool_capped` counts offers
     # SHORTENED to what the pool can carry and `offer_pool_refused` the lookups given
     # no offer at all because not one job fits. `last_offer_pool` is the arithmetic of
@@ -2018,6 +2081,11 @@ def reset_state_for_tests() -> None:
             "prune_adopted_entries": 0, "prune_uncovered_entries": 0,
             "prune_direct_writes": 0, "prune_kept_last_entries": 0,
             "last_prune": None,
+            "group_take_observations": 0, "group_take_dropped_groups": 0,
+            "group_take_dropped_entries": 0, "group_take_unbacked_groups": 0,
+            "group_take_refusals": 0,
+            "group_take_unavailable": 0, "last_group_take_gap": None,
+            "take_gap_episode": False,
             "offer_pool_capped": 0, "offer_pool_refused": 0,
             "last_offer_pool": None,
             "offer_block_capped": 0, "offer_block_size_seen": None,
@@ -2627,6 +2695,68 @@ def counters_view(out: dict) -> dict:
                       "sides left in step, the direct-write witness count, and the "
                       "Step-3 split of the candidate set into covered and uncovered "
                       "(0.2.52)",
+        # THE TRUNCATION GATE (0.2.53). Every one of these is incremented by
+        # `observe_group_take_truncation`; none of them is derived from another.
+        "group_take_observations": "how many times the alloc-time gate measured the "
+                                   "fork's own per-group take against the manager's "
+                                   "per-group hit list, in a process that reached "
+                                   "`update_state_after_alloc` with an external load. "
+                                   "THE DENOMINATOR: it is what makes "
+                                   "`group_take_dropped_groups = 0` read as 'audited "
+                                   "and clean' instead of 'never looked' (unit: "
+                                   "alloc observations)",
+        "group_take_dropped_groups": "GROUP observations where the fork's slice "
+                                     "`cpu_hit_blocks_full[g][:n_take_g]` "
+                                     "(`manager.py:454`) is about to DROP trailing "
+                                     "entries, i.e. `len(cpu_hit_blocks_full[g]) - "
+                                     "n_take_g > 0`. Counted per group per alloc, "
+                                     "because the fork's loop is per group and an "
+                                     "align-mode group's ONE state entry is the LAST "
+                                     "element of its list - so one observation of that "
+                                     "group is one dropped boundary state, the shape "
+                                     "that answers wrongly in 00:08's form (unit: "
+                                     "group observations)",
+        "group_take_dropped_entries": "the SUM of `len(cpu_hit_blocks_full[g]) - "
+                                      "n_take_g` over those groups: the number of "
+                                      "entries the fork's slice discards, priced. A "
+                                      "one-entry gap and a twenty-entry gap are the "
+                                      "same finding at different sizes (unit: entries)",
+        "group_take_unbacked_groups": "THE WRONG-ANSWER COUNT. Group observations "
+                                      "where the slice drops at least one REAL entry "
+                                      "AND leaves the claimed prefix with no real "
+                                      "entry at all: the group's whole claimed span "
+                                      "has nothing to pair, so the engine reads KV "
+                                      "from a block nobody wrote. On this box's "
+                                      "geometry that is the align-mode group whose "
+                                      "single state block is the list's LAST element - "
+                                      "the 2026-10-06 00:08 answer, in one number. "
+                                      "Every non-zero reading of this counter should "
+                                      "be read as a data bug, and it is the reading "
+                                      "the gate refuses on, while "
+                                      "`group_take_dropped_groups` keeps counting the "
+                                      "harmless trims a partial adoption produces "
+                                      "(unit: group observations)",
+        "group_take_refusals": "disk offers the gate refused at the door because the "
+                               "same predicate was already true of the tuple this "
+                               "module was about to hand the fork - the refusal that "
+                               "costs a recompute rather than an answer. Also the "
+                               "`refused[group_hit_truncated]` taxonomy name, which "
+                               "counts the same events from the refusal side (unit: "
+                               "offers)",
+        "group_take_unavailable": "alloc observations where the gate could not "
+                                  "measure the predicate at all - no "
+                                  "`prefix_cacheable_group_ids`, no "
+                                  "`group_block_sizes`, a hit list that is not a "
+                                  "sequence. Counted separately so a silent gate is a "
+                                  "reading and not an absence (unit: alloc "
+                                  "observations)",
+        "last_group_take_gap": "the arithmetic of the most recent sighting or refusal: "
+                               "the request, the group, that group's "
+                               "`group_block_sizes` entry, `num_external_tokens`, the "
+                               "`n_take_g` the fork's cdiv produced, the length of "
+                               "that group's "
+                               "hit list, the difference, and whether this module had "
+                               "appended disk blocks to that list (0.2.53)",
         "witness_kind": "the stable name of the last verdict: the emission key is "
                        "(verdict, kind) and never the sentence, because the sentence "
                        "quotes counters. AS OF THE LAST EMISSION, NOT NOW: it is the "
@@ -9560,6 +9690,316 @@ def _stamp(wrapper, name: str, original=None) -> None:
     wrapper.__name__ = name
 
 
+def group_take_gap(hit_lists, group_block_sizes, cacheable,
+                   num_external_tokens: int) -> list:
+    """THE TRUNCATION PREDICATE, ONE PLACE FOR BOTH DOORS (0.2.53).
+
+    For every prefix-cacheable group `g`, the fork takes
+    `n_take_g = cdiv(num_external_tokens, group_block_sizes[g])` and then slices
+    `cpu_hit_blocks_full[g][:n_take_g]` (`manager.py:447-454`). This returns one record
+    per group whose hit list is LONGER than that take - the entries the slice is about
+    to discard:
+
+        {"group": g, "group_block_size": ..., "hit_len": ..., "n_take": ...,
+         "dropped": hit_len - n_take, "num_external_tokens": ...}
+
+    WHY IT NEEDS ITS OWN FUNCTION. The same three numbers decide two different
+    decisions - whether to make an offer at all (the free refusal, `_offer`), and
+    whether the fork is silently discarding bytes it was promised (`observe_group_take
+    _truncation`, the alloc door). Two spellings of a predicate is how one ends up
+    checking `disk_tokens` while the other checks `num_external_tokens` and both look
+    right. The comparison is against the PER-GROUP LIST LENGTH and the fork's own
+    `n_take_g`; NOT `disk_tokens`, NOT the offer's token count.
+
+    A missing or unusable input yields `[]` ("cannot measure"), never a guess: the
+    caller counts that separately as `group_take_unavailable`, because a gate that
+    silently saw nothing is a different reading from a gate that saw nothing.
+    """
+    out: list = []
+    try:
+        if not cacheable or not group_block_sizes:
+            return out
+        tokens = int(num_external_tokens)
+        if tokens <= 0:
+            return out
+        lists = list(hit_lists or [])
+        for entry in cacheable:
+            try:
+                group, gpu_ids = entry if isinstance(entry, (list, tuple)) \
+                    else (entry, None)
+                g = int(group)
+            except (TypeError, ValueError):
+                continue
+            if g < 0 or g >= len(lists) or g >= len(group_block_sizes):
+                continue
+            size = int(group_block_sizes[g])
+            if size <= 0:
+                continue
+            hit_len = len(lists[g] or [])
+            n_take = -(-tokens // size)          # the fork's cdiv, same shape
+            if hit_len - n_take > 0:
+                # THE TAIL, INSPECTED, AND THE PREFIX TOO. `hit_len - n_take` is the
+                # brief's invariant to the letter and it is counted whatever the tail
+                # is made of - but a longer list is not automatically the wrong answer,
+                # and a gate that refuses everything is a gate nobody trusts.
+                #
+                # The fork claims exactly `num_external_tokens` external tokens and
+                # pairs the LEADING `n_take_g` entries with
+                # `group_gpu_ids[gpu_ext_start + i]`, so a trailing entry beyond
+                # `n_take_g` names a GPU block that is NOT part of the claim: dropping
+                # it is the fork spending its token budget, and the request simply gets
+                # a shorter restore than the one offered. What is NOT survivable is the
+                # align-mode shape this module itself builds -
+                # `[null]*(B-1) + [ONE real state block]`. Under a partial adoption
+                # that cuts below B, the slice keeps the NULLS and drops the state:
+                # the group is then claimed as loaded across its whole span while
+                # contributing NO real block to the pairing - a GDN/SSM recurrence
+                # resumed from a block nobody wrote. That is the 2026-10-06 00:08
+                # answer, and it is exactly `dropped_real > 0 and kept_real == 0`.
+                #
+                # So three numbers, not one: `dropped` (the invariant, counted always),
+                # `dropped_real` (bytes that were read and will never be DMA'd - a
+                # wasted read and an accounting lie on a positional group), and
+                # `kept_real` (0 with a claim still standing = the wrong answer).
+                tail = (lists[g] or [])[n_take:hit_len]
+                dropped_real = sum(
+                    1 for block in tail
+                    if not bool(getattr(block, "is_null", False)))
+                kept_real = sum(
+                    1 for block in (lists[g] or [])[:n_take]
+                    if not bool(getattr(block, "is_null", False)))
+                out.append({"group": g, "group_block_size": size,
+                            "hit_len": hit_len, "n_take": n_take,
+                            "dropped": hit_len - n_take,
+                            "dropped_real": dropped_real,
+                            "kept_real": kept_real,
+                            # THE WRONG-ANSWER SHAPE, decided here so the two doors
+                            # cannot disagree about which sighting is the dangerous
+                            # one: the group's list had a real block somewhere, and
+                            # after the slice the claim has none to pair.
+                            "unbacked_claim": dropped_real > 0 and kept_real == 0,
+                            "num_external_tokens": tokens})
+    except Exception as exc:  # noqa: BLE001 - a gate must never break a step
+        snapshot._error(exc, "disk_restore group_take_gap")
+    return out
+
+
+def observe_group_take_truncation(manager, request, blocks,
+                          num_external_tokens) -> dict:
+    """THE ALLOC-TIME DOOR: is the fork about to claim a span nobody will write?
+
+    Called from `make_wrapper(METHOD_ALLOC)` BEFORE the fork's body, because
+    `update_state_after_alloc` POPS `manager._pending_cpu_hits[req_id]` inside itself
+    (`manager.py:415-429`) and after it the numbers this gate needs are gone. Same
+    vantage point `disk_restore_verify.observe_alloc` uses; a DIFFERENT question, and
+    one that must be asked on EVERY step rather than behind the verifier's env switch.
+
+    WHAT IT DOES, and why each piece is the most it can honestly do:
+      * counts every gap (`group_take_dropped_groups` / `_dropped_entries`) and, apart
+        from them, the gaps that leave a claimed group with no real block to pair
+        (`group_take_unbacked_groups`) - the difference between the fork trimming our
+        padding under a partial adoption and the 2026-10-06 00:08 wrong answer. Only
+        the second kind is refused; a gate that refused every gap would refuse the
+        trims that are the fork spending its token budget, and would be turned off
+        within a day.
+      * logs ONCE PER EPISODE (`take_gap_episode`), not once per alloc. This is the
+        alloc path, once per scheduled request per step; a line per sighting is how a
+        finding becomes noise. A clean observation closes the episode, so
+        "happened, stopped, came back" is three lines and not one.
+      * on an unbacked claim about a request THIS module offered: counts the refusal
+        under the taxonomy name `group_hit_truncated` (whose `why` says what it means),
+        pulls the request's disk fuse so the tier does not offer it into the same shape
+        on the next step, and reports the claimed-but-unwritten GPU blocks through the
+        existing load-error channel so the engine RECOMPUTES them.
+      * deliberately does NOT rewrite the pending tuple or re-claim tokens. At this
+        door the scheduler has already adopted `num_external_tokens` and advanced the
+        request's computed count; shrinking the tuple here would leave GPU blocks the
+        engine counts as computed with nothing in them - the same hazard, self-inflicted
+        and unreported. The engine's own recompute path is the only lever that actually
+        unwinds a claim made without our bytes, and that is what the report drives.
+
+    Never raises; returns a status dict for the tests.
+    """
+    status = {"ok": True, "violations": [], "refused": False}
+    try:
+        request_id = str(getattr(request, "request_id", "") or "")[:256]
+        _state["group_take_observations"] += 1
+        gate = _take_gate(manager)
+        if gate is None:
+            _state["group_take_unavailable"] += 1
+            return status
+        sizes, cacheable = gate
+        pending = None
+        table = getattr(manager, "_pending_cpu_hits", None)
+        if isinstance(table, dict) and request_id:
+            pending = table.get(request_id)
+        if not isinstance(pending, tuple) or len(pending) < 1 \
+                or not isinstance(pending[0], (list, tuple)):
+            # No pending hit means the fork has nothing to pair for this request,
+            # so there is no slice to audit. Counted, never guessed at.
+            _state["group_take_unavailable"] += 1
+            return status
+        violations = group_take_gap(pending[0], sizes, cacheable,
+                                    num_external_tokens)
+        if not violations:
+            # THE EPISODE ENDS HERE: the next sighting logs again. An episode with no
+            # sighting has no line, and that is the state an operator wants.
+            _state["take_gap_episode"] = False
+            return status
+        status["violations"] = violations
+        # THE GATE ACTS ON THE UNBACKED CLAIM, not on every gap. A gap whose tail is
+        # all nulls is the fork trimming our padding under a partial adoption and the
+        # restore is fine; a gap that leaves a claimed group with no real block to
+        # pair is the wrong answer. Both are counted (see `units`), only the second
+        # refuses, and `last_group_take_gap` names which one this was.
+        fatal = [item for item in violations if item["unbacked_claim"]]
+        worst = max(fatal or violations, key=lambda item: item["dropped_real"])
+        ours = bool(_loads.get(request_id))
+        _state["group_take_dropped_groups"] += len(violations)
+        _state["group_take_dropped_entries"] += sum(
+            int(item["dropped"]) for item in violations)
+        _state["group_take_unbacked_groups"] += len(fatal)
+        _state["last_group_take_gap"] = {
+            **worst,
+            "request_id": request_id[:48],
+            "groups": [int(item["group"]) for item in violations],
+            "unbacked_groups": [int(item["group"]) for item in fatal],
+            "num_groups_audited": len(list(cacheable)),
+            "our_entry_is_dropped": ours,
+            "at": round(time.time(), 3),
+        }
+        if fatal and not _state["take_gap_episode"]:
+            _state["take_gap_episode"] = True
+            _logger.warning(
+                "kvtier-dev-plugin: TRUNCATION GATE: the fork's own "
+                "cpu_hit_blocks_full[g][:n_take_g] (manager.py:454) drops %d "
+                "trailing entr(y|ies) of group %d (list %d, n_take %d = "
+                "cdiv(%d, %d)) for request %s, and %d real block(s) go with them "
+                "while the prefix keeps %d - so that group's whole claimed span has "
+                "NO real block to pair. A GDN/SSM recurrence would be resumed from a "
+                "block nobody wrote: the 2026-10-06 00:08 answer. %d of %d cacheable "
+                "group(s) are gapped, %d of them unbacked; %s. "
+                "refused[group_hit_truncated] carries the count; one line per "
+                "episode.",
+                worst["dropped"], worst["group"], worst["hit_len"],
+                worst["n_take"], worst["num_external_tokens"],
+                worst["group_block_size"], request_id[:32],
+                worst["dropped_real"], worst["kept_real"], len(violations),
+                len(list(cacheable)), len(fatal),
+                "this request's disk offer is refused and its GPU blocks reported "
+                "as load errors so the engine recomputes" if ours
+                else "no disk offer of ours was in flight for this request")
+        elif not fatal and not _state["take_gap_episode"]:
+            # Counted, not fatal, and said once so a reviewer can tell the gate is
+            # alive and what it is looking at. A trimmed null padding is not a bug.
+            _state["take_gap_episode"] = True
+            _logger.warning(
+                "kvtier-dev-plugin: TRUNCATION GATE: the fork's take is shorter "
+                "than the hit list for %d of %d cacheable group(s) "
+                "(worst: group %d, list %d vs n_take %d), but every claimed group "
+                "still keeps at least one real block, so nothing is claimed that "
+                "nobody writes. Counted as group_take_dropped_groups/entries; no "
+                "restore refused. One line per episode.",
+                len(violations), len(list(cacheable)), worst["group"],
+                worst["hit_len"], worst["n_take"])
+        if fatal and ours and request_id:
+            # OUR OWN offer is the one in the tuple, so OUR bytes are the ones being
+            # dropped: count the refusal under the taxonomy name that explains it,
+            # then pull the request's fuse so the tier does not offer it into the
+            # same shape on the next step. The record goes last, because releasing a
+            # record reads the span the fuse wants. Named on the FATAL group, not on
+            # the widest gap: the payload must point at the group that answers wrongly.
+            bad = fatal[0]
+            _state["group_take_refusals"] += 1
+            _refuse("group_hit_truncated",
+                    f"group {bad['group']} hit list {bad['hit_len']} vs "
+                    f"n_take {bad['n_take']} (cdiv({bad['num_external_tokens']}, "
+                    f"{bad['group_block_size']})), so {bad['dropped']} trailing "
+                    f"entr(y|ies) go, {bad['dropped_real']} of them real, leaving "
+                    f"{bad['kept_real']} real block(s) behind for a claimed span of "
+                    f"{bad['n_take']} - nothing to pair",
+                    )
+            suppress_load(request_id, "group_hit_truncated",
+                          span=(_loads.get(request_id) or {}).get("span"))
+            _drop_load(request_id, "the fork's take is shorter than the hit list "
+                                   "this offer built")
+            status["refused"] = True
+        _report_dropped_gpu_blocks(blocks, request, fatal)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic cannot break a step
+        snapshot._error(exc, "disk_restore observe_group_take_truncation")
+        status["ok"] = False
+    return status
+
+
+def _take_gate(manager):
+    """The fork's OWN per-group gate, read the way `manager.py:437-445` reads it.
+
+    Returns `(group_block_sizes, cacheable)` - `cacheable` a list of `(group, None)`
+    pairs in the shape `group_take_gap` takes - or None when the fork exposes neither
+    spelling of the gate. Counting that separately is the point: a gate that silently
+    saw nothing must be distinguishable from a gate that saw nothing.
+    """
+    try:
+        sizes = getattr(manager, "group_block_sizes", None)
+        if not sizes:
+            return None
+        sizes = list(sizes)
+        named = getattr(manager, "prefix_cacheable_group_ids", None)
+        if named is not None:
+            return sizes, [(int(g), None) for g in named]
+        block_ids = getattr(manager, "block_ids", None)
+        if block_ids is not None:
+            # The pre-guard fork: every group that owns blocks was cacheable, which
+            # is the same set this module offers into.
+            return sizes, [(g, None) for g in range(len(list(block_ids)))]
+        return None
+    except Exception as exc:  # noqa: BLE001
+        snapshot._error(exc, "disk_restore _take_gate")
+        return None
+
+
+def _report_dropped_gpu_blocks(blocks, request, violations) -> None:
+    """Name the GPU blocks the fork claims as computed but will never write.
+
+    The fork pairs entry `i` of group `g` with `group_gpu_ids[gpu_ext_start + i]`
+    (`manager.py:460-478`), `gpu_ext_start = num_computed_tokens // g_block_size`. A
+    group left with no real entry inside the claim therefore has a whole claimed span
+    whose GPU blocks the scheduler has advanced past with NOTHING written into them -
+    blocks the engine will READ as KV on the next step. Reporting them through
+    `_remember_invalid` (the channel a failed disk read uses, drained by
+    `take_invalid_block_ids`, and the ONLY one that makes the engine recompute rather
+    than trust a block) turns the silent wrong answer into a recompute: slower, and
+    right. This is the same lever the worker already pulls when a read fails, which is
+    why it needs nothing from the fork.
+
+    Only the UNBACKED groups are reported, and only the span the claim actually
+    covers (`[0, n_take)`, the entries the slice keeps): the entries beyond `n_take`
+    are outside the claim and reporting them would truncate an unrelated request that
+    holds one of those blocks later - the exact hazard `take_invalid_block_ids`
+    drains for. Bounded by the same cap every other ledger here uses.
+    """
+    try:
+        computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+        tables = blocks.get_block_ids() if hasattr(blocks, "get_block_ids") \
+            else blocks
+        if not tables:
+            return
+        for item in violations[:MAX_TRACKED_SLOTS]:
+            if not item["unbacked_claim"]:
+                continue
+            g = int(item["group"])
+            if g >= len(tables) or not tables[g]:
+                continue
+            gpu_ids = list(tables[g])
+            start = computed // int(item["group_block_size"])
+            for index in range(int(item["n_take"])):
+                slot = start + index
+                if 0 <= slot < len(gpu_ids):
+                    _remember_invalid(int(gpu_ids[slot]))
+    except Exception as exc:  # noqa: BLE001 - a report cannot break a step
+        snapshot._error(exc, "disk_restore _report_dropped_gpu_blocks")
+
+
 def make_wrapper(name: str, original):
     """One scheduler entry point, with the restore hook AFTER the fork's body.
 
@@ -9584,6 +10024,17 @@ def make_wrapper(name: str, original):
             # why the install below fits it best-effort and never fatally.
             disk_restore_verify.observe_alloc(self, request, blocks,
                                               num_external_tokens)
+            # THE TRUNCATION GATE (0.2.53), and it is NOT a diagnostic: it is the
+            # same vantage point the verifier uses, for a different question. The
+            # verifier asks "does the pairing line up?" and is gated behind an env
+            # switch; this asks "is the fork about to throw away entries it was
+            # promised, including an align group's only state block?" and must run on
+            # EVERY step, armed or not, verifier on or off. It reads the pending
+            # tuple BEFORE the fork's body pops it, counts the gap against the
+            # per-group list length, and refuses OUR OWN restore for a request whose
+            # tuple is inconsistent - the refusal the plugin can honestly enforce.
+            observe_group_take_truncation(self, request, blocks,
+                                      num_external_tokens)
             return original(self, request, blocks, num_external_tokens)
     elif name == METHOD_BUILD_META:
         def wrapper(self, scheduler_output):

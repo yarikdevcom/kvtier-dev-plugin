@@ -4309,6 +4309,117 @@ property the prune's membership test stands on) and `test_an_empty_pool_costs_th
 and_never_the_delivery`, which runs a step with the pool deliberately never filled because
 that is what a real first step after a boot looks like.
 
+**A cold-start gap was closed beside it (0.2.53).** Every test in that file inherits the
+`witness` fixture's `monkeypatch.setattr(disk_gpu_write, "_ensure_thread", lambda: True)`, and
+its end-to-end test additionally calls `fill_pool(worker)` before its first apply. Both are
+pieces a real boot does not hand over: the module's thread is started BY the first armed apply,
+rows are allocated only inside a refill, and a thread born before a worker exists refills
+nothing because `_resolve_worker()` answers None until an apply registers one. So the first
+apply of every boot finds an empty pool - the one moment delivery mode's claim ("the cold pool
+costs the witness, never the copy") could be false, and the one moment nothing in that file
+could assert `thread_started`, because the thread it believed absent was a stub.
+`tests/test_disk_gpu_write_cold_delivery.py` (5 tests, 0.2.53) arms the mode with two
+environment variables and nothing else: the first delivery of a boot lands and starts the
+module's own real thread; the cold boot goes on to WITNESS a delivery (asserted on the thread
+names every pinned allocation ran on, so the kill-switch lane is shown reachable and not merely
+claimed); an injected wrong copy LATCHES the switch from that cold boot and the consumer's prune
+refuses under `kill_switch_fired`; and the last test names both pre-arms and machine-checks that
+this file provides neither. Put the sibling's `lambda: True` back and four of the five fail -
+that is the measurement of the gap, not a claim about it.
+
+## The truncation gate: is a claimed span left with nothing to pair? (`disk_restore.py`, 0.2.53)
+
+`SimpleCPUOffloadScheduler.update_state_after_alloc` trims the per-group CPU hit lists it was
+handed before it pairs anything (`manager.py:437-454`):
+
+```python
+n_take_g = cdiv(num_external_tokens, g_block_size)
+cpu_hit_blocks.append(cpu_hit_blocks_full[g][:n_take_g])
+```
+
+It claims `num_external_tokens` external tokens and pairs the **leading** entries it kept with
+`group_gpu_ids[gpu_ext_start + i]` (`manager.py:460-478`). So a group whose list is LONGER than
+its take has trailing entries the slice discards - and on this box's geometry that is not a
+hypothetical. Groups 0-3 are align-mode GDN groups at a 3,200-token block, and the list
+`_merge_into_pending` builds for one is `[null]*(B-1) + [ONE state block]`: the entry at the END
+is the only real block, because the fork's pairing loop preserves the index of a skipped null
+and that is what lands the recurrent state on the run's LAST GPU block rather than its first.
+Trim that list below `B` and the nulls survive while the state is discarded, and the tokens are
+still claimed as loaded - a GDN/SSM recurrence resumed from a GPU block nobody wrote. That is
+the **2026-10-06 00:08** answer: wrong output, no exception, nothing in a log.
+
+The equality this depends on - `n_take_g == len(list[g])` - is maintained by two files this
+repository does not own (`MambaManager.find_longest_cache_hit` sizes an align group's list by
+the ACCEPTED length, and the scheduler adopts what `get_num_new_matched_tokens` reported) and
+by nothing else. No test in the fork pins it. **0.2.53 is the observer that says when the two
+stop agreeing, on the plugin's side of the boundary.**
+
+**No flag, because a gate is not a feature.** It runs inside the `update_state_after_alloc`
+wrapper, BEFORE the fork's body - the only moment the numbers exist, because the fork POPS
+`_pending_cpu_hits[req_id]` inside that body (`manager.py:415-429`). Every other hook in this
+module is fitted AFTER the fork (a restore must not run before the fork decided); this one is
+fitted first and still returns the fork's value untouched. `disk_restore_verify.observe_alloc`
+sees the same inputs and asks "does the pairing line up?" behind an env switch; this asks "is a
+claimed span about to have no bytes behind it?" on every step, armed or not, verifier on or
+off.
+
+**Not every gap is the bug, and the gate does not pretend otherwise.** A partial adoption that
+trims our NULL PADDING discards no bytes: the group keeps a real block inside the claim, the
+answer is right, and the restore is simply shorter than offered. Refusing that would refuse the
+fork spending its own token budget, and a gate like that gets switched off inside a day. So the
+tail is inspected, not assumed, and only one reading is fatal - `dropped_real > 0` (a real entry
+went away) **and** `kept_real == 0` (nothing real is left in the claim). That combination is
+`unbacked_claim`, and it is the only thing the gate refuses on.
+
+| counter | it means | act when |
+|---|---|---|
+| `group_take_observations` | alloc observations the gate measured. **THE DENOMINATOR**: it is what makes `dropped_groups: 0` read as "audited and clean" instead of "never looked" | never on its own; this is the proof the others mean something |
+| `group_take_dropped_groups` / `_entries` | groups (and entries) where the fork's slice drops trailing entries, whatever they are made of | rising beside a flat `group_take_unbacked_groups` is the fork trimming padding: a cost, not a bug |
+| `group_take_unbacked_groups` | **THE WRONG-ANSWER COUNT**: a real entry dropped AND no real entry left in the claim | ALWAYS, at once. A non-zero reading means a claimed span has no bytes behind it |
+| `group_take_refusals` | disk offers the gate withdrew for an unbacked claim, also counted as `refused[group_hit_truncated]` | with the reason in `OFFER_REFUSAL_WHY`; this is the refusal that costs a recompute instead of an answer |
+| `group_take_unavailable` | observations the gate could not measure (no `prefix_cacheable_group_ids`, no `group_block_sizes`, no pending hit) | a clean zero and a blind pass are different readings, and this is the key that keeps them apart |
+| `last_group_take_gap` | the arithmetic of the last sighting in the fork's own field names: group, its `group_block_sizes` entry, `hit_len`, `n_take`, `dropped`, `dropped_real`, `kept_real`, `unbacked_claim`, and whether an offer of ours was in the tuple | read it before believing any of the counters above |
+
+**What the gate does about it, and what it honestly cannot.** At the alloc door the scheduler has
+already adopted `num_external_tokens` and advanced the request's computed count, so the plugin
+cannot un-claim a span from outside the fork, and rewriting the pending tuple there would leave
+GPU blocks the engine counts as computed with nothing in them - the same hazard, self-inflicted
+and unreported. Two levers remain, and both are pulled: the request's disk fuse is pulled
+(`suppress_load`, so the next step cannot offer it into the same shape a second time - the same
+loop-killer that stopped 123,474 offers in 3.9 minutes on 2026-10-05) and the claimed-but-
+unwritten GPU blocks of the UNBACKED groups go onto the load-error channel, the same one a failed
+disk read uses and the only one that makes the engine recompute instead of reading a block as KV.
+The range reported is the claimed span `[gpu_ext_start, gpu_ext_start + n_take)`, never the
+dropped tail's own blocks: those sit outside the claim and reporting them would truncate an
+unrelated request that later holds one. It logs **one line per episode**, never one per alloc
+(this is the alloc path, once per scheduled request per step); a clean observation closes the
+episode, so "happened, stopped, came back" is three lines and not one. The counters keep moving
+the whole time - the line is rate-limited, the evidence is not.
+
+The refusal reason is in the existing taxonomy: `group_hit_truncated` is a member of
+`OFFER_REFUSALS` with an `OFFER_REFUSAL_WHY` entry, so `refused[group_hit_truncated]` and
+`last_refusal` carry it without a new payload key.
+
+**Tests.** `tests/test_disk_take_truncation_gate.py` (17 tests, 0.2.53) opens with the pure
+predicate - exact take, shorter list, one entry longer, a tail of nulls, an unmeasurable
+geometry - and then the door itself. The test to read first is
+`test_the_mutated_padding_line_moves_the_truncation_counter`: it does not hand the gate a
+hand-built bad tuple, it re-executes the shipped `_merge_into_pending` with ONE line changed -
+the align group's null padding, `range(max(0, spans - 1))` becoming `range(max(0, spans))`, the
+line whose whole job is making an align group's list exactly as long as the fork's take - and
+runs the SAME offer on the live hybrid geometry as its own control. Control: the gate audits five
+cacheable groups and finds nothing. Mutant: the four GDN lists are five long, the take is four,
+the discarded entry is each group's only state block, `kept_real` is 0, and every counter above
+moves. The mutation is pinned to the shipped source (it fails loudly if that line moves), and it
+is reverted by restoring the one attribute it touched rather than by unwinding `monkeypatch`,
+which would also tear down the spill root the test is standing on. The rest of the suite covers:
+the fuse plus the exact GPU-block range reported (and that the attention group's span is NOT
+reported, and that the drain drains); one-line-per-episode with the episode closing on a clean
+alloc; a foreign claim (a tuple with no `_loads` entry) reported but NOT refused; nonsense shapes
+(string entries, `None` sizes, an argument-less request) coming back as a status and never an
+exception; and the wiring itself asserted through `make_wrapper(METHOD_ALLOC)` - the fork's body
+pops the tuple, and the gate still saw it.
+
 ## Pruning the pairs an adopted restore no longer needs (`disk_restore.py`, 0.2.49)
 
 Four steps retire the host-RAM arena. Step 1 (0.2.43-0.2.44) made the plugin able to write a
@@ -5686,7 +5797,7 @@ uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -e '.[de
 .venv/bin/python -m pytest -q
 ```
 
-2653 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+2709 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU
