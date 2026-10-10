@@ -415,7 +415,23 @@ ARG_SPECS: dict[str, dict] = {
                                           "authority", "failures", "shadow",
                                           "gpu-shadow", "restore-verify",
                                           "gpu-write", "restore-source",
-                                          "adoptions")},
+                                          "adoptions",
+                                          # LAST, because `DISK_OPS` order is pinned
+                                          # against the dispatch table IN ORDER by a
+                                          # test and this enum is derived from the same
+                                          # tuple: `flush` waits BOUNDED for this
+                                          # process's spill queue (0.2.66).
+                                          "flush")},
+                        # `op=flush` (0.2.66): how long the caller is willing to wait
+                        # for the spill queue. Bounded at the ceiling the ENGINE
+                        # enforces (`disk_spill.FLUSH_BUDGET_SECONDS_MAX`) for the
+                        # standing reason - a wire bound looser than the engine's only
+                        # moves the refusal, and a tighter one lies about what the verb
+                        # can do. A ceiling on a WAIT matters more than one on a
+                        # listing: this call runs on a thread that can be holding a
+                        # suspend, so a caller that asks for an hour must get 30 seconds
+                        # and see that it did.
+                        "timeout_seconds": {"kind": "int", "min": 0, "max": 30},
                         # `op=restore-source` (0.2.59): where a restore's destination
                         # rows come from, and how many of them may be in flight. A
                         # three-word enum: two postures (`arena`, `bounded`) and one

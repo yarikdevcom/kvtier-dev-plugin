@@ -166,7 +166,31 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # the fact every test measures, and a test wanting another value names it.
             config.ENV_DISK_BOOT_DRAIN_SECONDS,
             config.ENV_DISK_BOOT_DRAIN_BYTES,
-            config.ENV_DISK_INDEX_REFRESH_BYTES)
+            config.ENV_DISK_INDEX_REFRESH_BYTES,
+            # MIRROR MODE (0.2.66). Its DEFAULT IS ON, and ON is the claim this release
+            # ships - so an inherited `VLLM_E2_TIER_DISK_SPILL_ON_STORE=0` would have
+            # every spill test in the suite measuring a CLOSED door while believing it
+            # measured the shipped one, and the reverse leak is invisible because ON is
+            # also the default. It is also the variable the ceiling-guard tests depend
+            # on
+            # being predictable: a refusal counted as `disabled` instead of `ceiling`
+            # is a
+            # wrong conclusion, not just a wrong number.
+            config.ENV_DISK_SPILL_ON_STORE,
+            # THE SHUTDOWN FLUSH BUDGET (0.2.66). Listed because the shipped DEFAULT IS
+            # A WAIT (15 s on the stop path), and a suite that inherited
+            # `VLLM_E2_TIER_DISK_SHUTDOWN_FLUSH_SECONDS=3600` from a developer's shell
+            # would be measuring a clamp while believing it measured the default - and
+            # one
+            # that inherited `0` would be running tests against a drain that is not
+            # installed at all, from a file that asserts it is.
+            config.ENV_DISK_SHUTDOWN_FLUSH_SECONDS,
+            # THE LOOKUP LEDGER'S BOOT ARM (0.2.66). Default ON, and the boot step's
+            # whole
+            # claim is that a fresh boot arms the ring. A suite that inherited `0` would
+            # have every ledger test finding a disarmed ring it did not disarm, and the
+            # boot-line token tests reading `[env-refused]` where they assert `[armed]`.
+            config.ENV_LOOKUP_LEDGER_BOOT_ARM)
 
 
 def _isolate(state: dict) -> dict:

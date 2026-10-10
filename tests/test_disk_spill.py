@@ -216,7 +216,7 @@ def test_configuring_the_root_without_arming_still_writes_nothing(tmp_path):
     assert disk_spill._state["thread_started"] == 0
 
 
-def test_no_env_var_arms_the_spill_path():
+def test_no_env_var_arms_the_spill_path(monkeypatch):
     """The `guard_mode`/`blockdump` rule, applied to the tier that writes KV to disk.
 
     `config.py` owns every env var the plugin reads. The two disk ones name a
@@ -225,9 +225,31 @@ def test_no_env_var_arms_the_spill_path():
     """
     names = [name for name in dir(config) if name.startswith("ENV_")]
     assert names
-    assert not [name for name in names
-                if any(word in name.upper() for word in
-                       ("DUMP", "BLOCK", "ARM", "SPILL"))]
+    # THE TWO 0.2.66 NAMES THAT PASS THE TEXTUAL TEST AND MUST NOT PASS THE REAL ONE.
+    # `ENV_DISK_SPILL_ON_STORE` is a MODE switch that can only ever REMOVE work (it
+    # closes the mirror door; it cannot open the tier), and `ENV_LOOKUP_LEDGER_BOOT_ARM`
+    # arms a read-only ring in a module that writes nothing to the store. Both are
+    # spelled out rather than filtered by a looser word list, because loosening the
+    # filter
+    # is how the next variable that only LOOKS harmless gets in. What matters is the
+    # behavioural half below: with both set to their most permissive values, the spill
+    # path is still DISARMED, and the arm file is still the only way to arm it.
+    # Attribute NAMES, because `dir(config)` enumerates those, not the env var strings.
+    mode_switches = {"ENV_DISK_SPILL_ON_STORE", "ENV_LOOKUP_LEDGER_BOOT_ARM"}
+    flagged = [name for name in names
+               if any(word in name.upper() for word in
+                      ("DUMP", "BLOCK", "ARM", "SPILL"))]
+    assert set(flagged) <= mode_switches, flagged
+    # UNCHANGED, not False: this file's own fixtures arm the tier, and the claim is
+    # that these two variables cannot MOVE the arm - which is the same guarantee whether
+    # the starting state is armed or not, and holds when the tests run in any order.
+    before = disk_spill.is_armed()
+    monkeypatch.setenv(config.ENV_DISK_SPILL_ON_STORE, "1")
+    monkeypatch.setenv(config.ENV_LOOKUP_LEDGER_BOOT_ARM, "1")
+    assert disk_spill.is_armed() is before, "a mode switch moved the tier's arm"
+    monkeypatch.setenv(config.ENV_DISK_SPILL_ON_STORE, "0")
+    monkeypatch.setenv(config.ENV_LOOKUP_LEDGER_BOOT_ARM, "0")
+    assert disk_spill.is_armed() is before, "closing the mirror door disarmed the tier"
 
 
 def test_arm_requires_a_root_because_a_knob_that_cannot_act_is_a_lie(
@@ -1134,9 +1156,17 @@ def test_the_module_imports_only_the_standard_library():
     # is stdlib (`concurrent.futures.thread`), so the rule - no torch, no vllm, no
     # third-party dependency in a plugin that must install into a live vllm venv
     # without touching any other package - still holds exactly as before.
-    assert pulled <= {"__future__", "concurrent", "ctypes", "hashlib", "json",
-                      "os", "queue", "threading", "time", "blockdump", "config",
-                      "disk_layout", "snapshot"}, sorted(pulled)
+    # `atexit` and `logging` joined the list in 0.2.66, and both are still the standard
+    # library: `atexit` is the SECONDARY shutdown seam (the primary one is the
+    # connector's
+    # own `shutdown`, because `os._exit` skips `atexit` in a worker), and `logging` is
+    # how
+    # the drain's one line reaches the engine log at WARNING. Neither imports the
+    # engine,
+    # which is the invariant this test guards.
+    assert pulled <= {"__future__", "atexit", "concurrent", "ctypes", "hashlib", "json",
+                      "logging", "os", "queue", "threading", "time", "blockdump",
+                      "config", "disk_layout", "snapshot"}, sorted(pulled)
     for module in ("torch", "vllm", "numpy"):
         assert module not in sys.modules
 

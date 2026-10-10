@@ -449,7 +449,21 @@ def test_queue_depth_cap_is_unchanged_and_still_bounds_the_queue(monkeypatch,
     assert len(refused) >= 8, (
         "the surplus past CAP + readers must ALL be refused: fewer means the bound "
         "moved")
-    assert disk_read.counters()["queue_depth_peak"] <= disk_read.MAX_QUEUE_DEPTH
+    # THE PEAK IS BOUNDED BY CAP + ONE JOB PER READER, NOT BY THE CAP ALONE. The
+    # gauge counts a job from ACCEPT until SETTLE, so a reader parked inside
+    # `_read_file` still owns its job while the queue slot it came from is free - the
+    # same CAP + readers capacity the paragraph above already establishes for
+    # `len(accepted)`. Asserting the bare CAP here asked for a race with thread
+    # startup: on a run where all four readers woke and parked before the loop drained,
+    # the peak legitimately reached CAP + 4 and the assertion failed on a healthy
+    # engine (observed 2/20 on the unmodified 0.2.65 tree, 3/10 on 0.2.66 -
+    # pre-existing, not a regression). What this still catches is the failure it was
+    # written for: an
+    # unbounded queue, where the peak runs past CAP + readers with the surplus ACCEPTED
+    # rather than refused - and `len(accepted)` plus the surplus refusal two lines above
+    # pin that independently.
+    assert (disk_read.counters()["queue_depth_peak"]
+            <= disk_read.MAX_QUEUE_DEPTH + readers)
     gate.hold.set()
     disk_read.cancel_batch("deep", "test teardown")
 

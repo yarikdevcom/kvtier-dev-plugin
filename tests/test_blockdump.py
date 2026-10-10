@@ -1229,7 +1229,19 @@ def test_no_env_var_arms_the_dump_facility():
     """
     names = [name for name in dir(config) if name.startswith("ENV_")]
     assert names
-    assert not [name for name in names
-                if any(word in name.upper() for word in
-                       ("DUMP", "BLOCK", "ARM"))]
+    # THE TWO 0.2.66 NAMES NAMED RATHER THAN FILTERED OUT, and the reason is the whole
+    # point of this test: widening the word list is how the next variable that merely
+    # LOOKS harmless gets in. `ENV_DISK_SPILL_ON_STORE` can only REMOVE spill work (it
+    # closes the mirror door) and `ENV_LOOKUP_LEDGER_BOOT_ARM` arms a read-only ring in
+    # a
+    # module that never touches this facility. The claim that matters is behavioural,
+    # and
+    # the line below is where it is checked: the arm file is still the only writer.
+    # Attribute NAMES, because `dir(config)` enumerates those, not the env var strings.
+    mode_switches = {"ENV_DISK_SPILL_ON_STORE", "ENV_LOOKUP_LEDGER_BOOT_ARM"}
+    flagged = [name for name in names
+               if any(word in name.upper() for word in
+                      ("DUMP", "BLOCK", "ARM"))]
+    assert set(flagged) <= mode_switches, flagged
+    assert blockdump.is_armed() is False, "a 0.2.66 mode switch armed the dump facility"
     assert blockdump.capability() == "not_deployed"     # every test's environment

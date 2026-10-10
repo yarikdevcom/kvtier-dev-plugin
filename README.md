@@ -115,6 +115,9 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DISK_BOOT_DRAIN_SECONDS` | **how many seconds the boot's journal drain may take (0.2.65). Unset, or anything that is not a finite number above 0, = `disk_index.BOOT_DRAIN_DEADLINE_SECONDS` = 45 s.** THE HARD CEILING ON A STARTUP COST, and the reason it is a deadline and not a byte count: a journal that grows without bound must never be able to stall a boot. Sized against the box's own measurement (the drain reads ~2.2 MB/s of journal, so 45 s permits ~99 MB of reading - ~57 MB of journal at the measured 1.73x line-cap amplification, ~2.3x the ~25 MB the incident boot had to read). Tonight's ~25 MB converges in ~11-12 modelled seconds, which is what the boot pays and a request no longer does. `0` is REFUSED, not honoured: a deadline of 0 drains nothing and reads as "configured". The value in force is `restore.index.drain_limits.boot_deadline_seconds` with its origin in `boot_deadline_source` (`default` / `env` / `env_ignored`), and a refused value reports its complaint in `problems` instead of defaulting silently. See *Who pays for the drain (`disk_index.py`, 0.2.65)*. |
 | `VLLM_E2_TIER_DISK_BOOT_DRAIN_BYTES` | **how many bytes the boot's journal drain may read in total (0.2.65). Unset, or anything that is not an integer above 0, = `disk_index.BOOT_DRAIN_MAX_BYTES` = 64 MiB.** The 32 MiB it replaces could not have covered the incident boot even with an infinite deadline: a bounded pass reads a whole `MAX_READ_PER_REFRESH`-sized window but applies only the lines its line cap fits, and the cursor advances past APPLIED lines only, so the tail of every window is read again by the next pass - measured in this repo at **1.73x** on the incident's shape (28.0 MB read for 16.2 MB of journal, 4 ranks x 110k lines). 64 MiB covers 25 MB x 1.73 = ~43 MB with ~1.5x headroom. Past either bound the boot stops, `boot_drain.stopped_at` says WHICH bound, and the remainder keeps draining on the request path exactly as before. Grammar only (`config.disk_index_drain_env`); the policy is `disk_index.drain_limits()`. |
 | `VLLM_E2_TIER_DISK_INDEX_REFRESH_BYTES` | **the STEADY-STATE cap: bytes one refresh after the boot drain may read across all journals (0.2.65). Unset, or anything that is not an integer above 0, = `disk_index.MAX_READ_PER_REFRESH` = 512 KiB - the number every release before this one used, UNCHANGED by 0.2.65 on purpose.** The offer path's work bound is what stops a burst of requests becoming a burst of reads; widening it is a decision an operator makes after the boot drain has proved itself, not a side effect of this release. It is the trickle's rate: `boot_drain.lag_bytes / this` is the number of refreshes a boot that stopped early still owes. Published as `restore.index.drain_limits.read_bytes_per_refresh` with `read_bytes_source`. |
+| `VLLM_E2_TIER_DISK_SPILL_ON_STORE` | **MIRROR MODE (0.2.66): does a store completion alone queue the slot for NVMe? Unset is ENABLED; `0`/`false`/`off`/`no` close the door at boot (`source: "env"`); a word in neither vocabulary stays ENABLED and reports `recognised: false` with its complaint in `problems`.** ON is the default because the door only ever ADDS spill work and has no door to a serving posture, an arm or a request path - so the direction a typo can move in is the direction that keeps spilling, and `0` is the rollback. The cost was measured first: `slots_offered 3,076` against `spill_queued 2,556` on this boot's rank files, so mirroring everything is ~1.20x today's write volume. A mirror offer that would take the rank past its ceiling is refused AT THE DOOR (`disk_spill.mirror_headroom`, counted as `ceiling`) and never written. Read it at `spill_on_store` in `/disk op:status`, `/snapshot` or a rank file, with `spill_on_store_verdict()`'s `source`/`raw`/`recognised`/`problems`. See *The arena is a buffer, not a store (0.2.66)*. |
+| `VLLM_E2_TIER_DISK_SHUTDOWN_FLUSH_SECONDS` | **how many seconds the spill queue may be waited on at STOP (0.2.66). Unset, or anything that is not a finite non-negative number, = `disk_spill.SHUTDOWN_FLUSH_SECONDS_DEFAULT` = 15 s; `0` means NO drain is installed at all; anything above `FLUSH_BUDGET_SECONDS_MAX` = 30 s is CLAMPED to it and says so (`clamped: true`).** A wait on the stop path needs a ceiling more than a listing does: the call runs on a thread that can be holding a suspend, so a value typed as `3600` for an experiment must not hold one for an hour. Sized against the box's real budgets (`TimeoutStopSec=90`, `--shutdown-timeout 60`, `KillMode=control-group`) - but read the caveat: on an idle box the executor's worker ladder (`VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`, default 5 s, + 4 s) binds first at ~9 s. Fail-open: an expired budget costs one WARNING line and the stop proceeds. Read it at `spill.shutdown_flush` in `/snapshot` and `/disk op:status`. See *The automatic drain, and why it is not an `atexit` handler (0.2.66)*. |
+| `VLLM_E2_TIER_DEV_LOOKUP_LEDGER_BOOT_ARM` | **does the boot arm the per-request lookup/adopt ring (0.2.66)? Unset is ENABLED; a disable word means the boot records nothing (`LOOKUP_LEDGER[env-refused]`).** OBSERVABILITY ONLY, and that is the whole design: a boot that cannot arm the ring boots, counts it in `boot_arm_refusals` and logs ONE line, and the verdict never joins `boot["refusals"]` - a missing diagnostic is not a tier that declined to serve. The verdict is on the boot line as a bracketed token (`armed` / `env-refused` / `refused` / `inert` / `not_run`), never `key=value`, so the restart verifier's `grep -oE "tier=[A-Za-z_]+" | tail -1` can never land on it. See *The lookup ledger arms at boot (0.2.66)*. |
 
 There is deliberately **no env var for guard mode** - no env var that turns it *on*.
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
@@ -5707,6 +5710,170 @@ propagates.
 the machine it ran on. Its headline test asserts its own fixture is deeper than the
 retired 5.0 s budget and shallower than the shipped 45 s, so the test cannot drift into
 passing either way.
+
+## The arena is a buffer, not a store: mirror mode (`disk_store.py`, 0.2.66)
+
+**THE MEASUREMENT.** One conversation - **207,861 tokens** at 01:22, asked again at 16:34
+after a single **15-hour suspend** - came back with **0.0% reuse** and `reads_applied: 0`
+for the whole fresh process. Nothing had been evicted to make room for it and nothing had
+been discarded: the prefix was still resident in the host-RAM arena when the proxy stopped
+the backend to suspend the box, and it died with the process. The spill path had evicted
+**nothing** that night, which is the fact that names the bug - a block reached NVMe only
+when the arena needed a slot *back*, so a stop that happened while nobody needed the slots
+destroyed a prefix that was never written anywhere.
+
+**THE FIX IS A DOOR, NOT A PIPELINE.** `disk_store.on_store_completed` is the one seam that
+holds both halves of the fact at once: the `(cpu_slot, block_hash)` pairs were copied out at
+`bind_connector_metadata` (the only moment the metadata is in this process's hands, per the
+fork's contract at `worker.py:111`) and the completion diff says those slots now hold the
+bytes those names describe. A slot is reusable by the NEXT store the instant its event
+completes, so a spill that waits for anything later is either a stale read or a byte that
+never lands. **MIRROR MODE** queues the slot at that moment, through `disk_spill
+.request_spill` - the existing queue, the existing writer thread, the existing deduplication
+(one boot absorbed **1,552** duplicate writes for free), the existing journal. There is no
+second writer, no second queue, no second journal path, and none is planned.
+
+**WHAT THE COST WAS, BEFORE THE DECISION AND NOT AFTER.** This boot's rank files showed
+`slots_offered 3,076` against `spill_queued 2,556`: mirroring every store is **~1.20x**
+today's write volume, not 4x. The ratio is published per rank as
+`spill_on_store_queued / slots_offered`, because a cost assumed in advance is a claim and a
+cost measured is a number.
+
+**THE ONE RISK IT CARRIES, AND THE GUARD THAT CARRIES IT.** The live store sits at **961 GB
+of a 1 TB** soft ceiling and the filesystem behind it has **~400 GB** free, so the way this
+change becomes an outage is a mirror that outruns the evictor and fills `/home`. The evictor
+cannot be the guard (it runs *after* a committed write), and `request_spill` cannot be it
+either (by then the bytes are already snapshotted into the job), so `disk_spill
+.mirror_headroom()` is asked **before the copy**: `_accountable_bytes()` - the same currency
+the ceiling pass itself decides in - plus the bytes already queued, plus this slot's width,
+against the ceiling. A refusal is counted in the door's own table as `ceiling`, and **no
+byte is copied**. The table is `MIRROR_REFUSAL_REASONS` = `ceiling` / `queue_full` /
+`disabled` / `other`, and it is deliberately NOT `REFUSAL_REASONS`: those are the spill
+mechanism's reasons, and putting "mirror mode filled the ceiling" in the same table as
+"this rank was never armed" merges two statements with opposite meanings.
+
+**WHAT THE DOOR MAY NEVER DO**, each half pinned by a test in
+`tests/test_spill_mirror_mode.py`: block the serving path (its cost is one ceiling
+comparison plus the queue's own `put_nowait`; a full queue is a counted `queue_full`, never
+a wait); exceed the ceiling (the guard above, and `mirror_headroom` returns the arithmetic
+it used in `basis`, because a refusal a reader cannot reconstruct is a refusal he has to
+re-derive by hand); or touch a serving posture. The last one is proved against the door's
+**source**, not its behaviour - `spill_on_store_verdict`, `mirror_admission` and
+`note_mirror_refusal` may not name `set_disk_authority`, `set_offer_switch`, `serving_as` or
+`arm(` once their docstrings are stripped. Behavioural equality over one run cannot rule out
+a door that fires on another path.
+
+**THE ROLLBACK IS STRUCTURAL.** `VLLM_E2_TIER_DISK_SPILL_ON_STORE=0` closes the door at boot
+and `spill_on_store_verdict()` reports it as `source: "env", recognised: true`; a value that
+is neither an enable word nor a disable word (`flase`) stays **ON** and reports
+`recognised: false` with its complaint in `problems`, because a reader who meant to close the
+door and typed it wrong must not be handed a payload that reads as his intent.
+
+**RELEASE DISCIPLINE - SAID IN THE PAYLOAD, NOT ONLY IN THE SOURCE.** Once the arena's bytes
+reach NVMe promptly, its slots could become releasable as soon as a spill commits instead of
+when the arena needs them back: a much smaller `KV_OFFLOAD_SIZE` for the same prefix depth.
+**THIS CHANGE DOES NOT DO THAT.** No arena release, eviction or capacity policy is touched
+here, and the sentence saying so (`SPILL_ON_STORE_RELEASE_NOTE`, published inside every
+`spill_on_store` block) is in the payload because the idea is the kind that gets implemented
+by whoever finds it undocumented.
+
+### `op=flush`: the primitive that says the backlog arrived (0.2.66)
+
+Mirror mode makes the spill asynchronous by design, so the instant a stop takes the process
+down there can still be jobs in the queue - the exact data the change exists to protect. The
+verb is the bounded wait that closes that gap:
+
+```
+POST /plugins/kvtier/disk  {"op":"flush","timeout_seconds":20}
+```
+
+Flat answer, no nesting: `ok`, `drained`, `queue_depth_before`, `queue_depth_after`,
+`bytes_written`, `elapsed_seconds`, `timed_out`, `reason`, plus `budget_seconds`/`clamped`.
+`ok` describes the **call**, `drained` describes the **queue** - a budget that expires is
+`ok: true, drained: false, reason: "timeout"`, because a proxy that read `ok` as "the bytes
+are safe" would suspend on a store that still holds the conversation. The named reasons are
+`timeout` (a live writer that could not finish), `writer_down` (nobody will drain this:
+answered in milliseconds rather than after the budget, because the caller's decision is the
+same either way), `disabled` (`VLLM_E2_TIER_DISK_SHUTDOWN_FLUSH_SECONDS=0`) and a refusal
+before the queue is touched for a malformed `timeout_seconds`.
+
+Two properties are load-bearing. **An empty queue returns in milliseconds** - the suspend
+path calls this on every sleep, and a flush that slept first and looked afterwards would cost
+every suspend 100 ms and teach the operator to stop calling it (a test asserts the bound).
+**The budget is clamped at 30 s** (`FLUSH_BUDGET_SECONDS_MAX`) whoever asked, and the clamp is
+reported rather than applied in silence: this waits on a thread that can be holding a suspend.
+
+**THE SCOPE IS IN THE PAYLOAD, AND THIS IS THE PART TO READ.** `disk_spill`'s queue is
+**per process**, and the writer thread runs in the **worker** ranks (the processes that own
+the CPU slots), while `/plugins/kvtier/disk` is answered by whichever process the utility call
+landed on - the same trap that made `op:status` report `evictions: 0` for a store that had
+shed 234 GiB. So the answer names its `scope` and adds `ranks`, read from the rank files each
+worker writes. A caller that wants "no rank in this boot is still writing" must read `ranks`;
+a `drained: true` that meant "the process that answered happened to be idle" would be a
+silent no-op at the worst possible moment, which is the failure mode this op could otherwise
+have shipped.
+
+### The automatic drain, and why it is not an `atexit` handler (0.2.66)
+
+The same wait runs on the engine's own shutdown, so an operator does not have to remember to
+call it. Where it hooks was decided by reading the live fork rather than by assumption:
+
+* **`atexit` does not run in a worker.** A worker ends its *orderly* shutdown in
+  `v1/executor/multiproc_executor.py:_exit_worker_process` with `os._exit(exit_code)`, which
+  skips `atexit`, every pending `finally` and interpreter finalization. A drain registered
+  only there would be silent in the one process that OWNS the spill queue - silently, on
+  exactly the path it was written for.
+* **The connector's own `shutdown` does run.** `Worker.shutdown()`
+  (`v1/worker/gpu_worker.py:1699`) calls `ensure_kv_transfer_shutdown()`
+  (`distributed/kv_transfer/kv_transfer_state.py:97`), which calls the connector agent's
+  `shutdown()` - and that happens **before** the `os._exit`. So the connector instance the
+  plugin already sees at creation is the seam in the right process at the right moment.
+  `disk_spill.install_shutdown_flush()` wraps that ONE instance's method, marks it, refuses
+  to wrap twice, runs the drain **first** (what follows it in the fork is
+  `destroy_model_parallel()` and then the exit), calls the original afterwards, and lets the
+  ORIGINAL's exception propagate: that failure is the fork's story. Our own failure is owned
+  here - counted in `flush_errors`, logged once, and the fork's teardown runs regardless.
+  `atexit` is kept as the secondary seam for processes that really do exit normally.
+
+**THE BUDGET, AND THE WALL THAT ACTUALLY BINDS.** The unit is `KillMode=control-group` with
+`KillSignal=15` and `TimeoutStopSec=90`, and the engine is launched with `--shutdown-timeout
+60`, so SIGTERM reaches the EngineCore and every worker directly and 15 s fits inside both.
+But on an idle box the wall that binds first is neither of those:
+`VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS` (unset on the box, so **5 s**) plus the executor's
+4 s SIGTERM wait is ~9 s from the workers. The shipped drain default is 15 s because the
+operator asked for it; on a box that has not raised that variable, a drain that needs more
+than ~9 s will be interrupted by the executor's ladder, and the honest answer to "did the
+backlog make it" is then the `SHUTDOWN FLUSH` line in the engine log, not the budget.
+
+Fail-open is the whole contract: a budget that expires costs ONE WARNING line
+(`SHUTDOWN FLUSH did NOT drain the spill queue (reason=..., N job(s) left)`) and the stop
+proceeds. A drain that could hold a suspend hostage would be a diagnostic causing the outage
+it measures. And the rollback is structural: `VLLM_E2_TIER_DISK_SHUTDOWN_FLUSH_SECONDS=0`
+installs **nothing**, because a wrapper that runs and does nothing is still a wrapper that
+can fail on the stop path.
+
+### The lookup ledger arms at boot (`lookup_ledger.py`, 0.2.66)
+
+The per-request offer/adopt ring was DISARMED on the boot where it was needed. The question
+"why did the 16:34 request get 0 tokens off the arena after a 15-hour suspend" was
+unrecoverable - the ring records nothing while disarmed, and `calls_before_arming` is a count
+with no records behind it. Two investigations answered in one query what the ledger would have
+answered for free, forever, had it been armed. So the boot arms it, and a boot that cannot
+arm it **boots normally**, counts the refusal in `boot_arm_refusals`, and logs ONE line.
+
+Verdicts are on the boot LINE as a bracketed token - `LOOKUP_LEDGER[armed]`,
+`[env-refused]`, `[refused]`, `[inert]`, `[not_run]` - because a bare absence cannot be told
+from a value nobody grepped. Bracketed and never `key=value` for the standing reason: the
+restart verifier in `llm-api` pulls its PASS criterion with
+`grep -oE "tier=[A-Za-z_]+" | tail -1`, and a token containing an `=` would become a candidate
+match for a grep that was never meant to see it.
+
+**AN OBSERVABILITY STEP, ALLOWED TO FAIL.** Its verdict never joins `boot["refusals"]` - a
+missing diagnostic is not a tier that declined to serve - and `tests
+/test_lookup_ledger_boot_arm.py` compares every *decision* of a boot that could not arm the
+ring against the same boot with it armed. Arming a ring that changes the boot it observes is
+worse than no diagnostic. The gate is `VLLM_E2_TIER_DEV_LOOKUP_LEDGER_BOOT_ARM` (default ON),
+and the step is pinned by AST to name no serve posture, no offer switch and no arm writer.
 
 ## The run-end anchor patch (`mamba_anchor.py`, 0.2.64)
 

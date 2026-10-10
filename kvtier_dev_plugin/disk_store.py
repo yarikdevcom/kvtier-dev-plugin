@@ -147,6 +147,38 @@ SAFETY ENVELOPE (the `blockdump` posture, because this writes where that only re
     total the width the fingerprint declared, so even a hand-copied name would be
     refused at the read rather than spill the wrong bytes.
 
+MIRROR MODE (0.2.66): THE ARENA IS A BUFFER, NOT A STORE
+--------------------------------------------------------
+THE FAILURE, MEASURED. The proxy STOPS the backend in order to suspend the box, so every
+prefix still resident in the host-RAM arena when nobody needed its slots is destroyed
+with the process. One conversation - 207,861 tokens at 01:22, returned at 16:34 after a
+single 15-hour suspend - came back with 0.0% reuse and `reads_applied: 0` for the whole
+fresh process, while the spill path had evicted NOTHING: the data was never there to
+lose, because a block reached NVMe only when the arena needed a slot back.
+
+So a store completion IS the moment to write. `on_store_completed` is the only seam that
+holds both halves of the fact at once: the `(cpu_slot, block_hash)` pairs were copied
+out
+at `bind_connector_metadata` (the only moment the metadata is in this process's hands)
+and the completion diff says those slots now hold the bytes those names describe. A slot
+is reusable by the NEXT store the instant its event completes, so a spill that waits for
+anything else is either a stale read or a byte that never lands. `request_spill` is a
+`put_nowait` on the queue the evictor already uses, with the deduplication the writer
+already does (1,552 duplicate writes absorbed for free on one boot) - so mirror mode is
+ONE door on the existing queue, never a second writer, queue or journal path.
+
+WHAT THE DOOR MAY NEVER DO, each half pinned by a test: block the serving path (its cost
+is one ceiling comparison plus the queue's own `put_nowait`; a full queue or a writer
+that is not running is a counted refusal); write past the ceiling (961 GB of a 1 TB soft
+ceiling with ~400 GB free behind it, so `disk_spill.mirror_headroom` is consulted BEFORE
+a byte is copied and the refusal is counted as `ceiling`); or touch a serving posture -
+it arms nothing and serves nothing, which `tests/test_spill_mirror_mode.py` pins against
+the door's own source, not its behaviour.
+
+RELEASE DISCIPLINE - WHAT THIS MAKES POSSIBLE, AND WHAT IT DELIBERATELY DOES NOT DO.
+See `SPILL_ON_STORE_RELEASE_NOTE`: once the arena's contents are on disk promptly, its
+slots become releasable sooner. THAT IS THE NEXT CHANGE, and it needs its own evidence.
+
 WHAT THIS DOES NOT CLAIM
 ------------------------
 Nothing about restore any more - it landed in the same wheel. The two sentences that
@@ -244,6 +276,44 @@ MAX_RETAINED_EVENTS = 32            # STEPS remembered between bind and completi
 MAX_SLOTS_PER_EVENT = 4096          # SLOTS copied out of one step's metadata
 MAX_COMPLETED_SCAN = 512            # ENTRIES of `_completed_store_events` we diff
 MAX_SLOTS_PER_TICK = 64             # spill requests handed over per step
+
+# MIRROR MODE (0.2.66). The door's shipped default, and the reason it is a named
+# constant: "mirror mode is on" is a claim the release makes, and a flip of it must be a
+# diff a reviewer sees rather than a word inside a dict.
+SPILL_ON_STORE_DEFAULT = True
+
+# The door's OWN refusal vocabulary, deliberately much smaller than `REFUSAL_REASONS`
+# (which is the spill mechanism's). `ceiling` is the risk of the change, `queue_full` is
+# the proof it cannot block a step, `disabled` is the operator's own rollback, and
+# `other` is everything the spill path answered that is neither - kept in ONE bucket
+# rather than a growing list because the spill path's own `refused` table already breaks
+# those down, and a payload that restates another module's enum in two places is a
+# payload whose two copies disagree the first time one is edited.
+MIRROR_REFUSAL_REASONS = ("ceiling", "queue_full", "disabled", "other")
+
+# The refusal reasons that mean "the queue was the bound". `queue_bytes_full` is the
+# same event priced in the queue's second currency (copy-at-completion made a job carry
+# its bytes), so folding it into `queue_full` is one fact said once, not two enums.
+MIRROR_QUEUE_BOUND_REASONS = frozenset({"queue_full", "queue_bytes_full"})
+
+# THE SENTENCE THIS RELEASE OWES THE NEXT READER, and publishes in the payload rather
+# than only in the source, because the idea is the kind that gets implemented by
+# whoever finds it undocumented. Mirror mode makes the arena a buffer whose bytes reach
+# NVMe promptly, which means an arena slot could in principle be released as soon as its
+# spill commits instead of when the arena needs it back - a much smaller
+# `KV_OFFLOAD_SIZE`
+# for the same prefix depth. THIS CHANGE DOES NOT DO IT: no release, eviction or
+# capacity
+# policy is touched here, and the change that does must be justified by its own evidence
+# (how long a spill a slot's bytes actually take to commit, and what a shorter arena
+# costs
+# the RAM tier's hit rate), not by this sentence.
+SPILL_ON_STORE_RELEASE_NOTE = (
+    "mirror mode makes the arena a buffer whose bytes reach NVMe at store completion, "
+    "which means an arena slot could become releasable as soon as its spill commits "
+    "instead of when the arena needs the slot back. This change does NOT do that and "
+    "does not touch any arena release, eviction or capacity policy; the change that "
+    "does needs its own measured evidence, not this sentence.")
 MAX_HANDLED_EVENTS = 256            # EVENTS remembered as already spilled
 FINGERPRINT_RETRY_SECONDS = 5.0     # SECONDS between rebuilds while one is failing
 MAX_MISSING_REPORTED = 16           # unreadable fields named in one report
@@ -304,7 +374,13 @@ MAX_STRING_CHARS = 160
 
 DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "identities",
              "offers", "authority", "failures", "shadow", "gpu-shadow",
-             "restore-verify", "gpu-write", "restore-source", "adoptions")
+             "restore-verify", "gpu-write", "restore-source", "adoptions",
+             # LAST, for the same in-order reason as `gpu-write`/`restore-source`/
+             # `adoptions`: the status route advertises this tuple, the dispatch table
+             # below is pinned against it IN ORDER by a test, and `endpoint` derives the
+             # route's `op` enum from it. A mid-tuple insertion advertises an order the
+             # dispatcher does not have.
+             "flush")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
                      "gpu-shadow", "restore-verify", "gpu-write", "restore-source")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
@@ -434,6 +510,22 @@ _state: dict = {
     "retained_now": 0,
     "slots_offered": 0,
     "spill_queued": 0,
+    # THE MIRROR DOOR (0.2.66). `spill_queued` keeps its exact meaning (the queue
+    # accepted it) so no existing reader changes; these count the DOOR: how many pairs
+    # it queued, what that will cost in bytes, and why it refused the rest. The ratio of
+    # the first to `slots_offered` is the number the design was priced at (~1.20x on the
+    # boot this shipped against), so it is the number to watch when the store's growth
+    # rate is questioned.
+    "spill_on_store_queued": 0,
+    "spill_on_store_bytes": 0,
+    "spill_on_store_refused": {reason: 0 for reason in MIRROR_REFUSAL_REASONS},
+    "spill_on_store_refused_total": 0,
+    "spill_on_store_last_refusal": None,
+    # reason -> the count at which it was first logged. The door's log throttle: a
+    # mirror refused at the ceiling is refused on EVERY step for the rest of the boot,
+    # and a per-step WARNING would hide the one fact it reports (the counter below
+    # counts every offer, so nothing is lost by logging once).
+    "mirror_logged": {},
     "delegated_refusals": 0,
     "slots_capped": 0,
     "scan_skipped": 0,
@@ -523,6 +615,14 @@ def reset_state_for_tests() -> None:
         "binds": 0, "steps_idle": 0, "completions": 0,
         "events_retained": 0, "retained_dropped": 0, "retained_now": 0,
         "slots_offered": 0, "spill_queued": 0, "delegated_refusals": 0,
+        # THE MIRROR DOOR'S tallies (0.2.66). A reset that left these behind would let
+        # one test's refused offers be read as the next test's ceiling event - and the
+        # log throttle with it, which would silence a warning the next test means to
+        # see.
+        "spill_on_store_queued": 0, "spill_on_store_bytes": 0,
+        "spill_on_store_refused": {reason: 0 for reason in MIRROR_REFUSAL_REASONS},
+        "spill_on_store_refused_total": 0, "spill_on_store_last_refusal": None,
+        "mirror_logged": {},
         "slots_capped": 0, "scan_skipped": 0,
         "spill_spans_classified": 0, "spill_spans_complete": 0,
         "spill_incomplete_state": 0, "spill_incomplete_attention": 0,
@@ -1863,6 +1963,155 @@ def completed_snapshot(handler):
     return frozenset(completed.keys())
 
 
+def spill_on_store_verdict() -> dict:
+    """MIRROR MODE's posture: is a store completion enough to spill on? A QUESTION about
+    this rank's boot configuration and nothing else - it decides no refusal, arms
+    nothing
+    and blocks nothing, which is what its shape is for.
+
+    SAME SHAPE AS `staging_rows_verdict()` for the same reason: an operator reading a
+    refusal must be able to tell the shipped default, the boot environment and a value
+    the grammar refused apart, and must see the difference between "disabled" and
+    "unrecognised, so the default applied". A `VLLM_E2_TIER_DISK_SPILL_ON_STORE=flase`
+    means the door is OPEN; a payload that only said `enabled: false` would have told a
+    reader the opposite of what the typo did.
+
+    It reads `os.environ` and nothing else. No latch, no decision file, no arm: the
+    lever
+    that changes spilling mid-boot is the spill arm (a different question - whether
+    spilling is permitted at all), and conflating the two would make `armed` a three-way
+    switch with one of its positions undocumented.
+    """
+    out = {"enabled": SPILL_ON_STORE_DEFAULT, "source": "default", "raw": None,
+           "recognised": True, "problems": [], "default": SPILL_ON_STORE_DEFAULT,
+           "env_var": config.ENV_DISK_SPILL_ON_STORE,
+           "note": "a store completion alone is enough to queue the slot for NVMe",
+           # THE SENTENCE THIS RELEASE OWES THE NEXT READER, published inside the
+           # posture
+           # rather than beside it: the payload that says "mirror mode is ON" is exactly
+           # the payload that has to say what it does NOT do, in every door that shows
+           # the
+           # posture - the rank file, the snapshot, the verb - and not in a sibling key
+           # one
+           # door happens to carry and another does not.
+           "release_note": SPILL_ON_STORE_RELEASE_NOTE}
+    try:
+        env = config.disk_spill_on_store()
+    except Exception as exc:  # noqa: BLE001 - a posture read is never worth a fault
+        snapshot._error(exc, "disk_store spill-on-store verdict")
+        out["problems"] = [f"the environment read raised {type(exc).__name__}"]
+        return out
+    out["raw"] = env.get("raw")
+    out["source"] = str(env.get("source") or "default")
+    out["recognised"] = bool(env.get("recognised", True))
+    out["problems"] = [str(problem) for problem in (env.get("problems") or [])]
+    out["enabled"] = bool(env.get("enabled", SPILL_ON_STORE_DEFAULT))
+    return out
+
+
+def mirror_admission(width_bytes: int | None = None) -> dict:
+    """Ask the door ONE question: may ONE more slot be mirrored right now? A QUESTION.
+
+    Two gates, in this order, because they answer different things: the POSTURE first (a
+    closed door is the operator's own rollback and must never be reported as a capacity
+    event), then the CEILING, which is the risk this change actually carries on a store
+    at
+    961 GB of a 1 TB soft ceiling. The ceiling question belongs to
+    `disk_spill.mirror_headroom`, which counts in the SAME currency as the evictor
+    (`_accountable_bytes`) plus the bytes already queued - so the door cannot promise
+    what
+    the evictor will spend, and a refusal can be reconstructed from the payload.
+
+    IT DECIDES NOTHING AND COUNTS NOTHING: the caller in `on_store_completed` keeps the
+    tally, because a tally belongs to the loop that made the offers and not to the
+    question they asked. That separation is also what lets this same function answer a
+    reader who only wants to know where the door currently stands.
+    """
+    out = {"ok": True, "reason_kind": None, "reason": None, "gate": "posture",
+           "headroom": None}
+    verdict = spill_on_store_verdict()
+    if not verdict["enabled"]:
+        out["ok"] = False
+        out["gate"] = "posture"
+        out["reason_kind"] = "disabled"
+        out["reason"] = (f"{verdict['env_var']}={verdict['raw']!r} closed the mirror "
+                         "door, so a store completion queues nothing on its own")
+        return out
+    # NO CONTAINMENT HERE, on purpose. `mirror_headroom` already owns the failure it can
+    # produce (an unparseable ceiling means no ceiling, and says so in `basis`); a raise
+    # out of it means the spill module itself is broken, and that is the one answer this
+    # door must NOT translate into "no ceiling is enforced" - a guard that could not be
+    # asked would be reporting the store safe. It propagates to `on_store_completed`'s
+    # own
+    # containment, which counts it, logs it and reports the hook as failed: loud, and
+    # the
+    # mirror stops, which is the conservative direction for a disk-fill risk.
+    headroom = disk_spill.mirror_headroom(width_bytes)
+    out["headroom"] = headroom
+    if not headroom.get("ok", True):
+        out["ok"] = False
+        out["gate"] = "ceiling"
+        out["reason_kind"] = "ceiling"
+        out["reason"] = str(headroom.get("reason") or "the ceiling guard refused")
+    return out
+
+
+def note_mirror_refusal(reason_kind, detail: str | None = None,
+                        count: int = 1) -> None:
+    """Count a refusal the DOOR made, in the door's own table, and log it ONCE per
+    reason.
+
+    THE TABLE IS THE DOOR'S OWN, deliberately not `REFUSAL_REASONS`: those are the spill
+    mechanism's reasons (`not_armed`, `no_fingerprint`, ...) and a mirror refusal is a
+    different decision made at a different moment - before the queue, before the copy,
+    on
+    a posture and a ceiling. Merging them would put the sentence "mirror mode filled the
+    ceiling" in the same table as "this rank was never armed", and the two have opposite
+    meanings about what the tier is doing.
+
+    ONE LOG LINE PER REASON PER BOOT because a mirror refused at the ceiling will be
+    refused on every step for the rest of the boot, and a per-step WARNING is a log file
+    that hides the one fact it reports. The counter, by contrast, counts every offer - a
+    silent counter is the same lie in the other direction.
+    """
+    bucket = _mirror_refusal_bucket(reason_kind)
+    times = count if isinstance(count, int) and not isinstance(count, bool) \
+        and count > 0 else 1
+    table = dict(_state["spill_on_store_refused"])
+    table[bucket] = int(table[bucket]) + times
+    _state["spill_on_store_refused"] = table
+    _state["spill_on_store_refused_total"] = int(
+        _state["spill_on_store_refused_total"]) + times
+    _state["spill_on_store_last_refusal"] = {
+        "reason_kind": bucket, "count": int(table[bucket]),
+        "detail": _clip(detail, 160) if detail else None}
+    noted = _state["mirror_logged"]
+    if bucket in noted:
+        return
+    noted = dict(noted)
+    noted[bucket] = int(table[bucket])
+    _state["mirror_logged"] = noted
+    _logger.warning("kvtier-dev-plugin: MIRROR DOOR refusing offers (%s): %s",
+                    bucket, detail or "no detail was given")
+
+
+def _mirror_refusal_bucket(reason_kind) -> str:
+    """A spill-path verdict, mapped onto the door's OWN four reasons. Never raises.
+
+    `queue_bytes_full` folds into `queue_full` on purpose: it is the same event (the
+    queue
+    was at its bound) priced in the queue's other currency, and a reader who wants the
+    split has the spill path's own `refused` table published beside this one. Restating
+    another module's enum in two places is how the two copies come to disagree.
+    """
+    key = str(reason_kind or "other")
+    if key in MIRROR_REFUSAL_REASONS:
+        return key
+    if key in MIRROR_QUEUE_BOUND_REASONS:
+        return "queue_full"
+    return "other"
+
+
 def on_store_completed(handler, before) -> dict:
     """Spill the slots each newly-completed store event wrote. Never raises.
 
@@ -1921,6 +2170,20 @@ def on_store_completed(handler, before) -> dict:
                 _state["errors"] = int(_state["errors"]) + 1
                 _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
             spilled_here = 0
+            # THE MIRROR DOOR. The POSTURE is read once per store event rather than once
+            # per pair: it cannot change mid-event, and re-reading an environment
+            # variable
+            # 64 times a step to learn the same answer is how an observability flag buys
+            # itself a place on a hot path it has no business being on. The CEILING is
+            # asked per pair (cached for the rest of the event below), because that
+            # number
+            # genuinely moves as this tick's jobs are queued.
+            mirror_on = spill_on_store_verdict()["enabled"]
+            ceiling_closed = None
+            refused_ceiling = 0
+            refused_queue = 0
+            refused_other = 0
+            disabled_refused = 0
             for slot, key in record["pairs"]:
                 if handed >= MAX_SLOTS_PER_TICK:
                     remaining = len(record["pairs"]) - spilled_here
@@ -1932,6 +2195,34 @@ def on_store_completed(handler, before) -> dict:
                 _state["slots_offered"] = int(_state["slots_offered"]) + 1
                 handed += 1
                 spilled_here += 1
+                if not mirror_on:
+                    # THE ROLLBACK'S OWN TALLY. This loop hands EVERY completed pair to
+                    # `request_spill` when the door is open, so a closed door is not "no
+                    # behaviour" - it is the spill-on-store hand-off switching off.
+                    # Count
+                    # it, or `spill_on_store_queued: 0` reads as "the release does not
+                    # work" instead of "the operator closed the door". Nothing else
+                    # moves:
+                    # this is the plugin's spill, and the fork never writes this store.
+                    disabled_refused += 1
+                    continue
+                if ceiling_closed is None:
+                    # THE CEILING GATE, BEFORE THE QUEUE AND THEREFORE BEFORE ANY WRITE.
+                    # The evictor cannot be this guard (it runs after a committed write)
+                    # and `request_spill` cannot be it either (by then the bytes are
+                    # already snapshotted into the job), so this is the only moment a
+                    # mirror offer can be refused without having cost a copy first.
+                    ceiling_closed = not mirror_admission(
+                        disk_spill.slot_width_bytes())["ok"]
+                if ceiling_closed:
+                    # REMEMBERED FOR THE REST OF THE EVENT, because nothing in this loop
+                    # can move the number: while the door refuses, no job is queued, so
+                    # the accountable total cannot fall and the next pair faces the same
+                    # ceiling. Each pair is still COUNTED as its own refused offer - the
+                    # operator asked how much work the guard turned away, not how many
+                    # times the guard was consulted.
+                    refused_ceiling += 1
+                    continue
                 # THE SHADOW'S COMPARISON WINDOW. `snapshot` decides (default OFF, then
                 # sampled and bounded) whether THIS store is compared, and returns a
                 # plan `request_spill` fills with the bytes it captured - so the
@@ -1954,10 +2245,47 @@ def on_store_completed(handler, before) -> dict:
                 if answer.get("ok"):
                     _state["spill_queued"] = int(_state["spill_queued"]) + 1
                     report["queued"] = int(report["queued"]) + 1
+                    _state["spill_on_store_queued"] = int(
+                        _state["spill_on_store_queued"]) + 1
+                    # PRICED IN THE SAME CURRENCY the ceiling guard and the evictor use:
+                    # the fingerprint's own block width, or 0 when this process has no
+                    # fingerprint - and a width this process cannot know is never
+                    # invented, because a made-up number here would be a store-size
+                    # forecast nobody can check.
+                    _state["spill_on_store_bytes"] = int(
+                        _state["spill_on_store_bytes"]) + int(
+                            disk_spill.slot_width_bytes() or 0)
                 else:
                     _state["delegated_refusals"] = \
                         int(_state["delegated_refusals"]) + 1
                     _state["last_reason"] = _clip(answer.get("reason"))
+                    reason_kind = _mirror_refusal_bucket(answer.get("reason_kind"))
+                    if reason_kind == "queue_full":
+                        refused_queue += 1
+                    elif reason_kind == "ceiling":
+                        # The spill path enforced a ceiling of its own (it can: the
+                        # evictor's pass runs inside `commit_spill`). Counted as the
+                        # door's ceiling refusal, because to the store's owner it is one
+                        # fact: this rank is at its ceiling.
+                        refused_ceiling += 1
+                    else:
+                        refused_other += 1
+            for reason_kind, times, detail in (
+                    ("disabled", disabled_refused,
+                     f"{config.ENV_DISK_SPILL_ON_STORE} closed the mirror door, so "
+                     f"{disabled_refused} slot(s) of this store were not mirrored"),
+                    ("ceiling", refused_ceiling,
+                     f"{refused_ceiling} slot(s) of this store were refused because "
+                     "mirroring them would take this rank past its ceiling"),
+                    ("queue_full", refused_queue,
+                     f"{refused_queue} slot(s) were refused because the spill queue "
+                     "was at its bound (depth or bytes); the offer is dropped, never "
+                     "waited on"),
+                    ("other", refused_other,
+                     f"{refused_other} slot(s) were refused by the spill path itself; "
+                     "see its own `refused` table for the reasons")):
+                if times:
+                    note_mirror_refusal(reason_kind, detail, count=times)
             report["spilled"] = int(report["spilled"]) + spilled_here
             report["events"].append({"event": event, "spilled": spilled_here,
                                      "slots": int(record["count"]),
@@ -2621,6 +2949,21 @@ def _op_contains(body: dict) -> dict:
 RANK_ROLLUP_FIELDS = (("evictions", ("disk", "evictions"), "files"),
                       ("spilled", ("disk", "files_written"), "files"),
                       ("spill_queued", ("disk", "spill_queued"), "requests"),
+                      # MIRROR MODE (0.2.66), summed across the ranks that were asked.
+                      # The pair `spill_on_store_queued` /
+                      # `spill_on_store_refused_total`
+                      # is the fleet's answer to "is the door keeping up with the
+                      # stores",
+                      # and `spill_on_store_bytes` is what that work will cost the
+                      # store -
+                      # the two numbers that decide whether the ceiling guard is doing
+                      # real work or is fitted for show.
+                      ("spill_on_store_queued", ("disk", "spill_on_store_queued"),
+                       "requests"),
+                      ("spill_on_store_bytes", ("disk", "spill_on_store_bytes"),
+                       "bytes"),
+                      ("spill_on_store_refused_total",
+                       ("disk", "spill_on_store_refused_total"), "requests"),
                       ("spill_errors", ("disk", "spill_errors"), "writes"),
                       ("bytes_written", ("disk", "bytes_written"), "bytes"),
                       ("queue_depth", ("disk", "queue_depth"),
@@ -2696,6 +3039,18 @@ RANK_ROLLUP_MEANINGS = {
     "spilled": "files this rank wrote (the rank file's `files_written`, which is "
                "disk_spill's `spilled` counter)",
     "spill_queued": "requests this rank handed to its writer thread",
+    # MIRROR MODE (0.2.66). `spill_queued` is what the queue accepted; these three say
+    # what the DOOR asked for and what it turned away, which is the pair that answers
+    # "is
+    # mirroring keeping up with the stores, and is the ceiling guard doing real work".
+    "spill_on_store_queued": "slots this rank queued for NVMe AT THE STORE COMPLETION "
+                             "(mirror mode), a subset of `spill_queued`",
+    "spill_on_store_bytes": "bytes this rank's mirror offers will cost the store, "
+                            "priced at the rank's own block width",
+    "spill_on_store_refused_total": "mirror offers this rank refused - the sum of "
+                                    "ceiling, queue_full, disabled and other; the "
+                                    "split is in the rank file's own "
+                                    "`spill_on_store_refused`",
     "spill_errors": "writes this rank's thread failed",
     "bytes_written": "bytes this rank wrote since its boot - NOT the store's current "
                      "size: an eviction removes bytes this counter never subtracts. "
@@ -3740,6 +4095,12 @@ def _op_status(_body: dict) -> dict:
     return {"ok": True, "reason": None, "op": "status", "rank": rank,
             "rank_source": source, "armed": disk_spill.is_armed(),
             "capability": disk_spill.capability(),
+            # MIRROR MODE'S POSTURE, on the door an operator reads first (0.2.66). The
+            # counters say how many offers the door queued and refused; without the
+            # posture beside them `spill_on_store_queued: 0` cannot be told apart from a
+            # closed door, and a reader will not leave the payload to go ask the
+            # environment which of the two he is looking at.
+            "spill_on_store": spill_on_store_verdict(),
             "root": disk_spill.disk_root(),
             "ceiling_bytes": disk_spill.capacity_ceiling_bytes(),
             "arm_state": disk_spill.arm_state(),
@@ -3772,7 +4133,14 @@ def _op_status(_body: dict) -> dict:
                        "walk_sampled_files", "walk_total_files",
                        "walk_measured_bytes", "walk_entries_examined",
                        "walk_skipped_files", "walk_truncated",
-                       "walk_count_truncated", "plan_truncated")},
+                       "walk_count_truncated", "plan_truncated",
+                       # THE FLUSH TALLIES (0.2.66), in the same block as the queue they
+                       # describe. `queue_depth` already lives here, so the wait that
+                       # empties it belongs beside it - and these are PER-PROCESS like
+                       # every other field in `spill`, which is why the fleet view is
+                       # `spill_rollup` below and never a sum of these.
+                       "flush_calls", "flush_drained", "flush_timed_out",
+                       "flush_bytes_written", "flush_errors")},
             # THE SAME MECHANISM, SEEN FROM OUTSIDE THIS PROCESS. Everything above -
             # `spill.evictions`, `ceiling_checks`, the `walk_*` fields - is THIS
             # process's `disk_spill._state`, and on a multi-rank boot the processes
@@ -3848,6 +4216,72 @@ def _op_disarm(_body: dict) -> dict:
     verdict = disk_spill.disarm()
     disk_boot.note_operator_disarm("POST {\"op\":\"disarm\"}")
     return verdict
+
+
+def _op_flush(body: dict) -> dict:
+    """`{"op":"flush"}`, and optionally `{"op":"flush","timeout_seconds":20}`: wait,
+    BOUNDED, for this process's spill queue to reach empty. Never raises.
+
+    WHY IT EXISTS, AND WHY IT IS CALLED `flush` RATHER THAN ANYTHING THAT SOUNDS LIKE A
+    DUMP. Mirror mode (0.2.66) made the arena's bytes reach NVMe asynchronously by
+    design, so the moment a stop takes the process down there can still be jobs in the
+    queue - exactly the conversation the change exists to protect. This is the primitive
+    that closes that gap for a caller that wants it closed: a MIRROR of the queue's
+    state
+    at a deadline, not a procedure that rewrites anything.
+
+    THE SCOPE, SAID IN THE PAYLOAD AND NOT ONLY HERE. `disk_spill`'s queue is PER
+    PROCESS, and the writer thread that drains it lives in the WORKER ranks (the
+    processes that own the CPU slots), while this door is answered by the process that
+    holds the connector's lifecycle. So this answer describes THIS process's queue and
+    points at the rank rollup for the fleet: a caller that wants "no rank in this boot
+    is
+    still writing" must read `ranks` here (each rank publishes its own `queue_depth`),
+    not
+    assume this one flush covered four workers. Naming that boundary is the whole point
+    -
+    the failure mode this op could otherwise ship is a `drained: true` that meant "the
+    process that answered was idle", which is a silent no-op at the worst possible
+    moment.
+
+WHAT IT NEVER DOES: block the serving path (it waits on the CALLER's thread, which is
+why the budget is honoured rather than advisory, and why the ceiling exists), arm or
+disarm, move a posture, or touch a byte of the arena itself. `MUTATING_DISK_OPS`
+deliberately does NOT contain it: a bounded look is not a state change, and a GET that
+waits 20 s is a worse surprise than a 405.
+    """
+    # THE ARGUMENT'S PRESENCE IS THE QUESTION, not its value: an absent
+    # `timeout_seconds` takes the environment's budget, while an explicit null or string
+    # is a malformed request and must be refused. `FLUSH_BUDGET_UNSET` is how the two
+    # are
+    # told apart without inventing a value a caller could send by accident.
+    # `.get(key, UNSET)` and NOT a truthiness test: an explicit null is a value the
+    # caller SENT (and is refused as malformed), while a missing key is the caller
+    # declining to choose and takes the environment's budget.
+    asked = body.get("timeout_seconds", disk_spill.FLUSH_BUDGET_UNSET)
+    answer = disk_spill.flush(asked)
+    answer["scope"] = {"role": ROLE,
+                       "process": f"pid {os.getpid()}",
+                       "note": ("this answer describes THIS process's spill queue; the "
+                                "fleet's queue depths are in `ranks`, summed from each "
+                                "rank's own file"),
+                       "budget_env_var": config.ENV_DISK_SHUTDOWN_FLUSH_SECONDS,
+                       "budget_max_seconds": float(disk_spill.FLUSH_BUDGET_SECONDS_MAX)}
+    # THE FLEET VIEW, from the rank files the workers write. Contained: a flush whose
+    # answer depended on being able to read four other processes' files would be a flush
+    # that fails when a worker is wedged, which is precisely when someone calls it.
+    try:
+        rollup = rank_rollup(force=True)
+        answer["ranks"] = {"ranks_reporting": rollup.get("ranks_reporting"),
+                           "queue_depth_total": rollup.get("queue_depth"),
+                           "writer_alive_all": rollup.get("writer_alive"),
+                           "per_rank": rollup.get("ranks"),
+                           "rollup_reason": rollup.get("reason")}
+    except Exception as exc:  # noqa: BLE001 - the fleet view is detail, never a fault
+        snapshot._error(exc, "disk_store flush rollup")
+        answer["ranks"] = {"error": f"{type(exc).__name__}"[:200]}
+    answer["release_note"] = SPILL_ON_STORE_RELEASE_NOTE
+    return answer
 
 
 def _op_offers(body: dict) -> dict:
@@ -4257,7 +4691,12 @@ _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              "restore-source": _op_restore_source,
              # LAST, for the same in-order reason: per-request disk-adoption
              # attribution out of the scheduler's bounded ring (0.2.61).
-             "adoptions": _op_adoptions}
+             "adoptions": _op_adoptions,
+             # LAST, for the same in-order reason: a BOUNDED wait for this process's
+             # spill queue (0.2.66), the primitive behind a shutdown drain and behind
+             # any caller that wants to know the backlog reached NVMe before it
+             # proceeded.
+             "flush": _op_flush}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring
@@ -4410,6 +4849,22 @@ def worker_report() -> dict:
                   "completions": int(_state["completions"]),
                   "slots_offered": int(_state["slots_offered"]),
                   "spill_queued": int(_state["spill_queued"]),
+                  # MIRROR MODE (0.2.66): the door's own tallies, per rank. Published
+                  # beside `spill_queued` because the pair is the whole story - `queued`
+                  # is what the queue accepted, `refused_total` is what the door turned
+                  # away and `refused.ceiling` is the reason this change could ever cost
+                  # the store more than it can hold.
+                  "spill_on_store_queued": int(_state["spill_on_store_queued"]),
+                  "spill_on_store_bytes": int(_state["spill_on_store_bytes"]),
+                  "spill_on_store_refused": dict(
+                      _state["spill_on_store_refused"]),
+                  "spill_on_store_refused_total": int(
+                      _state["spill_on_store_refused_total"]),
+                  "spill_on_store_last_refusal": (
+                      dict(_state["spill_on_store_last_refusal"])
+                      if isinstance(_state["spill_on_store_last_refusal"], dict)
+                      else None),
+                  "spill_on_store": spill_on_store_verdict(),
                   # THE COMPLETENESS OF THIS RANK'S SPILLS, so the fleet's rate is a
                   # sum of four honest per-rank counters rather than the answering
                   # process's own view of a job it did not do (the 2026-10-05 "every
@@ -4939,6 +5394,19 @@ def hook_section(include_fingerprint: bool = True) -> dict:
             "completions": int(_state["completions"]),
             "slots_offered": int(_state["slots_offered"]),
             "spill_queued": int(_state["spill_queued"]),
+            # MIRROR MODE (0.2.66). The door's tallies, with its posture next to them:
+            # `spill_on_store_queued: 0` means something entirely different when
+            # `spill_on_store.enabled` is false, and a reader who has to go and ask the
+            # environment which it is will not ask at all.
+            "spill_on_store_queued": int(_state["spill_on_store_queued"]),
+            "spill_on_store_bytes": int(_state["spill_on_store_bytes"]),
+            "spill_on_store_refused": dict(_state["spill_on_store_refused"]),
+            "spill_on_store_refused_total": int(
+                _state["spill_on_store_refused_total"]),
+            "spill_on_store_last_refusal": (
+                dict(_state["spill_on_store_last_refusal"])
+                if isinstance(_state["spill_on_store_last_refusal"], dict) else None),
+            "spill_on_store": spill_on_store_verdict(),
             "delegated_refusals": int(_state["delegated_refusals"]),
             "slots_capped": int(_state["slots_capped"]),
             "scan_skipped": int(_state["scan_skipped"]),
@@ -5034,6 +5502,19 @@ def section() -> dict:
             "completions": int(_state["completions"]),
             "slots_offered": int(_state["slots_offered"]),
             "spill_queued": int(_state["spill_queued"]),
+            # MIRROR MODE (0.2.66). The door's tallies, with its posture next to them:
+            # `spill_on_store_queued: 0` means something entirely different when
+            # `spill_on_store.enabled` is false, and a reader who has to go and ask the
+            # environment which it is will not ask at all.
+            "spill_on_store_queued": int(_state["spill_on_store_queued"]),
+            "spill_on_store_bytes": int(_state["spill_on_store_bytes"]),
+            "spill_on_store_refused": dict(_state["spill_on_store_refused"]),
+            "spill_on_store_refused_total": int(
+                _state["spill_on_store_refused_total"]),
+            "spill_on_store_last_refusal": (
+                dict(_state["spill_on_store_last_refusal"])
+                if isinstance(_state["spill_on_store_last_refusal"], dict) else None),
+            "spill_on_store": spill_on_store_verdict(),
             "delegated_refusals": int(_state["delegated_refusals"]),
             "slots_capped": int(_state["slots_capped"]),
             # The completeness tally, again (see `hook_section`): three classes and
@@ -5055,7 +5536,12 @@ def section() -> dict:
             "spill": {key: state[key] for key in
                       ("spilled", "accepted", "requests", "drops", "bytes_written",
                        "evictions", "errors", "group_collisions",
-                       "journal_records", "journal_failures")},
+                       "journal_records", "journal_failures",
+                       # THE FLUSH TALLIES (0.2.66), so a snapshot and `op:status`
+                       # answer "did anyone wait for this queue, and did it work" with
+                       # the same numbers.
+                       "flush_calls", "flush_drained", "flush_timed_out",
+                       "flush_bytes_written", "flush_errors")},
             "retained": retained_view(),
             "spill_one": {"requests_written": int(_state["requests_written"]),
                           "fulfilled": int(_state["fulfilled"]),

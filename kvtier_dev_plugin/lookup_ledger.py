@@ -80,9 +80,16 @@ engine. Disarmed, `record_from_call()` is one dict lookup and a return.
 from __future__ import annotations
 
 import json
+import logging
 import time
 
-from . import snapshot
+from . import config, snapshot
+
+# WARNING, for the reason every other module in this package gives: a plugin logger is
+# not one of the `vllm.*` loggers the engine configures, so an INFO line from here never
+# reaches `/tmp/vllm-serve.log`, which is the only engine log an operator reads. The
+# BOOT-ARM line is a refusal notice, and a refusal nobody can read is a silent failure.
+_logger = logging.getLogger("kvtier_dev_plugin.lookup_ledger")
 
 PROTOCOL_VERSION = 1
 
@@ -148,7 +155,33 @@ _state: dict = {
     "last_error": None,
     "install": None,
     "uninstall": None,
+    # THE BOOT ARM (0.2.66). `boot_arms` counts boots that armed the ring,
+    # `boot_arm_refusals` counts boots that could not and BOOTS ANYWAY (this is
+    # observability: a missing diagnostic is never a tier that declined to serve, so
+    # neither number ever joins `boot["refusals"]`). `boot_verdict` is the last
+    # verdict THIS PROCESS reached, and `armed_at` is when the ring actually started
+    # recording - the field that distinguishes "armed from the first request" from
+    # "someone POSTed arm in the middle of the boot", which is the whole lesson of the
+    # incident that made this a boot step.
+    "boot_arms": 0,
+    "boot_arm_refusals": 0,
+    "boot_verdict": None,
+    "boot_reason": None,
+    "armed_at": None,
 }
+
+# THE BOOT ARM'S CLOSED VERDICT VOCABULARY (0.2.66), rendered as
+# `LOOKUP_LEDGER[verdict]` on the boot line. Bracketed and never `key=value` for the
+# reason `mamba_anchor.boot_token` gives: the restart verifier in llm-api pulls its
+# PASS criterion with `grep -oE "tier=[A-Za-z_]+" | tail -1`, and a token that happens
+# to contain an `=` becomes a candidate match for a grep that was never meant to see it.
+VERDICT_ARMED = "armed"                # the ring is recording from this instant
+VERDICT_ENV_REFUSED = "env-refused"    # the operator asked for no ring, by name
+VERDICT_REFUSED = "refused"            # something stopped the arm; the boot is intact
+VERDICT_INERT = "inert"                # an inert boot installs nothing, ring included
+VERDICT_NOT_RUN = "not_run"            # this boot never reached the step
+BOOT_VERDICTS = (VERDICT_ARMED, VERDICT_ENV_REFUSED, VERDICT_REFUSED, VERDICT_INERT,
+                 VERDICT_NOT_RUN)
 
 # req_id -> (slot, seq of the record waiting for its adopt). Bounded by `cap`:
 # see the module docstring. A dict, not a deque, because an adopt for ANY older
@@ -166,6 +199,12 @@ def reset_state_for_tests() -> None:
         "join_refusals": 0, "arms": 0, "disarms": 0, "clears": 0, "reads": 0,
         "verdicts": 0, "record_errors": 0, "last_error": None,
         "install": None, "uninstall": None,
+        # THE BOOT ARM'S STATE TOO (0.2.66). A reset that left `boot_verdict` behind
+        # would let one test read another test's boot verdict as its own, and
+        # `armed_at` with it - which is the field a reader uses to decide whether the
+        # ring was recording when the request he is investigating arrived.
+        "boot_arms": 0, "boot_arm_refusals": 0, "boot_verdict": None,
+        "boot_reason": None, "armed_at": None,
     })
     _pending.clear()
 
@@ -199,6 +238,14 @@ def counters() -> dict:
         "verdicts": int(_state["verdicts"]),
         "record_errors": int(_state["record_errors"]),
         "last_error": _state["last_error"],
+        # THE BOOT ARM (0.2.66): was the ring recording from this boot's first
+        # request, and if not, which of the five verdicts says why.
+        "boot_arms": int(_state["boot_arms"]),
+        "boot_arm_refusals": int(_state["boot_arm_refusals"]),
+        "boot_verdict": (_state["boot_verdict"]
+                         if _state["boot_verdict"] in BOOT_VERDICTS else None),
+        "boot_reason": _state["boot_reason"],
+        "armed_at": _state["armed_at"],
     }
 
 
@@ -712,11 +759,124 @@ def arm(cap=None) -> dict:
     if not _state["armed"]:
         _state["arms"] += 1
         _state["armed"] = True
+        # WHEN recording started, in wall-clock terms. The field that separates "armed
+        # from the first request of this boot" from "armed by a POST at 16:40, so the
+        # 16:34 request was never recorded" - the distinction the boot arm exists to
+        # make, and worthless unless the moment is stamped where the arm happens.
+        _state["armed_at"] = round(time.time(), 3)
         report["reason"] = f"recording the lookup/adopt pair into a {wanted}-slot ring"
     else:
         report["reason"] = "already armed" + (
             " at a new cap" if report["reallocated"] else "")
     return report
+
+
+def boot_arm(guard_wrappers_installed: bool = True,
+             inert: bool = False) -> dict:
+    """ARM THE RING AT BOOT. Fail-open in the strongest sense: this function may not
+    change the boot it is observing, and the only thing a refusal may cost is the ring.
+
+    WHY A BOOT STEP RATHER THAN A POST. The ledger was disarmed on the boot where the
+    16:34 request came back with 0.0% reuse after a 15-hour suspend, and its refusal
+    reason was unrecoverable: the ring records NOTHING while disarmed, so the question
+    "why did that offer adopt 0 tokens" had no answer and took two investigations to
+    approximate. An observability ring that must be remembered is an observability ring
+    that is disarmed for exactly the incident you will care about.
+
+    THE ORDER OF THE GATES, and each gate's reason for being first:
+
+      * INERT first, because `VLLM_E2_TIER_DEV_BOOT_INERT` is the operator's explicit
+        "install and stop there" and arming a ring on that boot would be doing work the
+        opt-out refused. It is NOT a refusal and is not counted.
+      * the ENVIRONMENT second, because `0` is the rollback and must be distinguishable
+        from a failure. Also not counted: an operator asked for no ring.
+      * the GUARD WRAPPERS third. The ring is fed by `record_from_call`, which the guard
+        wrappers call, so arming it on a boot that installed no wrappers would arm a
+        recorder that nothing writes into - a payload saying `armed: true` over an empty
+        ring, which is the worst shape of a lie this module could tell. So the
+        dependency is ASKED, and the answer says which side failed.
+      * `arm()` last, inside the guard, because a ring that cannot be allocated is a
+        fact to count and log - not an exception to hand to a boot.
+
+    WHAT THIS FUNCTION MUST NEVER DO: join `boot["refusals"]`, change the tier's arm, or
+    touch a serve posture. `tests/test_lookup_ledger_boot_arm.py` pins that against this
+    function's own source, and its behavioural test compares every other boot verdict
+    field for field against the same boot with the ledger armed.
+    """
+    out = {"armed": False, "verdict": VERDICT_REFUSED, "reason": None,
+           "cap": int(_state["cap"]), "recognised": True, "raw": None,
+           "problems": [], "env_var": config.ENV_LOOKUP_LEDGER_BOOT_ARM,
+           "note": ("a per-request offer/adopt ring, armed by the boot so the first "
+                    "lookup of this boot is a record and not a counted miss")}
+    if inert:
+        out["verdict"] = VERDICT_INERT
+        out["reason"] = (f"{config.ENV_BOOT_INERT} is set: this boot installs and "
+                         "stops there, so no ring is armed and no lookup is recorded")
+        _state["boot_verdict"] = VERDICT_INERT
+        _state["boot_reason"] = out["reason"]
+        return out
+    try:
+        gate = config.lookup_ledger_boot_arm()
+    except Exception as exc:  # noqa: BLE001 - a posture read never costs a boot
+        snapshot._error(exc, "lookup_ledger boot arm gate")
+        gate = {"enabled": True, "source": "default", "raw": None,
+                "recognised": True,
+                "problems": [f"the read raised {type(exc).__name__}"]}
+    out["raw"] = gate.get("raw")
+    out["recognised"] = bool(gate.get("recognised", True))
+    out["problems"] = [str(problem) for problem in (gate.get("problems") or [])]
+    if not gate.get("enabled", True):
+        out["verdict"] = VERDICT_ENV_REFUSED
+        out["reason"] = (f"{config.ENV_LOOKUP_LEDGER_BOOT_ARM}="
+                         f"{gate.get('raw')!r} asked for no ledger, so this boot "
+                         "records no lookup/adopt pair")
+        _state["boot_verdict"] = VERDICT_ENV_REFUSED
+        _state["boot_reason"] = out["reason"]
+        return out
+    if not guard_wrappers_installed:
+        # THE DEPENDENCY, ASKED RATHER THAN ASSUMED. A ring nothing writes into is worse
+        # than no ring: it makes an empty answer look like a measured one.
+        out["verdict"] = VERDICT_REFUSED
+        out["reason"] = ("no guard wrappers are installed on this manager, so nothing "
+                         "would write into the ring: arming it here would publish "
+                         "`armed: true` over a ring that can never hold a record")
+        _state["boot_arm_refusals"] = int(_state["boot_arm_refusals"]) + 1
+        _state["boot_verdict"] = VERDICT_REFUSED
+        _state["boot_reason"] = out["reason"]
+        _logger.warning("kvtier-dev-plugin: LOOKUP LEDGER not armed at boot: %s. The "
+                        "boot is otherwise unaffected - this costs a diagnostic, not a "
+                        "tier.", out["reason"])
+        return out
+    try:
+        verdict = arm()
+    except Exception as exc:  # noqa: BLE001 - an observability arm never costs a boot
+        snapshot._error(exc, "lookup_ledger boot arm")
+        out["verdict"] = VERDICT_REFUSED
+        out["reason"] = (f"{type(exc).__name__}: the ring could not be armed "
+                         f"({exc})")
+        _state["boot_arm_refusals"] = int(_state["boot_arm_refusals"]) + 1
+        _state["boot_verdict"] = VERDICT_REFUSED
+        _state["boot_reason"] = out["reason"]
+        # ONE line per episode, at WARNING like the boot line, because a diagnostic that
+        # could not be fitted has to be readable from the log - and one line per BOOT is
+        # the discipline that keeps it a notice instead of a flood.
+        _logger.warning("kvtier-dev-plugin: LOOKUP LEDGER not armed at boot: %s. The "
+                        "boot is otherwise unaffected - this costs a diagnostic, not a "
+                        "tier.", out["reason"])
+        return out
+    out["armed"] = bool(verdict.get("armed")) and bool(_state["armed"])
+    out["cap"] = int(_state["cap"])
+    out["armed_at"] = _state["armed_at"]
+    out["reallocated"] = bool(verdict.get("reallocated"))
+    out["verdict"] = VERDICT_ARMED if out["armed"] else VERDICT_REFUSED
+    out["reason"] = str(verdict.get("reason") or "the ring was armed")
+    if out["verdict"] == VERDICT_ARMED:
+        _state["boot_arms"] = int(_state["boot_arms"]) + 1
+    else:
+        _state["boot_arm_refusals"] = int(_state["boot_arm_refusals"]) + 1
+    _state["boot_verdict"] = out["verdict"]
+    _state["boot_reason"] = out["reason"]
+    return out
 
 
 def disarm() -> dict:

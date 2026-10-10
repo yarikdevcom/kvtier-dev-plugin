@@ -59,7 +59,7 @@ def fail(module, *names):
 
 # --- the default: off, and un-configurable ----------------------------------
 
-def test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off():
+def test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off(monkeypatch):
     """A facility that can mask bugs must not be arming-able from a launcher script.
 
     `config.py` owns every env var this plugin reads; none of them is a guard. The
@@ -80,10 +80,26 @@ def test_no_env_var_can_arm_guard_mode_and_at_import_it_is_off():
     # name has to say so: a variable called something neutral that armed a dev
     # facility would be this test's failure wearing a different hat.
     assert "INERT" in config.ENV_BOOT_INERT
+    # THE 0.2.66 EXCEPTION, NAMED AND PROVED. `VLLM_E2_TIER_DEV_LOOKUP_LEDGER_BOOT_ARM`
+    # contains the word because it arms the per-request lookup RING - a recorder in
+    # `lookup_ledger.py` that writes no byte, offers nothing and serves nothing. It is
+    # named here instead of the filter being narrowed, because a filter narrowed to let
+    # one variable through lets the next one through too. What proves the exception is
+    # honest is the line after it: with the variable set to its most permissive value,
+    # guard mode is STILL not armed - arming the ledger and arming the guard are
+    # different
+    # questions, and `tests/test_lookup_ledger_boot_arm.py` pins that the ledger step
+    # cannot name a posture, an offer switch or an arm writer at all.
+    # The exception is a set of config ATTRIBUTE NAMES, because that is what `dir()`
+    # enumerates - the env var string is the same variable's other face.
+    ledger_switch = {"ENV_LOOKUP_LEDGER_BOOT_ARM"}
     with_guard_arming = [name for name in env_names
                          if any(w in name.upper() for w in
                                 ("ARM", "GUARD", "TIER_ARM"))]
-    assert with_guard_arming == []
+    assert set(with_guard_arming) <= ledger_switch, with_guard_arming
+    monkeypatch.setenv(config.ENV_LOOKUP_LEDGER_BOOT_ARM, "1")
+    assert config.lookup_ledger_boot_arm()["enabled"] is True
+    assert guard_mode.is_armed() is False, "the ledger's gate armed guard mode"
 
 
 def test_a_wrapper_from_a_sibling_module_is_composed_with_not_refused(tier):

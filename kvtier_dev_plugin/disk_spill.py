@@ -310,9 +310,11 @@ space gate - lives in `disk_layout.py` and is not re-implemented here.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import queue
 import threading
@@ -328,6 +330,16 @@ from . import (
     snapshot,
     worker_diag,
 )
+
+# WHY WARNING AND NOT INFO, stated here as well as in `disk_store`: a plugin logger is
+# not one of the `vllm.*` loggers the engine configures, so an INFO line from this
+# module
+# never reaches the log the operator greps. The shutdown drain's one line is exactly the
+# kind of verdict that must be readable after the fact - it answers "did the backlog
+# make
+# it before the stop?" from `/tmp/vllm-serve.log`, and a line nobody can see is the same
+# as no line.
+_logger = logging.getLogger("kvtier_dev_plugin.disk_spill")
 
 # --- the caps, and the unit of every one of them ----------------------------
 
@@ -370,6 +382,38 @@ SPAN_COST_MEANING = {
 }
 SPILL_WINDOW_SECONDS = 60.0          # SECONDS in the write-rate window
 MAX_FILES_PER_WINDOW = 200           # FILES written per window
+
+# THE FLUSH BUDGET (0.2.66). A flush is a bounded poll of THIS module's own queue, so
+# its cost is one `qsize()` per interval and the only thing that can make it slow is
+# the budget itself. `SHUTDOWN_FLUSH_SECONDS_DEFAULT` is the wait the stop path may
+# spend getting the queued bytes onto NVMe before it hands the process back to the
+# fork's teardown; `FLUSH_BUDGET_SECONDS_MAX` is the ceiling on ANY flush, whoever asked
+# (the verb's caller or the environment), because a wait on the stop path is the one
+# place where a typo costs a suspend rather than a byte.
+SHUTDOWN_FLUSH_SECONDS_DEFAULT = 15.0
+FLUSH_BUDGET_SECONDS_MAX = 30.0
+FLUSH_POLL_SECONDS = 0.02            # SECONDS between looks at the queue depth
+SHUTDOWN_FLUSH_ATTR = "kvtier_dev_shutdown_flush"    # the wrapper's own marker
+
+# WHY THE DRAIN IS HOOKED TO THE CONNECTOR AND NOT TO `atexit`, read out of the live
+# fork rather than assumed: a worker ends its ORDERLY shutdown in
+# `v1/executor/multiproc_executor.py:_exit_worker_process` with `os._exit(exit_code)`,
+# and `os._exit` skips `atexit`, every pending `finally` and interpreter finalization.
+# A drain registered only with `atexit` would therefore never run in the process that
+# OWNS the spill queue (the queue is built in the worker, by `request_spill`, which runs
+# inside the worker's `get_finished`) - silently, on exactly the path it was written
+# for.
+# The worker's teardown does, however, call the connector: `Worker.shutdown()`
+# (`v1/worker/gpu_worker.py:1699`) -> `ensure_kv_transfer_shutdown()`
+# (`distributed/kv_transfer/kv_transfer_state.py:97`) ->
+# `_KV_CONNECTOR_AGENT.shutdown()`,
+# and that runs BEFORE the `os._exit`. So the connector's own `shutdown` is the seam
+# that exists in the right process at the right moment, and `atexit` stays as the
+# secondary seam for the processes that really do exit normally (an in-process boot).
+SHUTDOWN_FLUSH_NOTE = (
+    "the drain runs on the connector's own shutdown (the worker's teardown calls it "
+    "before os._exit) and on atexit secondarily, because os._exit skips atexit and "
+    "the spill queue lives in the worker process")
 MIN_FREE_BYTES = 1024 * 1024 * 1024  # BYTES the filesystem must keep free
 MAX_REGIONS = 64                     # REGION TENSORS making up one slot
 MAX_STRING_CHARS = 160
@@ -671,6 +715,22 @@ _state: dict = {
     "thread_alive": False,
     "queue_depth": 0,
     "queue_depth_peak": 0,
+    # THE FLUSH TALLIES (0.2.66). A flush is a bounded WAIT on this queue, added for
+    # mirror mode: a stop that happens while the queue still holds work loses exactly
+    # the bytes the change exists to protect. `flush_calls` counts the calls this
+    # process answered, `flush_drained`/`flush_timed_out` split them by outcome, and
+    # `flush_bytes_written` is the bytes that landed *inside those waits* - never the
+    # boot total, because a caller that asked "did MY backlog arrive" must be able to
+    # read that off one answer. `flush_errors` is the fail-open tally: a flush that
+    # raised, which must be visible and must never be a fault on the stop path.
+    "flush_calls": 0,
+    "flush_drained": 0,
+    "flush_timed_out": 0,
+    "flush_bytes_written": 0,
+    "flush_errors": 0,
+    "flush_last": None,
+    # THE SHUTDOWN DRAIN'S verdict, for the boot-line/verb readers.
+    "shutdown_flush": None,
     # Bytes of SNAPSHOTTED slots held by queued jobs. Load-bearing since the copy moved
     # to store completion: the queue's memory is now bytes x depth, so admission is
     # checked in both currencies (see MAX_QUEUED_BYTES).
@@ -927,6 +987,11 @@ def reset_state_for_tests() -> None:
         "fingerprint": None, "geometry_digest": None,
         "thread_started": 0, "thread_alive": False,
         "queue_depth": 0, "queue_depth_peak": 0,
+        # The flush tallies: a reset that left these behind would let one test read
+        # another test's wait as its own, including the bytes it claimed to have seen.
+        "flush_calls": 0, "flush_drained": 0, "flush_timed_out": 0,
+        "flush_bytes_written": 0, "flush_errors": 0, "flush_last": None,
+        "shutdown_flush": None,
         "queue_bytes": 0, "queue_bytes_peak": 0,
         "window_start_mono": None, "window_files": 0,
         "requests": 0, "accepted": 0, "spilled": 0, "duplicates": 0,
@@ -2897,6 +2962,68 @@ def _ceiling_trigger() -> dict:
                         "under the fair share and the store-wide ceiling"))}
 
 
+def mirror_headroom(width_bytes: int | None = None) -> dict:
+    """Would ONE more mirrored slot take this rank past its ceiling? A QUESTION, not a
+    decision: it counts nothing, arms nothing and refuses nothing. The caller - the
+    mirror door in `disk_store` - decides and counts.
+
+    WHY THE DOOR EXISTS AT ALL. The live store sits at 961 GB of a 1 TB soft ceiling and
+    the filesystem behind it has ~400 GB free, so the one way mirror mode becomes an
+    outage is a mirror that outruns the evictor and fills `/home`. The evictor is not
+    the guard: it runs AFTER a committed write, so an offer that is already queued is
+    too late to ask. This is the check that happens BEFORE the bytes are copied.
+
+THE CURRENCY IS THE ONE THE CEILING ITSELF DECIDES ON, so the door and the evictor
+cannot disagree about where the store stands: `_accountable_bytes()` (this rank's own
+bytes plus the dead-geometry and unattributable bytes it is accountable for, or the
+store-wide estimate before any attribution - the eager direction, deliberately) plus
+`_state["queue_bytes"]`, the snapshotted bytes already queued and therefore already
+promised. Omitting the queued half would let 256 jobs x 11.4 MB walk past a ceiling they
+had already spent.
+
+    A MISSING OR UNPARSEABLE CEILING MEANS NO CEILING, and this inherits that verdict
+    from `capacity_ceiling_bytes()` rather than restating it: "0" would mean "evict
+    everything you see", so a typo must never become a destructive reading - and here it
+    would additionally mean "refuse every mirror offer", which is a typo turning the
+    tier off. `basis` names which number was used, because a refusal a reader cannot
+    reconstruct is a refusal he has to re-derive by hand.
+    """
+    out = {"ok": True, "reason_kind": None, "reason": None,
+           "ceiling_bytes": None, "accountable_bytes": 0, "queued_bytes": 0,
+           "width_bytes": None, "projected_bytes": 0, "basis": "no ceiling configured"}
+    try:
+        ceiling = capacity_ceiling_bytes()
+        out["ceiling_bytes"] = ceiling
+        if not ceiling:
+            return out
+        width = int(width_bytes) if isinstance(width_bytes, int) \
+            and not isinstance(width_bytes, bool) and width_bytes > 0 else 0
+        accountable = int(_accountable_bytes())
+        queued = int(_state["queue_bytes"])
+        out["width_bytes"] = int(width_bytes) if width else None
+        out["accountable_bytes"] = accountable
+        out["queued_bytes"] = queued
+        out["projected_bytes"] = accountable + queued + width
+        out["basis"] = ("accountable+queued+width vs ceiling_bytes"
+                        if width else
+                        "accountable+queued vs ceiling_bytes (no width given)")
+        if out["projected_bytes"] > int(ceiling):
+            out["ok"] = False
+            out["reason_kind"] = "ceiling"
+            out["reason"] = (
+                f"one more mirrored slot would put this rank at "
+                f"{out['projected_bytes']} B accountable+queued against a "
+                f"{ceiling} B ceiling (accountable {accountable} B, already "
+                f"queued {queued} B, this slot {width} B): the offer is refused "
+                f"at the door and no byte is copied")
+        return out
+    except Exception as exc:  # noqa: BLE001 - a headroom question is never a fault
+        snapshot._error(exc, "disk_spill mirror headroom")
+        out["ok"] = True
+        out["basis"] = f"unreadable ({type(exc).__name__}): no ceiling is enforced"
+        return out
+
+
 def _ceiling_budget_seconds() -> dict:
     """The pass's time budget in force: the operator's, else the shipped default.
 
@@ -4330,6 +4457,374 @@ def stop_writer(timeout_seconds: float = 2.0) -> dict:
             else "the thread did not exit inside the timeout"}
 
 
+def _queue_backlog() -> int:
+    """Jobs queued OR being written RIGHT NOW. Never raises; 0 when no queue exists.
+
+    `unfinished_tasks` rather than `qsize()`: a job the writer has taken but not
+    finished is not on the queue and IS still unwritten, so a flush that reported
+    `drained: true` on `qsize() == 0` would be reporting a file that is mid-`write()`.
+    """
+    local = _queue
+    if local is None:
+        return 0
+    try:
+        return int(local.unfinished_tasks)
+    except Exception:  # noqa: BLE001 - a queue that cannot answer is treated as empty
+        return 0
+
+
+def shutdown_flush_verdict() -> dict:
+    """The SHUTDOWN DRAIN's budget, resolved from the environment. Never raises.
+
+    Same three-door honesty as `disk_restore.staging_rows_verdict()`: the shipped
+    default, the boot environment, and a value the grammar refused reported with its
+    complaint while the default stands. `0` is the operator's off switch and is legal,
+    because a drain is an addition to the stop path that he must be able to take back.
+    """
+    out = {"seconds": float(SHUTDOWN_FLUSH_SECONDS_DEFAULT),
+           "default_seconds": float(SHUTDOWN_FLUSH_SECONDS_DEFAULT),
+           "maximum": float(FLUSH_BUDGET_SECONDS_MAX), "enabled": True,
+           "source": "default", "raw": None, "recognised": True, "clamped": False,
+           "problems": [], "env_var": config.ENV_DISK_SHUTDOWN_FLUSH_SECONDS,
+           "note": SHUTDOWN_FLUSH_NOTE}
+    try:
+        env = config.disk_shutdown_flush_env()
+    except Exception as exc:  # noqa: BLE001 - a budget read is never worth a fault
+        snapshot._error(exc, "disk_spill shutdown flush verdict")
+        return out
+    out["raw"] = env.get("raw")
+    out["source"] = str(env.get("source") or "default")
+    out["recognised"] = bool(env.get("recognised", True))
+    out["clamped"] = bool(env.get("clamped"))
+    out["problems"] = [str(problem) for problem in (env.get("problems") or [])]
+    seconds = env.get("seconds")
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+        out["seconds"] = max(0.0, min(float(FLUSH_BUDGET_SECONDS_MAX), float(seconds)))
+    out["enabled"] = out["seconds"] > 0.0
+    return out
+
+
+# "No budget was asked for", as a value. A sentinel rather than `None` because `None`
+# is a value a caller can SEND (`{"op":"flush","timeout_seconds":null}`), and those two
+# facts must not mean the same thing: an absent argument takes the environment's budget,
+# while an argument that is not a number is a malformed request and is refused.
+FLUSH_BUDGET_UNSET = object()
+
+
+def _flush_budget(requested) -> tuple:
+    """(seconds, problem) for ONE flush. A non-numeric ask is a PROBLEM, never a wait.
+
+    The budget is a WAIT that somebody asked for, so the two ways to get it wrong are
+    asymmetric: a missing ask takes the environment's value (that is what the env var is
+    for), while a malformed ask must be REFUSED - silently falling back to "wait 20
+    seconds" would put a wait on the caller's path that nobody requested.
+    """
+    verdict = shutdown_flush_verdict()
+    if requested is FLUSH_BUDGET_UNSET:
+        return verdict["seconds"], None, verdict
+    if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+        return 0.0, (f"timeout_seconds must be a number of seconds, got "
+                     f"{requested!r}"), verdict
+    try:
+        asked = float(requested)
+    except (TypeError, ValueError):  # noqa: BET001 - defensive: a weird numeric type
+        return 0.0, (f"timeout_seconds must be a number of seconds, got "
+                     f"{requested!r}"), verdict
+    if asked != asked or asked < 0.0:      # NaN, or a negative wait
+        return 0.0, (f"timeout_seconds must be 0 or a positive number, got "
+                     f"{asked}"), verdict
+    if asked > FLUSH_BUDGET_SECONDS_MAX:
+        # The caller asked for more than the ceiling allows: it gets the ceiling AND
+        # sees
+        # that it did, on the same `clamped` field the environment's clamp reports. A
+        # bound that is applied in silence is a bound a caller can never discover.
+        verdict = dict(verdict)
+        verdict["clamped"] = True
+        verdict["problems"] = list(verdict["problems"]) + [
+            f"timeout_seconds={asked} is above the "
+            f"{FLUSH_BUDGET_SECONDS_MAX} s ceiling; the ceiling stands"]
+        return float(FLUSH_BUDGET_SECONDS_MAX), None, verdict
+    return asked, None, verdict
+
+
+def flush(budget_seconds=FLUSH_BUDGET_UNSET) -> dict:
+    """Wait, BOUNDED, for the spill queue to reach empty. Never raises, never blocks
+    longer than the budget, and returns in milliseconds when there is nothing to do.
+
+    WHY THIS EXISTS. Mirror mode made the spill asynchronous by design, so a stop that
+    happens the instant the queue still holds work loses exactly the data the change
+    exists to protect. This is the bounded wait that closes that gap - a MIRROR, not a
+    flush procedure: nobody has to know how the bytes got there, they only have to ask
+    whether the queue is empty.
+
+    WHAT IT IS NOT: a dump of the arena. It waits for jobs already in the queue; it
+    never queues anything itself, never arms or disarms, never touches a posture, and
+    never writes a byte on the caller's thread. The mechanism is one `unfinished_tasks`
+    read per `FLUSH_POLL_SECONDS`, which is why the empty case costs a comparison and a
+    dict build rather than a sleep.
+
+    THE NAMED REASONS, because a caller that cannot tell the causes cannot decide: a
+    budget that expired is `timeout` (the backlog is real, the disk is slow), a queue
+    with no live writer is `writer_down` (those jobs will NEVER land, so waiting is a
+    hang - this returns promptly), a budget of 0 is `disabled` (the operator's own off
+    switch), and a no-seam answer is `not_installed`. `ok` is about the CALL, so a
+    timeout is `ok: true, drained: false`: a proxy that read `ok` as "the bytes are
+    safe" would suspend on a queue that still holds the conversation.
+    """
+    started = time.monotonic()
+    budget, problem, verdict = _flush_budget(budget_seconds)
+    answer = {"ok": True, "drained": False, "queue_depth_before": 0,
+              "queue_depth_after": 0, "bytes_written": 0, "elapsed_seconds": 0.0,
+              "timed_out": False, "reason": None, "budget_seconds": None,
+              "clamped": bool(verdict["clamped"]), "budget_source": verdict["source"],
+              "budget_problems": list(verdict["problems"]),
+              "poll_seconds": FLUSH_POLL_SECONDS, "writer_alive":
+              bool(_state["thread_alive"]), "mechanism": SHUTDOWN_FLUSH_NOTE}
+    # THE DEPTH IS MEASURED FIRST, before any refusal branch: a caller whose budget was
+    # rejected still needs to see what was sitting on the queue when it asked, because
+    # that is the number it is deciding about. `_queue_backlog()` owns its own failure
+    # (a queue that cannot answer reads as empty), so no guard is needed here.
+    answer["queue_depth_before"] = _queue_backlog()
+    if problem is not None:
+        answer["ok"] = False
+        answer["reason"] = problem
+        answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+        return answer
+    answer["budget_seconds"] = float(budget)
+    _state["flush_calls"] = int(_state["flush_calls"]) + 1
+    try:
+        before = answer["queue_depth_before"]
+        bytes_before = int(_state["bytes_written"])
+        if before <= 0:
+            # THE COMMON CASE, and the one the suspend path runs on every sleep: look
+            # first, so "nothing to do" costs a comparison instead of a sleep.
+            answer["drained"] = True
+            answer["queue_depth_after"] = 0
+            answer["bytes_written"] = 0
+            _state["flush_drained"] = int(_state["flush_drained"]) + 1
+            answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+            _state["flush_last"] = dict(answer)
+            return answer
+        if budget <= 0.0:
+            answer["reason"] = "disabled"
+            answer["queue_depth_after"] = before
+            answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+            _state["flush_last"] = dict(answer)
+            return answer
+        thread = _writer_thread
+        if not (thread is not None and thread.is_alive()):
+            # Nobody is going to drain this. Say so now rather than after the budget:
+            # the caller's decision (proceed with the stop) is the same either way, and
+            # a suspend that waits 15 s to learn it is a suspend 15 s late.
+            answer["reason"] = "writer_down"
+            answer["queue_depth_after"] = before
+            answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+            _state["flush_last"] = dict(answer)
+            return answer
+        deadline = started + float(budget)
+        while _queue_backlog() > 0 and time.monotonic() < deadline:
+            time.sleep(FLUSH_POLL_SECONDS)
+        after = _queue_backlog()
+        answer["queue_depth_after"] = after
+        answer["bytes_written"] = max(0, int(_state["bytes_written"]) - bytes_before)
+        answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+        answer["drained"] = after == 0
+        if answer["drained"]:
+            _state["flush_drained"] = int(_state["flush_drained"]) + 1
+        else:
+            answer["timed_out"] = True
+            answer["reason"] = "timeout"
+            _state["flush_timed_out"] = int(_state["flush_timed_out"]) + 1
+        _state["flush_bytes_written"] = int(_state["flush_bytes_written"]) + int(
+            answer["bytes_written"])
+        _state["flush_last"] = dict(answer)
+        return answer
+    except Exception as exc:  # noqa: BLE001 - a flush never breaks a stop or a step
+        snapshot._error(exc, "disk_spill flush")
+        _state["flush_errors"] = int(_state["flush_errors"]) + 1
+        answer["ok"] = False
+        answer["reason"] = f"the flush raised {type(exc).__name__}"
+        answer["queue_depth_after"] = _queue_backlog()
+        answer["elapsed_seconds"] = round(time.monotonic() - started, 6)
+        return answer
+
+
+# The ONE atexit registration this module ever makes, so a repeated install cannot
+# stack handlers. `atexit` is the SECONDARY seam (see `SHUTDOWN_FLUSH_NOTE`): it runs in
+# a process that exits normally and NOT in a worker, which ends with `os._exit`.
+_atexit_registered = [False]
+_atexit_lock = threading.Lock()
+
+
+def drain_at_shutdown(budget_seconds=None) -> dict:
+    """The stop-path entry: ONE bounded flush, one log line, and never a raise.
+
+    Fail-open is the whole contract here. A budget that expires costs one WARNING and
+    the stop proceeds; a drain that could hold a suspend hostage would be a diagnostic
+    causing the outage it measures. The log is ONE line per process, at WARNING like the
+    boot line, because the question "did the backlog make it before the stop?" is asked
+    after the fact from the engine log.
+
+    `budget_seconds` is an OPTIONAL OVERRIDE for a caller that knows it has less time
+    than the environment allows; the ceiling is honoured either way, so an override can
+    shorten a drain and can never lengthen one past `FLUSH_BUDGET_SECONDS_MAX`.
+    """
+    verdict = shutdown_flush_verdict()
+    if not verdict["enabled"]:
+        return {"ok": True, "drained": True, "reason": "disabled",
+                "budget_seconds": 0.0, "skipped": True}
+    asked = budget_seconds
+    if isinstance(asked, bool) or not isinstance(asked, (int, float)):
+        asked = None
+    budget = (float(verdict["seconds"]) if asked is None
+              else max(0.0, min(float(FLUSH_BUDGET_SECONDS_MAX), float(asked))))
+    answer = flush(budget)
+    answer["budget_source"] = ("override" if asked is not None
+                               else verdict["source"])
+    if answer["drained"] and not int(answer["queue_depth_before"]):
+        # NOTHING TO DRAIN, SO NOTHING TO SAY. This is the common case at a stop (the
+        # queue drained long ago), and the line exists to answer "did the backlog make
+        # it?" - a question that has no content when there was no backlog. The
+        # empty-case
+        # answer still travels in the return value for a caller that asked directly.
+        answer["skipped"] = True
+        return answer
+    answer.setdefault("skipped", False)
+    if answer["drained"]:
+        _logger.warning("kvtier-dev-plugin: SHUTDOWN FLUSH drained the spill queue "
+                       "(%d job(s), %d B written) in %.3f s of a %.1f s budget",
+                       int(answer["queue_depth_before"]),
+                       int(answer["bytes_written"]), float(answer["elapsed_seconds"]),
+                       float(answer["budget_seconds"] or 0.0))
+    else:
+        _logger.warning("kvtier-dev-plugin: SHUTDOWN FLUSH did NOT drain the spill "
+                       "queue (reason=%s, %d job(s) left, %d B written) after "
+                       "%.3f s; the stop proceeds anyway and those bytes are lost "
+                       "with the process (budget %.1f s, %s)",
+                       answer["reason"], int(answer["queue_depth_after"]),
+                       int(answer["bytes_written"]), float(answer["elapsed_seconds"]),
+                       float(answer["budget_seconds"] or 0.0),
+                       verdict["env_var"])
+    return answer
+
+
+def install_shutdown_flush(connector) -> dict:
+    """Chain a bounded drain onto the connector's own `shutdown`, ONCE, in this process.
+
+    WHY THE CONNECTOR, AND NOT `atexit` (the finding that decided this, read out of the
+    live fork): the spill queue is built in the WORKER process - `request_spill` runs
+    inside the worker's `get_finished` - and a worker ends its orderly shutdown in
+    `multiproc_executor.py:_exit_worker_process` with `os._exit`, which skips `atexit`,
+    every pending `finally` and interpreter finalization. A drain registered only with
+    `atexit` would therefore be silent in the one process that owns the queue. The
+    worker's teardown DOES reach the connector, however: `Worker.shutdown()` ->
+    `ensure_kv_transfer_shutdown()` -> `_KV_CONNECTOR_AGENT.shutdown()`, and that runs
+    BEFORE the `os._exit`. So the connector instance the plugin already sees at creation
+    is the seam that exists in the right process at the right moment.
+
+    AN INSTANCE WRAP, NOT A CLASS PATCH. It is the object the fork handed us, wrapped
+    once and marked, so it cannot clobber a sibling layer, cannot double-wrap on a
+    retry, and cannot survive to the next connector. The chain is honest: the drain
+    runs FIRST (what follows it in the fork is `destroy_model_parallel()` and then the
+    exit), the original is called afterwards with its arguments, and the ORIGINAL's own
+    exception still propagates - that failure is the fork's story and not ours to
+    swallow. Our own failure is owned here: counted in `flush_errors`, logged once, and
+    the fork's teardown runs regardless.
+    """
+    report = {"installed": False, "already_installed": False, "reason": None,
+              "reason_kind": None, "budget_seconds": None, "atexit": False,
+              "seams": [], "target": type(connector).__name__}
+    try:
+        verdict = shutdown_flush_verdict()
+        report["budget_seconds"] = float(verdict["seconds"])
+        if not verdict["enabled"]:
+            # The rollback is structural, not a budget of zero: a wrapper that runs and
+            # does nothing is still a wrapper that can fail on the stop path.
+            report["reason_kind"] = "disabled"
+            report["reason"] = (f"{verdict['env_var']}={verdict['raw']!r} asked for no "
+                                "shutdown drain, so nothing is installed")
+            return report
+        if connector is None:
+            report["reason_kind"] = "no_connector"
+            report["reason"] = "no connector object was handed over, so there is no " \
+                               "lifecycle seam to chain onto"
+            return report
+        existing = getattr(connector, "shutdown", None)
+        if existing is not None and getattr(existing, SHUTDOWN_FLUSH_ATTR, None) \
+                == SHUTDOWN_FLUSH_ATTR:
+            report["already_installed"] = True
+            report["reason"] = "this connector already carries the drain"
+            return report
+        if not callable(existing):
+            report["reason_kind"] = "no_seam"
+            report["reason"] = (f"{report['target']} has no callable `shutdown` to "
+                                "chain onto (a fork rename, or a connector shape this "
+                                "release has not seen)")
+            return report
+        original = existing
+
+        def shutdown(*args, **kwargs):
+            try:
+                drain_at_shutdown()
+            except Exception as exc:  # noqa: BLE001 - the fork's teardown must still run
+                snapshot._error(exc, "disk_spill shutdown flush")
+                _state["flush_errors"] = int(_state["flush_errors"]) + 1
+            return original(*args, **kwargs)
+
+        setattr(shutdown, SHUTDOWN_FLUSH_ATTR, SHUTDOWN_FLUSH_ATTR)
+        connector.shutdown = shutdown
+        # THE MARKER ON THE OBJECT TOO, so "is this connector carrying the drain?" is
+        # one
+        # `getattr` for any reader, not a walk into the method's attributes - and the
+        # idempotence check above reads the method's marker, which is the one that
+        # matters
+        # for not wrapping twice.
+        setattr(connector, SHUTDOWN_FLUSH_ATTR, SHUTDOWN_FLUSH_ATTR)
+        report["installed"] = True
+        report["seams"].append("connector.shutdown")
+        with _atexit_lock:
+            if not _atexit_registered[0]:
+                atexit.register(drain_at_shutdown)
+                _atexit_registered[0] = True
+        report["atexit"] = bool(_atexit_registered[0])
+        if report["atexit"]:
+            report["seams"].append("atexit")
+        report["reason"] = ("the drain is chained onto the connector's own shutdown "
+                            "and registered with atexit; atexit does not run in a "
+                            "worker (os._exit), which is why the connector seam is the "
+                            "primary one")
+        _state["shutdown_flush"] = {"installed": True,
+                                    "budget_seconds": float(verdict["seconds"]),
+                                    "budget_source": verdict["source"],
+                                    "seams": list(report["seams"]),
+                                    "target": report["target"]}
+        return report
+    except Exception as exc:  # noqa: BLE001 - an install failure never costs a connector
+        snapshot._error(exc, "disk_spill install shutdown flush")
+        report["installed"] = False
+        report["reason_kind"] = "error"
+        report["reason"] = f"the install raised {type(exc).__name__}"
+        return report
+
+
+def shutdown_flush_state() -> dict:
+    """What this process installed, if anything. Never raises, creates nothing."""
+    state = _state.get("shutdown_flush")
+    verdict = shutdown_flush_verdict()
+    if isinstance(state, dict):
+        out = dict(state)
+        out["enabled"] = bool(verdict["enabled"])
+        out["budget_configured_seconds"] = float(verdict["seconds"])
+        out["problems"] = list(verdict["problems"])
+        out["note"] = SHUTDOWN_FLUSH_NOTE
+        return out
+    return {"installed": False, "enabled": bool(verdict["enabled"]),
+            "budget_seconds": float(verdict["seconds"]),
+            "budget_configured_seconds": float(verdict["seconds"]),
+            "budget_source": verdict["source"], "seams": [], "target": None,
+            "problems": list(verdict["problems"]), "note": SHUTDOWN_FLUSH_NOTE}
+
+
 def verify_slot(key, fingerprint=None) -> dict:
     """Read back what we wrote, and check its length. The ONLY read path here.
 
@@ -4841,6 +5336,17 @@ def section() -> dict:
         "queue_bytes_peak": int(_state["queue_bytes_peak"]),
         "queue_depth_peak": int(_state["queue_depth_peak"]),
         "queue_max": MAX_QUEUE_DEPTH,
+        # THE FLUSH TALLIES (0.2.66): the bounded waits this process answered, and what
+        # they saw land. Beside the queue's own numbers on purpose - a flush is a
+        # statement ABOUT that queue, and the split between `flush_drained` and
+        # `flush_timed_out` is the difference between "the stop was safe" and "the stop
+        # lost the backlog". Per-process, like every counter in this block.
+        "flush_calls": int(_state["flush_calls"]),
+        "flush_drained": int(_state["flush_drained"]),
+        "flush_timed_out": int(_state["flush_timed_out"]),
+        "flush_bytes_written": int(_state["flush_bytes_written"]),
+        "flush_errors": int(_state["flush_errors"]),
+        "shutdown_flush": shutdown_flush_state(),
         "window_files": int(_state.get("window_files") or 0),
         "caps": {"max_queue_depth": MAX_QUEUE_DEPTH,
                  # The queue's SECOND admission currency. Published as a cap because a
@@ -4893,6 +5399,14 @@ def section() -> dict:
         "last_error": _clip(_state["last_error"]),
         "units": _per_process_units(disk_layout._units(
             "bytes_written", "evicted_bytes",
+            # THE FLUSH TALLIES (0.2.66), declared with the block they belong to. The
+            # payload unit test exists because `flush_bytes_written` is a volume and
+            # `flush_calls` is a count, and a reader who confuses them reads a 4 GB
+            # write
+            # total as 4 GB of waits.
+            "flush_calls", "flush_drained", "flush_timed_out", "flush_errors",
+            "flush_bytes_written", "budget_seconds", "budget_configured_seconds",
+            "budget_max_seconds",
             "estimated_bytes", "write_seconds",
             "read_seconds", "ceiling_bytes", "requests",
             "accepted", "spilled", "duplicates",

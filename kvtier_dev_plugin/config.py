@@ -725,6 +725,52 @@ ENV_DISK_PRUNE_RESTORED_LOADS = "VLLM_E2_TIER_DISK_PRUNE_RESTORED_LOADS"
 # and it has no influence on guard mode, the RAM tier's arm or the raw-byte dump.
 ENV_DISK_BOOT_ENABLE = "KVTIER_DISK_BOOT_ENABLE"
 
+# MIRROR MODE (0.2.66, `disk_store.py`): the arena is a BUFFER, not a store. A block
+# that lands in a CPU slot is queued for NVMe AT THE STORE COMPLETION, so a stop that
+# happens while nobody needed the slots no longer destroys a prefix that was never
+# written; eviction stays purely the capacity valve.
+#
+# WHY THE DEFAULT IS ON (`mamba_anchor_patch()`'s grammar, including the default).
+# The mode only ever ADDS spill work - it can add data to the store and it has no door
+# to a serving posture, an arm or a request path, which is what `spill_on_store_verdict
+# ()` and tests/test_spill_mirror_mode.py pin - so the useful direction is the one that
+# runs and `0` is the rollback. The cost was measured before the decision, not after:
+# this boot's rank files showed `slots_offered 3,076` against `spill_queued 2,556`, so
+# mirroring everything is ~1.20x today's write volume. What a typo must NOT do is close
+# the door silently, which is why a value in neither vocabulary stays ON and is
+# reported as unrecognised.
+#
+# THE ONE RISK THIS CARRIES, and the reason the door is a ceiling guard rather than a
+# plain switch: the live store sits at 961 GB of a 1 TB soft ceiling and the filesystem
+# behind it has ~400 GB free. A mirror offer that would take the rank past its ceiling
+# is refused AT THE DOOR (`disk_spill.mirror_headroom`) and counted - never written.
+ENV_DISK_SPILL_ON_STORE = "VLLM_E2_TIER_DISK_SPILL_ON_STORE"
+
+# THE SHUTDOWN FLUSH BUDGET (0.2.66, `disk_spill.py`): how many seconds the spill queue
+# may be waited on at stop, so the backlog mirror mode created actually reaches NVMe
+# before the process ends. UNSET = `disk_spill.SHUTDOWN_FLUSH_SECONDS_DEFAULT` (15 s);
+# `0` = off, and the stop path runs the fork's teardown with nothing of ours installed.
+# The number was chosen against the measured budgets on the box, not against the wish:
+# the unit is `TimeoutStopSec=90` with `KillMode=control-group`, and the engine is
+# launched with `--shutdown-timeout 60`, so 15 s sits inside both with room. It is
+# clamped at `disk_spill.FLUSH_BUDGET_SECONDS_MAX` (30 s) because a wedged writer must
+# never hold a suspend hostage: the ceiling is what a budget typo cannot be allowed to
+# restore. A value that will not parse means the shipped default and says why.
+ENV_DISK_SHUTDOWN_FLUSH_SECONDS = "VLLM_E2_TIER_DISK_SHUTDOWN_FLUSH_SECONDS"
+
+# THE LOOKUP LEDGER'S BOOT ARM (0.2.66, `lookup_ledger.py`): the per-request
+# offer/adopt ring, armed by the boot instead of by a POST that arrives after the
+# request you needed it for. Default ON, `mamba_anchor_patch()`'s grammar.
+#
+# WHY ON: the ledger was disarmed on the boot where the 16:34 request came back with
+# 0.0% reuse after a 15-hour suspend, and its refusal reason was unrecoverable - a
+# question that should have taken one query took two investigations. It is OBSERVABILITY
+# only: a boot that cannot arm it boots normally, counts the refusal and logs once, and
+# the arm never joins `boot["refusals"]`. What it can never do is move a posture, arm a
+# tier or serve a request, which tests/test_lookup_ledger_boot_arm.py pins against the
+# step's own source.
+ENV_LOOKUP_LEDGER_BOOT_ARM = "VLLM_E2_TIER_DEV_LOOKUP_LEDGER_BOOT_ARM"
+
 # The words that turn the disk tier's boot default OFF. Everything else - including a
 # value that is not a word at all - reads as ENABLED, because the default is on and a
 # typo must not silently produce the off posture (a boot the operator believes is
@@ -1013,6 +1059,142 @@ def disk_prune_restored_loads() -> dict:
     return {"enabled": False, "source": "env", "raw": raw,
             "recognised": lowered in _DISK_BOOT_OFF_WORDS,
             "env_var": ENV_DISK_PRUNE_RESTORED_LOADS}
+
+
+def disk_spill_on_store() -> dict:
+    """MIRROR MODE's boot posture, read by `disk_store.py`. The SAME grammar as
+    `mamba_anchor_patch()`, including the default: UNSET is ENABLED.
+
+    ON is the default for the same reason it is the anchor patch's: the door only ever
+    ADDS spill work, so the direction a typo can move in is the direction that keeps
+    spilling, and `0` is the rollback (`source: "env"`, `recognised: true`). A value in
+    neither vocabulary stays ENABLED and reports `recognised: False` plus a complaint in
+    `problems`, because a reader who meant to close the door and typed `flase` needs the
+    payload to tell him the word he wrote is not a disable word - not a document that
+    reads as his intent.
+
+    It reads `os.environ` and nothing else: no latch, no arm file, no decision from an
+    earlier boot. The live lever stays the tier's own arm, and the two are different
+    things (this door says WHEN a slot is queued; the arm says whether spilling is
+    permitted at all).
+    """
+    # `raw` is what the operator TYPED, spaces included; `word` is what the grammar
+    # decides on. A payload that echoes a stripped value back would not match the line
+    # in
+    # the launcher that produced it, which is the one thing a reader greps next.
+    raw = os.environ.get(ENV_DISK_SPILL_ON_STORE, "")
+    word = raw.strip()
+    if not word:
+        return {"enabled": True, "source": "default", "raw": None,
+                "recognised": True, "problems": [],
+                "env_var": ENV_DISK_SPILL_ON_STORE}
+    lowered = word.lower()
+    if lowered in _DISK_BOOT_OFF_WORDS:
+        return {"enabled": False, "source": "env", "raw": raw,
+                "recognised": True, "problems": [],
+                "env_var": ENV_DISK_SPILL_ON_STORE}
+    recognised = lowered in _DISK_BOOT_ON_WORDS
+    problems = ([] if recognised else
+                [f"{ENV_DISK_SPILL_ON_STORE}={raw!r} is neither an enable word "
+                 f"({sorted(_DISK_BOOT_ON_WORDS)}) nor a disable word "
+                 f"({sorted(_DISK_BOOT_OFF_WORDS)})"])
+    return {"enabled": True, "source": "env" if recognised else "default",
+            "raw": raw, "recognised": recognised, "problems": problems,
+            "env_var": ENV_DISK_SPILL_ON_STORE}
+
+
+def lookup_ledger_boot_arm() -> dict:
+    """The lookup ledger's BOOT ARM, read by `lookup_ledger.boot_arm()`. The SAME
+    grammar as `mamba_anchor_patch()`, including the default: UNSET is ENABLED.
+
+    WHY ON IS THE DEFAULT FOR AN OBSERVABILITY SWITCH: the ring records nothing while
+    disarmed, so the boot that needs it must be the boot that has it - the incident was
+    a request that had already happened. And why that is safe to default: arming the
+    ring allocates a bounded list and installs nothing of its own (it rides the guard
+    wrappers, which the boot installs anyway when it installs them at all), so the
+    worst a default can cost is one bounded ring per process.
+    """
+    # `raw` is what the operator TYPED, spaces included; `word` is what the grammar
+    # decides on. A payload that echoes a stripped value back would not match the line
+    # in
+    # the launcher that produced it, which is the one thing a reader greps next.
+    raw = os.environ.get(ENV_LOOKUP_LEDGER_BOOT_ARM, "")
+    word = raw.strip()
+    if not word:
+        return {"enabled": True, "source": "default", "raw": None,
+                "recognised": True, "problems": [],
+                "env_var": ENV_LOOKUP_LEDGER_BOOT_ARM}
+    lowered = word.lower()
+    if lowered in _DISK_BOOT_OFF_WORDS:
+        return {"enabled": False, "source": "env", "raw": raw,
+                "recognised": True, "problems": [],
+                "env_var": ENV_LOOKUP_LEDGER_BOOT_ARM}
+    recognised = lowered in _DISK_BOOT_ON_WORDS
+    problems = ([] if recognised else
+                [f"{ENV_LOOKUP_LEDGER_BOOT_ARM}={raw!r} is neither an enable word "
+                 f"({sorted(_DISK_BOOT_ON_WORDS)}) nor a disable word "
+                 f"({sorted(_DISK_BOOT_OFF_WORDS)})"])
+    return {"enabled": True, "source": "env" if recognised else "default",
+            "raw": raw, "recognised": recognised, "problems": problems,
+            "env_var": ENV_LOOKUP_LEDGER_BOOT_ARM}
+
+
+def disk_shutdown_flush_env() -> dict:
+    """The SHUTDOWN FLUSH BUDGET, read by `disk_spill.shutdown_flush_verdict()`.
+
+    `{seconds, default_seconds, minimum, maximum, source, raw, recognised, enabled,
+    clamped, problems}` and never raises. The grammar is `settle_env()`'s and
+    `ceiling_env()`'s, with one difference that matters: `0` is LEGAL here and means
+    "no drain" (the operator's off switch), because a drain is an addition to the stop
+    path and an operator must be able to take the stop path back.
+
+    WHY A MAXIMUM AT ALL: this is a wait on the stop path. A value typed as `3600` for
+    an experiment would hold a suspend for an hour for a cache tier whose missing bytes
+    cost a recompute, so the clamp is the difference between a mistake and an outage -
+    and it is reported (`clamped: true`) rather than applied in silence.
+    """
+    from . import disk_spill  # noqa: PLC0415 - the bounds live with the mechanism
+
+    default = float(disk_spill.SHUTDOWN_FLUSH_SECONDS_DEFAULT)
+    maximum = float(disk_spill.FLUSH_BUDGET_SECONDS_MAX)
+    out = {"seconds": default, "default_seconds": default, "minimum": 0.0,
+           "maximum": maximum, "source": "default", "raw": None,
+           "recognised": True, "enabled": True, "clamped": False, "problems": [],
+           "env_var": ENV_DISK_SHUTDOWN_FLUSH_SECONDS}
+    raw = os.environ.get(ENV_DISK_SHUTDOWN_FLUSH_SECONDS, "").strip()
+    if not raw:
+        return out
+    out["raw"] = raw
+    out["source"] = "env"
+    try:
+        value = float(raw)
+    except ValueError:
+        out["recognised"] = False
+        out["problems"] = [f"{ENV_DISK_SHUTDOWN_FLUSH_SECONDS}={raw!r} is not a "
+                           "number of seconds"]
+        out["source"] = "default"
+        return out
+    if value != value or value == float("inf"):     # NaN / inf
+        out["recognised"] = False
+        out["problems"] = [f"{ENV_DISK_SHUTDOWN_FLUSH_SECONDS}={raw!r} is not a finite "
+                           "number of seconds"]
+        out["source"] = "default"
+        return out
+    if value < 0.0:
+        out["recognised"] = False
+        out["problems"] = [f"{ENV_DISK_SHUTDOWN_FLUSH_SECONDS}={raw!r} is negative; a "
+                           "drain budget must be 0 (off) or a positive number"]
+        out["source"] = "default"
+        return out
+    if value > maximum:
+        out["seconds"] = maximum
+        out["clamped"] = True
+        out["problems"] = [f"{ENV_DISK_SHUTDOWN_FLUSH_SECONDS}={raw!r} is above the "
+                           f"{maximum} s ceiling; the ceiling stands"]
+    else:
+        out["seconds"] = value
+    out["enabled"] = value > 0.0
+    return out
 
 
 def mamba_anchor_patch() -> dict:

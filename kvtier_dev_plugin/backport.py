@@ -1968,6 +1968,13 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             # means this boot never reached the step (a boot note for a process with no
             # tier to boot).
             "journal_drain": None,
+            # THE LOOKUP LEDGER'S BOOT ARM (0.2.66): whether this boot armed the
+            # per-request offer/adopt ring, and if not which of the five verdicts says
+            # why. OBSERVABILITY ONLY, and that is the whole design: a refusal here is
+            # counted and logged and NEVER joins `refusals`, because a missing
+            # diagnostic
+            # is not a tier that declined to serve. `None` means the step never ran.
+            "lookup_ledger": None,
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -2093,6 +2100,27 @@ def boot_from_connector(cls, install_report, manager) -> dict:
         # once. It is never a REFUSAL and never joins `refusals`: a slow index costs a
         # recompute, and a boot that could not read a journal is still a boot.
         boot["journal_drain"] = _boot_journal_drain(boot)
+
+        # THE LOOKUP LEDGER, ARMED HERE RATHER THAN BY A POST THAT ARRIVES AFTER THE
+        # REQUEST YOU NEEDED IT FOR. The ring joins each `get_num_new_matched_tokens`
+        # offer to the `update_state_after_alloc` adopt that followed it, and it records
+        # NOTHING while disarmed - so a boot that needs an answer about a request that
+        # already happened has no answer. That is exactly the hole the 16:34 request
+        # left
+        # after a 15-hour suspend: 0.0% reuse, `reads_applied: 0`, and a ledger that had
+        # never been armed, which turned one query into two investigations.
+        #
+        # IT IS AN OBSERVABILITY STEP AND IS ALLOWED TO FAIL. A boot that could not arm
+        # the ring boots, counts the refusal and logs ONE line; the verdict is on the
+        # boot
+        # LINE as `LOOKUP_LEDGER[...]` because a bare absence cannot be told from a
+        # value
+        # nobody grepped. It never joins `refusals`: the tier's own verdicts describe
+        # what
+        # the engine will serve, and a missing recorder changes nothing about that. Its
+        # own source is pinned - in `tests/test_lookup_ledger_boot_arm.py`, against the
+        # AST - to name no serve posture, no offer switch and no arm writer.
+        boot["lookup_ledger"] = _boot_lookup_ledger(boot)
 
         _state["boots"] += 1
         _state["boot"] = boot
@@ -2366,6 +2394,16 @@ def boot_line(boot: dict) -> str:
     # the first request find the NVMe tier, or recompute it?" - the question tonight's
     # 129,285-token recompute asked and the boot log could not answer.
     parts.append(_journal_drain_token(boot))
+    # THE LOOKUP LEDGER'S BOOT ARM (0.2.66), in the same bracketed-token shape and for
+    # the
+    # same reason as the two above it: `LOOKUP_LEDGER[armed]` answers "will this boot be
+    # able to explain a 0-token offer later?" in one glance, and `[env-refused]` /
+    # `[refused]` / `[inert]` / `[not_run]` say which kind of no it is. Observability,
+    # so
+    # it is deliberately NOT part of `refused=` below: a missing recorder is not a tier
+    # that declined to serve, and putting it there would make the one list an operator
+    # triages on lie about what actually went wrong.
+    parts.append(lookup_ledger_token(boot))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2419,7 +2457,8 @@ def boot_section() -> dict:
                 "tier": False, "faults_at_boot": 0, "refusals": [],
                 "not_covered": [], "nested": [], "live_check": None,
                 "install_reason": None, "manager": None, "restore": None,
-                "arena": None, "disk_boot": None,
+                "arena": None, "disk_boot": None, "journal_drain": None,
+                "lookup_ledger": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "
@@ -2502,6 +2541,109 @@ def _journal_drain_token(boot: dict) -> str:
         return "JOURNAL_DRAIN[not_run]"
 
 
+def _install_shutdown_flush(connector) -> dict:
+    """Chain the bounded spill-queue drain onto one connector object. Never raises.
+
+    The work is `disk_spill.install_shutdown_flush`'s (it owns the queue, the budget and
+    the fail-open guard); this wrapper exists so the connector hook cannot be broken by
+    a
+    layer it installed, and so the verdict is counted where the other hook outcomes are.
+    A budget of 0 installs NOTHING at all - the rollback has to be structural, not a
+    wrapper that runs and does nothing.
+    """
+    from . import disk_spill  # noqa: PLC0415 - sibling layer, lazy by idiom
+    try:
+        report = disk_spill.install_shutdown_flush(connector)
+    except Exception as exc:  # noqa: BLE001 - a drain install never costs a connector
+        snapshot._error(exc, "backport shutdown flush install")
+        report = {"installed": False, "reason": f"the install raised "
+                                                f"{type(exc).__name__}",
+                  "reason_kind": "error"}
+    _state["shutdown_flush"] = report
+    return report
+
+
+def shutdown_flush_state() -> dict:
+    """WHAT THIS PROCESS INSTALLED for the shutdown drain, and what it would cost.
+
+    Published through the tier's own payload so the answer to "will a stop wait for the
+    spill queue, and for how long" is readable from a route rather than from the source.
+    Never raises: an unreadable install reports "not installed", which is the honest
+    pessimistic reading for a caller deciding whether to wait for this process itself.
+    """
+    from . import disk_spill  # noqa: PLC0415 - sibling layer, lazy by idiom
+    try:
+        state = disk_spill.shutdown_flush_state()
+        state["install_report"] = _state.get("shutdown_flush")
+        return state
+    except Exception as exc:  # noqa: BLE001 - a payload section is never a fault
+        snapshot._error(exc, "backport shutdown flush state")
+        return {"installed": False, "error": type(exc).__name__,
+                "note": "the drain's state could not be read"}
+
+
+def _boot_lookup_ledger(boot: dict) -> dict:
+    """ARM THE LOOKUP/ADOPT RING AT BOOT (0.2.66). Never raises, never a refusal.
+
+    All the decision lives in `lookup_ledger.boot_arm()` - the gate, the inert posture,
+    the guard-wrapper dependency and the fail-open guard. This function's job is the one
+    thing only the boot knows: whether THIS boot put wrappers on the manager, since the
+    ring is fed from inside those wrappers and arming it without them would publish
+    `armed: true` over a ring that can never hold a record.
+
+    IT CANNOT JOIN `refusals`, and the containment below is written so that it cannot:
+    whatever happens here, `boot["tier"]`, `boot["guard"]`, `boot["backport"]`,
+    `boot["arena"]`, the disk tier's own boot verdict and the journal drain's record are
+    exactly what the same boot decided without this step. A diagnostic that changes the
+    boot it observes is worse than no diagnostic, and
+    `tests/test_lookup_ledger_boot_arm.py` compares those decisions field by field
+    against a baseline boot to prove it.
+    """
+    from . import lookup_ledger  # noqa: PLC0415 - sibling layer, lazy by idiom
+    try:
+        return lookup_ledger.boot_arm(
+            guard_wrappers_installed=bool(boot.get("guard")),
+            inert=boot.get("mode") == BOOT_MODE_INERT)
+    except Exception as exc:  # noqa: BLE001 - an observability arm never costs a boot
+        snapshot._error(exc, "backport lookup ledger boot arm")
+        try:
+            verdict = lookup_ledger.VERDICT_REFUSED
+            cap = int(lookup_ledger.counters().get("cap") or 0)
+        except Exception:  # noqa: BLE001 - the fallback cannot be allowed to fail
+            verdict, cap = "refused", 0
+        return {"armed": False, "verdict": verdict, "cap": cap, "recognised": True,
+                "raw": None, "problems": [], "reason":
+                f"the boot step raised {type(exc).__name__}"[:200]}
+
+
+def lookup_ledger_token(boot: dict) -> str:
+    """The BOOT line's `LOOKUP_LEDGER[...]` token, from THIS boot's own record.
+
+    A bracketed token and never `key=value`, for the reason `mamba_anchor.boot_token`
+    gives: the restart verifier in the llm-api repo pulls its PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, and a token containing an `=` would become a
+    candidate match for a grep that was never meant to see it.
+
+Read from the BOOT DICT (the `JOURNAL_DRAIN` discipline), so a line describes the boot
+that produced it rather than whatever the last boot in this process left in module
+state. A boot that never reached the step renders `[not_run]`; a record whose verdict is
+outside the closed vocabulary renders `[refused]`, because the honest pessimistic
+reading of a verdict this module cannot name is "it did not work".
+    """
+    try:
+        from . import lookup_ledger  # noqa: PLC0415 - sibling layer, lazy by idiom
+        record = boot.get("lookup_ledger") if isinstance(boot, dict) else None
+        if not isinstance(record, dict):
+            return f"LOOKUP_LEDGER[{lookup_ledger.VERDICT_NOT_RUN}]"
+        verdict = record.get("verdict")
+        if verdict not in lookup_ledger.BOOT_VERDICTS:
+            verdict = lookup_ledger.VERDICT_REFUSED
+        return f"LOOKUP_LEDGER[{verdict}]"
+    except Exception as exc:  # noqa: BLE001 - a token is never worth a lost line
+        snapshot._error(exc, "backport lookup ledger token")
+        return "LOOKUP_LEDGER[not_run]"
+
+
 def boot_note(reason: str) -> dict:
     """The BOOT line for a process that has NO tier to boot. Same format.
 
@@ -2517,7 +2659,7 @@ def boot_note(reason: str) -> dict:
             "refusals": [reason], "not_covered": [], "nested": [],
             "live_check": None, "manager": None, "install_reason": None,
             "restore": None, "arena": None, "disk_boot": None,
-            "journal_drain": None, "line": None}
+            "journal_drain": None, "lookup_ledger": None, "line": None}
     boot["line"] = boot_line(boot)
     _state["boot_line"] = boot["line"]
     logger.warning("kvtier-dev-plugin: %s", boot["line"])
@@ -2543,6 +2685,24 @@ def _after_connector_created(connector) -> None:
                       f"tier connector (a tier nested inside it is the known "
                       f"gap: see disarm_limits)")
             return
+        # THE SPILL QUEUE'S SHUTDOWN DRAIN, chained onto THIS connector's own
+        # `shutdown`, before anything else in this hook can divert the path. WHY HERE:
+        # this is the one moment this plugin is handed the connector OBJECT, and the
+        # worker role (the `manager is None` branch below) otherwise returns without
+        # this process ever seeing the object again - while the worker is exactly where
+        # the spill queue lives, because `request_spill` runs inside the worker's
+        # `get_finished`. A drain registered only with `atexit` would never run there: a
+        # worker ends its orderly shutdown in
+        # `multiproc_executor.py:_exit_worker_process` with `os._exit`, which skips
+        # `atexit`, every pending `finally` and interpreter finalization. The
+        # connector's `shutdown` is reached BEFORE that, by `Worker.shutdown()` ->
+        # `ensure_kv_transfer_shutdown()`, so wrapping the instance is the only seam in
+        # the right process at the right moment.  THE SCHEDULER ROLE GETS IT TOO, by the
+        # same line and for the same reason: its queue is its own, its budget is the
+        # same environment variable, and a single process boot is covered by the same
+        # code rather than by a second rule. Contained: an install that raises costs the
+        # drain and nothing else, and the engine always gets its connector.
+        _install_shutdown_flush(connector)
         manager = getattr(connector, "scheduler_manager", None)
         if manager is None:
             # THE WORKER CASE. `role=WORKER` builds `worker_handler`, never a

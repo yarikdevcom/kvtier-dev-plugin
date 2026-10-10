@@ -341,6 +341,20 @@ UNITS_BY_NAME = {
     # otherwise present a count of drops as a volume of memory - the same shape as the
     # `*_event` counters, and the reason the payload unit test exists.
     "queue_bytes_full": "refusals",
+    # THE FLUSH TALLIES (0.2.66). Declared explicitly because the walker labels by NAME:
+    # `flush_bytes_written` is a volume and `flush_calls` is a count, and a payload that
+    # presented one as the other is the exact failure this unit test exists to catch.
+    "flush_calls": "flushes",
+    "flush_drained": "flushes",
+    "flush_timed_out": "flushes",
+    "flush_errors": "flushes",
+    "flush_bytes_written": "bytes",
+    # `budget_seconds` and `default_seconds` are already declared below in alphabetical
+    # order; only the two NEW names of 0.2.66 belong here. A repeated key in a literal
+    # is
+    # a silent last-write-wins, which is exactly how two unit maps come to disagree.
+    "budget_configured_seconds": "seconds",
+    "budget_max_seconds": "seconds",
     "snapshot_failed": "refusals",
     "bad_call": "refusals",
     "bad_digest": "refusals",
@@ -358,7 +372,6 @@ UNITS_BY_NAME = {
     "cp_world_size": "ranks",
     "current": "files",
     "dcp_world_size": "ranks",
-    "default_seconds": "seconds",
     "digest_group_overflow": "events",
     "digest_groups_cap": "key16s",
     "digest_groups_dropped": "key16s",
