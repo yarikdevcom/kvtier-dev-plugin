@@ -81,7 +81,7 @@ Nothing activates yet - see the switches below.
 |---------|---------|
 | `VLLM_PLUGINS` | vLLM's own allowlist. **Endpoint plugins never load unless named here.** One name (`kvtier_dev`) covers both halves. |
 | `VLLM_E2_TIER_DEV` | this plugin's switch. Unset/`0`/`false`/`off`/`no` = inert: no engine methods attached, HTTP answers 503. |
-| `VLLM_E2_TIER_DEV_TOKEN` | required for the mutating verbs (`policy/reload`, and every shape of `trace` and `guard`), **and for every read from a non-loopback peer**. Unset = those requests refused (403) and no non-loopback read is served. Loopback reads do not need it - except `trace`/`guard`, which are token-gated as a whole because they can change engine dev state. |
+| `VLLM_E2_TIER_DEV_TOKEN` | **NO LONGER A GATE (0.2.68).** It used to be required of the mutating verb, then of every read from a non-loopback peer, then of every shape of the six dev-state routes (`trace`, `guard`, `tier`, `lookups`, `blockdump`, `disk`) - loopback included, so even a plain `GET /trace` needed it. **The plugin no longer reads it for access control at all**, and a value set here is ignored. Setting it is not a risk and not a protection: the boot says so once at `WARNING` (`<VAR> is SET but is no longer read by this plugin`) and `/status` answers `token_gating: false` with `token_note` naming the release. Unset it, because a variable that reads like a control and is not one is how an operator ends up believing a door is shut. What gates this surface now is `VLLM_E2_TIER_DEV_ALLOW` below, and nothing else. |
 | `VLLM_E2_TIER_DEV_ALLOW` | extra peers beyond loopback: a comma-separated list of addresses or CIDRs. **Unset/empty = loopback only** (the pre-allowlist behaviour). A malformed entry is logged and skipped - never fatal, never an opening. See *Access model*. |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | seconds the HTTP layer waits for the engine before answering 504. Default `5.0`, clamped to `[0.05, 60]`. |
 | `VLLM_E2_TIER_DIAG` | the worker diagnostics directory (capability 5). **Unset = the worker writer is completely inert: no directory created, no file written, nothing wrapped in the worker.** Set it to a path both the worker ranks and the proxy host's reader can see. |
@@ -123,7 +123,7 @@ There is deliberately **no env var for guard mode** - no env var that turns it *
 The boot arms it (see *Booting the tier*), because an unguarded tier exception kills
 the EngineCore, and `VLLM_E2_TIER_DEV_BOOT_INERT` is the one switch that stops the
 boot doing so; there is no env var that arms guard mode on an inert boot, which can
-only be done with `POST /plugins/kvtier/guard` and the token - see *Guard mode*.
+only be done with `POST /plugins/kvtier/guard` - see *Guard mode*.
 
 There is equally **no env var that arms the KV tier on an inert boot**. The tier is
 disarmed at plugin *load* (`backport.BOOT_ARMED = False`) because the plugin's
@@ -154,7 +154,6 @@ sudo systemctl edit vllm.service        # creates a drop-in override
 [Service]
 Environment=VLLM_PLUGINS=kvtier_dev
 Environment=VLLM_E2_TIER_DEV=1
-Environment=VLLM_E2_TIER_DEV_TOKEN=put-a-real-token-here
 Environment=VLLM_E2_TIER_DEV_TIMEOUT=5
 # Worker diagnostics: leave this out and the worker writer never runs at all.
 Environment=VLLM_E2_TIER_DIAG=/tmp/kv-tier-diagnostics
@@ -167,11 +166,12 @@ Environment=VLLM_E2_TIER_DEV_ALLOW=192.168.2.64,192.168.2.120
 sudo systemctl daemon-reload && sudo systemctl restart vllm.service
 ```
 
-Prefer `EnvironmentFile=/etc/vllm/kvtier-dev.env` (mode 0600) if you do not
-want the token in `systemctl show` output. If you launch from a launcher script
-instead: `export VLLM_PLUGINS=kvtier_dev VLLM_E2_TIER_DEV=1
-VLLM_E2_TIER_DEV_TOKEN=...` before the `vllm serve` line - and note the
-launcher is what needs restarting, not just the shell you curl from.
+Prefer `EnvironmentFile=/etc/vllm/kvtier-dev.env` if you would rather keep the
+settings out of `systemctl show` output. If you launch from a launcher script
+instead: `export VLLM_PLUGINS=kvtier_dev VLLM_E2_TIER_DEV=1` before the
+`vllm serve` line - and note the launcher is what needs restarting, not just the
+shell you curl from. Do **not** re-add `VLLM_E2_TIER_DEV_TOKEN` to a unit file: since
+0.2.68 nothing reads it, and the boot warns about it (see *Access model*).
 
 ## Verify it is really mounted
 
@@ -327,23 +327,30 @@ make is one you will eventually skip, which is what 0.2.50 fixed.
 
 ## Using it
 
-The whole surface, all under `/plugins/kvtier`:
+The whole surface, all under `/plugins/kvtier`. **No route in this table requires a
+token any more** (0.2.68 removed it from every route, in every shape): the ONLY gate
+is the peer rule - loopback, or an address in `VLLM_E2_TIER_DEV_ALLOW`. And because
+`/plugins/*` is **not** covered by vLLM's `--api-key` (that covers `/v1`, `/v2`,
+`/inference` and `/cohere` only), the allowlist is not a second line of defence
+behind a key - it is the whole defence. The table used to carry a `Token` column
+with `off-box only` / `always` per row; it is gone because every answer is now
+`none`, and a column of `none` is how a table starts lying.
 
-| Route | Methods | Token | What it does |
-|-------|---------|-------|--------------|
-| `/status` | GET | off-box only | local facts; makes **no** engine call, so it answers while the engine is wedged |
-| `/snapshot` | GET, POST | off-box only | the scheduler-side tier view (pools, counters, policy, `store_hook`, `guard`, `trace`) |
-| `/kvconfig` | GET, POST | off-box only | the KV-cache geometry: per-group block sizes, spec classes, prefix-cacheability, and every group's divisibility verdict |
-| `/block` | GET, POST | off-box only | one GPU block by id (and group), plus the tier's CPU slot of the same id |
-| `/request` | GET, POST | off-box only | one request by id: its blocks per group and what the tier could park |
-| `/trace` | GET, POST | **always** | the bounded event ring: read it, or arm / disarm / clear it |
-| `/guard` | GET, POST | **always** | guard mode: state, captured faults, arm, disarm |
-| `/tier` | GET, POST | **always** | the tier's runtime kill switch and the PR #56810 backport's state |
-| `/lookups` | GET, POST | **always** | the lookup/adopt ledger: read, arm, disarm, verdict |
-| `/blockdump` | GET, POST | **always** | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
-| `/disk` | GET, POST | **always** | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `identities` (the paged, digest-only per-rank view of the index, 0.2.46 - the other half of the diff against `ls`), `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs) and `restore-source` (0.2.59: where a restore's destination rows come from, `arena` or the plugin's staging ring; per boot, and its answer carries the ring's pressure beside the posture) and `adoptions` (0.2.61: WHICH request got how many tokens from
+| Route | Methods | What it does |
+|-------|---------|--------------|
+| `/status` | GET | local facts; makes **no** engine call, so it answers while the engine is wedged |
+| `/snapshot` | GET, POST | the scheduler-side tier view (pools, counters, policy, `store_hook`, `guard`, `trace`) |
+| `/kvconfig` | GET, POST | the KV-cache geometry: per-group block sizes, spec classes, prefix-cacheability, and every group's divisibility verdict |
+| `/block` | GET, POST | one GPU block by id (and group), plus the tier's CPU slot of the same id |
+| `/request` | GET, POST | one request by id: its blocks per group and what the tier could park |
+| `/trace` | GET, POST | the bounded event ring: read it, or arm / disarm / clear it |
+| `/guard` | GET, POST | guard mode: state, captured faults, arm, disarm |
+| `/tier` | GET, POST | the tier's runtime kill switch and the PR #56810 backport's state |
+| `/lookups` | GET, POST | the lookup/adopt ledger: read, arm, disarm, verdict |
+| `/blockdump` | GET, POST | the bounded raw-KV-byte dump: status, arm, disarm, dump (see `blockdump.py`) |
+| `/disk` | GET, POST | the SSD spill tier: status, arm, disarm, `spill-one`, `ls`, `contains`, `identities` (the paged, digest-only per-rank view of the index, 0.2.46 - the other half of the diff against `ls`), `offers` (RAM-first gap fill) and `authority` (every request served from disk), plus `failures` and `shadow` (the read-only byte-witness, see `disk_shadow.py`) and `gpu-shadow` (the GPU-direct shadow writer, see `disk_gpu_shadow.py`) and `restore-verify` (the restore-side byte verifier, see `disk_restore_verify.py`) and `gpu-write` (the GPU-direct write's counters and latch, see `disk_gpu_write.py` - its answer carries `scope`, because the apply point this op arms is code only a worker runs) and `restore-source` (0.2.59: where a restore's destination rows come from, `arena` or the plugin's staging ring; per boot, and its answer carries the ring's pressure beside the posture) and `adoptions` (0.2.61: WHICH request got how many tokens from
 disk, newest first, `limit` up to the whole 256-record ring). A mutating `op` on GET is a `405` |
-| `/policy/reload` | POST | **always** | reload `<package dir>/policy.py`, and adopt the store-policy patch |
+| `/policy/reload` | POST | reload `<package dir>/policy.py`, and adopt the store-policy patch |
 
 **Arguments.** GET takes them as query parameters, POST as a JSON object body, and
 both are validated against the SAME per-route table (`endpoint.ARG_SPECS`), so a
@@ -361,27 +368,26 @@ nothing that worked before arguments changed. Which engine method a request reac
 is fixed by the route and can never come from the body.
 
 ```bash
-TOK='put-a-real-token-here'
 B=http://127.0.0.1:8000/plugins/kvtier
 
 curl -s $B/snapshot | python3 -m json.tool | head -60
 curl -s $B/kvconfig | python3 -m json.tool
 curl -s "$B/block?block_id=412&group=5" | python3 -m json.tool
 curl -s "$B/request?request_id=cmpl-a" | python3 -m json.tool
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"request_id":"cmpl-a","ids_cap":200}' \
+curl -s -X POST -d '{"request_id":"cmpl-a","ids_cap":200}' \
      $B/request | python3 -m json.tool
 
 # the ring: arm it, work, read it, disarm it (nothing is wrapped while disarmed)
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"arm","depth":256}' $B/trace
-curl -s -H "x-kvtier-dev-token: $TOK" "$B/trace?limit=40" | python3 -m json.tool
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"disarm"}' $B/trace
+curl -s -X POST -d '{"op":"arm","depth":256}' $B/trace
+curl -s "$B/trace?limit=40" | python3 -m json.tool
+curl -s -X POST -d '{"op":"disarm"}' $B/trace
 
-# the one mutating verb of the old surface
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" $B/policy/reload | python3 -m json.tool
+# the mutating verb: no header, no token, only the peer rule
+curl -s -X POST $B/policy/reload | python3 -m json.tool
 ```
 
-From an allowlisted machine the same calls work with the token on all of them
-(`status` and `snapshot` need it off-box, loopback does not):
+From an allowlisted machine the SAME calls work unchanged - since 0.2.68 there is
+nothing to add to them, off-box or on it:
 
 ```bash
 # on the engine's own machine, nothing to configure:
@@ -389,8 +395,8 @@ ssh llm curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot | python3 -m json.
 
 # from 192.168.2.64 / 192.168.2.120, once VLLM_E2_TIER_DEV_ALLOW names you:
 B=http://192.168.2.42:8000/plugins/kvtier
-curl -s -H "x-kvtier-dev-token: $TOK" $B/status | python3 -m json.tool
-curl -s -H "x-kvtier-dev-token: $TOK" $B/snapshot | python3 -m json.tool
+curl -s $B/status | python3 -m json.tool
+curl -s $B/snapshot | python3 -m json.tool
 ```
 
 `status` is the place to check what you actually opened: `allow_networks` is the
@@ -563,9 +569,12 @@ cannot reproduce.
   built is counted as a fallback. Installing and arming are separate decisions - an
   installed observer records nothing while the ring is disarmed.
 
-`/trace`, `/guard` and `/lookups` require the token in every shape, loopback
-included: a route that can change engine dev state is token-gated as a whole, not
-per field.
+`/trace`, `/guard`, `/tier`, `/lookups`, `/blockdump` and `/disk` can change engine
+dev state, and until 0.2.68 they were token-gated as a whole (not per field) in every
+shape, loopback included. **That gate is removed.** What still separates an arm from a
+read is the engine-side arm itself (`POST {"op":"arm"}`, an arm that expires or latches
+per verb), the `safe_method` wall that refuses a mutating `op` on a `GET` with a 405,
+and the peer allowlist - see *Access model*.
 
 ## The lookup ledger: where a host-RAM prefix hit goes missing (`lookup_ledger.py`)
 
@@ -632,14 +641,13 @@ so a dropped hit at or above `block_size` cannot come from that rule at all
 hit somewhere in `[local + hit, local + block_size - 1]`.
 
 ```bash
-T=$VLLM_E2_TIER_DEV_TOKEN
 # arm it, let it see traffic, then ask the question
-curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+curl -s -X POST localhost:8000/plugins/kvtier/lookups \
      -H 'content-type: application/json' -d '{"op":"arm"}' | jq .reason
-curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+curl -s -X POST localhost:8000/plugins/kvtier/lookups \
      -H 'content-type: application/json' -d '{"op":"verdict"}' | jq '.counts, .dropped_examples'
-curl -s -H "x-kvtier-dev-token: $T" localhost:8000/plugins/kvtier/lookups | jq .entries
-curl -s -H "x-kvtier-dev-token: $T" -X POST localhost:8000/plugins/kvtier/lookups \
+curl -s localhost:8000/plugins/kvtier/lookups | jq .entries
+curl -s -X POST localhost:8000/plugins/kvtier/lookups \
      -H 'content-type: application/json' -d '{"op":"disarm"}'   # removes the wrappers if alone
 ```
 
@@ -721,15 +729,15 @@ request id - with a cause attached, plus a measured answer to "how many tokens c
 the RAM tier actually retain".
 
 ```bash
-# arm it (token-gated, like every other shape of /lookups)
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/lookups \
+# arm it: no token, since 0.2.68 (the peer address is the gate)
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/lookups \
   -H 'content-type: application/json' -d '{\"op\":\"arm\",\"cap\":256}'"
 
 # the per-request attributions (optionally &verdict=root_missing)
-ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=requests&limit=32'"
-ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=depth'"   # measured retention
-ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=order'"   # root-eviction witness
-ssh llm "curl -s -H '$H' 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=rates'"   # unit-checked ratios only
+ssh llm "curl -s 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=requests&limit=32'"
+ssh llm "curl -s 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=depth'"   # measured retention
+ssh llm "curl -s 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=order'"   # root-eviction witness
+ssh llm "curl -s 'http://127.0.0.1:8000/plugins/kvtier/lookups?op=rates'"   # unit-checked ratios only
 ```
 
 `op=depth` answers **without arming anything**, and the same block is in
@@ -868,10 +876,10 @@ list of requests that missed.
 > zero work usually means it is *declining* - and the captures say why.
 
 ```bash
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"armed":true}'  $B/guard
-curl -s -H      "x-kvtier-dev-token: $TOK"        "$B/guard" | python3 -m json.tool
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"captures","limit":2}' $B/guard
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"armed":false}' $B/guard   # restore
+curl -s -X POST -d '{"armed":true}' $B/guard
+curl -s "$B/guard" | python3 -m json.tool
+curl -s -X POST -d '{"op":"captures","limit":2}' $B/guard
+curl -s -X POST -d '{"armed":false}' $B/guard   # restore
 ```
 
 Armed, the tier's entry points return the fork's own "nothing happened" value
@@ -1056,26 +1064,24 @@ first and the dump's second, each contained on its own.
 ### The dump sequence (after a restart, to settle D vs P)
 
 ```bash
-T='<the VLLM_E2_TIER_DEV_TOKEN value>'      # /blockdump needs the token in EVERY shape
-H="x-kvtier-dev-token: $T"
 B=http://127.0.0.1:8000/plugins/kvtier
 D=/tmp/kv-tier-diagnostics                  # whatever VLLM_E2_TIER_DIAG is on the box
 
 # 1. is it deployed, and disarmed?  (expect "capability": "deployed_disarmed")
-ssh llm "curl -s -H '$H' $B/blockdump" | python3 -m json.tool
+ssh llm "curl -s $B/blockdump" | python3 -m json.tool
 
 # 2. arm it for 30 minutes (a fresh boot is disarmed; nothing works until this)
-ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"arm\",\"seconds\":1800}' $B/blockdump"
+ssh llm "curl -s -X POST -d '{\"op\":\"arm\",\"seconds\":1800}' $B/blockdump"
 
 # 2b. if you do not know the region names yet: arm a made-up group and read the
 #     refusal, which lists every region this rank has
-ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"dump\",\"group\":\"list\",\"block_id\":0,\"length\":16}' $B/blockdump"
+ssh llm "curl -s -X POST -d '{\"op\":\"dump\",\"group\":\"list\",\"block_id\":0,\"length\":16}' $B/blockdump"
 ssh llm "cat $D/blockdump-PP0_TP0.json" | python3 -m json.tool     # .reason names them
 
 # 3. one dump per region, at the SAME slot index - collecting the file in between
 #    (the response file is OVERWRITTEN by the next dump, and one is in flight/rank)
 for R in 0 1 2 3 5; do
-  ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"dump\",\"group\":\"$R\",\"block_id\":170,\"offset\":0,\"length\":4096}' $B/blockdump" >/dev/null
+  ssh llm "curl -s -X POST -d '{\"op\":\"dump\",\"group\":\"$R\",\"block_id\":170,\"offset\":0,\"length\":4096}' $B/blockdump" >/dev/null
   sleep 2
   ssh llm "cat $D/blockdump-PP0_TP0.json" > dump-g$R-slot170.json
   ssh llm "rm -f $D/blockdump-PP0_TP0.json"
@@ -1091,7 +1097,7 @@ for f in sorted(glob.glob('dump-g*-slot170.json')):
           'bpb', b['bytes_per_block'])"
 
 # 5. stand down (or let the arm expire on its own)
-ssh llm "curl -s -H '$H' -X POST -d '{\"op\":\"disarm\"}' $B/blockdump"
+ssh llm "curl -s -X POST -d '{\"op\":\"disarm\"}' $B/blockdump"
 ```
 
 Two operational facts the payload states too: `get_finished` only runs while the
@@ -1148,32 +1154,32 @@ read from the metadata **type**, so the question is answerable without generatin
 store. `no_key_for_slot` in the refusal table is that state, counted.
 
 ```bash
-H="Authorization: Bearer $VLLM_E2_TIER_DEV_TOKEN"; B=http://127.0.0.1:8000/plugins/kvtier
+B=http://127.0.0.1:8000/plugins/kvtier
 # what can this boot do?
-ssh llm "curl -s -H '$H' $B/disk" | python3 -m json.tool
+ssh llm "curl -s $B/disk" | python3 -m json.tool
 # arm the tier, then prove the path writes real bytes for one slot. SINCE 0.2.35 THE ARM
 # IS A LATCH: `seconds` is still accepted (an existing caller must not start failing) and
 # does nothing - the verdict answers `seconds_ignored: true`. It comes down on `disarm`.
-curl -s -H "$H" -X POST -d '{"op":"arm"}' $B/disk
+curl -s -X POST -d '{"op":"arm"}' $B/disk
 # `key` is the engine's GROUP-QUALIFIED block hash: the 16-hex `key16` plus the
 # group id as 8 hex chars (`key16 + f"{group:08x}"`, so 24 hex). A bare 16-hex key is
 # refused - it cannot say which group's bytes these are. Find both halves with
 # `GET /plugins/kvtier/block?block_id=<cpu slot>`: `tier_cpu_slot.block` carries
 # `hash_hex` and `hash_group_id`, and any CPU slot is nameable up to the CPU pool's
 # size (which is larger than the GPU pool's - the id is bounded per pool).
-curl -s -H "$H" -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f60700000003"}' $B/disk
-curl -s -H "$H" -X POST -d '{"op":"ls","limit":20}' $B/disk
+curl -s -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f60700000003"}' $B/disk
+curl -s -X POST -d '{"op":"ls","limit":20}' $B/disk
 # ONE IDENTITY, NOT THE WHOLE STORE (since 0.2.21). "Did the span I park actually land,
 # and for WHICH RANKS?" - answered from the replayed journals in memory, never by
 # walking the store (that is `ls`). One park span is one file PER RANK, so the answer is
 # a set of ranks: `ranks_present: 2` on a boot with 4 armed ranks is a half-written span.
-curl -s -H "$H" -X POST -d '{"op":"contains","key":"a3f0b7c1d4e5f60700000003"}' $B/disk
+curl -s -X POST -d '{"op":"contains","key":"a3f0b7c1d4e5f60700000003"}' $B/disk
 # the query-string form does the same thing (and since 0.2.21, so does every other op)
-curl -s -H "$H" -X POST "$B/disk?op=contains&key=a3f0b7c1d4e5f60700000003"
+curl -s -X POST "$B/disk?op=contains&key=a3f0b7c1d4e5f60700000003"
 # name the four rank FILES of one span without listing the whole store: `shard` is the
 # first two hex of the key16 (the filter has always existed; 0.2.21 whitelists the key)
-curl -s -H "$H" -X POST "$B/disk?op=ls&shard=a3f0&limit=20"
-ssh llm "curl -s -H '$H' -X POST -d '{"op":"disarm"}' $B/disk"
+curl -s -X POST "$B/disk?op=ls&shard=a3f0&limit=20"
+ssh llm "curl -s -X POST -d '{"op":"disarm"}' $B/disk"
 ```
 
 **`contains` answers "I cannot answer" as its own verdict, with `present: null`.** Five
@@ -1273,10 +1279,10 @@ arm, and `KVTIER_DISK_BOOT_ENABLE=0` restores the pre-0.2.33 posture where **a f
 serves nothing from disk until you POST**:
 
 ```bash
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"authority"}' $B/disk  # read
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
+curl -s -X POST -d '{"op":"authority"}' $B/disk  # read
+curl -s -X POST \
      -d '{"op":"authority","enabled":true}' $B/disk        # EVERY request from SSD
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
+curl -s -X POST \
      -d '{"op":"offers","enabled":true}' $B/disk           # RAM first, disk fills gaps
 ```
 
@@ -1953,24 +1959,24 @@ already on disk microseconds later.) Hence:
 # READ the posture of the process that answers, plus who has answered the last ask
 # (the read never relays: the channel carries instructions, and a rank's own count is
 # already in its rank file):
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads"}' $B/disk
+curl -s -X POST -d '{"op":"read-threads"}' $B/disk
 # RAISE or LOWER it, as often as you like, in one boot. `threads` outside [1, 16],
 # or not an integer, is a 400 at the wire and a refusal here, and it changes nothing:
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":16}' $B/disk
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6}' $B/disk
+curl -s -X POST -d '{"op":"read-threads","threads":16}' $B/disk
+curl -s -X POST -d '{"op":"read-threads","threads":6}' $B/disk
 # ASK the fleet to move. The default posts the ask and returns at once (`wait_s: 0`),
 # because a wait here holds the loop that dispatches the steps the ranks need to poll on.
 # Read the receipts back with the plain `read-threads` call above:
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6}' $B/disk
+curl -s -X POST -d '{"op":"read-threads","threads":6}' $B/disk
 # the same request as a query string works too (POST honours BOTH halves):
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" "$B/disk?op=read-threads&threads=6"
+curl -s -X POST "$B/disk?op=read-threads&threads=6"
 # `wait_s` (integer seconds) is accepted up to the wire's 30 but HONOURED only up to the
 # door's budget minus a margin, and to a 1.0 s grace, and the answer says what it did
 # (`wait_capped`, `wait_cap.why`). Ask for 15 and you get the cap in the response, not a
 # 504 over a resize that worked. `ranks: false` skips the workers and says so;
 # `ranks: true` makes an impossible relay fail the call:
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6,"wait_s":15}' $B/disk
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6,"ranks":false}' $B/disk
+curl -s -X POST -d '{"op":"read-threads","threads":6,"wait_s":15}' $B/disk
+curl -s -X POST -d '{"op":"read-threads","threads":6,"ranks":false}' $B/disk
 # and what each WORKER is actually running is its own rank file, not this answer:
 #   readers.configured / readers.threads_source / readers.last_resize
 ```
@@ -2877,10 +2883,10 @@ the store-wide rule ever did), `tests/test_disk_fill_block.py` (the fill as arit
 the `basis`/`read_basis`/`ceiling_basis` distinction, nulls instead of invented numbers,
 missing ranks named, a stale rank aged, the size cap at 24 ranks, and the signature
 cache reparsing when a rank file changes), and eleven tests in `tests/test_routes.py`
-(the proxy peer on `192.168.2.64` reading the block with the token, a 403 without it, a
-token not bypassing the allowlist, loopback needing no token, a spoofed
-`X-Forwarded-For` buying nothing, the block travelling on `/snapshot` too, and an inert
-plugin 503-ing before any fill read).
+(the proxy peer on `192.168.2.64` reading the block with no header at all, a peer off
+the allowlist refused on peer grounds while holding the old token, loopback needing
+nothing, a spoofed `X-Forwarded-For` buying nothing, the block travelling on
+`/snapshot` too, and an inert plugin 503-ing before any fill read).
 
 ### An unattributable name never buys capacity: fail-closed eviction (0.2.34)
 
@@ -3158,20 +3164,20 @@ layout's geometry digest for that rank, and the journal line (`<seq> <+|-> <key1
 walks no store, moves no counter and reads no file, and it is not in `MUTATING_DISK_OPS`.
 
 ```bash
-B=http://127.0.0.1:8000/plugins/kvtier/disk; H='Authorization: Bearer <token>'
+B=http://127.0.0.1:8000/plugins/kvtier/disk
 # 1. what the index intersects over, and what the last sampled pass saw
-curl -s -H "$H" "$B?op=status" | jq '.restore.index | {ranks_expected, ranks_expected_source,
+curl -s "$B?op=status" | jq '.restore.index | {ranks_expected, ranks_expected_source,
     claims_removed, claims_kept_past_peer_removal, rank_claims_unmatched, inserts_incomplete_span,
     sampled_last}'
 # 2. the index's per-rank claims: 200 identities, digests only, no paths
-curl -s -H "$H" -X POST -d '{"op":"identities","limit":200}' $B | jq '.identities[0]'
+curl -s -X POST -d '{"op":"identities","limit":200}' $B | jq '.identities[0]'
 # 3. keep paging until `truncated` is false - that is the census, not this page
-curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"after":"<next from page 2>"}' $B
+curl -s -X POST -d '{"op":"identities","limit":200,"after":"<next from page 2>"}' $B
 # 4. only the withheld spans; only one rank's claims
-curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"which":"partial"}' $B
-curl -s -H "$H" -X POST -d '{"op":"identities","limit":200,"rank":"PP1_TP1"}' $B
+curl -s -X POST -d '{"op":"identities","limit":200,"which":"partial"}' $B
+curl -s -X POST -d '{"op":"identities","limit":200,"rank":"PP1_TP1"}' $B
 # 5. the STORE's side of the same question, by shard: real FILE NAMES, one per rank
-curl -s -H "$H" -X POST -d '{"op":"ls","shard":"a3f0","limit":50}' $B
+curl -s -X POST -d '{"op":"ls","shard":"a3f0","limit":50}' $B
 ```
 
 Both directions of the `identities`-vs-`ls` diff mean something, and the verb's `next_step`
@@ -3364,7 +3370,7 @@ done'
 ssh llm "grep -a 'DISK\[proof\] GATE' /tmp/vllm-serve.log | tail -20"
 
 # 3. THE POSTURE AND THE TALLY, from the process that decides.
-ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' -H "$H" \
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' \
   | python3 -c "import json,sys; d=json.load(sys.stdin)['disk_restore']; c=d['counters']
   print(d['gate']['open'], d['gate']['reason_kind'],
         {k: c[k] for k in ('proof_gate_open','proof_closures','proof_openings') if k in c},
@@ -3560,7 +3566,7 @@ compares the bytes against the blob the spill path captured for the same block.
 # the worker's switch is the environment, because the worker is another process:
 #   VLLM_E2_TIER_DISK_SHADOW=1        (read once at first use; restart to change it)
 # this op reads the counters, and arms the process that ANSWERS (it writes no file):
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"shadow"}' $B/disk
+curl -s -X POST -d '{"op":"shadow"}' $B/disk
 ```
 
 **A mismatch is a QUESTION, and the categories say which one.** A completed store's GPU
@@ -3645,7 +3651,7 @@ with a retention cap of its own.
 #   VLLM_E2_TIER_DISK_GPU_SHADOW_ROOT=/path   (optional; default = <store>/../gpu-shadow)
 # this op reads the counters, and arms the process that ANSWERS (which is usually NOT
 # the worker - the answer says so in `scope`):
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"gpu-shadow"}' $B/disk
+curl -s -X POST -d '{"op":"gpu-shadow"}' $B/disk
 ```
 
 **Files land beside the store, never inside it.** With the box's store at
@@ -3956,7 +3962,7 @@ the number an operator acts on the number he cannot act on.
 
 ```bash
 #   VLLM_E2_TIER_DISK_RESTORE_VERIFY=1        (read once at first use; restart to change)
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"restore-verify"}' $B/disk
+curl -s -X POST -d '{"op":"restore-verify"}' $B/disk
 ```
 
 The POST latches only the process that answers - which for this module is the EngineCore,
@@ -4317,11 +4323,11 @@ why it is sampled, and why the interesting part of it is not the copy but the wi
 # this op READS: the counters, the pinned pool's live shape, the geometry the comparison
 # used and the last verdicts. Its `scope` field says why an EngineCore will report
 # `writes: 0` for ever - it has no apply point to write from:
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"gpu-write"}' $B/disk
+curl -s -X POST -d '{"op":"gpu-write"}' $B/disk
 # ... and this one lATCHES the process that answers. For this feature that is the wrong
 # process: the write happens at the restore apply point, which only a worker runs, so arm
 # the worker with the environment variable above and read the result here.
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"gpu-write","enabled":true}' $B/disk
+curl -s -X POST -d '{"op":"gpu-write","enabled":true}' $B/disk
 ```
 
 **Why a wrong write here cannot corrupt anything.** At the restore apply point the plugin
@@ -4652,11 +4658,9 @@ deliberately not among them**: that event is already in the document once, as
 event is how a reader ends up counting it twice.
 
 ```bash
-# READ-ONLY. The snapshot route is token-gated; the token is read from the engine's own environ.
+# READ-ONLY, and needs nothing: the snapshot route is gated on the peer address alone.
 # The box's shell is zsh: every path is quoted and no glob is allowed to fail.
-T=$(tr "\0" "\n" < /proc/$(systemctl show vllm-engine -p MainPID --value)/environ \
-     | sed -n "s/^VLLM_E2_TIER_DEV_TOKEN=//p" | head -1)
-ssh llm "curl -s -H 'x-kvtier-dev-token: $T' http://127.0.0.1:8000/plugins/kvtier/snapshot" \
+ssh llm "curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot" \
   | python3 -c 'import json,sys
  d = json.load(sys.stdin).get("disk_restore") or {}
  p = d.get("load_prune") or {}
@@ -4718,10 +4722,8 @@ boot, then fine" and "fine, then blind again" are two lines - and the counter ke
 regardless, because dedup is a log rule and never a counting rule.
 
 ```bash
-# READ-ONLY, on the same token-gated route. Shows the cause of every blind look.
-T=$(tr "\0" "\n" < /proc/$(systemctl show vllm-engine -p MainPID --value)/environ \
-     | sed -n "s/^VLLM_E2_TIER_DEV_TOKEN=//p" | head -1)
-ssh llm "curl -s -H 'x-kvtier-dev-token: $T' http://127.0.0.1:8000/plugins/kvtier/snapshot" \
+# READ-ONLY, on the same peer-gated route. Shows the cause of every blind look.
+ssh llm "curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot" \
   | python3 -c 'import json,sys
  d = json.load(sys.stdin).get("disk_restore") or {}
  p = d.get("load_prune") or {}
@@ -4900,7 +4902,7 @@ flag off is a normal staged rollout - the fork keeps every destination and
 # READ-ONLY look at the scheduler-side view. An EngineCore has NO apply point, so it answers the
 # switch and zeros, and says so; the counters that MOVE are in the worker's rank file, below.
 # Every `/disk` answer carries the restore verdict under `restore`:
-ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/disk' -H "$H"   | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['restore']['load_prune'], indent=2))"
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/disk'   | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['restore']['load_prune'], indent=2))"
 # THE COUNTERS THAT MOVE, from the rank files (the WORKER is the process with an apply point):
 ssh llm 'for f in /tmp/kv-tier-diagnostics/rank-*.json; do python3 -c "
 import json,sys
@@ -5171,14 +5173,13 @@ declines is never offered to the policy, which keeps the eight
 ### The kill switch (two steps, no restart, nothing new to call)
 
 ```bash
-TOK='put-a-real-token-here'
 # 1. make the veto unconditional - the whole body of decide_store:
 #        def decide_store(ctx):
 #            return "veto"
 #    in kvtier_dev_plugin/policy.py (the copy `status` reported)
 
 # 2. the ONE existing mutating verb:
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" \
+curl -s -X POST \
      http://127.0.0.1:8000/plugins/kvtier/policy/reload | python3 -m json.tool
 
 # 3. prove it: vetoes rise, `stored` stops moving
@@ -5461,12 +5462,12 @@ nothing. Both halves are now handled at the one moment the class exists:
 # 2. read it back. This no longer PATCHES or ARMS anything (the boot did), it
 #    CONFIRMS it: expect installed: true, armed: true, boot.mode: "auto",
 #    boot.ran: true, patched_before_first_request: true
-ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+ssh llm 'curl -s "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
   | python3 -c 'import sys,json;p=json.load(sys.stdin);b=p["pr56810"]["boot"];print(p["armed"],b["mode"],b["backport"],b["guard"],b["tier"],b["faults_at_boot"])'
 
 # 3. prove the boot was CLEAN, not merely UP. A guard-arm means a tier exception
 #    is now a DECLINE, so a broken tier looks healthy from `armed` alone.
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/guard \
   -d '{\"op\":\"captures\",\"limit\":5}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["count"],"faults");[print(c["method"],c["exception_type"],c["message"][:80]) for c in d["captures"]]'
 
 # 4. send traffic.
@@ -5525,7 +5526,8 @@ lever. A value that is not a word in either vocabulary (`flase`) reads as the de
 box still serving from disk after somebody decided it should not.
 
 **It is a disable switch, not an arm switch.** Every other facility here starts off and
-is armed by a token-gated POST, and that rule is untouched: guard mode, the RAM tier's
+is armed by a POST (peer-gated, like everything else since 0.2.68), and that rule is
+untouched: guard mode, the RAM tier's
 arm, the byte dump and `spill-one` have no env var. `KVTIER_DISK_BOOT_ENABLE` has the
 same shape as `VLLM_E2_TIER_DEV_BOOT_INERT` - it can only turn a boot effect **off** - and
 `VLLM_E2_TIER_DEV_BOOT_INERT` outranks it, because an inert boot arms nothing at all and
@@ -5632,14 +5634,14 @@ kvtier-dev-plugin: KVTIER disk boot default=ON (KVTIER_DISK_BOOT_ENABLE unset ->
 # builder, so they cannot disagree: the boot line's `disk_boot=` token, the snapshot's
 # `disk_restore.boot_default`, and `/disk`'s own `disk_boot_default`.
 grep 'disk boot default' /tmp/vllm-serve.log | tail -1
-curl -s -H "x-kvtier-dev-token: $TOK" $B/snapshot | python3 -c \
+curl -s $B/snapshot | python3 -c \
   'import sys,json;b=json.load(sys.stdin)["disk_restore"]["boot_default"];print(b["outcome"],b["honoured"],b["armed_now"],b["arm_expires"],b["disarmed_by_operator"])'
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"status"}' $B/disk | python3 -c \
+curl -s -X POST -d '{"op":"status"}' $B/disk | python3 -c \
   'import sys,json;print(json.load(sys.stdin)["disk_boot_default"]["reason"])'
 
 # Take it off THIS boot, and permanently, in that order.
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"authority","enabled":false}' $B/disk
-curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"disarm"}' $B/disk
+curl -s -X POST -d '{"op":"authority","enabled":false}' $B/disk
+curl -s -X POST -d '{"op":"disarm"}' $B/disk
 # ...and for the next boot: Environment=KVTIER_DISK_BOOT_ENABLE=0, then restart.
 ```
 
@@ -5653,7 +5655,7 @@ absence never has to be interpreted on the path where something went wrong.
 ### The kill switch (runtime, no restart)
 
 ```
-curl -s -X POST localhost:8000/plugins/kvtier/tier -H "authorization: Bearer $TOK" \
+curl -s -X POST localhost:8000/plugins/kvtier/tier \
      -d '{"op": "disarm"}'          # or "arm", or "status"
 ```
 
@@ -6104,17 +6106,11 @@ the second against `spill_incomplete_state` MOVING when the flag flips.
 
 Terse commands for standing at the box while something is wrong. Everything
 below runs **on the box** (`ssh llm ...`) because `/plugins/kvtier/*` is
-loopback-or-allowlist. The mutating/dev-state routes (`/tier`, `/guard`) need
-the token in every shape, loopback included (`~/.local/share/kvtier-dev-token`,
-mode 600, never in the repo). The plain reads (`/status`, `/snapshot`) are
-token-free from loopback.
-
-Set the token once per shell:
-
-```bash
-TOK=$(cat ~/.local/share/kvtier-dev-token)
-H="x-kvtier-dev-token: $TOK"
-```
+loopback-or-allowlist. Nothing needs a header: since 0.2.68 the dev-state routes
+(`/tier`, `/guard`, `/disk`, ...) answer a loopback peer exactly like the plain
+reads do, so `~/.local/share/kvtier-dev-token` is only a receipt of an older
+posture, not a credential. If a command below ever starts answering 403, the
+question is "which address did the engine see", not "which token did I send".
 
 ### Every boot with the tier env set: the order traffic goes in
 
@@ -6127,19 +6123,19 @@ H="x-kvtier-dev-token: $TOK"
 #    KVCacheConfig); this curl only CONFIRMS it - and it is still the read that
 #    proves the claim. Expect installed:true, armed:true, boot.mode:"auto",
 #    boot.backport/guard/tier all true, patched_before_first_request:true
-ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+ssh llm 'curl -s "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);b=d["pr56810"]["boot"];print(d["install"]["installed"],d["armed"],b["mode"],b["tier"],b["refusals"],d["operator_note"])'
 
 # 2. prove it is CLEAN, not just armed. Guard mode is armed by the boot, so a tier
 #    exception is a recorded DECLINE: `armed:true` alone cannot tell you the tier
 #    is doing work. A non-zero count here means the tier is alive and refusing.
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/guard \
   -d '{\"op\":\"captures\",\"limit\":5}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["count"],"faults");[print(c["method"],c["exception_type"],c["message"][:80]) for c in d["captures"]]'
 
 # 3. only a REFUSAL needs a verb now. If step 1 says armed:false with mode "auto",
 #    read boot.refusals - it names the gate (install / live-object check / guard
 #    coverage). To arm by hand once the cause is fixed:
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/tier \
   -d '{\"op\":\"arm\"}'" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["applied"],d["armed"],d.get("reason"),d["next_step"])'
 
 # 4. now let traffic in.
@@ -6214,7 +6210,7 @@ If guard mode was armed there is also a structured capture of the fault (guard
 mode is OFF at every boot; there is no capture unless someone armed it):
 
 ```bash
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/guard \
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/guard \
   -d '{\"op\":\"captures\",\"limit\":2}'"   # capture.decline, ...geometry.groups_failing_divisibility
 ```
 
@@ -6253,7 +6249,7 @@ line says `BOOT[inert]` so the two are never confused.) So:
 Confirm which one you are looking at:
 
 ```bash
-ssh llm 'curl -s -H "$H" "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
+ssh llm 'curl -s "http://127.0.0.1:8000/plugins/kvtier/tier?op=status"' \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);b=d["pr56810"]["boot"];print(json.dumps({k:d[k] for k in ("armed","boot_default_armed","operator_note","next_step")}, indent=1)); print(json.dumps({k:b[k] for k in ("ran","mode","backport","guard","tier","refusals","faults_at_boot")}, indent=1)); print(d["install"])'
 ```
 
@@ -6263,7 +6259,7 @@ Also the state the engine starts in: `disarm` is how you get back to the boot
 posture without a reboot.
 
 ```bash
-ssh llm "curl -s -X POST -H '$H' http://127.0.0.1:8000/plugins/kvtier/tier \
+ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/tier \
   -d '{\"op\":\"disarm\"}'"
 # prove it: armed=false, and the connector now reports no pending work
 ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot' \
@@ -6372,10 +6368,10 @@ ssh llm "grep -a 'DISK\[proof\] GATE' /tmp/vllm-serve.log | tail -20"
 `GET /plugins/kvtier/status` makes **no engine call** (it answers while the
 engine is wedged) and therefore does NOT show the live armed/installed state -
 it only echoes the route note. The live truth is in `snapshot` (or
-`GET /tier?op=status`, token) under `pr56810`:
+`GET /tier?op=status`) under `pr56810`:
 
 ```bash
-ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' -H "$H" \
+ssh llm 'curl -s http://127.0.0.1:8000/plugins/kvtier/tier?op=status' \
   | python3 -m json.tool | sed -n '/"pr56810"/,$p'
 ```
 
@@ -6463,35 +6459,62 @@ Read `docs/usage/security.md:349` first: `--api-key` only covers `/v1`, `/v2`,
 test_real_socket_*`).
    *Do not* put uvicorn's proxy-headers middleware in front of this: it rewrites
    `scope["client"]` from `X-Forwarded-For` and would hand the forgeability back.
-3. **Token for every off-box request.** This is the part that changed when the
-   surface became reachable off-box:
+3. **There is no third gate (0.2.68).** Until this release a bearer token stood
+   behind the peer rule, in three shapes:
 
-   * `POST /policy/reload` always requires `x-kvtier-dev-token` to equal
-     `VLLM_E2_TIER_DEV_TOKEN` (`hmac.compare_digest`), loopback included, and is
-     refused when that variable is unset.
-   * **a read from a non-loopback peer requires that same token too.** A
-     loopback read needs none, so `ssh llm curl http://127.0.0.1:8000/...` is
-     unchanged.
+   * `POST /policy/reload` required `x-kvtier-dev-token` to equal
+     `VLLM_E2_TIER_DEV_TOKEN` (compared with a constant-time digest), loopback
+     included, and was refused when that variable was unset;
+   * a read from a non-loopback peer required that same token (a loopback read
+     needed none, so `ssh llm curl http://127.0.0.1:8000/...` was unchanged);
+   * the six dev-state routes (`/trace`, `/guard`, `/tier`, `/lookups`,
+     `/blockdump`, `/disk`) required it in EVERY shape - a loopback `GET /trace`
+     included.
 
-   **The transport is plaintext HTTP with no TLS.** The token crosses the LAN in
-   clear text and is sniffable by anything on that broadcast domain (and by any
-   machine that can ARP-spoof it). The allowlist is the compensating control for
-   that: it is what limits *who can even see a request enough to try*, so keep
-   it as narrow as possible - individual `/32` addresses, not `/16`, and never
-   `0.0.0.0/0`. Remove the entries when you are done; unset the variable and the
-   surface is loopback-only again. If the token is ever exposed, rotate
-   `VLLM_E2_TIER_DEV_TOKEN` and restart.
+   **All three are removed**, by the operator's decision: the token made the surface
+   painful to drive from the proxy and from scripts, and the engine is to be
+   access-controlled later by other means. The consequence, stated plainly because it
+   is the sentence this section exists to make impossible to miss:
 
-   Order on every route: prove the peer is allowed -> prove the plugin is
-   enabled -> prove the token where it is required. A peer the guard rejects gets
-   403 and learns nothing about the plugin's configuration (not even the
-   contents of the allowlist, which are deliberately absent from the refusal).
-4. **One mutating verb, one file.** The engine-side method takes **no
-   arguments**, so nothing on the wire selects a module. The HTTP layer
-   separately validates any `path` you send, and refuses anything that does not
-   resolve to exactly `<package dir>/policy.py` (`../`, symlinks out of the
-   tree, other file names, module names, `NUL`: all rejected). A rejected path
-   is a 400 and the engine is never called.
+   > **The peer allowlist is now the ONLY gate on this surface, and `/plugins/*` is
+   > NOT covered by vLLM's `--api-key`** (that covers `/v1`, `/v2`, `/inference` and
+   > `/cohere` only). A key in front of `/v1` protects nothing here. An address on
+   > `VLLM_E2_TIER_DEV_ALLOW` reaches this surface unauthenticated and can arm guard
+   > mode, arm the SSD spill tier, reload the policy and read parked KV bytes. Keep
+   > the list at individual `/32` addresses, never `0.0.0.0/0`, and remove entries
+   > when you are done - unset the variable and the surface is loopback-only again.
+
+   What stands between a caller and engine state is therefore not a secret: the arm
+   itself (a `POST {"op":"arm"}` per facility, expiring or latching per verb, and
+   there is no env var that arms guard mode, the byte dump or `spill-one`), the
+   `safe_method` wall (a mutating `/disk` `op` on a `GET` is a 405 before the engine
+   is touched), the argument specs (`ARG_SPECS`, validated before the engine is
+   reached, with the engine method a route may call fixed by the route and never by
+   the wire), and `policy.py`'s own path validation. Those got MORE important in
+   0.2.68, not less.
+
+   **The transport is plaintext HTTP with no TLS**, as it always was. Nothing secret
+   crosses it now - that is the one security gain in the removal.
+
+   Order on every route: prove the peer is allowed -> prove the plugin is enabled ->
+   run. A peer the guard rejects gets 403 and learns nothing about the plugin's
+   configuration (not even the contents of the allowlist, which are deliberately
+   absent from the refusal), and that 403 names the PEER rule and never a token,
+   because there is no token left to name.
+
+   **`VLLM_E2_TIER_DEV_TOKEN` does not go quietly.** A variable that reads like a
+   control and gates nothing is a story an operator tells themselves, so the plugin
+   says so where an operator looks. The boot logs ONE `WARNING` naming the variable,
+   the release that stopped reading it and the gate that replaced it (`... is SET but
+   is no longer read by this plugin (since 0.2.68) ...`; its VALUE is never logged),
+   and `/status` answers `token_gating: false`, `token_header`,
+   `non_loopback_peers_require_token: false`, `vllm_api_key_covers_these_routes:
+   false` and a `token_note` carrying the same sentence. `token_configured` and
+   `token_env` are still published with their literal meaning ("is the variable set",
+   "which variable"), because a key vanishing from the payload is its own kind of
+   silence. Setting the variable moves `token_configured` and nothing else anywhere on
+   the surface - pinned by
+   `tests/test_routes.py::test_setting_the_token_env_changes_the_report_and_nothing_else`.
 4. **One mutating verb, one file.** The engine-side method takes **no
    arguments**, so nothing on the wire selects a module. The HTTP layer
    separately validates any `path` you send, and refuses anything that does not
@@ -6650,10 +6673,15 @@ touch-clock / peer-rank / deadline / evict-pool behaviour is in
 loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
 peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
 loopback-only, malformed entries that neither raise nor admit, cache invalidation
-when the env shrinks), the token on off-box reads *and* its continued absence for
-loopback reads, the token requirement on `trace`/`guard` in **every** shape, the
-guard order (peer -> enabled -> token), the `status` payload's `allow_networks` /
-`loopback_only` / `non_loopback_peers_require_token` fields and its `guard_mode` /
+when the env shrinks), **that no route asks for a token in any shape** (the whole
+surface swept route-by-route from an allowlisted peer with no header, including the
+six dev-state routes from loopback, and every refusal asserted to name the PEER rule
+and never a token), that the dead `VLLM_E2_TIER_DEV_TOKEN` moves exactly one field of
+`status` (`token_configured`) and nothing else, that the boot warns once when it is
+set and says nothing when it is not, and that a mutating `/disk` `op` on a `GET` is
+still a 405, the guard order (peer -> enabled), the `status` payload's
+`allow_networks` / `loopback_only` / `non_loopback_peers_require_token` fields and
+its `guard_mode` /
 `dev_state` / `worker_diagnostics` fields (including `guard_mode` being `null` -
 not `false` - until an engine has actually said something), path rejection for the
 reload verb, holder-based reload actually changing behaviour (same-size/same-mtime
@@ -6664,7 +6692,7 @@ answers under both dispatch shapes, and that the mount point is exactly the twel
 `/plugins/kvtier/*` paths (a list derived from `config.ROUTES`, so a new route
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
-one from loopback with no token, two from a source-bound non-loopback client socket
+one from loopback, two from a source-bound non-loopback client socket
 on this host's own LAN address (skipped on a box with no such address).
 
 The raw-byte dump (`tests/test_blockdump.py`) is the one that tests bytes rather
@@ -6932,7 +6960,8 @@ copy of either method. The fork's own tier suite is unaffected: `84 passed`
   fault ring survives the boot, `boot.faults_at_boot`/`faults_now` compare across
   it, and the ring is named in the boot line itself. **Read
   `{"op":"captures"}` after every boot**: a tier that is armed, up, and doing no
-  work is a tier that is declining. It needs the token to reach, echoes
+  work is a tier that is declining. Reachable from any allowlisted peer since 0.2.68
+  (there is no token to have), it echoes
   `guard_mode: true` everywhere, is opt-out-able only as a whole
   (`VLLM_E2_TIER_DEV_BOOT_INERT`), and must be disarmed before a production boot.
   The same reasoning covers tracing: the ring is bounded and the observers are pure,

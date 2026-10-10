@@ -81,6 +81,10 @@ class RealVerbEngine:
 
 @pytest.fixture(autouse=True)
 def plugin_on(monkeypatch):
+    """Live, plus the token variable set: 0.2.68 removed the gate it used to feed,
+    and every call in this file still sends the header - so the file measures that a
+    leftover variable and a stale header change no answer, including the 405 that is
+    now the only wall in front of a mutating `op` on a GET."""
     monkeypatch.setenv(config.ENV_ENABLE, "1")
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
 

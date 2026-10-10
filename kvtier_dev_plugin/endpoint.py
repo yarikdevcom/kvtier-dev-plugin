@@ -16,16 +16,22 @@ it):
                                          that id, each bounded by its own pool
     GET|POST /plugins/kvtier/request     one request by id; no id = the id list
     GET  /plugins/kvtier/trace           the trace ring's newest events
-    POST /plugins/kvtier/trace           arm / disarm / clear / read   [TOKEN]
-    GET  /plugins/kvtier/guard           guard-mode state                   [read]
-    POST /plugins/kvtier/guard           arm / disarm / fetch captures   [TOKEN]
+    POST /plugins/kvtier/trace           arm / disarm / clear / read  [dev-state]
+    GET  /plugins/kvtier/guard           guard-mode state
+    POST /plugins/kvtier/guard           arm / disarm / fetch captures  [dev-state]
     GET  /plugins/kvtier/lookups         the lookup/adopt ledger's newest records
-    POST /plugins/kvtier/lookups         arm / disarm / clear / verdict    [TOKEN]
+    POST /plugins/kvtier/lookups         arm / disarm / clear / verdict  [dev-state]
     GET  /plugins/kvtier/blockdump       the raw-byte dump's capability state
-    POST /plugins/kvtier/blockdump       arm / disarm / dump bounded ranges [TOKEN]
+    POST /plugins/kvtier/blockdump       arm / disarm / dump ranges  [dev-state]
     GET  /plugins/kvtier/disk            the SSD spill tier's state
-    POST /plugins/kvtier/disk            arm / disarm / spill-one / ls       [TOKEN]
-    POST /plugins/kvtier/policy/reload   reload <package dir>/policy.py  [TOKEN]
+    POST /plugins/kvtier/disk            arm / disarm / spill-one / ls   [dev-state]
+    POST /plugins/kvtier/policy/reload   reload <package dir>/policy.py
+
+[dev-state] marks the members of `config.DEV_STATE_ROUTES`: they can change engine
+dev state, so `status` lists them as such and the engine-side verbs behind them are
+arm-gated. SINCE 0.2.68 THE MARK IS NOT A GATE: no route on this surface asks for a
+token in any shape, and the ONLY gate on every one of them is the peer rule in (b)
+of the security notes below.
 
 GET takes its arguments from query parameters, POST from a JSON object body.
 Both are validated against the SAME per-route spec (`ARG_SPECS`) before anything
@@ -57,8 +63,12 @@ vllm/v1/engine/core.py:1035-1037).
 
 SECURITY. The engine binds 0.0.0.0:8000 and `--api-key` covers only the /v1,
 /v2, /inference and /cohere prefixes (docs/usage/security.md:349), so a plugin
-route is unauthenticated on the LAN unless the plugin says otherwise. This one
-does:
+route is unauthenticated on the LAN unless the plugin says otherwise. THIS
+SURFACE IS NOT COVERED BY vLLM's `--api-key`: a request to /plugins/kvtier/* that
+carries the engine's API key is no more trusted than one that carries nothing, and
+an operator who protects /v1 with a key has NOT protected this surface.
+
+Since 0.2.68 there is exactly ONE gate here, and it is the peer address:
 
   (a) everything is under /plugins/kvtier, never /v1/*;
   (b) EVERY request is refused unless the ASGI peer address is loopback OR is
@@ -70,23 +80,30 @@ does:
       Caveat for the operator: do not put uvicorn's proxy-headers middleware in
       front of this, because that middleware REWRITES scope["client"] from
       X-Forwarded-For and would hand the forgeability back.
-  (c) the mutating verbs require VLLM_E2_TIER_DEV_TOKEN, compared with
-      hmac.compare_digest, and are refused when that env is unset; AND, because
-      the surface is now reachable off-box, a NON-LOOPBACK peer must present
-      that same token on every request, reads included. Loopback needs no token
-      for reads, so `ssh llm curl 127.0.0.1` keeps working. `/trace` and `/guard`
-      can change engine dev state, so they require the token in EVERY shape -
-      even a loopback `POST /trace {"op": "read"}` needs it, deliberately: a
-      route that can change dev state is token-gated as a whole, not per field.
-      The transport is plaintext HTTP, so the allowlist is the compensating
-      control for the sniffable bearer token: keep it as narrow as a single
-      address.
+  (c) THERE IS NO SECOND GATE. Until 0.2.68 a bearer token (the environment
+      variable VLLM_E2_TIER_DEV_TOKEN, checked with a constant-time digest
+      comparison) was
+      required of every mutating verb, of every non-loopback read, and of every
+      shape of the six DEV_STATE_ROUTES - loopback included, so even a plain
+      `GET /trace` needed it. That requirement is removed by the operator's
+      decision: it made the surface painful to drive from the proxy and from
+      scripts, and the engine is to be access-controlled later by other means.
+      The variable is now READ FOR REPORTING ONLY (`status` publishes it and says
+      it gates nothing) and the boot WARNS once if it is set, so it cannot rot
+      into a knob that looks like a control while doing nothing. The peer
+      allowlist is therefore the WHOLE gate, and VLLM_E2_TIER_DEV_ALLOW must be
+      kept as narrow as the trust that actually exists: with the token gone, an
+      address on that list can arm guard mode, arm the spill tier, reload the
+      policy and read parked KV bytes. The transport is plaintext HTTP either way.
   (d) the mutating verbs cannot name a file, a method or a module. The engine
       reloads the single file this package owns, and the HTTP layer separately
       validates any `path` the caller sends so it can only ever be that file.
       Which engine method a route reaches is fixed per route and never comes from
       the wire: `getattr(self, method_name)` on the EngineCore would otherwise be
-      an arbitrary-method-call primitive handed to whoever holds a token.
+      an arbitrary-method-call primitive handed to whoever can reach the port -
+      which, since 0.2.68, is anyone on the allowlist. That is why the argument
+      specs (`ARG_SPECS`) and the `safe_method` wall are now the heaviest security
+      properties on this surface: besides the peer address, they are all of it.
 
 GUARD MODE IS A DEVELOPMENT FACILITY. `POST /plugins/kvtier/guard {"armed":
 true}` makes the tier's entry points turn an exception into a record plus a safe
@@ -109,7 +126,6 @@ InvalidStateError (core_client.py:847-865).
 from __future__ import annotations
 
 import asyncio
-import hmac
 import ipaddress
 import json
 import logging
@@ -189,12 +205,6 @@ def _peer_address_unwrapped(scope):
     return address if mapped is None else mapped
 
 
-def peer_is_loopback(scope) -> bool:
-    """True only when loopback_denial() says so - the one definition of
-    loopback, so 'needs a token' and 'is loopback' cannot drift apart."""
-    return loopback_denial(scope) is None
-
-
 def peer_denial(scope) -> str | None:
     """None if this peer may reach these routes at all, else the why-not.
 
@@ -226,55 +236,40 @@ def require_peer(scope) -> None:
         raise GuardDenied(403, denial)
 
 
-def require_bearer(headers, verb: str) -> None:
-    """The token check, shared by the mutating verb and by any read from a
-    non-loopback peer. Fail closed: an unset/blank token refuses."""
-    expected = config.mutating_token()
-    if not expected:
-        raise GuardDenied(403, f"{verb} refused: {config.ENV_TOKEN} is not set")
-    presented = ""
-    if headers is not None:
-        presented = headers.get(TOKEN_HEADER, "") or ""
-    if not presented or not hmac.compare_digest(presented, expected):
-        raise GuardDenied(403, f"missing or wrong {TOKEN_HEADER}")
+def guard_route(request: Request) -> None:
+    """THE gate for the whole /plugins/kvtier surface: peer, then enabled.
 
+    Since 0.2.68 there is nothing third. There used to be a bearer token
+    (`require_bearer`, and the three helpers built on it:
+    `require_mutating_token`, `require_dev_state_token`,
+    `require_token_for_remote_read`) and it was asked in three different shapes -
+    always of the mutating verb, always of the six dev-state routes, and of reads
+    from any non-loopback peer. All four are DELETED rather than left unreachable:
+    a helper nobody calls misdescribes this surface exactly as surely as a variable
+    nobody reads would (`tests/test_guards.py::test_the_token_guards_are_gone_*`
+    fails if one comes back). `VLLM_E2_TIER_DEV_TOKEN` is now read only to be
+    REPORTED - in `status_payload` and in the boot warning in
+    `KVTierDevEndpointPlugin.attach_router` - so it cannot rot into a knob that
+    looks like a control while doing nothing.
 
-def require_mutating_token(headers) -> None:
-    require_bearer(headers, "reload")
+    What has NOT moved is the peer gate: `peer_denial()` and
+    `config.allow_networks()` are untouched and stay fail-closed - loopback only
+    when `VLLM_E2_TIER_DEV_ALLOW` is unset, empty or garbage. The gate got thinner,
+    not absent, and the allowlist is now the whole of it: keeping that list narrow
+    is the operator's remaining job on this surface.
 
-
-def require_dev_state_token(headers) -> None:
-    """The token for a route that CAN change dev state, in every shape.
-
-    `/trace` and `/guard` are mutating-capable verbs, so the whole route is
-    token-gated rather than the individual `op`: a caller who cannot produce the
-    token cannot even ask for a read through the same door that arms guard mode.
-    Loopback is not an exemption here - exactly like the reload verb.
+    It raises `HTTPException` itself - converting the framework-free `GuardDenied`
+    at the one place the two shapes meet - so no route can forget the conversion and
+    answer 500 for a peer the guard refused.
     """
-    require_bearer(headers, "dev-state verb")
-
-
-def require_token_for_remote_read(scope, headers) -> None:
-    """Reads are token-free from loopback only.
-
-    Off-box traffic is plaintext HTTP on a shared LAN segment, so once the
-    allowlist opened the surface the token had to become a read requirement
-    too; loopback stays token-free so the operator's `ssh llm curl 127.0.0.1`
-    workflow is unchanged.
-    """
-    if peer_is_loopback(scope):
-        return
-    require_bearer(headers, "read from a non-loopback peer")
-
-
-def _guard_read(request: Request) -> None:
-    # Order is the contract: prove the peer, then prove the plugin is even on,
-    # then prove the token where the token is required.
-    require_peer(request.scope)
+    try:
+        require_peer(request.scope)
+    except GuardDenied as denied:
+        raise HTTPException(status_code=denied.status_code,
+                            detail=denied.detail) from None
     if not config.enabled():
         raise HTTPException(status_code=503,
                             detail=f"inert: {config.ENV_ENABLE} is not enabled")
-    require_token_for_remote_read(request.scope, request.headers)
 
 
 # --- engine hop -------------------------------------------------------------
@@ -671,9 +666,12 @@ async def post_arguments(request: Request, route: str) -> dict:
         the bug being fixed;
       * the SAFE-method route is untouched. A mutating `op` still cannot run from a
         method a browser may issue without a preflight (`route_disk`'s 405 and the
-        engine-side `safe_method` refusal are the two guards), and the token gate is
-        method-independent, so a query-string `op` is exactly as authenticated as a
-        body `op`.
+        engine-side `safe_method` refusal are the two guards), and the guard is
+        method-independent, so a query-string `op` is exactly as authorised as a
+        body `op`. Since 0.2.68 that word carries the whole weight: with the token
+        gone, "this peer is allowed" is the entire authentication on both methods -
+        which is exactly why the safe-method half stays POST-only discipline that
+        no token ever covered.
     """
     body = await body_arguments(request, route)
     query = query_arguments(request, route)
@@ -856,6 +854,26 @@ def status_payload(dev_state: dict | None = None) -> dict:
                                       "is a 400 and never reaches the engine"},
         "token_configured": config.token_configured(),
         "token_env": config.ENV_TOKEN,
+        # THE DEAD TOKEN VARIABLE, SAID OUT LOUD (0.2.68). `token_configured` and
+        # `token_env` keep their LITERAL meaning ("is the variable set", "which
+        # variable") because a key that vanishes from this payload is a silent change
+        # for anything that reads it - and a variable that is still set would then be
+        # reported by nothing at all, which is how a dead knob survives. What they do
+        # NOT get to keep is the implication: `token_gating` is false, `token_note`
+        # says so and names the release, and both this note and `guard` say the thing
+        # a reader most needs to know - these routes are not covered by vLLM's
+        # --api-key, so the allowlist is not a second line of defence, it is the only
+        # one. Nothing here is read for access control any more.
+        "token_gating": False,
+        "token_header": TOKEN_HEADER,
+        "token_note": (f"{config.ENV_TOKEN} no longer gates anything, since 0.2.68. "
+                       "It is read only to be reported here. The peer allowlist "
+                       f"({config.ENV_ALLOW}, with loopback always admitted) is the "
+                       f"ONLY gate on {config.ROUTE_PREFIX}: a value set in "
+                       f"{config.ENV_TOKEN} is ignored, and so is any "
+                       f"{TOKEN_HEADER} header. These routes are NOT covered by "
+                       "vLLM's --api-key, which covers /v1, /v2, /inference and "
+                       "/cohere only. Unset the variable to stop the boot warning."),
         "timeout_seconds": config.timeout_seconds(),
         "timeout_env": config.ENV_TIMEOUT,
         "policy_target": {"path": target, "loadable": loadable, "refusal": refusal},
@@ -865,10 +883,20 @@ def status_payload(dev_state: dict | None = None) -> dict:
         "allow_env": config.ENV_ALLOW,
         "allow_networks": [str(network) for network in allowed],
         "loopback_only": not allowed,
-        "non_loopback_peers_require_token": True,
+        # 0.2.68: this used to be `True`, and it was the whole shape of the old
+        # second gate. The key STAYS with its value flipped rather than being deleted,
+        # so a reader finds a truthful `false` instead of a missing key.
+        "non_loopback_peers_require_token": False,
+        # The sentence this payload exists to make impossible to miss: protecting
+        # /v1 with vLLM's --api-key protects NOTHING on this surface.
+        "vllm_api_key_covers_these_routes": False,
         "guard": "ASGI scope['client'] must be a loopback IP or be contained "
-                 "in VLLM_E2_TIER_DEV_ALLOW; forwarded headers are ignored; a "
-                 "non-loopback peer must also send the token header",
+                 "in VLLM_E2_TIER_DEV_ALLOW; forwarded headers are ignored. This is "
+                 "the ONLY gate: since 0.2.68 there is no token on any route here, "
+                 "and vLLM's --api-key does NOT cover /plugins/* (it covers /v1, /v2, "
+                 "/inference and /cohere), so a peer on the allowlist reaches this "
+                 "surface unauthenticated - keep the list as narrow as the trust "
+                 "that actually exists.",
         # GUARD MODE, up top and impossible to miss, and the trace ring beside
         # it. `null` here means THIS API PROCESS HAS NEVER SEEN AN ENGINE ANSWER
         # - never "off": status makes no engine call, so it cannot know, and a
@@ -1081,11 +1109,7 @@ async def route_status(request: Request):
     last value this process MIRRORED from an engine answer (with its age), or
     null when nothing has been seen - never a guessed `false`.
     """
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     return JSONResponse(content=status_payload(dev_state_view(request)))
 
 
@@ -1093,11 +1117,7 @@ async def route_status(request: Request):
 async def route_snapshot(request: Request):
     """The scheduler-side tier view. Takes no arguments; an unknown query
     parameter is a 400, so the strictness is symmetrical with POST."""
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = query_arguments(request, config.ROUTE_SNAPSHOT)
     return as_json(await engine_call(request, config.METHOD_SNAPSHOT, args,
                                      source="snapshot read"))
@@ -1106,11 +1126,7 @@ async def route_snapshot(request: Request):
 @router.post(config.ROUTE_SNAPSHOT)
 async def route_snapshot_post(request: Request):
     """The same view. A body is validated (it may only be empty) and forwarded."""
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_SNAPSHOT)
     return as_json(await engine_call(request, config.METHOD_SNAPSHOT, args,
                                      source="snapshot read"))
@@ -1120,11 +1136,7 @@ async def route_snapshot_post(request: Request):
 async def route_kvconfig(request: Request):
     """The KV-cache geometry: block sizes, spec classes, divisibility per group.
     Read-only; no arguments are accepted, on either method."""
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = query_arguments(request, config.ROUTE_KVCONFIG)
     return as_json(await engine_call(request, config.METHOD_KVCONFIG, args,
                                      source="kvconfig read"))
@@ -1132,11 +1144,7 @@ async def route_kvconfig(request: Request):
 
 @router.post(config.ROUTE_KVCONFIG)
 async def route_kvconfig_post(request: Request):
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_KVCONFIG)
     return as_json(await engine_call(request, config.METHOD_KVCONFIG, args,
                                      source="kvconfig read"))
@@ -1146,11 +1154,7 @@ async def route_kvconfig_post(request: Request):
 async def route_block(request: Request):
     """`GET /plugins/kvtier/block?block_id=412&group=5` - the block-inspector
     shape, straight out of a browser or one curl."""
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = query_arguments(request, config.ROUTE_BLOCK)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="block inspect"))
@@ -1158,11 +1162,7 @@ async def route_block(request: Request):
 
 @router.post(config.ROUTE_BLOCK)
 async def route_block_post(request: Request):
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_BLOCK)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="block inspect"))
@@ -1172,11 +1172,7 @@ async def route_block_post(request: Request):
 async def route_request(request: Request):
     """`?request_id=cmpl-...` for one request; no id at all lists the ids the
     engine currently has (capped)."""
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = query_arguments(request, config.ROUTE_REQUEST)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="request inspect"))
@@ -1184,38 +1180,20 @@ async def route_request(request: Request):
 
 @router.post(config.ROUTE_REQUEST)
 async def route_request_post(request: Request):
-    try:
-        _guard_read(request)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_REQUEST)
     return as_json(await engine_call(request, config.METHOD_INSPECT, args,
                                      source="request inspect"))
 
 
-async def _guard_dev_state_route(request: Request) -> None:
-    """Peer, then enabled, then ALWAYS the token - see require_dev_state_token."""
-    try:
-        require_peer(request.scope)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
-    if not config.enabled():
-        raise HTTPException(status_code=503,
-                            detail=f"inert: {config.ENV_ENABLE} is not enabled")
-    try:
-        require_dev_state_token(request.headers)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
-
-
 @router.get(config.ROUTE_TRACE)
 async def route_trace(request: Request):
-    """The trace ring's newest events. Token required even for this read: the
-    same door arms the recorder."""
-    await _guard_dev_state_route(request)
+    """The trace ring's newest events.
+
+    Answered without a token since 0.2.68, the read included - the same door arms
+    the recorder, and what stands in front of that door is the peer address.
+    """
+    guard_route(request)
     raw = query_arguments(request, config.ROUTE_TRACE)
     args = dict(raw)
     args.setdefault("op", "read")
@@ -1231,7 +1209,7 @@ async def route_trace_post(request: Request):
     a wrapped method that faults is recorded rather than raised); `disarm`
     removes every wrapper this plugin owns outside the init-time ones.
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_TRACE)
     return as_json(await engine_call(request, config.METHOD_TRACE, args,
                                      source="trace verb"))
@@ -1239,8 +1217,8 @@ async def route_trace_post(request: Request):
 
 @router.get(config.ROUTE_GUARD)
 async def route_guard(request: Request):
-    """Guard-mode state and its error histogram. Token required, as for /trace."""
-    await _guard_dev_state_route(request)
+    """Guard-mode state and its error histogram. No token, as for /trace."""
+    guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_GUARD))
     args.setdefault("op", "status")
     return as_json(await engine_call(request, config.METHOD_GUARD, args,
@@ -1260,7 +1238,7 @@ async def route_guard_post(request: Request):
     It NEVER swallows a `BaseException`: cancellation, SystemExit and
     KeyboardInterrupt always continue on their way.
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_GUARD)
     return as_json(await engine_call(request, config.METHOD_GUARD, args,
                                      source="guard verb"))
@@ -1268,11 +1246,12 @@ async def route_guard_post(request: Request):
 
 @router.get(config.ROUTE_TIER)
 async def route_tier(request: Request):
-    """KV-tier state: is the PR #56810 fix live, and is the tier armed? Token
-    required, because the same door arms AND disarms the connector. With no `op`
+    """KV-tier state: is the PR #56810 fix live, and is the tier armed? The same
+    door arms AND disarms the connector, and since 0.2.68 the peer rule is all that
+    gates it. With no `op`
     this is `op=status`: it installs the fix against the live manager and reports
     `armed: false` - arming is a separate, deliberate act (see the runbook)."""
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_TIER))
     args.setdefault("op", "status")
     return as_json(await engine_call(request, config.METHOD_TIER, args,
@@ -1315,7 +1294,7 @@ async def route_tier_post(request: Request):
     `tier.patched` is false the tier is harmless ONLY while it is disarmed, and
     arming such an engine is what `set_armed` refuses.
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_TIER)
     return as_json(await engine_call(request, config.METHOD_TIER, args,
                                      source="tier verb"))
@@ -1323,9 +1302,9 @@ async def route_tier_post(request: Request):
 
 @router.get(config.ROUTE_LOOKUPS)
 async def route_lookups(request: Request):
-    """The lookup/adopt ledger's newest records. Token required even for this
+    """The lookup/adopt ledger's newest records. No token even for this
     read, as for `/trace`: the same door arms the recorder."""
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_LOOKUPS))
     args.setdefault("op", "read")
     return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
@@ -1353,7 +1332,7 @@ async def route_lookups_post(request: Request):
     removes them only when nothing else still needs them. The ring has a hard
     capacity, a monotonic `dropped` count, and records nothing while disarmed.
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_LOOKUPS)
     return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
                                      source="lookup ledger verb"))
@@ -1361,9 +1340,9 @@ async def route_lookups_post(request: Request):
 
 @router.get(config.ROUTE_BLOCKDUMP)
 async def route_blockdump(request: Request):
-    """The raw-byte dump's capability state. Token required even for this read,
+    """The raw-byte dump's capability state. Answered even for this read without
     as for `/trace` and `/guard`: the same door ARMS the facility."""
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_BLOCKDUMP))
     args.setdefault("op", "status")
     return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
@@ -1380,7 +1359,9 @@ async def route_blockdump_post(request: Request):
     so the payload is bytes - which is exactly why this route is shaped the way it
     is:
 
-      * TOKEN-GATED like `/guard`: the door that can read KV bytes is not a read.
+      * PEER-GATED like `/guard`, and since 0.2.68 NOTHING else: the peer address is
+        the whole gate, which is why the bounds below (not a token) are what keep
+        this verb from reading the host dry.
       * DISARMED at every boot, no env var that arms it, and an arm EXPIRES
         (`seconds`, default 1800, max 7200). `op: dump` on a disarmed engine is a
         refusal that names the arm verb, never a silent no-op.
@@ -1396,7 +1377,7 @@ async def route_blockdump_post(request: Request):
         where. Reading a slot is host-memory arithmetic only: no CUDA, and no
         refcount, free-queue or hash-state change (see `blockdump.py`).
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_BLOCKDUMP)
     return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
                                      source="blockdump verb"))
@@ -1404,8 +1385,9 @@ async def route_blockdump_post(request: Request):
 
 @router.get(config.ROUTE_DISK)
 async def route_disk(request: Request):
-    """The SSD spill tier's state. Token required even for this read, as for
-    `/blockdump`: the same door ARMS a facility that writes real KV bytes.
+    """The SSD spill tier's state. Answered without a token, as for `/blockdump`:
+    the same door ARMS a facility that writes real KV bytes, and what gates that
+    door since 0.2.68 is the peer address alone.
 
     READ-ONLY BY CONSTRUCTION. The `op` is a QUERY PARAMETER here, so the URL that
     arms the tier is as short as the URL that reads its status - and a browser
@@ -1416,7 +1398,7 @@ async def route_disk(request: Request):
     engine-side verb directly (the `GET /api/config/auto-suspend` lesson: one verb,
     two methods, and the mutating half must not answer on the safe one).
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_DISK))
     from . import disk_store  # noqa: PLC0415 - the op lists live with the verb, and
     # this module otherwise knows only `config` (no engine-side module at import).
@@ -1526,8 +1508,10 @@ async def route_disk_post(request: Request):
       refusal door. The fallback stays silent and cheap: the fork's own
       answer.
 
-      * TOKEN-GATED like `/guard` and `/blockdump`: this route can arm a facility
-        that writes KV bytes to disk, so it is a dev-state route in every shape.
+      * PEER-GATED like `/guard` and `/blockdump`, and that is the whole gate since
+        0.2.68: this route can arm a facility that writes KV bytes to disk, so the
+        narrowness of VLLM_E2_TIER_DEV_ALLOW is what stands between a page load and
+        an armed spill tier - together with the POST-only rule below.
       * OFF TWICE OVER: `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the
         tmpfs roots are refused by the layout layer), AND the tier must be ARMED.
         No env var arms it; `{"op":"arm"}` does, and since 0.2.35 an arm is a LATCH:
@@ -1595,7 +1579,7 @@ async def route_disk_post(request: Request):
         engine the worker hook refuses and counts `no_key_for_slot` and writes
         nothing - which is the same build being correct on both engines.
     """
-    await _guard_dev_state_route(request)
+    guard_route(request)
     args = await post_arguments(request, config.ROUTE_DISK)
     from . import disk_store  # noqa: PLC0415 - the key rule lives with the verb
     # A malformed key is a `400`, answered HERE so that "you asked badly" can never
@@ -1611,22 +1595,12 @@ async def route_disk_post(request: Request):
 
 @router.post(config.ROUTE_RELOAD)
 async def route_reload_policy(request: Request):
-    # Order matters: prove the peer is allowed (loopback or allowlisted), then
-    # prove we are even on, then prove the caller holds the token. Nothing is
-    # leaked to a peer that is not allowed.
-    try:
-        require_peer(request.scope)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
-    if not config.enabled():
-        raise HTTPException(status_code=503,
-                            detail=f"inert: {config.ENV_ENABLE} is not enabled")
-    try:
-        require_mutating_token(request.headers)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
+    # THE SAME ONE GATE as every other route, in the same order: prove the peer is
+    # allowed (loopback or allowlisted), then prove we are even on. Nothing is
+    # leaked to a peer that is not allowed. Until 0.2.68 a third step demanded the
+    # bearer token here - this was the ONE mutating verb the token was invented for,
+    # and the header is now inert on this route like every other.
+    guard_route(request)
 
     body = await read_json_object(request)
     if body is None:
@@ -1679,6 +1653,21 @@ class KVTierDevEndpointPlugin:
         logger.info("kvtier-dev-plugin: routes attached under %s "
                     "(inert until %s is set)", config.ROUTE_PREFIX,
                     config.ENV_ENABLE)
+        # NO SILENT DEAD CONFIG (0.2.68). An operator who still exports the variable
+        # this plugin stopped reading believes they have a token in front of this
+        # surface. They do not, and silence would be the lie - so the boot that
+        # ignores it says so, once, at WARNING, naming the variable (NEVER its
+        # value), the release that stopped reading it, and the gate that replaced it.
+        # Unset means no line: the point is to be read, not to be noise.
+        if config.token_configured():
+            logger.warning("kvtier-dev-plugin: %s is SET but is no longer read by "
+                           "this plugin (since 0.2.68): there is no token gate on %s "
+                           "any more, and the peer allowlist %s (loopback always "
+                           "admitted) is the ONLY gate - keep it narrow, because "
+                           "these routes are not covered by vLLM's --api-key. Unset "
+                           "%s to silence this line; GET %s/status repeats it",
+                           config.ENV_TOKEN, config.ROUTE_PREFIX, config.ENV_ALLOW,
+                           config.ENV_TOKEN, config.ROUTE_PREFIX)
 
     # `args` is part of the EndpointPlugin protocol; this plugin needs
     # nothing from it.

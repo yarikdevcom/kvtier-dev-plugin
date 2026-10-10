@@ -12,9 +12,16 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
                                {"", "0", "false", "off", "no"} enables it.
                                Unset = the plugin is inert: the general plugin
                                attaches nothing, the endpoint answers 503.
-  VLLM_E2_TIER_DEV_TOKEN    -- required bearer token for the ONE mutating verb
-                               (policy reload). Unset/empty = reload is refused
-                               (fail closed), reads still work.
+  VLLM_E2_TIER_DEV_TOKEN    -- NO LONGER A GATE (0.2.68). It used to be the bearer
+                               token for the mutating verb, then for every read from
+                               a non-loopback peer, then for every shape of the six
+                               dev-state routes. All of that is removed: the plugin
+                               does not read it for access control at all. A value
+                               set here is IGNORED - the boot says so once at
+                               WARNING and `status` publishes `token_gating: false`
+                               with the same sentence - so unset it rather than
+                               trusting it. What is left in front of this surface is
+                               VLLM_E2_TIER_DEV_ALLOW below, and nothing else.
   VLLM_E2_TIER_DEV_TIMEOUT  -- seconds the HTTP layer waits for the engine
                                utility call before answering 504. Default 5.0,
                                clamped to [0.05, 60.0]; garbage falls back.
@@ -36,11 +43,15 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
                                UNSET OR EMPTY = LOOPBACK ONLY, which is the
                                pre-allowlist behaviour and the safe default.
                                A malformed entry is logged and skipped, never
-                               fatal and never an opening. A peer admitted here
-                               must still present VLLM_E2_TIER_DEV_TOKEN on
-                               every request, reads included (loopback peers do
-                               not need it for reads). Traffic is plaintext
-                               HTTP, so keep this list as narrow as possible.
+                               fatal and never an opening. SINCE 0.2.68 THIS IS THE
+                               ONLY GATE on /plugins/kvtier: there is no token in
+                               front of it any more, so an address admitted here can
+                               arm guard mode, arm the SSD spill tier, reload the
+                               policy and read parked KV bytes, unauthenticated.
+                               These routes are NOT covered by vLLM's --api-key
+                               (that covers /v1, /v2, /inference and /cohere only).
+                               Traffic is plaintext HTTP, so keep this list as narrow
+                               as the trust that actually exists.
 
 There is deliberately NO env var that selects the policy file. The reloadable
 policy is `kvtier_dev_plugin/policy.py` next to this file, and nothing else.
@@ -861,11 +872,14 @@ ROUTE_GUARD = "/guard"
 ROUTE_TIER = "/tier"
 ROUTE_LOOKUPS = "/lookups"
 # The bounded raw-KV-byte dump. It can ARM a diagnostic that reads real KV bytes,
-# so it is a dev-state route: token required in every shape, loopback included.
+# so it is a dev-state route: listed as one on `status`, and its engine-side verb
+# stays arm-gated. Since 0.2.68 the mark is NOT a gate - no route asks for a token.
 ROUTE_BLOCKDUMP = "/blockdump"
 # The SSD spill tier's control verb. It can ARM a facility that writes real KV
 # bytes to disk, and `spill-one` makes a worker write one, so it is a dev-state
-# route on the same rule as `/blockdump`: token in every shape, loopback included.
+# route on the same rule as `/blockdump`: a category, and since 0.2.68 not a gate.
+# What still gates the mutating half of it is POST-only (`MUTATING_DISK_OPS`) and
+# the engine's own arm - both deliberately untouched by the removal.
 ROUTE_DISK = "/disk"
 
 # The same routes as one tuple, in the order a reader wants them, so `status`
@@ -875,8 +889,12 @@ ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUE
           ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS, ROUTE_BLOCKDUMP,
           ROUTE_DISK, ROUTE_RELOAD)
 
-# The routes that can change engine dev state. Token in every shape, loopback
-# included - see endpoint.require_dev_state_token.
+# The routes that can change engine dev state, published as `dev_state_routes` on
+# `status`. UNTIL 0.2.68 THIS TUPLE WAS ALSO A GATE (`endpoint.require_dev_state_token`
+# demanded the token on every one of them, loopback included). The tuple stays - it is
+# an inventory of what can move engine state, and the tests that sweep the dev surface
+# read it from here - but it gates nothing. The only gate on the whole surface is
+# `endpoint.peer_denial()`.
 DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS,
                     ROUTE_BLOCKDUMP, ROUTE_DISK)
 
@@ -1309,12 +1327,17 @@ def disk_gpu_shadow_root() -> dict:
 
 
 def token_configured() -> bool:
+    """Is `VLLM_E2_TIER_DEV_TOKEN` set? REPORTED ONLY - it no longer gates anything.
+
+    Since 0.2.68 nothing in this package reads the token for access control: the
+    bearer-token gate was removed from every route, in every shape, by the operator's
+    decision (see `endpoint.guard_route`). This function survives because the honest
+    report needs it - `status` publishes the answer beside `token_gating: false`, and
+    `KVTierDevEndpointPlugin.attach_router` warns at boot when an operator still
+    exports a variable that now does nothing. It must stay the ONLY reader of
+    `ENV_TOKEN`, and a test enumerates the files that mention it.
+    """
     return bool(os.environ.get(ENV_TOKEN, "").strip())
-
-
-def mutating_token() -> str:
-    """The token a mutating request must present. "" means "reload refused"."""
-    return os.environ.get(ENV_TOKEN, "").strip()
 
 
 def allow_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:

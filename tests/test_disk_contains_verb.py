@@ -82,8 +82,10 @@ def fresh_index(tmp_path, monkeypatch):
     monkeypatch.setenv(config.ENV_DIAG_RANK, RANKS[0])
     monkeypatch.setenv(config.ENV_DISK_ROOT, str(tmp_path / "kv-store"))
     monkeypatch.setenv(config.ENV_DISK_BYTES, str(64 * WIDTH))
-    # The route-level tests below need the plugin live and a token to spend; the
-    # index-level ones ignore both.
+    # The route-level tests below need the plugin live; the index-level ones ignore
+    # it. The token variable is set to prove it stays inert (0.2.68 removed the gate
+    # it used to feed) - the route calls below still send the header, and must keep
+    # working exactly as well without it.
     monkeypatch.setenv(config.ENV_ENABLE, "1")
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
     disk_restore.reset_state_for_tests()

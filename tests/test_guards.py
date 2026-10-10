@@ -1,36 +1,34 @@
 """The guards, in isolation: no FastAPI, no engine, no vllm.
 
-`loopback_denial()`, `peer_denial()`, `require_token_for_remote_read()` and
-`require_mutating_token()` are deliberately framework free (they take an ASGI
-scope / a header mapping), which is what lets the security properties be tested
-here directly instead of through a transport.
+`loopback_denial()` and `peer_denial()` are deliberately framework free (they
+take an ASGI scope), which is what lets the security properties be tested here
+directly instead of through a transport.
+
+SINCE 0.2.68 THE PEER ALLOWLIST IS THE ONLY GATE ON THIS SURFACE. There used to
+be a second guard here - `require_bearer()` and the three helpers built on it -
+and this file used to test them. They are gone from the product and from this
+file; what replaced them is `test_the_token_guards_are_gone_*` below (a deleted
+gate must not survive as an unreachable function) and
+`test_the_token_env_grants_nothing_and_refuses_nothing` (a variable that is read
+by nothing must also be able to HURT nothing).
 """
 
 from __future__ import annotations
 
 import pytest
 
-from kvtier_dev_plugin import config
+from kvtier_dev_plugin import config, endpoint
 from kvtier_dev_plugin.endpoint import (
-    TOKEN_HEADER,
     GuardDenied,
     loopback_denial,
     peer_denial,
-    peer_is_loopback,
     require_loopback,
-    require_mutating_token,
     require_peer,
-    require_token_for_remote_read,
 )
 
 
 def scope(client):
     return {"type": "http", "client": client, "headers": []}
-
-
-class FakeHeaders(dict):
-    """Starlette's Headers are a case-insensitive mapping; a plain dict keyed
-    the way the router lowercases them is enough for these checks."""
 
 
 # --- loopback ---------------------------------------------------------------
@@ -287,84 +285,120 @@ def test_a_non_ip_peer_string_is_refused_even_when_allowlisted(monkeypatch):
     assert peer_denial(scope(("127.0.0.1:1234", 1))) is not None
 
 
-# --- the token on reads from a non-loopback peer -----------------------------
+# --- the token is GONE from the gate (0.2.68) --------------------------------
+#
+# Two directions of the same lie are pinned here. A gate that was removed but is
+# still read (`require_bearer()` with no route behind it) and a name that was
+# removed but is still reachable (a helper nobody calls). The first is the
+# incident this repo is named for; the second is its mirror image, and both are
+# checked against the SOURCE of the package rather than against one input, so a
+# future edit cannot re-add a reader or a reader-less helper unnoticed.
 
-def test_remote_reads_need_the_token_but_loopback_reads_do_not(monkeypatch):
+# Every name the bearer-token gate was made of. All five are production code that
+# 0.2.68 deleted; listing them here is what stops any of them coming back as a
+# function no route calls.
+DEAD_TOKEN_GATES = ("require_bearer", "require_mutating_token",
+                    "require_dev_state_token", "require_token_for_remote_read",
+                    "peer_is_loopback")
+
+
+@pytest.mark.parametrize("name", DEAD_TOKEN_GATES)
+def test_the_token_guards_are_gone_from_the_product(name):
+    assert not hasattr(endpoint, name), (
+        f"endpoint.{name} is reachable again - the token gate was removed in 0.2.68 "
+        "and a helper with no caller is a lie about the gate")
+
+
+def test_the_token_helpers_and_their_imports_are_absent_from_the_package():
+    """Source-level, not name-level: `hmac` was the token comparison and is gone.
+
+    A module-level `import hmac` in `endpoint.py` would mean something still
+    compares a secret, and `config.mutating_token()` was the one reader of the
+    token env - both must stay deleted.
+    """
+    assert not hasattr(endpoint, "hmac")
+    assert not hasattr(config, "mutating_token")
+    import inspect  # noqa: PLC0415 - one assertion
+
+    source = inspect.getsource(endpoint)
+    assert "hmac" not in source
+    assert "mutating_token()" not in source
+
+
+def test_the_token_env_reaches_the_report_and_nothing_else():
+    """Where `VLLM_E2_TIER_DEV_TOKEN` may still be touched in the package.
+
+    It is REPORTED (status, and the boot warning) and never READ for access. This
+    enumerates the files that mention it, so a new `os.environ.get(ENV_TOKEN)` in
+    some future module is a failing test rather than a silent second reader.
+    """
+    import pathlib  # noqa: PLC0415
+
+    package = pathlib.Path(config.__file__).parent
+    readers = sorted(path.name for path in package.glob("*.py")
+                     if config.ENV_TOKEN in path.read_text(encoding="utf-8"))
+    # config.py DEFINES the name and owns `token_configured()`; endpoint.py is the
+    # only consumer, and both of its uses are reporting.
+    assert readers == ["config.py", "endpoint.py"]
+
+
+@pytest.mark.parametrize("token_env", [None, "s3cr3t-token", "   ", "wrong"])
+def test_the_token_env_grants_nothing_and_refuses_nothing(token_env, monkeypatch):
+    """THE rule of 0.2.68, at the guard level: the token variable is inert.
+
+    Same peer, same allowlist, four values of VLLM_E2_TIER_DEV_TOKEN (absent,
+    correctly set, blank, arbitrary) - and no header is passed at all, because
+    the gate cannot ask for one. An allowlisted peer is admitted under every
+    value; the variable can neither open the peer gate nor close it.
+    """
     monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
-    monkeypatch.setenv(config.ENV_TOKEN, "s3cr3t-token")
-    # Loopback: the operator's `ssh llm curl 127.0.0.1` workflow, no token.
-    require_token_for_remote_read(scope(("127.0.0.1", 1)), FakeHeaders({}))
-    require_token_for_remote_read(scope(("::1", 1)), FakeHeaders({}))
-    # Allowlisted non-loopback peer: the token is required, and works.
-    with pytest.raises(GuardDenied) as excinfo:
-        require_token_for_remote_read(scope(("192.168.2.64", 1)), FakeHeaders({}))
-    assert excinfo.value.status_code == 403
-    assert TOKEN_HEADER in excinfo.value.detail
-    with pytest.raises(GuardDenied):
-        require_token_for_remote_read(scope(("192.168.2.64", 1)),
-                                      FakeHeaders({TOKEN_HEADER: "s3cr3t-toke"}))
-    require_token_for_remote_read(scope(("192.168.2.64", 1)),
-                                  FakeHeaders({TOKEN_HEADER: "s3cr3t-token"}))
+    if token_env is None:
+        monkeypatch.delenv(config.ENV_TOKEN, raising=False)
+    else:
+        monkeypatch.setenv(config.ENV_TOKEN, token_env)
+    peer = scope(("192.168.2.64", 1))
+    assert peer_denial(peer) is None
+    require_peer(peer)                                # must not raise
+    # And loopback is admitted the same way, whatever the variable says.
+    require_peer(scope(("127.0.0.1", 1)))
 
 
-def test_remote_read_is_refused_when_no_token_is_configured(monkeypatch):
-    """Fail closed: an allowlisted peer with no VLLM_E2_TIER_DEV_TOKEN set gets
-    nothing, because there is no way to prove who it is."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
-    assert config.token_configured() is False
-    with pytest.raises(GuardDenied) as excinfo:
-        require_token_for_remote_read(scope(("192.168.2.64", 1)),
-                                      FakeHeaders({TOKEN_HEADER: "anything"}))
-    assert excinfo.value.status_code == 403
-    assert config.ENV_TOKEN in excinfo.value.detail
+@pytest.mark.parametrize("token_env", [None, "s3cr3t-token", "wrong"])
+def test_a_refused_peer_is_refused_on_peer_grounds_alone(token_env, monkeypatch):
+    """The refusal a stranger sees names the PEER rule, with no token involved.
 
-
-def test_an_allowlisted_peer_is_still_not_loopback(monkeypatch):
-    """`peer_is_loopback()` answers the address question, not the access
-    question: widening the allowlist must not silently widen token exemption."""
+    Before 0.2.68 two guards could both say 403 on one request and the messages
+    were the only way to tell them apart. There is now one guard, so every refusal
+    of a non-allowlisted peer must be the peer message - and must not be able to
+    mention a token, because a stranger reading "missing or wrong <header>" would
+    go looking for a knob that no longer exists.
+    """
     monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.0/24")
-    assert peer_is_loopback(scope(("192.168.2.64", 1))) is False
-    assert peer_is_loopback(scope(("127.0.0.1", 1))) is True
-    assert peer_is_loopback(scope(("203.0.113.9", 1))) is False
-
-
-def test_mutating_token_message_is_unchanged_for_the_reload_verb(monkeypatch):
-    """The shared token helper must not rewrite the reload verb's refusal."""
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    if token_env is None:
+        monkeypatch.delenv(config.ENV_TOKEN, raising=False)
+    else:
+        monkeypatch.setenv(config.ENV_TOKEN, token_env)
+    hostile = scope(("203.0.113.9", 51234))
+    denial = peer_denial(hostile)
+    assert denial is not None
+    assert "not loopback" in denial and config.ENV_ALLOW in denial
+    assert "203.0.113.9" in denial
+    assert "token" not in denial.lower()
+    assert config.ENV_TOKEN not in denial
     with pytest.raises(GuardDenied) as excinfo:
-        require_mutating_token(FakeHeaders({}))
-    assert excinfo.value.detail == f"missing or wrong {TOKEN_HEADER}"
-
-
-# --- token ------------------------------------------------------------------
-
-def test_reload_is_refused_when_no_token_is_configured(enabled):
-    """Fail closed: an unset VLLM_E2_TIER_DEV_TOKEN means no mutation at all."""
-    assert config.token_configured() is False
-    with pytest.raises(GuardDenied) as excinfo:
-        require_mutating_token(FakeHeaders({TOKEN_HEADER: "anything"}))
+        require_peer(hostile)
     assert excinfo.value.status_code == 403
-    assert config.ENV_TOKEN in excinfo.value.detail
+    assert "token" not in excinfo.value.detail.lower()
 
 
-def test_token_must_match(enabled, monkeypatch):
-    monkeypatch.setenv(config.ENV_TOKEN, "s3cr3t-token")
-    with pytest.raises(GuardDenied):
-        require_mutating_token(FakeHeaders({}))
-    with pytest.raises(GuardDenied):
-        require_mutating_token(FakeHeaders({TOKEN_HEADER: ""}))
-    with pytest.raises(GuardDenied):
-        require_mutating_token(FakeHeaders({TOKEN_HEADER: "s3cr3t-toke"}))
-    with pytest.raises(GuardDenied):
-        require_mutating_token(FakeHeaders({TOKEN_HEADER: "s3cr3t-token2"}))
-    require_mutating_token(FakeHeaders({TOKEN_HEADER: "s3cr3t-token"}))
-
-
-def test_whitespace_only_token_counts_as_unset(monkeypatch):
-    monkeypatch.setenv(config.ENV_TOKEN, "   ")
+def test_token_configured_still_answers_the_env_question():
+    """`token_configured()` survives as the REPORT's source of truth (say so rather
+    than disappear quietly), so it must still read the env honestly - and must say
+    in its own docstring that it no longer gates anything.
+    """
     assert config.token_configured() is False
-    with pytest.raises(GuardDenied):
-        require_mutating_token(FakeHeaders({TOKEN_HEADER: "   "}))
+    assert config.token_configured.__doc__ is not None
+    assert "no longer" in config.token_configured.__doc__.lower()
 
 
 # --- gating -----------------------------------------------------------------

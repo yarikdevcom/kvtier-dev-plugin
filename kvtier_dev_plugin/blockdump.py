@@ -150,9 +150,13 @@ A `length` is REQUIRED by the `dump` verb: the caller must ask for an explicit
 number of bytes. This module has no path that dumps "a whole arena", and no path
 that reads a block without being told how far to read.
 
-THE TOKEN IS NEVER PRINTED OR LOGGED. The route is gated by the same dev token
-`/trace` and `/guard` use (`require_dev_state_token`, `hmac.compare_digest` in
-`endpoint.py`); this module reads no token and logs none - it never even sees it.
+THE PEER ALLOWLIST IS THE GATE (0.2.68). This route is reached through the ONE
+gate this surface has - the ASGI peer address, loopback or
+`VLLM_E2_TIER_DEV_ALLOW` - and nothing else. The bearer token that used to be
+demanded of `/trace`, `/guard` and this route in every shape is GONE (`see
+endpoint.guard_route), which is exactly why the bounds above are the safety: an
+explicit `length`, one region, one slot, an arm that expires, a rate window. This
+module reads no secret and logs none - it never even sees one.
 NO USER CONTENT EVER LEAVES THROUGH HERE. These are KV bytes, not tokens: the
 plugin's rule is that the diagnostic plane carries no prompt or completion
 content, which is why a caller must name an explicit byte length and cannot ask

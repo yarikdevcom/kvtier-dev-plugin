@@ -1091,7 +1091,8 @@ def http(monkeypatch, tmp_path):
     )
 
     monkeypatch.setenv(config.ENV_ENABLE, "1")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")   # the dead knob, set on purpose: the
+    # header built below must not be what makes these calls work.
 
     def make(result=None, peer=("127.0.0.1", 43210)):
         engine = FakeEngineCoreClient(result=result or {"version": 2,
@@ -1101,14 +1102,19 @@ def http(monkeypatch, tmp_path):
     return make
 
 
-def test_the_route_requires_the_token_even_to_read(http, tmp_path, monkeypatch):
+def test_the_route_answers_a_loopback_peer_with_no_token_at_all(http, tmp_path,
+                                                                monkeypatch):
+    """`/blockdump` can read parked KV bytes, so it used to be the sharpest case of
+    "the door that can read bytes is not a read" - token required even to ask. Since
+    0.2.68 the peer rule is the whole gate: loopback reads it, and the arm-gating
+    that actually protects the bytes is untouched."""
     monkeypatch.setenv(config.ENV_DIAG_DIR, str(tmp_path / "diag"))
     client, engine, headers = http(result={"version": 2, "op": "status",
                                            "blockdump_armed": True})
     from test_routes import BLOCKDUMP
 
-    assert client.get(BLOCKDUMP).status_code == 403        # token, even to read
-    assert client.post(BLOCKDUMP, json={"op": "arm"}).status_code == 403
+    assert client.get(BLOCKDUMP).status_code == 200      # no header, from loopback
+    assert client.post(BLOCKDUMP, json={"op": "arm"}).status_code == 200
     assert client.get(BLOCKDUMP, headers=headers).status_code == 200
     assert engine.calls[-1] == (config.METHOD_BLOCKDUMP, ({"op": "status"},))
     client.post(BLOCKDUMP, headers=headers,
@@ -1133,12 +1139,19 @@ def test_the_route_refuses_an_unknown_verb_and_an_unknown_key(http):
     assert engine.calls == []
 
 
-def test_the_route_is_token_gated_from_a_non_loopback_peer_too(http):
+def test_the_route_is_refused_from_a_non_loopback_peer_with_or_without_a_token(http):
+    """The gate that remains: an address that is not loopback and not allowlisted.
+    The old token, sent or not, changes nothing about the answer or its reason."""
     from test_routes import BLOCKDUMP
 
     client, _engine, headers = http(peer=("198.51.100.9", 51234))
-    assert client.get(BLOCKDUMP).status_code == 403
-    assert client.get(BLOCKDUMP, headers=headers).status_code == 403
+    for sent in ({}, headers):
+        response = client.get(BLOCKDUMP, headers=sent)
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert "not loopback" in detail and config.ENV_ALLOW in detail
+        assert "198.51.100.9" in detail
+        assert "token" not in detail.lower()
 
 
 def test_status_reports_the_capability_and_never_invents_an_arm(http, tmp_path,

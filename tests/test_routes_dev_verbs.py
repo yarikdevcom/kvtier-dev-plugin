@@ -4,16 +4,20 @@ The UTILITY channel is a `getattr(self, method_name)(*args)` call
 (vllm/v1/engine/core.py:1669-1671), which makes two things a security property
 rather than a convenience:
 
-* the METHOD is chosen by the route, never by the wire - otherwise a token holder
-  would hold an arbitrary-method-call primitive on the EngineCore;
+* the METHOD is chosen by the route, never by the wire - otherwise whoever could
+  reach the port would hold an arbitrary-method-call primitive on the EngineCore,
+  which since 0.2.68 is a bigger deal and not a smaller one: the peer allowlist is
+  the only thing between a LAN address and these routes;
 * the ARGUMENTS are a plain dict of JSON primitives within bounds, validated
   against `endpoint.ARG_SPECS` before the call, so no verb receives a shape its
   own module did not declare.
 
-GET and POST are held to the SAME spec: a bound you can evade by switching
-methods is not a bound. `/trace` and `/guard` can change engine dev state, so
-they require the token in every shape, loopback included - the one place where a
-read is not free.
+GET and POST are held to the SAME spec: a bound you can evade by switching methods
+is not a bound. Since 0.2.68 the token is gone from every shape of every route -
+including `/trace`, `/guard`, `/tier`, `/lookups`, `/blockdump` and `/disk`, which
+used to require it even from loopback. That is why the argument specs and the
+`safe_method` wall matter MORE now: besides the peer address, they are all the gate
+that is left.
 """
 
 from __future__ import annotations
@@ -35,18 +39,18 @@ from test_routes import (
     TRACE,
     FakeAsyncLLM,
     FakeEngineCoreClient,
+    assert_refused_on_peer_grounds,
     build_app,
     client_for,
     token_headers,
 )
 
 from kvtier_dev_plugin import config, endpoint
-from kvtier_dev_plugin.endpoint import TOKEN_HEADER
 
 pytest.importorskip("fastapi")
 
 # This module is about arguments and routing, not about the plugin being off, so
-# every test runs with it on. The inert/peer/token-order tests live in
+# every test runs with it on. The inert/peer-order tests live in
 # test_routes.py and are parametrized over the WHOLE route list there.
 @pytest.fixture(autouse=True)
 def plugin_on(monkeypatch):
@@ -60,6 +64,15 @@ def engine():
 
 @pytest.fixture
 def armed_token(monkeypatch):
+    """`VLLM_E2_TIER_DEV_TOKEN` set, and nothing else - deliberately kept after
+    0.2.68 deleted the gate it used to feed.
+
+    Every verb test in this file runs with it set and most send the header, so the
+    file as a whole measures the property that matters for an operator who has not
+    cleaned their launcher: a configured token variable and a stale header change
+    NO answer on any of these routes. The tests that used to assert a refusal here
+    now assert the opposite, and would fail the day a gate came back.
+    """
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
 
 
@@ -115,9 +128,10 @@ def test_an_empty_body_is_no_arguments_not_an_empty_dict(engine):
 
 
 def test_the_route_picks_the_method_and_the_body_cannot(engine):
-    """The one thing a token holder must never control: which EngineCore method
-    runs. `{"method": ...}` is an unknown key, and even a known key cannot redirect
-    the call."""
+    """The one thing a caller must never control: which EngineCore method runs.
+    `{"method": ...}` is an unknown key, and even a known key cannot redirect the
+    call. Since 0.2.68 the caller does not hold a token to be trusted with, either -
+    it only has to be on the allowlist, which makes this the load-bearing rule."""
     client = client_for(build_app(FakeAsyncLLM(engine)))
     refused = client.post(BLOCK, json={"method": "kvtier_dev_reload_policy"})
     assert refused.status_code == 400
@@ -191,15 +205,19 @@ def test_a_snapshot_query_parameter_is_refused_so_nothing_silently_ignores_it(
     assert engine.calls == []
 
 
-# --- the dev-state routes: token in every shape -----------------------------
+# --- the dev-state routes: no token in any shape (0.2.68) -------------------
 
-def test_the_trace_route_needs_the_token_even_from_loopback(engine, armed_token):
-    """The one read that is not free: this route can arm the recorder, so the
-    whole route is token-gated rather than the individual op."""
+def test_the_trace_route_answers_a_loopback_peer_with_no_token(engine, armed_token):
+    """The read that used to be the one thing loopback could not do for free.
+
+    `GET /trace` and `POST /trace {"op":"read"}` are answered from loopback with no
+    header at all, even though the same door arms the recorder: the whole route is
+    gated on the PEER, not on a token, and the engine sees no difference.
+    """
     client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.get(TRACE).status_code == 403
-    assert TOKEN_HEADER in client.post(TRACE, json={"op": "read"}).json()["detail"]
-    assert engine.calls == []
+    assert client.get(TRACE).status_code == 200
+    assert client.post(TRACE, json={"op": "read"}).status_code == 200
+    assert engine.calls
     assert client.get(TRACE, headers=token_headers()).status_code == 200
 
 
@@ -220,27 +238,22 @@ def test_arming_the_recorder_over_http(engine, armed_token):
     assert engine.calls == [(config.METHOD_TRACE, ({"op": "arm", "depth": 64},))]
 
 
-def test_the_guard_route_is_gated_the_same_way_and_carries_its_op(engine,
-                                                                  armed_token):
+def test_the_guard_route_answers_without_a_token_and_carries_its_op(engine,
+                                                                    armed_token):
     client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.post(GUARD, json={"armed": True}).status_code == 403
-    response = client.post(GUARD, json={"armed": True}, headers=token_headers())
-    assert response.status_code == 200
+    assert client.post(GUARD, json={"armed": True}).status_code == 200
     assert engine.calls == [(config.METHOD_GUARD, ({"armed": True},))]
     client.get(GUARD, headers=token_headers())
     assert engine.calls[-1] == (config.METHOD_GUARD, ({"op": "status"},))
 
 
-def test_the_lookup_ledger_route_is_gated_like_the_trace_ring(engine, armed_token):
-    """Token in every shape, the read included: the same door arms the recorder."""
+def test_the_lookup_ledger_route_answers_like_the_trace_ring(engine, armed_token):
+    """No token in any shape, the arm included: what stands in front of this door
+    is the peer address, and nothing else."""
     client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.get(LOOKUPS).status_code == 403
-    assert engine.calls == []
-    denied = client.post(LOOKUPS, json={"op": "arm"})
-    assert denied.status_code == 403
-    assert TOKEN_HEADER in denied.json()["detail"]
-    assert engine.calls == []
-    assert client.get(LOOKUPS, headers=token_headers()).status_code == 200
+    assert client.get(LOOKUPS).status_code == 200
+    assert client.post(LOOKUPS, json={"op": "arm"}).status_code == 200
+    assert engine.calls[-1] == (config.METHOD_LOOKUPS, ({"op": "arm"},))
 
 
 def test_a_lookup_read_defaults_to_read_and_a_verdict_travels_as_an_op(engine,
@@ -290,8 +303,8 @@ def test_status_mirrors_the_ledger_only_when_the_engine_said_so(engine,
     assert client.get(STATUS).json()["lookup_ledger_armed"] is None
     engine.result = {"version": 1, "guard_mode": False, "trace_armed": False,
                      "lookup_ledger_armed": True, "epoch": "e1"}
-    # /lookups is token-gated in every shape, so the mirror is fed through the
-    # token path - the same door that arms the recorder.
+    # /lookups answers a loopback peer with no header, and the mirror is fed by
+    # that read - the same door that arms the recorder.
     client.get(LOOKUPS, headers=token_headers())
     status = client.get(STATUS).json()
     assert status["lookup_ledger_armed"] is True
@@ -327,14 +340,33 @@ def test_a_guard_argument_outside_its_bounds_is_refused(engine, armed_token, bod
     assert fragment in response.json()["detail"]
 
 
-def test_a_remote_peer_still_needs_the_token_for_every_new_verb(engine,
-                                                                monkeypatch):
+def test_an_allowlisted_peer_reaches_every_new_verb_with_no_token(engine,
+                                                                  monkeypatch):
+    """What 0.2.68 buys, on the peers the box actually has: the proxy's address, no
+    header anywhere, and the whole dev surface answering - the six dev-state verbs
+    (trace, guard here; the rest in test_routes.py) plus the read verbs added with
+    the allowlist."""
     monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
     for path, method in ((KVCONFIG, "get"), (BLOCK, "get"), (BLOCK, "post"),
                          (REQUEST, "post"), (TRACE, "get"), (GUARD, "post")):
-        assert client.request(method, path).status_code == 403
+        response = client.request(method, path)
+        assert response.status_code == 200, (method, path, response.text)
+
+
+def test_a_peer_off_the_allowlist_is_refused_for_every_new_verb(engine,
+                                                                monkeypatch):
+    """The gate that stays, on the same six verbs: an address that is not on the
+    list is refused while holding the dead token, on PEER grounds, and the engine is
+    never touched."""
+    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    client = client_for(build_app(FakeAsyncLLM(engine)), ("198.51.100.9", 1))
+    for path, method in ((KVCONFIG, "get"), (BLOCK, "get"), (BLOCK, "post"),
+                         (REQUEST, "post"), (TRACE, "get"), (GUARD, "post")):
+        response = client.request(method, path, headers=token_headers("tk"))
+        assert_refused_on_peer_grounds(response, "198.51.100.9")
     assert engine.calls == []
 
 
@@ -370,11 +402,17 @@ def test_status_repeats_what_the_engine_last_told_this_process(engine):
 def test_a_verb_that_changes_state_updates_the_mirror_immediately(engine,
                                                                   armed_token):
     """The operator who just armed guard mode must see it on the very next
-    `/status`, without the status route having to ask the engine anything."""
+    `/status`, without the status route having to ask the engine anything.
+
+    A REFUSED call must still teach it nothing, so the first half asks from a peer
+    the gate does keep out: an unallowlisted address, holding the dead token.
+    """
     engine.result = {"version": 1, "guard_mode": True, "epoch": "boot-1"}
+    stranger = client_for(build_app(FakeAsyncLLM(engine)), ("198.51.100.9", 1))
+    assert_refused_on_peer_grounds(
+        stranger.post(GUARD, json={"armed": True}), "198.51.100.9")
     client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.post(GUARD, json={"armed": True}).status_code == 403
-    assert client.get(STATUS).json()["guard_mode"] is None    # a 403 taught it nothing
+    assert client.get(STATUS).json()["guard_mode"] is None   # a 403 taught it nothing
     response = client.post(GUARD, json={"armed": True}, headers=token_headers())
     assert response.status_code == 200
     status = client.get(STATUS).json()

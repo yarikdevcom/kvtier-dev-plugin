@@ -46,7 +46,8 @@ from kvtier_dev_plugin import backport, config, engine_side, guard_mode, step_tr
 
 pytest.importorskip("fastapi")
 
-TOK = "e2e-token"
+TOK = "e2e-token"   # inert since 0.2.68: sent by `headers()` below to prove the
+                    # real verbs answer with a leftover token in the environment
 P = config.ROUTE_PREFIX
 
 # A tier whose last group cannot be divided by the tier's hash block size: the
@@ -85,7 +86,13 @@ class FakeEngineProcess(FakeEngineCoreClient):
 
 @pytest.fixture
 def dev(monkeypatch, reset_dev_state):
-    """A live-ish engine: the real verbs, the fake tier, the real routes."""
+    """A live-ish engine: the real verbs, the fake tier, the real routes.
+
+    `VLLM_E2_TIER_DEV_TOKEN` is exported here on purpose and the requests below send
+    it back: since 0.2.68 the plugin does not read it for access, so this end-to-end
+    run doubles as proof that an operator's leftover token in the environment cannot
+    change one answer of the real verbs.
+    """
     monkeypatch.setenv(config.ENV_ENABLE, "1")
     monkeypatch.setenv(config.ENV_TOKEN, TOK)
     monkeypatch.delenv(config.ENV_DIAG_DIR, raising=False)
