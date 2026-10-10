@@ -29,6 +29,15 @@ Why each group below exists, in the order a failure would cost the box:
    publish the shape a partial restore takes with N readers (a hole in the MIDDLE
    instead of a hole at the end) and the bound on the disorder (a FIFO queue: a job
    cannot start while more than threads-1 earlier jobs are unstarted).
+7. **THE COUNT IS A RUNTIME LEVER (0.2.67).** `set_read_threads` and its `/disk` op
+   move the pool in place, in both directions, so a comparison no longer costs an
+   engine restart per step. The three things that make a runtime knob a lie are each
+   pinned here: the per-bind `_ensure_thread` re-reading the boot value, a shrink that
+   abandons the job its surplus slot is holding, and a refusal that moves the pool
+   anyway. Plus the boundary the verb must state rather than imply: per BOOT (the
+   launcher's env value remains the boot-time source of truth) and per PROCESS - and
+   since the relay landed, a worker IS reachable, through `disk-read-threads.json`, so
+   the per-rank rank file is the witness and `test_read_threads_relay.py` is the relay.
 
 Stdlib and the plugin only. `tmp_path` for every file; no engine, no vllm, no box.
 """
@@ -1226,3 +1235,491 @@ def test_the_rank_file_reports_concurrency_and_shape_under_its_byte_cap():
     assert len(raw) < worker_diag.MAX_CONTRIBUTION_BYTES, \
         f"the disk_restore contribution is {len(raw)} bytes of " \
         f"{worker_diag.MAX_CONTRIBUTION_BYTES}"
+
+
+# --- 7: the reader count becomes a RUNTIME lever (0.2.67) ----------------------
+#
+# WHY THIS GROUP EXISTS. The count used to be `VLLM_E2_TIER_DISK_READ_THREADS` and
+# nothing else, and the only way to move it was an engine restart: ~2 minutes of
+# downtime per step and the previous arm's counters wiped, which is why every
+# comparison made on the box rested on a short window. The trap in making it a verb is
+# the per-bind `_ensure_thread`, which re-reads the env-derived limit: a runtime knob
+# that silently reverts to the boot value on the NEXT STEP is a lie six minutes later.
+# So the tests below bind after every resize and assert the count, not just the answer.
+#
+# THE ASYMMETRY THAT MADE LOWERING IMPOSSIBLE: `_ensure_thread` re-reads the limit per
+# bind and will SPAWN additional threads, but never joins surplus ones. Raising worked
+# by accident; lowering could not happen at all. A shrink therefore has to be an exit
+# condition the reader loop itself obeys, and the tests here are written so that a
+# surplus slot which exits BEFORE finishing its job - or which leaves a queued job for
+# nobody - fails here rather than on a serving box.
+
+def test_the_verb_raises_the_pool_and_lowers_it_and_keeps_doing_both():
+    """Both directions, repeatedly, in one boot - the asymmetry was the obstacle."""
+    assert disk_read.begin_batch("both-ways", 0)["ok"] is True
+    assert disk_read.counters()["threads_configured"] == 1
+
+    grown = disk_read.set_read_threads(4)
+    assert grown["ok"] is True and grown["changed"] is True
+    assert grown["from"] == 1 and grown["to"] == 4 and grown["reason_kind"] is None
+    assert disk_read.counters()["threads_configured"] == 4
+    assert wait_for(lambda: disk_read.thread_alive_count() == 4), \
+        "a raise spawned nothing: the pool never grew"
+
+    lowered = disk_read.set_read_threads(2)
+    assert lowered["ok"] is True and lowered["from"] == 4 and lowered["to"] == 2
+    assert disk_read.counters()["threads_configured"] == 2
+    assert wait_for(lambda: disk_read.thread_alive_count() == 2), \
+        "a shrink left surplus readers polling: the count is a claim, not a wish"
+
+    again = disk_read.set_read_threads(3)
+    assert again["ok"] is True and again["to"] == 3
+    assert disk_read.counters()["threads_configured"] == 3
+    assert wait_for(lambda: disk_read.thread_alive_count() == 3), \
+        "a second raise after a shrink could not re-fill the slots it just emptied"
+    disk_read.cancel_batch("both-ways", "test teardown")
+
+
+def test_resizing_before_the_first_bind_gives_the_new_slots_real_witnesses(tmp_path):
+    """The realistic operator sequence: boot, POST the count, THEN serve traffic.
+
+    Two properties in one, and the second is a bug this module has really had. A slot
+    opened outside any `begin_batch` must still be a REAL slot whose reads are
+    attributed to its own row of `threads[]` - which holds because `_spawn_reader`
+    publishes `_threads[slot]` BEFORE `Thread.start()`, so a thread that reaches a job
+    immediately is its own witness (the ledger used to under-report exactly the
+    parallelism it exists to show). And if the override were applied only at bind, this
+    sequence would read on threads the ledger cannot see at all.
+    """
+    assert disk_read.set_read_threads(3)["ok"] is True
+    assert disk_read.counters()["threads_configured"] == 3
+    # THE ANSWER MUST BE THE POOL IT PROMISED, not one thread short. The first shape of
+    # the raise loop started at the OLD count and so never touched slot 0, which is
+    # invisible once traffic is flowing (a bind fills it) and obvious on an idle box:
+    # `configured: 6, alive: 5` for a POST that asked for 6. Asserted BEFORE any bind.
+    assert disk_read.thread_alive_count() == 3, (
+        f"a resize on an unbound boot left the pool short: "
+        f"{disk_read.thread_alive_count()} alive of 3")
+    paths = paths_for(tmp_path, 6, groups=3)
+    assert disk_read.begin_batch("prebind", len(paths))["ok"] is True
+    accepted, refused = issue("prebind", paths)
+    assert refused == [] and len(accepted) == 6
+    assert wait_for(lambda: disk_read.counters()["reads_completed"] == 6), \
+        disk_read.batch_status("prebind")
+    alive = [row for row in disk_read.counters()["threads_detail"] if row["alive"]]
+    assert len(alive) == 3
+    assert sum(row["jobs_read"] for row in alive) == 6, (
+        f"the queue did not spread the work across the resized slots: {alive}")
+    disk_read.finish_batch("prebind")
+
+
+def test_the_runtime_count_survives_a_re_bind(monkeypatch):
+    """THE TRAP THIS WHOLE FEATURE COULD FALL INTO, pinned as one assertion per bind.
+
+    `_ensure_thread` re-reads the env-derived limit on every bind because a batch
+    opening is the one moment a thread could need starting; if that read kept its
+    env-only source, a resize would hold until the next step and then silently revert
+    to the boot value. Three binds after the resize, the count is still the resize.
+    """
+    monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "16")
+    assert disk_read.begin_batch("rebind-0", 0)["ok"] is True
+    assert disk_read.counters()["threads_configured"] == 16
+    assert disk_read.set_read_threads(6)["ok"] is True
+
+    for step in range(1, 4):
+        assert disk_read.begin_batch(f"rebind-{step}", 0)["ok"] is True
+        assert disk_read.counters()["threads_configured"] == 6, (
+            "the count reverted to the boot value on a later bind: the runtime knob "
+            "is a lie")
+        assert disk_read._limits_now()["threads"] == 6
+        assert disk_read._limits_now()["threads_source"] == "verb"
+        assert disk_read.section()["caps"]["read_threads"] == 6
+        assert disk_read.section()["concurrency"]["threads_configured"] == 6
+    # THE BOOT VALUE IS STILL THE STORY, BESIDE the live one: `threads_requested` is
+    # what the launcher handed the process, and the resize does not overwrite it.
+    assert disk_read.counters()["threads_requested"] == 16
+    assert disk_read.counters()["threads_override"] == 6
+    assert wait_for(lambda: disk_read.thread_alive_count() == 6)
+    assert disk_read.thread_alive_count() == 6, (
+        "the surplus slots never retired, so configured 6 is a label on nine threads")
+
+
+def test_a_shrink_never_abandons_a_queued_or_an_in_flight_read(monkeypatch, tmp_path):
+    """The hazard a cooperative shrink exists to avoid, forced with a parked read.
+
+    Four readers, twelve jobs, four parked inside the kernel when the pool is cut to
+    one. Every job must still settle: the four in flight because a slot finishes the
+    job it holds before it exits, the eight queued because a shrink never takes the
+    LAST reader and slot 0 keeps draining. The buffer-pool identity check is the same
+    one `test_cancelling_with_n_threads_never_returns_a_buffer_twice` uses: a job that
+    is abandoned by two owners is how one request's bytes reach another's KV slot.
+    """
+    monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "4")
+    gate = _Gated(block=True)
+    monkeypatch.setattr(disk_read, "_read_file", gate)
+    paths = paths_for(tmp_path, 12, groups=4)
+    assert disk_read.begin_batch("shrink-busy", len(paths))["ok"] is True
+    accepted, refused = issue("shrink-busy", paths)
+    assert refused == [] and len(accepted) == 12
+    assert wait_for(lambda: disk_read.batch_status("shrink-busy")["running"] == 4), \
+        disk_read.batch_status("shrink-busy")
+
+    verdict = disk_read.set_read_threads(1)
+    assert verdict["ok"] is True
+    assert verdict["configured"] == 1 and verdict["alive"] == 4
+    assert verdict["surplus_draining"] == 3, (
+        "the answer must say the shrink has not happened yet, not imply it did")
+
+    gate.hold.set()
+    assert wait_for(lambda: disk_read.counters()["reads_completed"] == 12), \
+        disk_read.batch_status("shrink-busy")
+    status = disk_read.batch_status("shrink-busy")
+    assert status["settled"] is True and status["done"] == 12
+    assert status["failed"] == 0, "a shrink turned a good read into a failure"
+    assert disk_read.counters()["queue_depth"] == 0
+    assert disk_read.counters()["units_in_flight"] == 0
+    time.sleep(0.05)
+    identities = pooled_identities()
+    assert len(identities) == len(set(identities)), \
+        f"the pool holds the SAME buffer twice: {identities}"
+    assert wait_for(lambda: disk_read.thread_alive_count() == 1), \
+        "the surplus readers never retired"
+    assert disk_read.counters()["reader_threads_retired"] == 3
+    disk_read.finish_batch("shrink-busy")
+
+
+def test_a_shrink_holds_its_last_reader_even_when_asked_for_nothing():
+    """`0` is a refusal, not "stop every reader".
+
+    The floor is 1 by construction: a boot with no reader is the `thread_dead` refusal
+    path, and a verb that could walk the count to zero would be a verb that can stop
+    every later restore in this process with a typo.
+    """
+    assert disk_read.begin_batch("floor", 0)["ok"] is True
+    assert disk_read.set_read_threads(4)["ok"] is True
+    refused = disk_read.set_read_threads(0)
+    assert refused["ok"] is False and refused["reason_kind"] == "out_of_range"
+    assert disk_read.counters()["threads_configured"] == 4
+    assert disk_read.thread_alive() is True, "a refusal must not touch the pool"
+
+
+@pytest.mark.parametrize("value, kind", (
+    ("4", "bad_type"),
+    (4.0, "bad_type"),
+    (None, "bad_type"),
+    (True, "bad_type"),
+    ([2], "bad_type"),
+    (0, "out_of_range"),
+    (-3, "out_of_range"),
+    (disk_read.MAX_READ_THREADS + 1, "out_of_range"),
+    (10_000, "out_of_range"),
+))
+def test_a_count_that_is_not_an_int_in_range_is_refused_and_changes_nothing(monkeypatch,
+                                                                            value,
+                                                                            kind):
+    """Strict validation, named range, nothing moved, and a counter that says so.
+
+    One row per shape a caller can send, and the closed refusal vocabulary
+    (`bad_type` / `out_of_range` / `in_progress`) named by every refusal - a refusal
+    that reads as a shrug is a refusal an operator reads as a broken verb.
+
+    `True` is refused as a type and not honoured as `1`: `bool` IS an `int` in Python,
+    and a verb that resized the reader pool because a caller sent `true` would be a
+    verb whose argument grammar nobody could predict.
+    """
+    monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "3")
+    assert disk_read.begin_batch("strict", 0)["ok"] is True
+    before = disk_read.counters()["threads_configured"]
+    assert before == 3
+    answer = disk_read.set_read_threads(value)
+    assert answer["ok"] is False, f"{value!r} was accepted"
+    assert answer["reason_kind"] == kind
+    assert str(disk_read.MAX_READ_THREADS) in answer["reason"]
+    assert "1" in answer["reason"] and "nothing changed" in answer["reason"]
+    assert disk_read.counters()["threads_configured"] == before
+    assert disk_read.counters()["resize_refusals"] == 1
+    assert disk_read.counters()["resize_refused"][kind] == 1
+    record = disk_read.counters()["last_resize"]
+    assert record["ok"] is False and record["from"] == before
+    assert disk_read.thread_alive_count() <= before
+
+
+def test_asking_for_the_count_the_pool_already_has_is_an_idempotent_success():
+    """A no-op ask is a SUCCESS that moved nothing, and still counts as an instruction.
+
+    `changed: false` and `source: "verb"` together: the operator asked, the pool was
+    already there, and the boot's answer to "what was this running" is now the verb
+    rather than the environment - which is the honest record, not a no-op pretending
+    the env still owns the value.
+    """
+    assert disk_read.begin_batch("idem", 0)["ok"] is True
+    answer = disk_read.set_read_threads(1)
+    assert answer["ok"] is True and answer["changed"] is False
+    assert answer["from"] == 1 and answer["to"] == 1
+    assert disk_read.counters()["resize_refusals"] == 0
+    assert disk_read.threads_posture()["source"] == "verb"
+    assert disk_read.counters()["threads_alive"] == 1
+
+
+def test_only_one_resize_runs_at_a_time_and_the_refusal_leaves_the_gate_free():
+    """Single flight, refused rather than queued, and never a leaked lock.
+
+    A second resize waits for nothing: the verb runs on a caller's thread and a queue
+    of pending resizes is a queue of surprises. The last three lines are the point -
+    a refusal that forgot to release the gate would brick this lever for the rest of
+    the boot, which is a worse outcome than the race it prevents.
+    """
+    assert disk_read.begin_batch("flight", 0)["ok"] is True
+    assert disk_read._resize_gate.acquire(blocking=False)
+    try:
+        answer = disk_read.set_read_threads(3)
+    finally:
+        disk_read._resize_gate.release()
+    assert answer["ok"] is False and answer["reason_kind"] == "in_progress"
+    assert "in flight" in answer["reason"]
+    assert disk_read.counters()["threads_configured"] == 1
+    assert disk_read.counters()["resize_refusals"] == 1
+    assert disk_read.set_read_threads(3)["ok"] is True, (
+        "the in-flight refusal leaked the gate: the lever is broken for this boot")
+    assert wait_for(lambda: disk_read.thread_alive_count() == 3)
+
+
+def test_the_boot_publishes_where_its_count_came_from_and_its_last_resize():
+    """`threads_source`, `last_resize` and the refusal counter: the audit trail.
+
+    The question these answer is asked after the fact, from a rank file: "what was
+    this boot ACTUALLY running when that restore happened?". A number with no source
+    and no history cannot answer it.
+    """
+    assert disk_read.begin_batch("audit", 0)["ok"] is True
+    posture = disk_read.threads_posture()
+    assert posture["source"] == "env"
+    assert posture["override"] is None
+    assert posture["last_resize"] is None
+    assert posture["env_var"] == config.ENV_DISK_READ_THREADS
+    assert posture["ceiling"] == disk_read.MAX_READ_THREADS
+
+    disk_read.set_read_threads(3)
+    posture = disk_read.threads_posture()
+    assert posture["source"] == "verb" and posture["override"] == 3
+    record = posture["last_resize"]
+    assert set(record) == {"from", "to", "ts", "ok", "reason"}
+    assert record["from"] == 1 and record["to"] == 3 and record["ok"] is True
+    assert record["ts"] > 0
+    counters = disk_read.counters()
+    assert counters["threads_source"] == "verb"
+    assert counters["last_resize"] == record
+    assert counters["resize_refusals"] == 0
+
+    disk_read.set_read_threads(99)
+    counters = disk_read.counters()
+    assert counters["resize_refusals"] == 1
+    assert counters["last_resize"]["ok"] is False
+    assert counters["last_resize"]["to"] == 99
+    assert counters["threads_source"] == "verb", (
+        "a refused ask must not move the source, but the boot did ask, so the record "
+        "of the last instruction is the refusal")
+
+
+def test_a_restart_hands_the_count_back_to_the_environment(monkeypatch):
+    """The resize is PER BOOT and dies at a restart, and this pins it rather than
+    asserting it in prose.
+
+    `reset_state_for_tests()` is what a fresh process looks like: no override, the
+    environment owning the count again. The launcher's env value stays the boot-time
+    source of truth, and the `DISK[read]` announce line stays the proof of what a boot
+    was given - a runtime verb replaces neither.
+    """
+    monkeypatch.setenv(config.ENV_DISK_READ_THREADS, "4")
+    assert disk_read.begin_batch("restart", 0)["ok"] is True
+    assert disk_read.set_read_threads(2)["ok"] is True
+    assert disk_read._limits_now()["threads"] == 2
+    disk_read.stop_reader(timeout_seconds=1.0)
+    disk_read.reset_state_for_tests()
+    assert disk_read.threads_posture()["source"] == "env"
+    assert disk_read.threads_posture()["override"] is None
+    assert disk_read.threads_posture()["last_resize"] is None
+    assert disk_read._limits_now()["threads"] == 4
+
+
+# --- the verb, the route, and the boundary it does not cross ------------------
+
+def test_the_verb_reads_the_posture_without_moving_it_and_moves_it_when_asked():
+    """A key that is PRESENT is an instruction, a key that is absent is a question.
+
+    The house grammar of every mutating `/disk` op since `offers`. A read must not
+    move a serving box, and a malformed instruction must not be answered as a read.
+    """
+    from kvtier_dev_plugin import disk_store  # noqa: PLC0415 - the verb's own module
+    assert disk_read.begin_batch("verb", 0)["ok"] is True
+
+    read = disk_store.disk_for_engine(args={"op": "read-threads"})
+    assert read["ok"] is True
+    assert "resize" not in read, "a read reported a resize it did not perform"
+    assert read["read_threads"]["configured"] == 1
+    assert read["read_threads"]["source"] == "env"
+
+    moved = disk_store.disk_for_engine(args={"op": "read-threads", "threads": 3})
+    assert moved["ok"] is True
+    assert moved["resize"]["to"] == 3 and moved["resize"]["ok"] is True
+    assert moved["read_threads"]["configured"] == 3
+    assert moved["read_threads"]["source"] == "verb"
+    assert moved["per_boot"] is True and moved["survives_restart"] is False
+    assert "pid" in moved["process"]
+
+    refused = disk_store.disk_for_engine(args={"op": "read-threads", "threads": 0})
+    assert refused["ok"] is False
+    assert "nothing changed" in refused["reason"]
+    assert refused["read_threads"]["configured"] == 3, "a refusal moved the pool"
+
+
+def test_the_verb_says_what_process_it_moved_and_how_the_ranks_are_reached():
+    """THE SCOPE, in the answer, because this is the one verb whose answering process
+    may not be the process that reads.
+
+    The `/disk` door is answered by the process that holds the engine call, and a
+    worker is not reachable over it directly (that is why `spill-one` writes a request
+    file a worker polls). A reader pool is PER PROCESS, so the in-process half of a POST
+    moves exactly one process's pool - and the ranks that apply restores are usually not
+    it. `this_process_reads_spill_files` is the field that stops the answer being read
+    as a fleet-wide success, the same job `gpu-write`'s `scope` does for a process with
+    no apply point, and `workers_reachable_over_this_door` is TRUE because 0.2.67's
+    relay answers the question the sentence used to give up on - over
+    `disk-read-threads.json`, the same channel idiom, never over a socket.
+    """
+    from kvtier_dev_plugin import disk_store  # noqa: PLC0415 - the verb's own module
+    answer = disk_store.disk_for_engine(args={"op": "read-threads", "threads": 2})
+    assert answer["ok"] is True
+    note = answer["note"]
+    assert config.ENV_DISK_READ_THREADS in note
+    assert "THIS PROCESS" in note and "THIS BOOT" in note
+    assert "restart" in note, "the answer must say a restart undoes it"
+    assert "rank file" in note, "the answer must point at the per-rank witness"
+    assert "THIS process" in answer["scope"]["note"]
+    assert "polls the relay" in answer["scope"]["note"]
+    assert answer["scope"]["this_process_reads_spill_files"] in (True, False)
+    assert answer["scope"]["workers_reachable_over_this_door"] is True
+    assert disk_store.RESIZE_REQUEST_FILE in answer["scope"]["reach"]
+    assert "pid" in answer["scope"]["answered_by"]
+
+
+def test_the_op_is_mutating_listed_post_only_and_in_the_endpoint_enum():
+    """`read-threads` is in the op tuple, the dispatch table, `MUTATING_DISK_OPS`, and
+    the route's enum, and the route's bound for `threads` is the ENGINE's bound.
+
+    `op` is a query parameter on this route, so an op that starts and stops engine
+    threads must not be reachable from a method a browser may issue without a
+    preflight. The wire bound and the engine bound are pinned equal for the standing
+    reason: a looser one only moves the refusal, a tighter one lies about the verb.
+    """
+    from kvtier_dev_plugin import (
+        disk_store,  # noqa: PLC0415 - the verb's own module
+        endpoint,  # noqa: PLC0415 - the wire's argument table
+    )
+    assert "read-threads" in disk_store.DISK_OPS
+    assert "read-threads" in disk_store.MUTATING_DISK_OPS
+    assert "read-threads" in disk_store._DISK_OPS
+    assert list(disk_store._DISK_OPS) == list(disk_store.DISK_OPS), (
+        "the route advertises an order the dispatcher does not have")
+    refused = disk_store.disk_for_engine(args={"op": "read-threads", "threads": 4,
+                                               "safe_method": True})
+    assert refused["ok"] is False and "POST" in refused["reason"]
+    assert disk_read.counters()["threads_configured"] == 1, (
+        "the safe-method refusal ran the resize anyway")
+
+    spec = endpoint.ARG_SPECS[config.ROUTE_DISK]
+    assert set(spec["op"]["values"]) == set(disk_store.DISK_OPS)
+    assert spec["threads"]["kind"] == "int"
+    assert spec["threads"]["min"] == 1
+    assert spec["threads"]["max"] == disk_read.MAX_READ_THREADS
+
+
+def test_the_route_refuses_a_count_outside_the_engine_bound_before_the_engine():
+    """`?threads=99` is a 400 at the wire, and the engine's count never moves."""
+    from kvtier_dev_plugin import endpoint  # noqa: PLC0415 - the wire's argument table
+    assert disk_read.begin_batch("wire", 0)["ok"] is True
+    for raw, why in (("99", "16"), ("0", "1"), ("eight", "integer")):
+        with pytest.raises(Exception) as raised:
+            endpoint.validate_arguments(config.ROUTE_DISK,
+                                        {"op": "read-threads", "threads": raw})
+        assert why in str(raised.value), (raw, raised.value)
+    assert endpoint.validate_arguments(config.ROUTE_DISK,
+                                       {"op": "read-threads",
+                                        "threads": "6"})["threads"] == 6
+    assert disk_read.counters()["threads_configured"] == 1
+
+
+# --- the rank file's `readers` section: the three rates, and the audit fields --
+
+def test_the_rank_file_carries_the_three_throughput_scalars(tmp_path):
+    """The reason Task 1 exists: the rank file had the inputs to a throughput
+    arithmetic and not the arithmetic, and the derivation it forced (`bytes_per_file x
+    reads / (read_seconds_avg x threads)`) silently ASSUMES every configured thread
+    stayed busy - the exact assumption `parallel_efficiency` exists to falsify.
+
+    Asserted against `disk_read.section()["throughput"]` rather than against typed
+    numbers: one builder, two doors, and a figure that differs by door is unusable.
+    """
+    paths = paths_for(tmp_path, 4, groups=4)
+    assert disk_read.begin_batch("rates", len(paths))["ok"] is True
+    issue("rates", paths)
+    assert wait_for(lambda: disk_read.counters()["reads_completed"] == 4), \
+        disk_read.batch_status("rates")
+    rates = disk_read.section()["throughput"]
+    assert rates["bytes_per_reader_second"] is not None
+    readers = disk_restore.worker_report()["readers"]
+    for key in ("bytes_per_reader_second", "bytes_per_second_wall",
+                "parallel_efficiency"):
+        assert readers[key] == rates[key], key
+        assert isinstance(readers[key], float), key
+    # A single-reader boot cannot be more than one reader-wide.
+    assert readers["parallel_efficiency"] <= 1.0
+    disk_read.finish_batch("rates")
+
+
+def test_the_rank_file_rates_are_an_explicit_none_before_any_read():
+    """No read yet means no rate, and the key is PRESENT and None (the brief's rule,
+    and the one this package's degraded-view tests exist to keep)."""
+    readers = disk_restore.worker_report()["readers"]
+    for key in ("bytes_per_reader_second", "bytes_per_second_wall",
+                "parallel_efficiency"):
+        assert key in readers, f"the rank file lost {key!r} on an idle boot"
+        assert readers[key] is None, readers[key]
+    assert readers["threads_source"] == "env"
+    assert readers["last_resize"] is None
+    assert readers["resize_refusals"] == 0
+
+
+def test_the_rank_file_readers_section_ships_the_same_keys_empty_or_busy(tmp_path):
+    """A section whose key set floats is a section every reader has to guess at.
+
+    Enumerated EXACTLY, because the proxy host parses these names out of
+    `rank-<rank>.json` and a rename or a dropped key there is a silent hole. The two
+    shapes compared are the two the brief cares about: a boot that has read nothing
+    and resized nothing, and a boot that has done both.
+    """
+    quiet = disk_restore.worker_report()["readers"]
+    paths = paths_for(tmp_path, 2)
+    assert disk_read.begin_batch("busy", len(paths))["ok"] is True
+    issue("busy", paths)
+    assert wait_for(lambda: disk_read.counters()["reads_completed"] == 2)
+    disk_read.set_read_threads(2)
+    busy = disk_restore.worker_report()["readers"]
+
+    assert set(quiet) == {
+        "configured", "alive", "peak_units", "starved_polls", "buffer_refusals",
+        "out_of_order", "recency_promotions", "recency_promotions_throttled",
+        "recency_promotion_failures", "bytes_per_reader_second",
+        "bytes_per_second_wall", "parallel_efficiency", "threads_source",
+        "last_resize", "resize_refusals"}
+    assert set(busy) == set(quiet), sorted(set(busy) ^ set(quiet))
+    assert set(busy["last_resize"]) == {"from", "to", "ts", "ok", "reason"}
+    assert busy["threads_source"] == "verb" and busy["last_resize"]["to"] == 2
+    assert busy["configured"] == 2
+
+    whole = disk_restore.worker_report()
+    raw = json.dumps(whole, default=str)
+    assert len(raw) < worker_diag.MAX_CONTRIBUTION_BYTES, \
+        f"the disk_restore contribution is {len(raw)} bytes of " \
+        f"{worker_diag.MAX_CONTRIBUTION_BYTES}"
+    disk_read.finish_batch("busy")

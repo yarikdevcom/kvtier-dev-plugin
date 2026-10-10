@@ -4034,6 +4034,25 @@ def sched_fitted_here() -> bool:
         return False
 
 
+def worker_fitted_here() -> bool:
+    """Is the BYTE-MOVING (worker) half fitted in THIS process, right now?
+
+    The mirror of `sched_fitted_here`, and the fact a runtime lever needs said out
+    loud: the restore APPLY POINT - the only place in this tier that reads a spill
+    file - is worker-side code, so a process where this is False owns a reader pool
+    that never reads anything. `POST /disk {"op":"read-threads"}` publishes it as
+    `scope.this_process_reads_spill_files` for exactly that reason.
+
+    WHY IT READS `_state` AND NOT THE CLASS, when its scheduler mirror reads the class:
+    this is the SAME fact the rank file publishes as `worker_fitted` (see
+    `worker_report`), and the verb's scope note points a reader at that field - if the
+    two disagreed by door, the cross-check they exist to enable would be the noise of a
+    third opinion. The recorded verdict is set by the install pass that wrapped the
+    methods, and cleared by `uninstall`.
+    """
+    return bool(_state["worker_fitted"])
+
+
 def _restore_layer_beneath(method) -> bool:
     """True when our layer sits under a guard/switch wrapper on the same name."""
     if method is None:
@@ -11257,17 +11276,33 @@ def worker_report() -> dict:
                      or None)}
         # THE CONCURRENCY AND THE SHAPE, in the rank file because a WORKER is the only
         # process that reads, and both are worker-side facts. A handful of ints on
-        # purpose: this section is a guest in a byte-capped file, and the per-thread
-        # table, the throughput rates and the span-by-span record live in
-        # `disk_read.section()` / `apply_window()` on the snapshot and verb side.
+        # purpose: this section is a guest in a byte-capped file.
         #   * readers.configured vs alive tells an operator whether the threads they
         #     asked for exist; peak_units == 1 with configured > 1 says the reads were
         #     never actually concurrent; starved_polls and buffer_refusals name WHICH
         #     side starved (queue/pool vs disk).
+        #   * THE THREE RATES are here since 0.2.67, and the comment that used to claim
+        #     they "live in `disk_read.section()` / `apply_window()` on the snapshot and
+        #     verb side" was WRONG about the rank file: no reachable reader exposed them
+        #     to the proxy host. Without them the only way to answer "are more reader
+        #     threads helping?" was to derive a rate from `bytes_per_file x reads /
+        #     (read_seconds_avg x threads)`, which silently assumes EVERY configured
+        #     thread stayed busy - the exact assumption `parallel_efficiency` exists to
+        #     falsify. They are the same three figures `disk_read.throughput()` builds,
+        #     asserted equal to it by a test, and `None` rather than absent until a read
+        #     has happened this boot (a key that appears only when there is something to
+        #     report is a key a reader cannot index).
+        #   * THE THREAD COUNT'S SOURCE AND HISTORY (0.2.67) answer the question a rate
+        #     cannot: what was this rank ACTUALLY running when that restore happened? A
+        #     runtime resize is per process and per boot, so `configured` alone cannot
+        #     say whether 8 was the boot's number or a verb's, and `last_resize` names
+        #     the last ask (a refused ask included).
         #   * spans.hole_in_middle is the concurrency finding about PARTIAL restores,
         #     in the place a rank can report it: impossible for one reader, so a
         #     non-zero count next to configured > 1 is the measurement.
         read_state = disk_read.counters()
+        rates = read_state.get("throughput") or {}
+        resize = read_state.get("last_resize")
         report["readers"] = {
             "configured": int(read_state["threads_configured"]),
             "alive": int(read_state["threads_alive"]),
@@ -11284,6 +11319,21 @@ def worker_report() -> dict:
                 read_state.get("recency_promotions_throttled") or 0),
             "recency_promotion_failures": int(
                 read_state.get("recency_promotion_failures") or 0),
+            # THE THREE RATES, verbatim from `disk_read.throughput()`. The DEVICE rate
+            # should stay put as threads rise; the WALL rate is the one the engine step
+            # pays and should rise with them; the efficiency is reader seconds over wall
+            # seconds (~1.0 with one reader, ~N when N truly read together).
+            "bytes_per_reader_second": rates.get("bytes_per_reader_second"),
+            "bytes_per_second_wall": rates.get("bytes_per_second_wall"),
+            "parallel_efficiency": rates.get("parallel_efficiency"),
+            # `env` = the launcher's VLLM_E2_TIER_DISK_READ_THREADS still owns this
+            # process; `verb` = a runtime resize does, and `last_resize` says which ask.
+            "threads_source": read_state.get("threads_source"),
+            "last_resize": (None if resize is None else
+                            {"from": resize.get("from"), "to": resize.get("to"),
+                             "ts": resize.get("ts"), "ok": bool(resize.get("ok")),
+                             "reason": _clip(resize.get("reason"), 60)}),
+            "resize_refusals": int(read_state.get("resize_refusals") or 0),
         }
         # THE UNLINK POOL (0.2.29), beside the reader threads it is modelled on: the
         # spill tier's eviction workers live in this same process, and "did parallel

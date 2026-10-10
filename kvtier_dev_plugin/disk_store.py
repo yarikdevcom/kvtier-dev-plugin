@@ -335,6 +335,107 @@ MAX_RECEIPT_FILE_BYTES = 1024
 MAX_RANK_FILES = 32                 # receipt files one status read will open
 MAX_SERVED_RECORDS = 64             # per-process memory of answered requests
 
+# THE SECOND RELAY CHANNEL (0.2.67): the reader-count relay.
+#
+# WHY A SECOND FILE AND NOT SPILL-ONE'S SLOT. `spill-one`'s request is an EVENT: it
+# names one slot's bytes, and overwriting it silently loses a diagnostic - which is
+# why nothing else is allowed in that file. A resize ask is a STATEMENT ABOUT A COUNT,
+# and the two must not share a slot for a second reason too: a resize record read by
+# the spill reader would be a spill with no slot and no key, and a spill record read by
+# the resize reader would resize a pool from someone else's bytes. So the relay gets
+# its own name, its own role, and a REQUIRED role/op match on both reads, and the
+# prefixes are chosen so neither is a prefix of the other.
+#
+# ITS OWN SINGLE-SLOT SEMANTICS: one ask file, and a newer ask SUPERSEDES an older
+# unanswered one (the opposite of spill-one's refusal to share, and correct here
+# because the newest intent is the whole truth about a count). Receipts stay
+# per-rank and per-`request_seq`, so a superseded ask can never be counted as answered.
+RESIZE_REQUEST_FILE = "disk-read-threads.json"
+RESIZE_RECEIPT_FILE = "disk-read-threads-receipt-{rank}.json"
+RESIZE_RECEIPT_PREFIX = "disk-read-threads-receipt-"
+RESIZE_ROLE = "disk-read-threads"
+MAX_RESIZE_REQUEST_BYTES = 1024     # one count, an epoch and a stamp: 1 KiB is generous
+MAX_RESIZE_RECEIPT_BYTES = 1024
+
+# THE WAIT POLICY, and why it is derived rather than chosen. Two facts about where this
+# code runs decided it, both established in this repo's own citations:
+#
+#   1. THE HANDLER RUNS ON THE ENGINECORE LOOP THREAD. The UTILITY dispatch looks the
+#      method up and calls it inline (`vllm/v1/engine/core.py:1669-1671`, recorded at
+#      `engine_side.py:30-31`), the methods themselves say so (`engine_side.py:99`,
+#      `engine_side.py:308`), and the note at `engine_side.py:38-42` adds the rule this
+#      used to break: a UTILITY message arrives on the SAME `input_queue` the busy loop
+#      blocks on, "which is why these handlers answer while the engine has no requests
+#      in flight - and why they must be O(microseconds) reads". A `time.sleep` loop here
+#      IS the EngineCore loop not turning.
+#   2. A WAIT CANNOT BE ANSWERED ON THAT THREAD ANYWAY. The answer comes from a rank's
+#      `get_finished`, and a rank takes a step when the EngineCore dispatches one - the
+#      loop this handler is holding. So a wait waits on the very thing it is stopping:
+#      the box's first call returned `no_rank_answered` at exactly the default 3.0 s and
+#      the receipts landed immediately afterwards, which is that mechanism, not a slow
+#      rank. An idle engine is the same story without the irony: no steps, no poll.
+#
+# Hence: POST AND RETURN by default, and a wait that exists only to catch a rank whose
+# step was already in flight when the ask landed - which is what the grace below is for,
+# and why it is a grace rather than a poll interval.
+RESIZE_WAIT_SECONDS_DEFAULT = 0.0   # post the ask, return, read the receipts later
+RESIZE_WAIT_GRACE_SECONDS = 1.0     # the most a wait can ever be worth on this thread
+# Room for the response to get out: the door wraps the hop in
+# `asyncio.wait_for(..., config.timeout_seconds())` (`endpoint.py:315-319`) and answers
+# 504 when it expires, so a wait that fills the budget reports a TIMEOUT over a resize
+# every rank has already applied. The ceiling is derived from the SAME function the door
+# reads - a second hardcoded number is exactly how 30 s came to sit against an 8 s door.
+DOOR_MARGIN_SECONDS = 0.5
+
+# `spill-one`'s window, named rather than inlined - NOT a fix. It answers the same
+# 30-second ceiling against the same door, on the same loop thread, with the same
+# self-deadlock, and its DEFAULT is 3.0 s of sleep on the EngineCore loop. Reported for
+# a separate decision; pinned at today's values by `test_spill_one_still_offers_its_own
+# _thirty_second_window` so a change cannot happen by accident.
+SPILL_ONE_WAIT_SECONDS_DEFAULT = 3.0
+SPILL_ONE_WAIT_SECONDS_MAX = 30.0
+
+
+def _resize_wait_ceiling() -> float:
+    """The longest wait this door can carry right now, in seconds.
+
+    Read at CALL time, not bound as a constant: the budget is
+    `config.timeout_seconds()`, the same function the door's `asyncio.wait_for` reads,
+    and a constant would freeze the boot value while an operator can move the knob. If
+    the EngineCore and the door disagree about `VLLM_E2_TIER_DEV_TIMEOUT` (two
+    processes, one variable each), the error is in the safe direction: a smaller
+    honoured wait, never a 504.
+    """
+    return round(max(0.0, min(RESIZE_WAIT_GRACE_SECONDS,
+                               config.timeout_seconds() - DOOR_MARGIN_SECONDS)), 3)
+
+
+# WHAT THE RELAY CAN FAIL WITH, as a named enumerable set. Every one of these must
+# ALSO live in `REFUSAL_REASONS`, because `_count` folds an unnamed reason into
+# `bad_call` - and a relay failure reported as `bad_call` is a failure whose cause was
+# thrown away. There is deliberately NO "relay channel busy": a superseded resize ask
+# is not a collision (see above), so inventing a busy refusal would make the knob
+# sticky for a reason that does not exist.
+#   no_channel        - no diagnostics directory, so no worker can be asked at all
+#   not_armed         - the tier's own gate is down; a rank would refuse this ask
+#   relay_unwritable  - the ask file could not be written (I/O, permissions, size)
+#   relay_no_answer   - the window elapsed and NOT ONE rank wrote a receipt
+#   rank_refused      - a rank answered and said no (its own reason is in its receipt)
+RELAY_REFUSALS = ("no_channel", "not_armed", "relay_unwritable", "relay_no_answer",
+                  "rank_refused")
+
+# THE EIGHT ANSWERS THE RELAY CAN GIVE, and each one means something different to the
+# operator reading it. `not yet answered` exists so that a caller who declined to wait
+# gets a status that claims NOTHING rather than a failure it did not earn or a success
+# nobody proved; `answered_unverifiable` exists because "one rank obeyed" is NOT
+# "everyone obeyed" when nobody can say how many ranks there are; `answered_refused`
+# exists because "everybody answered" and "everybody obeyed" are different sentences and
+# a `complete` that hides a refusal is the exact lie this channel exists to prevent.
+RELAY_STATUSES = ("not requested", "not attempted", "not yet answered",
+                  "no_rank_answered", "answered_unverifiable", "answered_refused",
+                  "partial", "complete")
+
+
 # --- the cross-process spill ROLLUP: reading the ranks' own rank files --------
 # The counters in `disk_spill._state` are PER PROCESS, and the processes are many:
 # the spill writer thread and the ceiling enforcement run in every WORKER, while the
@@ -380,9 +481,22 @@ DISK_OPS = ("status", "arm", "disarm", "spill-one", "ls", "contains", "identitie
              # below is pinned against it IN ORDER by a test, and `endpoint` derives the
              # route's `op` enum from it. A mid-tuple insertion advertises an order the
              # dispatcher does not have.
-             "flush")
+             "flush",
+             # LAST, for the same in-order reason: the runtime reader-thread count
+             # (0.2.67). Also the reason `endpoint`'s op enum gained one more value -
+             # a test pins the two against each other as SETS, so forgetting one is a
+             # verb the route refuses to name.
+             "read-threads")
 MUTATING_DISK_OPS = ("arm", "disarm", "spill-one", "offers", "authority", "shadow",
-                     "gpu-shadow", "restore-verify", "gpu-write", "restore-source")
+                     "gpu-shadow", "restore-verify", "gpu-write", "restore-source",
+                     # LAST: it STARTS AND STOPS THREADS IN THE ANSWERING PROCESS, so a
+                     # method a browser may issue without a preflight must not reach it
+                     # - the same argument `gpu-shadow` and `gpu-write` make, and the
+                     # reader pool's is the weaker of the three because it writes no
+                     # byte and touches no KV. Appended rather than inserted because
+                     # this tuple is read as a set by the 405 check and by every test
+                     # that loops over it.
+                     "read-threads")
 """`offers` and `authority` are mutating and POST-only: each raises or drops ONE of
 this boot's two disk switches. Neither is the arm. Arming the spill tier says bytes
 may be WRITTEN; these say requests may be SERVED from disk, which on 2026-10-05 was a
@@ -401,7 +515,12 @@ REFUSAL_REASONS = ("no_key_for_slot", "key_count_mismatch", "bad_key_text",
                    "no_store_slots", "over_slot_cap",
                    "unretained_event", "fingerprint_incomplete",
                    "fingerprint_mismatch", "bad_digest", "bad_call", "not_armed",
-                   "not_configured", "no_channel", "expired", "over_tick_cap")
+                   "not_configured", "no_channel", "expired", "over_tick_cap",
+                   # THE READER-COUNT RELAY (0.2.67). `no_channel` and `not_armed`
+                   # above are REUSED, not restated: they already mean "no channel to a
+                   # worker" and "the gate is down", and a second word for the same
+                   # operational statement is how a refusal table grows two answers.
+                   "relay_unwritable", "relay_no_answer", "rank_refused")
 
 # --- SPAN COMPLETENESS AT THE HAND-OFF ----------------------------------------
 #
@@ -598,6 +717,26 @@ _state: dict = {
     "last_reason": None,
     "last_error": None,
     "last_path": None,
+    # THE READER-COUNT RELAY (0.2.67). The transport facts live HERE, beside the
+    # spill relay's own, because a channel is `disk_store`'s business; the COUNT the
+    # channel carries belongs to `disk_read`, which is the only place the live value
+    # lives. That split is what keeps the relay from becoming a second copy of the
+    # thing it is asking for.
+    "resize_polls": 0,
+    "resize_reads": 0,
+    "resize_absent": 0,
+    "resize_malformed": 0,
+    "resize_expired": 0,
+    "resize_adopted": 0,
+    "resize_fulfilled": 0,
+    "resize_fulfil_errors": 0,
+    "resize_receipt_errors": 0,
+    "resize_stat": None,
+    "resize_served": {},
+    "resize_requests_written": 0,
+    "resize_last_seq": None,
+    "resize_last_rank": None,
+    "resize_last_reason": None,
 }
 
 
@@ -640,6 +779,15 @@ def reset_state_for_tests() -> None:
         "load_paths_observed_on_a_step": None,
         "polls": 0, "poll_suppressed": 0, "last_poll_mono": None,
         "pending_stat": None, "pending_reads": 0, "pending_malformed": 0,
+        # The relay's tallies and its de-duplication memory, both per boot: a test
+        # that inherits "already served" would watch a rank decline to answer an ask it
+        # has never seen, which is the opposite of what the next test means to prove.
+        "resize_polls": 0, "resize_reads": 0, "resize_absent": 0,
+        "resize_malformed": 0, "resize_expired": 0, "resize_adopted": 0,
+        "resize_fulfilled": 0, "resize_fulfil_errors": 0,
+        "resize_receipt_errors": 0, "resize_stat": None, "resize_served": {},
+        "resize_requests_written": 0, "resize_last_seq": None,
+        "resize_last_rank": None, "resize_last_reason": None,
         "adopted": 0, "requests_written": 0, "fulfilled": 0,
         "fulfil_errors": 0, "receipt_errors": 0, "pending_seq": None,
         "last_rank": None, "last_reason": None, "last_error": None,
@@ -2509,9 +2657,820 @@ def fulfil_spill_one(handler, record=None) -> dict:
             "receipt": written["path"], "receipt_reason": written["reason"]}
 
 
+# --- THE READER-COUNT RELAY (0.2.67): the same idiom, a SECOND channel -------------
+#
+# WHY THIS EXISTS AT ALL. A reader thread pool is PROCESS state, and the process that
+# answers a `/disk` call is the one that holds the engine utility call - the EngineCore,
+# which never reads a spill file. The ranks that apply restores are the only processes
+# whose reader count changes anything, and a worker has no utility channel (that is the
+# whole reason `spill-one` writes a request FILE). So before 0.2.67 `read-threads` was a
+# knob on the wrong process, and saying `workers_reachable_over_this_door: false` in the
+# answer was honest but useless. This is the relay that makes the knob reach them.
+
+def _resize_request_path(directory=None):
+    directory = config.diagnostics_dir() if directory is None else directory
+    if directory is None:
+        return None
+    return os.path.join(str(directory), RESIZE_REQUEST_FILE)
+
+
+def _read_resize_record(path) -> tuple:
+    """(record | None, reason). One bounded, validated read of an untrusted file.
+
+    WHY THIS IS A SECOND READER AND NOT `_read_pending_record` WITH A FLAG. The two
+    channels' FIELD SETS do not overlap (a spill ask needs a slot and a block key; a
+    resize ask needs a count and nothing else), and the one check that makes the pair
+    safe is a REQUIRED `role`/`op` match. Expressed as a shared helper with a
+    `channel=` argument, that check becomes a boolean someone can flip; written twice,
+    the two refusals cannot be confused by construction. The ceremony that IS
+    duplicated (size cap, parse, object, version, seq, stamps) is the price, and it is
+    paid on purpose.
+    """
+    if path is None:
+        return None, f"{config.ENV_DIAG_DIR} is not set: no channel to a worker"
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        # THE COMMON CASE ON EVERY BOOT THAT NEVER USES THE RELAY, and the reason the
+        # branch is free: one failed stat per poll interval, counted `absent`, read
+        # nothing.
+        _state["resize_absent"] = int(_state["resize_absent"]) + 1
+        return None, "no resize request"
+    except OSError as exc:  # noqa: BLE001 - unreadable is reported, never a fault
+        return None, f"the request could not be stat'ed: {type(exc).__name__}"
+    if size > MAX_RESIZE_REQUEST_BYTES:
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, (f"the request is {size} bytes (cap "
+                      f"{MAX_RESIZE_REQUEST_BYTES}); refusing to trust it")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RESIZE_REQUEST_BYTES + 1)
+        document = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - a broken record is data, not a fault
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, f"the request did not parse: {type(exc).__name__}"
+    if not isinstance(document, dict):
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, "the request is not an object"
+    _state["resize_reads"] = int(_state["resize_reads"]) + 1
+    # THE ANTI-CONFUSION GATE, first among the field checks: a spill-one record parked
+    # in this file is data about somebody else's slot, and the alternative to refusing
+    # it is a rank resizing its pool because it read a spill ask.
+    for field, want in (("role", RESIZE_ROLE), ("op", "read-threads")):
+        if document.get(field) != want:
+            _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+            return None, (f"the request's {field} is {document.get(field)!r}, not "
+                          f"{want!r}: this file is the reader-count channel, and a "
+                          f"record from the other channel is never an instruction")
+    if document.get("version") != PROTOCOL_VERSION:
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, (f"the request is protocol version "
+                      f"{document.get('version')!r}, this build speaks "
+                      f"{PROTOCOL_VERSION}")
+    if _int(document.get("seq")) is None or document["seq"] <= 0:
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, "the request has no positive integer seq"
+    for field in ("requested_ts", "expires_ts"):
+        value = document.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+            return None, f"the request has no numeric {field}"
+    # The PAYLOAD is validated here, as a shape, and NOT as a range: a rank asked for 99
+    # must ANSWER that refusal (a receipt naming `out_of_range`) and must not go
+    # silent,
+    # because silence is indistinguishable from a dead poll. `set_read_threads` owns the
+    # range, and the caller that wrote the ask runs the same rule before writing.
+    threads = document.get("threads")
+    if isinstance(threads, bool) or not isinstance(threads, int):
+        _state["resize_malformed"] = int(_state["resize_malformed"]) + 1
+        return None, (f"the request's threads is {threads!r} "
+                      f"({type(threads).__name__}), not an integer")
+    return document, None
+
+
+def _write_resize_receipt(rank, record, *, refused, reason, reason_kind,
+                          posture, changed) -> dict:
+    """One rank's PROOF about one resize ask. Small, atomic, never raises.
+
+    THE FIELDS ARE READ BACK, NOT COPIED. `configured`/`alive`/`surplus_draining`/
+    `threads_source` come from `disk_read.threads_posture()` AFTER the apply, so the
+    receipt says what this process's live state actually is rather than echoing the
+    request it was handed. That is the only reason a caller can tell "this rank applied
+    it" from "this rank saw it" - and a receipt whose numbers contradict itself is
+    reported as NOT applied by `_resize_verdict`, so patching one cannot buy a success.
+    """
+    report = {"written": False, "path": None, "reason": None}
+    directory = config.diagnostics_dir()
+    if directory is None:
+        report["reason"] = "no diagnostics directory to write into"
+        return report
+    if rank is None:
+        # THE ASKING PROCESS MUST NOT ANSWER ITSELF. The EngineCore has no rank id, and
+        # a receipt from it would be counted among the ranks the completeness
+        # arithmetic has never heard of - turning "nobody answered" into "complete".
+        report["reason"] = ("this process has no rank id, so it writes no receipt: the "
+                            "relay counts answers from RANKS, and the process that "
+                            "wrote the ask is not one")
+        return report
+    document = {"version": PROTOCOL_VERSION, "role": RESIZE_ROLE, "rank": rank,
+                "writer": WRITER_TAG, "epoch": str(snapshot.epoch()),
+                "ts": round(time.time(), 6),
+                "request_seq": _int(record.get("seq")),
+                "requested_threads": _int(record.get("threads")),
+                "refused": bool(refused), "reason": _clip(reason),
+                "reason_kind": _clip(reason_kind, 32),
+                # `or {}`, not a bare `.get(...get(...))`: a rank that refused BEFORE
+                # the pool was ever touched (the gate was down) has no `last_resize` at
+                # all on a fresh boot, and reaching into `None` would raise OUTSIDE the
+                # contained try below - losing the receipt that is the whole point of
+                # answering, and turning a refusal the caller could report into a
+                # `poll raised` fallback.
+                "from": _int((posture.get("last_resize") or {}).get("from")),
+                "to": _int((posture.get("last_resize") or {}).get("to")),
+                # `changed` comes from the VERDICT the pool returned, not from
+                # `last_resize.ok`: an ask for the count the rank already ran is a
+                # success that changed nothing, and a receipt claiming `changed: true`
+                # for a no-op is the kind of number an operator then divides by to
+                # conclude the pool moved when it did not.
+                "changed": bool(changed) and not bool(refused),
+                "configured": int(posture["configured"]),
+                "alive": int(posture["alive"]),
+                "surplus_draining": int(posture["surplus_draining"]),
+                "threads_source": _clip(posture["source"], 16),
+                "override": _int(posture.get("override")),
+                "env_requested": _int(posture.get("env_requested")),
+                "resize_refusals": int(posture.get("resize_refusals") or 0),
+                "scope": ("THIS rank's answer only, read out of THIS rank's own live "
+                          "counters after the apply. The ask is rank-agnostic, so "
+                          "every rank that polls it moves ITS OWN reader pool and "
+                          "writes a receipt of its own; a rank missing here did not "
+                          "poll in time, which is NOT the same as it having refused.")}
+    path_out = os.path.join(str(directory), RESIZE_RECEIPT_FILE.format(rank=rank))
+    try:
+        raw = _dump(document)
+        if len(raw) > MAX_RESIZE_RECEIPT_BYTES:
+            report["reason"] = (f"the receipt is {len(raw)} bytes (cap "
+                                f"{MAX_RESIZE_RECEIPT_BYTES})")
+            return report
+        tmp = f"{path_out}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as handle:
+            handle.write(raw)
+        os.replace(tmp, path_out)
+        report.update({"written": True, "path": path_out})
+        return report
+    except Exception as exc:  # noqa: BLE001 - a verdict file never breaks a step
+        _state["resize_receipt_errors"] = int(_state["resize_receipt_errors"]) + 1
+        snapshot._error(exc, "disk_store read-threads receipt")
+        report["reason"] = f"{type(exc).__name__}"
+        return report
+
+
+def fulfil_read_threads(record) -> dict:
+    """Answer one resize ask in THIS process: move the pool, read the posture back,
+    receipt it.
+
+    THE ASK LANDS THROUGH `disk_read.set_read_threads` AND NOTHING ELSE. There is
+    deliberately no relay-side copy of the count: the override that function installs
+    is the one place `_resolve_limits` reads, which is the one place `_ensure_thread`
+    reads at every bind. A second state variable here would be a second answer to
+    "what is the count", and the two would disagree the first time a bind ran.
+    """
+    # `worker_diag` owns the one rank rule; `disk_read` owns the one count. Reached
+    # lazily like every other engine module this door touches: one dict lookup per
+    # adopted ask, on a path the arm gate already bounds to once per poll interval.
+    from . import disk_read, worker_diag  # noqa: PLC0415
+    if config.diagnostics_dir() is None:
+        _count("no_channel", f"{config.ENV_DIAG_DIR} is unset, so this worker has "
+                             f"no channel to read a resize request from")
+        return {"written": False, "reason": f"{config.ENV_DIAG_DIR} is unset"}
+    rank, _source = worker_diag.rank_id()
+    if record is None:
+        return {"written": False, "reason": "no request record"}
+    key = _record_key(record)
+    if key in (_state.get("resize_served") or {}):
+        return {"written": True, "reason": "already answered by this rank",
+                "refused": False, "rank": rank}
+    _state["resize_fulfilled"] = int(_state["resize_fulfilled"]) + 1
+    refused = False
+    reason = None
+    reason_kind = None
+    posture = None
+    changed = False
+    try:
+        if not _may_touch_disk():
+            # UNREACHABLE THROUGH THE POLL (whose gate runs first) and kept because
+            # this function is also callable directly, by a test and by whatever the
+            # next release wires it to.
+            refused, reason = True, ("the disk tier is not configured and armed in "
+                                     "this rank, so the tier's own gate forbids even "
+                                     "the control-plane change")
+            _count("not_armed" if disk_spill.disk_root() is not None
+                   else "not_configured", reason)
+            reason_kind = "not_armed"
+        else:
+            verdict = disk_read.set_read_threads(record.get("threads"))
+            posture = disk_read.threads_posture()
+            refused = not bool(verdict.get("ok"))
+            changed = bool(verdict.get("changed"))
+            reason = verdict.get("reason")
+            reason_kind = verdict.get("reason_kind")
+            if refused:
+                # The rank ANSWERED "no", which is a different fact from not answering,
+                # and the caller counts it separately.
+                _count("rank_refused", f"rank {rank} refused the resize to "
+                                       f"{record.get('threads')!r}: {reason}")
+    except Exception as exc:  # noqa: BLE001 - a resize ask never breaks a step
+        _state["resize_fulfil_errors"] = int(_state["resize_fulfil_errors"]) + 1
+        snapshot._error(exc, "disk_store read-threads fulfilment")
+        refused = True
+        reason_kind = "raised"
+        reason = f"fulfilment raised {type(exc).__name__}"
+    if posture is None:
+        posture = disk_read.threads_posture()
+    _remember("resize_served", key)
+    _state["resize_last_rank"] = rank
+    _state["resize_last_reason"] = _clip(reason)
+    written = _write_resize_receipt(rank, record, refused=refused, reason=reason,
+                                    reason_kind=reason_kind, posture=posture,
+                                    changed=changed)
+    return {"written": bool(written["written"]), "refused": refused, "rank": rank,
+            "configured": int(posture["configured"]),
+            "alive": int(posture["alive"]),
+            "reason": reason, "reason_kind": reason_kind,
+            "receipt": written["path"], "receipt_reason": written["reason"]}
+
+
+def poll_read_threads() -> dict:
+    """This rank's half of the reader-count channel, on the step-path poll.
+
+    BOUNDED THREE TIMES BEFORE IT READS ANYTHING: the diagnostics directory must exist,
+    the tier's own arm gate must be up, and the CALLER (`poll_spill_one`) has already
+    spent the interval gate. On the overwhelmingly common boot that never uses the
+    relay it stops at a `getsize` that raises `FileNotFoundError`.
+    """
+    outcome = {"polled": False, "adopted": False, "reason": None}
+    directory = config.diagnostics_dir()
+    if directory is None or not _may_touch_disk():
+        # NOT counted as a poll, and NOT counted `absent`: an unarmed rank never read
+        # the channel at all, and a counter that says otherwise would be reporting a
+        # read that did not happen.
+        outcome["reason"] = ("no diagnostics dir, or the tier is not configured and "
+                             "armed")
+        return outcome
+    outcome["polled"] = True
+    _state["resize_polls"] = int(_state["resize_polls"]) + 1
+    try:
+        record, reason = _read_resize_record(_resize_request_path(directory))
+        outcome["reason"] = reason
+        if record is not None:
+            expires = float(record["expires_ts"])
+            if time.time() >= expires:
+                # A RESIZE ADOPTED HOURS LATE IS A SURPRISE, NOT A SERVICE: the ask was
+                # written for a window the operator was watching, and honouring it after
+                # that window moves a serving pool for no reader.
+                outcome["reason"] = "the request had expired"
+                _state["resize_expired"] = int(_state["resize_expired"]) + 1
+                _state["resize_stat"] = "expired"
+                _count("expired", f"seq {record['seq']} expired before this rank "
+                                  f"answered it")
+            else:
+                key = _record_key(record)
+                if key in (_state.get("resize_served") or {}):
+                    outcome["reason"] = "already answered by this rank"
+                    _state["resize_stat"] = "served"
+                else:
+                    answered = fulfil_read_threads(record)
+                    outcome["adopted"] = True
+                    outcome["answer"] = answered
+                    _state["resize_adopted"] = int(_state["resize_adopted"]) + 1
+                    _state["resize_stat"] = "refused" if answered["refused"] \
+                        else "applied"
+    except Exception as exc:  # noqa: BLE001 - a control poll never breaks a step
+        _state["fallbacks"] = int(_state["fallbacks"]) + 1
+        snapshot._error(exc, "disk_store read-threads poll")
+        outcome["reason"] = f"poll raised {type(exc).__name__}"
+    return outcome
+
+
+def _resize_verdict(document) -> tuple:
+    """(applied, verdict) from ONE receipt, re-derived from the receipt's own numbers.
+
+    WHY THE CALLER DOES NOT BELIEVE A `refused: false`. A receipt that copies the
+    request instead of reading the process would report an application that never
+    happened, and every later conclusion about the reader pool would rest on it. So the
+    verdict here is arithmetic over fields the rank read out of its own live state:
+    the count it ended with must equal the count the ask asked for, and it must come
+    from a resize rather than the launcher. A receipt that contradicts itself is NOT
+    applied, and says which of its own numbers disagreed.
+    """
+    if bool(document.get("refused")):
+        said = document.get("reason")
+        return False, ("the rank answered and refused"
+                       + (f": {str(said)[:80]}" if said else ""))
+    configured = _int(document.get("configured"))
+    to = _int(document.get("to"))
+    requested = _int(document.get("requested_threads"))
+    source = document.get("threads_source")
+    if configured is None:
+        return False, ("the receipt names no resulting count, so this rank's own "
+                       "counters cannot be checked")
+    if to is None or requested is None:
+        return False, ("the receipt names no asked-for count, so this rank's own "
+                       "counters cannot be compared with the ask")
+    if configured != to or configured != requested:
+        return False, (f"the receipt does not match this rank's own counters: it asked "
+                       f"for {requested} and claims {to}, while its live count is "
+                       f"{configured}")
+    if source != "verb":
+        return False, (f"the receipt does not match this rank's own counters: the live "
+                       f"count comes from {source!r}, not from a resize, so nothing "
+                       f"applied it")
+    return True, ("applied: this rank's own counters report the count the ask asked "
+                  "for")
+
+
+def _read_resize_receipts(directory, seq) -> dict:
+    """The ranks that answered THIS resize ask, keyed by rank, each with a verdict.
+
+    An unreadable directory is NO receipts and a remembered reason, never a fake entry:
+    this dict's LENGTH is compared against the expected rank set, so a phantom key could
+    turn an I/O failure into a "complete" claim (the rule `_read_receipts` lives by).
+    A receipt whose `role` is not the resize role is skipped outright - a spill-one
+    receipt in the same directory must not be able to answer a resize ask.
+    """
+    out = {}
+    try:
+        names = sorted(os.listdir(str(directory)))
+    except OSError as exc:
+        _state["resize_last_reason"] = _clip(
+            f"the receipts could not be listed: {type(exc).__name__}")
+        return {}
+    for name in names[:MAX_RANK_FILES]:
+        if not (name.startswith(RESIZE_RECEIPT_PREFIX)
+                and name.endswith(FILE_SUFFIX)):
+            continue
+        document = _read_receipt_file(os.path.join(str(directory), name),
+                                      MAX_RESIZE_RECEIPT_BYTES)
+        if not document or document.get("role") != RESIZE_ROLE:
+            continue
+        rank = document.get("rank")
+        if not isinstance(rank, str) or not rank:
+            _state["resize_last_reason"] = _clip(
+                f"a receipt ({name}) named no rank, so it is not counted as an answer")
+            continue
+        if seq is not None and document.get("request_seq") != seq:
+            # An answer to an ASKED-BEFORE question. Counting it would let a rank that
+            # answered last week's ask satisfy this week's completeness claim.
+            continue
+        applied, verdict = _resize_verdict(document)
+        out[rank] = {"refused": bool(document.get("refused")),
+                     "reason": document.get("reason"),
+                     "reason_kind": document.get("reason_kind"),
+                     "requested_threads": _int(document.get("requested_threads")),
+                     "from": _int(document.get("from")),
+                     "to": _int(document.get("to")),
+                     "configured": _int(document.get("configured")),
+                     "alive": _int(document.get("alive")),
+                     "surplus_draining": _int(document.get("surplus_draining")),
+                     "threads_source": document.get("threads_source"),
+                     "applied": applied, "verdict": verdict,
+                     "epoch": document.get("epoch"),
+                     "ts": document.get("ts"),
+                     "request_seq": document.get("request_seq"),
+                     "receipt": name}
+    return out
+
+
+def _resize_ask(directory) -> tuple:
+    """(seq, threads, how this is known) for the ask the answer should report on.
+
+    WHY THE CALLER RE-READS THE FILE INSTEAD OF TRUSTING ITS OWN MEMORY. A receipt read
+    minutes after the ask - or by a second dashboard, or by a caller who asked a
+    question (`{"op":"read-threads"}`) rather than writing an ask - has to be matched to
+    SOME seq, and `_state["resize_last_seq"]` is one process's memory of writes it may
+    never have made. The ask file is the shared fact, so it is the first read; the local
+    memory is only a fallback for a file that was removed underneath us.
+    """
+    record, _reason = _read_resize_record(_resize_request_path(directory))
+    if record is not None:
+        return _int(record.get("seq")), _int(record.get("threads")), "the ask file"
+    if _state.get("resize_last_seq") is not None:
+        return int(_state["resize_last_seq"]), None, \
+            "the last ask this process wrote (its file is gone)"
+    return None, None, "no ask has been written or read in this process"
+
+
+# WHAT THE CALLER REFUSES TO CALL A SUCCESS. `not requested` and `not yet answered`
+# and `answered_unverifiable` do NOT block: the first is the operator's own opt-out, the
+# second is a caller that declined to wait (a verdict nobody earned must not be dressed
+# as a failure either way), and the third is "everybody who spoke obeyed, and nobody can
+# say who was silent" - reported in `completeness`, never invented into a verdict.
+# `not attempted` blocks only a caller that ASKED for the ranks by name; see
+# `RELAY_CAPABILITY_REFUSALS`, which is the exception spelled out where the body is
+# still visible.
+RELAY_BLOCKING_STATUSES = ("not attempted", "no_rank_answered", "answered_refused",
+                           "partial")
+
+# THE TWO REFUSALS THAT DESCRIBE A MISSING CAPABILITY RATHER THAN A FAILED ASK: there is
+# no channel, or the gate that would let a rank obey is down. These are the only ones
+# the `ok` composition excuses for a caller that did not name the ranks, and why: they
+# cannot be answered by waiting - the answer is an environment variable or an `op:arm`,
+# and the payload says which.
+RELAY_CAPABILITY_REFUSALS = ("no_channel", "not_armed")
+
+
+def relay_section() -> dict:
+    """THE RELAY'S OWN TALLIES, for `op:status` and the rank file's disk section.
+
+    The transport facts (asks written, polls run, malformed records, adoptions, receipt
+    errors, the two file names) live here because a channel is this module's business;
+    the COUNT the channel carries lives in `disk_read`, which is the only place the live
+    value exists. That split is what stops the relay from becoming a second answer to
+    "what is the reader count".
+
+    The file names are published because an operator debugging a rank that never answers
+    needs the path the rank is supposed to be reading, from the door, without grepping a
+    box.
+    """
+    return {"request_file": RESIZE_REQUEST_FILE,
+            "receipt_prefix": RESIZE_RECEIPT_PREFIX,
+            "role": RESIZE_ROLE,
+            "request_cap_bytes": MAX_RESIZE_REQUEST_BYTES,
+            "receipt_cap_bytes": MAX_RESIZE_RECEIPT_BYTES,
+            "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+            "ttl_seconds": REQUEST_TTL_SECONDS,
+            "wait_default_seconds": RESIZE_WAIT_SECONDS_DEFAULT,
+            "wait_grace_seconds": RESIZE_WAIT_GRACE_SECONDS,
+            # THE CEILING AS IT STANDS AT THIS MOMENT, derived from the door's own
+            # budget: publishing the derived number (not a constant) is what lets an
+            # operator see a tightened `VLLM_E2_TIER_DEV_TIMEOUT` tightening the wait.
+            "wait_ceiling_seconds": round(_resize_wait_ceiling(), 3),
+            "door_budget_seconds": config.timeout_seconds(),
+            "door_margin_seconds": DOOR_MARGIN_SECONDS,
+            "door_budget_env": config.ENV_TIMEOUT,
+            "statuses": list(RELAY_STATUSES),
+            "refusals": list(RELAY_REFUSALS),
+            "requests_written": int(_state["resize_requests_written"]),
+            "last_seq": _state["resize_last_seq"],
+            "last_rank": _state["resize_last_rank"],
+            "last_reason": _state["resize_last_reason"],
+            "last_stat": _state["resize_stat"],
+            "polls": int(_state["resize_polls"]),
+            "reads": int(_state["resize_reads"]),
+            "absent": int(_state["resize_absent"]),
+            "malformed": int(_state["resize_malformed"]),
+            "expired": int(_state["resize_expired"]),
+            "adopted": int(_state["resize_adopted"]),
+            "fulfilled": int(_state["resize_fulfilled"]),
+            "fulfil_errors": int(_state["resize_fulfil_errors"]),
+            "receipt_errors": int(_state["resize_receipt_errors"]),
+            "note": ("the reader-count relay's transport tallies. A rank that adopted "
+                     "an ask appears in `adopted` and in its own rank file's "
+                     "readers.last_resize; the asking process appears in "
+                     "`requests_written` and writes NO receipt: the relay counts "
+                     "answers from ranks and the asker is not one")}
+
+
+def _relay_base() -> dict:
+    """The relay answer every path starts from, including the ones that refuse.
+
+    ONE SHAPE FOR EVERY EXIT, so a caller can index the payload without learning which
+    branch it hit: a refused relay and a completed one carry the same keys, with `None`
+    where a fact does not exist. A caller that had to guess which keys a refusal left
+    out is a caller that writes `payload.get("ranks_applied", [])` and reads "nobody was
+    asked" as "nobody applied".
+    """
+    ceiling = _resize_wait_ceiling()
+    return {"attempted": False, "status": "not requested", "refusal": None,
+            "reason": None, "file": None, "seq": None, "asked": None,
+            # THE WAIT POLICY, published on every exit: what was asked, what was
+            # honoured, whether the two differ and why, and the three numbers behind the
+            # cap. An operator deciding what to send should be able to read the answer
+            # rather than the source.
+            "wait_s": 0.0, "wait_requested": None, "wait_capped": False,
+            "wait_cap": None, "wait_default_seconds": RESIZE_WAIT_SECONDS_DEFAULT,
+            "wait_grace_seconds": RESIZE_WAIT_GRACE_SECONDS,
+            "wait_ceiling_seconds": round(ceiling, 3),
+            "door_budget_seconds": config.timeout_seconds(),
+            "door_margin_seconds": DOOR_MARGIN_SECONDS,
+            "expected_ranks": None, "expected_ranks_source": None,
+            "ranks_answered": [], "ranks_applied": [], "ranks_refused": [],
+            "ranks_pending": [], "ranks_pending_unknown": False,
+            "completeness": "unknown", "receipts": {},
+            "ranks_note": ("the reader pool is PROCESS state, so only a WORKER's own "
+                           "answer counts: each rank publishes readers.configured / "
+                           "readers.threads_source / readers.last_resize in its own "
+                           "rank file, which is the fleet's truth"),
+            "note": ("a rank reads this channel on its step path, at most once per "
+                     f"{POLL_INTERVAL_SECONDS}s, so an unanswered ask is NOT a refused "
+                     "ask: `ranks_pending` names the silence and a later read of the "
+                     "receipts finishes the story. A LONG WAIT CANNOT BE ANSWERED "
+                     "HERE: "
+                     "this handler runs on the EngineCore loop, and a rank polls the "
+                     "channel on a step the same loop dispatches, so waiting waits on "
+                     "what it is stopping - which is why the default posts the ask and "
+                     "returns")}
+
+
+_READ_QUESTION_REASON = (
+    "this op was a question, not an instruction, and the channel carries instructions "
+    "only: a rank's reader count is already published in its own rank file, so a "
+    "relayed query would add a second receipt meaning for a fact the fleet already "
+    "answers")
+
+
+def _resize_relay_read() -> dict:
+    """The ANSWERS to the ask that is on the channel, for a caller asking a question.
+
+    WHY A READ REPORTS RECEIPTS AT ALL: the window is not where the story ends. A rank
+    that polls three seconds after the caller gave up still moves its pool and still
+    writes its receipt, so `{"op":"read-threads"}` re-reads the channel and answers
+    "who has applied it now". The ask it reports on is named by the ASK FILE (see
+    `_resize_ask`), which is why a second dashboard, or a second call minutes later, or
+    a process that never wrote anything, all get the same answer.
+
+    A read COUNTS nothing: `relay_no_answer` is a failure to ASK, and a question that
+    finds an old unanswered ask has failed at nothing.
+    """
+    relay = _relay_base()
+    directory = config.diagnostics_dir()
+    if directory is None:
+        relay["reason"] = (f"{_READ_QUESTION_REASON}; and {config.ENV_DIAG_DIR} is not "
+                           f"set here, so no ask could have been written either")
+        return relay
+    seq, threads, source = _resize_ask(directory)
+    expected, expected_source = _expected_ranks()
+    relay["expected_ranks"] = list(expected) if expected else None
+    relay["expected_ranks_source"] = expected_source
+    if seq is None:
+        relay["reason"] = _READ_QUESTION_REASON
+        return relay
+    relay["seq"] = seq
+    relay["asked"] = {"seq": seq, "threads": threads, "source": source}
+    receipts = _read_resize_receipts(directory, seq)
+    return _finish_resize_relay(relay, receipts, expected, counted=False)
+
+
+def _resize_relay(body: dict, *, asked: bool, refused_local: bool) -> dict:
+    """Ask the ranks to resize, or say precisely why this answer cannot.
+
+    THE HONEST CEILING, stated before the payload: the relay cannot GUARANTEE an answer
+    inside the caller's window, because a rank reads the channel at most once per
+    `POLL_INTERVAL_SECONDS` and nothing tells the writer when a given rank's next step
+    is. So the answer never blocks past the window the caller asked for and never
+    dresses a silent rank as a failure - it names the silent ranks in `ranks_pending`
+    and lets the next read finish the story. A rank that polled and answered lands in
+    `ranks_answered`, split into `ranks_applied` and `ranks_refused` by verdicts the
+    caller RE-DERIVED from each receipt's own numbers.
+
+    WHY THE ARM IS A PRECONDITION HERE TOO: a rank's poll refuses everything while the
+    tier is unarmed, so writing an ask into that directory would be litter some rank has
+    to chew through for nothing - the same rule `_op_spill_one` enforces, for the same
+    reason.
+    """
+    relay = _relay_base()
+    if refused_local:
+        # NO ASK IS WRITTEN FOR A QUESTION THIS PROCESS HAS ALREADY REFUSED. A bad count
+        # is bad on every rank too, and a file that earns four refusals makes the next
+        # operator read a policy disagreement where there was a typo.
+        relay["refusal"] = "bad_value"
+        relay["reason"] = ("the count was refused before any ask was written, so no "
+                           "rank was asked")
+        return relay
+    if not asked:
+        relay["reason"] = _READ_QUESTION_REASON
+        return relay
+    if body.get("ranks") is False:
+        relay["reason"] = ("`ranks: false` asked the local process only, so no ask was "
+                           "written and no rank was touched")
+        return relay
+    directory = config.diagnostics_dir()
+    expected, expected_source = _expected_ranks()
+    relay["expected_ranks"] = list(expected) if expected else None
+    relay["expected_ranks_source"] = expected_source
+    if directory is None:
+        relay["status"] = "not attempted"
+        relay["refusal"] = "no_channel"
+        relay["reason"] = (f"{config.ENV_DIAG_DIR} is not set, so there is no channel "
+                           f"to a worker; point it at the directory the engine's rank "
+                           f"files are in - the ranks cannot be asked any other way")
+        _count("no_channel", relay["reason"])
+        return relay
+    if not disk_spill.is_armed():
+        relay["status"] = "not attempted"
+        relay["refusal"] = "not_armed"
+        relay["reason"] = ("the spill tier is not armed in this process (and the arm "
+                           "file a worker reads is absent, unreadable or fenced to "
+                           "another boot), so every rank's poll would refuse this ask "
+                           "by its own gate: arm it with op:arm first, because an ask "
+                           "every rank must refuse is litter, not a diagnostic")
+        _count("not_armed", relay["reason"])
+        return relay
+    seq = _next_seq()
+    now = time.time()
+    record = {"version": PROTOCOL_VERSION, "role": RESIZE_ROLE, "op": "read-threads",
+              "seq": seq, "epoch": str(snapshot.epoch()),
+              "requested_ts": round(now, 6),
+              "expires_ts": round(now + REQUEST_TTL_SECONDS, 6),
+              "threads": int(body["threads"]),
+              "writer": WRITER_TAG,
+              "scope": ("rank-agnostic: every worker that polls this moves ITS OWN "
+                        "reader pool and writes a receipt of its own. A rank missing "
+                        "from the receipts did not poll in time, which is NOT the same "
+                        "as it having refused."),
+              "note": ("a shrink is ASYNCHRONOUS on each rank: a surplus slot finishes "
+                       "the read it is holding and exits at its next poll, so a rank's "
+                       "receipt can report `alive` above `configured` right after the "
+                       "apply, and that is the shrink landing rather than a refusal")}
+    path = _resize_request_path(directory)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        raw = _dump(record)
+        if len(raw) > MAX_RESIZE_REQUEST_BYTES:
+            raise OSError(f"the ask is {len(raw)} bytes (cap "
+                          f"{MAX_RESIZE_REQUEST_BYTES})")
+        with open(tmp, "wb") as handle:
+            handle.write(raw)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised at a caller
+        snapshot._error(exc, "disk_store read-threads request")
+        for candidate in (tmp, path):
+            # A half-written ask must not survive to be adopted: an ask the writer has
+            # given up on, answered with a receipt, is worse than no ask at all.
+            with contextlib.suppress(OSError):
+                os.unlink(candidate)
+        relay["status"] = "not attempted"
+        relay["refusal"] = "relay_unwritable"
+        relay["reason"] = (f"the ask could not be written to {path}: "
+                           f"{type(exc).__name__}: {str(exc)[:120]}")
+        _count("relay_unwritable", relay["reason"])
+        return relay
+    _state["resize_requests_written"] = int(_state["resize_requests_written"]) + 1
+    _state["resize_last_seq"] = seq
+    relay["attempted"] = True
+    relay["file"] = path
+    relay["seq"] = seq
+    relay["asked"] = {"seq": seq, "threads": int(body["threads"]),
+                      "expires_ts": record["expires_ts"]}
+    # THE WAIT, capped by what the door can carry and by what a wait can achieve. Both
+    # caps are reported rather than applied silently: the caller asked a question with a
+    # number in it, and the answer must say what happened to that number.
+    ceiling = _resize_wait_ceiling()
+    raw_wait = body.get("wait_s")
+    requested = RESIZE_WAIT_SECONDS_DEFAULT
+    if raw_wait is not None:
+        try:
+            requested = float(raw_wait)
+        except (TypeError, ValueError):
+            # Not a number is "the operator said nothing", the same reading the env
+            # grammar gives a malformed value: the default answers, and the payload says
+            # what it made of the request rather than failing a resize over a typo in a
+            # wait.
+            relay["wait_cap"] = {"requested": str(raw_wait)[:32],
+                                 "honoured": round(ceiling, 3),
+                                 "ceiling": round(ceiling, 3),
+                                 "why": (f"wait_s was not a number "
+                                         f"({type(raw_wait).__name__}), so the default "
+                                         f"{RESIZE_WAIT_SECONDS_DEFAULT}s was used")}
+    wait_s = max(0.0, min(ceiling, requested))
+    # `None` when the caller sent no `wait_s` at all: a fact that does not exist is
+    # reported as `None` rather than as the default it was answered with, so a reader
+    # can tell "asked for 0" from "asked for nothing".
+    relay["wait_requested"] = (None if raw_wait is None else round(requested, 3))
+    relay["wait_s"] = round(wait_s, 3)
+    if relay["wait_cap"] is None and requested > wait_s + 1e-9:
+        relay["wait_cap"] = {"requested": round(requested, 3),
+                             "honoured": round(wait_s, 3),
+                             "ceiling": round(ceiling, 3),
+                             "why": (f"a wait cannot exceed {round(ceiling, 3)}s: this "
+                                     f"handler runs on the EngineCore loop, the door "
+                                     f"answers 504 after {config.timeout_seconds()}s "
+                                     f"({config.ENV_TIMEOUT}) minus a "
+                                     f"{DOOR_MARGIN_SECONDS}s margin for the response, "
+                                     f"and the grace ceiling is "
+                                     f"{RESIZE_WAIT_GRACE_SECONDS}s because a wait "
+                                     f"cannot be answered on the thread it is blocking "
+                                     f'- read {{"op":"read-threads"}} after the next '
+                                     f"steps")}
+    relay["wait_capped"] = relay["wait_cap"] is not None
+    receipts = _read_resize_receipts(directory, seq)
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        # Completeness is NOT claimed without a handshake, so with no expected set the
+        # window is waited out in full rather than breaking at the first receipt.
+        if expected and len(receipts) >= len(expected):
+            break
+        time.sleep(0.05)
+        receipts = _read_resize_receipts(directory, seq)
+    return _finish_resize_relay(relay, receipts, expected)
+
+
+def _finish_resize_relay(relay: dict, receipts: dict, expected, *,
+                         counted: bool = True) -> dict:
+    """Fill in the answer from the receipts that exist, and set the status.
+
+    Shared by the write (which just asked) and the READ, which is how "did the ranks
+    apply it?" stays answerable AFTER the window: the receipts on disk are the record,
+    and the ask they belong to is named by the ask file rather than by one process's
+    memory of writing it.
+
+    `counted` is why the two callers are not the same caller: `relay_no_answer` and
+    `rank_refused` are tallies of FAILED ASKS, and a caller that only read the channel
+    has asked nothing and must not move a failure counter it did not earn.
+    """
+    answered = sorted(receipts)
+    applied = sorted(rank for rank in receipts if receipts[rank]["applied"])
+    refused = sorted(rank for rank in receipts if receipts[rank]["refused"])
+    relay["receipts"] = receipts
+    relay["ranks_answered"] = answered
+    relay["ranks_applied"] = applied
+    relay["ranks_refused"] = refused
+    if expected is None:
+        # "Unknown" is the only honest completeness here, and `ranks_pending_unknown`
+        # says so as a boolean so a dashboard does not have to parse the word.
+        relay["completeness"] = "unknown"
+        relay["ranks_pending"] = []
+        relay["ranks_pending_unknown"] = True
+    else:
+        pending = sorted(set(expected) - set(answered))
+        relay["ranks_pending"] = pending
+        relay["ranks_pending_unknown"] = False
+        relay["completeness"] = "complete" if not pending else "partial"
+    if relay["attempted"] and float(relay.get("wait_s") or 0.0) <= 0.0:
+        # The caller DECLINED to wait, so the only honest status is one that claims
+        # nothing. Neither a failure nobody earned nor a success anybody proved.
+        relay["status"] = "not yet answered"
+        relay["reason"] = ("the ask was written and no wait was asked for, so nothing "
+                           "is claimed about the ranks; read {\"op\":\"read-threads\"} "
+                           f"again to see who has answered (a rank polls at most once "
+                           f"per {POLL_INTERVAL_SECONDS}s)")
+        return relay
+    if not answered:
+        relay["status"] = "no_rank_answered"
+        relay["refusal"] = "relay_no_answer"
+        relay["reason"] = (
+            f"no rank answered the ask within {relay['wait_s']}s. "
+            + (f"These ranks have not answered: "
+               f"{', '.join(relay['ranks_pending'])}. "
+               if relay["ranks_pending"] else "")
+            + ("The rank set is unknown in this process (no capacity handshake "
+               "recorded), so nobody can say who is missing. "
+               if expected is None else "")
+            + f"a rank reads the channel on its step path at most once per "
+              f"{POLL_INTERVAL_SECONDS}s, and a step is dispatched by the loop this "
+              f"answer is running on, so a LONGER WAIT CANNOT HELP: read "
+              f'{{"op":"read-threads"}} after the engine takes its next steps - and '
+              f"this process's own pool did move, which `local` reports")
+        if counted:
+            _count("relay_no_answer", relay["reason"])
+        return relay
+    if refused:
+        relay["status"] = "answered_refused"
+        relay["refusal"] = "rank_refused"
+        relay["reason"] = (f"{len(refused)} rank(s) answered and refused: "
+                           + ", ".join(
+                               f"{rank} ({receipts[rank]['reason_kind']}: "
+                               f"{receipts[rank]['reason']})" for rank in refused[:4]))
+        if counted:
+            _count("rank_refused", relay["reason"])
+        return relay
+    if expected is None:
+        relay["status"] = "answered_unverifiable"
+        relay["reason"] = (f"{len(applied)} rank(s) applied the ask and none refused, "
+                           f"but the rank set is unknown in this process (no capacity "
+                           f"handshake recorded), so completeness CANNOT be claimed: "
+                           f"this is not the same answer as 'every rank applied it'")
+        return relay
+    if relay["ranks_pending"]:
+        relay["status"] = "partial"
+        relay["reason"] = (f"{len(applied)} of {len(expected)} rank(s) applied the "
+                           f"ask; these have not answered yet: "
+                           f"{', '.join(relay['ranks_pending'])}. "
+                           f"Read "
+                           f'{{"op":"read-threads"}} again after the engine takes '
+                           f"more steps: a rank polls at most once per "
+                           f"{POLL_INTERVAL_SECONDS}s and only while stepping, so "
+                           f"waiting here would only hold the loop that dispatches "
+                           f"those steps")
+        return relay
+    relay["status"] = "complete"
+    relay["reason"] = (f"every rank the handshake names ({len(expected)}) answered and "
+                       f"applied the ask, each proven by its own counters")
+    return relay
+
+
 def poll_spill_one(handler) -> dict:
-    """The engine-thread half of spill-one: at most one bounded control read, then
-    one rank's receipt. Bounded by time, the arm, and a configured directory."""
+    """The engine-thread half of BOTH relay channels: at most one bounded control read
+    each, then one rank's receipt. Bounded by time, the arm, and a configured
+    directory.
+
+    THE SIBLING BRANCH (0.2.67) IS THE SECOND HALF OF THIS FUNCTION, and it is in here
+    rather than in a poller of its own on purpose: `get_finished` is the engine's own
+    step-path call site, so a second poller would be a second file read on the step
+    thread AND a second interval to keep honest. Riding this one means the reader-count
+    ask inherits the arm gate and the `POLL_INTERVAL_SECONDS` budget exactly as the
+    spill ask does, and a boot that never uses the relay pays one failed `getsize`.
+    """
     if not config.diagnostics_dir() or not _may_touch_disk():
         _state["poll_suppressed"] = int(_state["poll_suppressed"]) + 1
         return _ok(polled=False, reason="no diagnostics dir, or the tier is not "
@@ -2550,6 +3509,16 @@ def poll_spill_one(handler) -> dict:
         _state["fallbacks"] = int(_state["fallbacks"]) + 1
         snapshot._error(exc, "disk_store spill-one poll")
         outcome["reason"] = f"poll raised {type(exc).__name__}"
+    # THE SIBLING BRANCH. Its own contained try/except, so a channel that raises cannot
+    # take the spill-one half's answer with it, and its own key in the outcome, so a
+    # caller can see the two verdicts separately.
+    try:
+        outcome["resize"] = poll_read_threads()
+    except Exception as exc:  # noqa: BLE001 - a control poll never breaks a step
+        _state["fallbacks"] = int(_state["fallbacks"]) + 1
+        snapshot._error(exc, "disk_store read-threads poll")
+        outcome["resize"] = {"polled": False, "adopted": False,
+                             "reason": f"poll raised {type(exc).__name__}"}
     return outcome
 
 
@@ -2592,10 +3561,22 @@ def _op_spill_one(body: dict) -> dict:
                               f"{checked_digest['reason']}"}
         fingerprint = checked_digest["value"]
     try:
-        wait_s = float(body.get("wait_s") or 3.0)
+        # `is None`, NOT a truth test: `body.get("wait_s") or 3.0` turned an explicit
+        # `wait_s: 0` ("write the ask and do not wait") into a 3-second block, which is
+        # the one value a caller is most likely to ask for on purpose. The `is None`
+        # shape is shared with `read-threads`; the WINDOW is deliberately not (see the
+        # note below and `_resize_wait_ceiling`).
+        raw_wait = body.get("wait_s")
+        wait_s = (SPILL_ONE_WAIT_SECONDS_DEFAULT if raw_wait is None
+                  else float(raw_wait))
     except (TypeError, ValueError):
         return {"ok": False, "reason": "wait_s must be a number"}
-    wait_s = max(0.0, min(30.0, wait_s))
+    # THE PRE-EXISTING WINDOW, named not narrowed: 30 s against a door that answers 504
+    # after `config.timeout_seconds()`, waited on the EngineCore loop thread, for an
+    # answer that can only arrive on a step that loop dispatches. `read-threads` fixed
+    # its own version of this (`RESIZE_WAIT_SECONDS_DEFAULT`, `_resize_wait_ceiling`);
+    # spill-one's is reported for a separate decision and pinned unchanged.
+    wait_s = max(0.0, min(SPILL_ONE_WAIT_SECONDS_MAX, wait_s))
     seq = _next_seq()
     now = time.time()
     record = {"version": PROTOCOL_VERSION, "role": ROLE, "op": "spill-one",
@@ -2673,12 +3654,13 @@ def _expected_ranks() -> tuple:
         return None, f"the rank set was unreadable: {type(exc).__name__}"
 
 
-def _read_receipt_file(path):
+def _read_receipt_file(path, limit=None):
+    limit = MAX_RECEIPT_FILE_BYTES if limit is None else limit
     try:
-        if os.path.getsize(path) > MAX_RECEIPT_FILE_BYTES:
+        if os.path.getsize(path) > limit:
             return None
         with open(path, "rb") as handle:
-            return json.loads(handle.read(MAX_RECEIPT_FILE_BYTES + 1).decode("utf-8"))
+            return json.loads(handle.read(limit + 1).decode("utf-8"))
     except Exception:  # noqa: BLE001 - a bad receipt is data, not a fault
         return None
 
@@ -4170,6 +5152,10 @@ def _op_status(_body: dict) -> dict:
                           "requests_written": int(_state["requests_written"]),
                           "poll_interval_seconds": POLL_INTERVAL_SECONDS,
                           "ttl_seconds": REQUEST_TTL_SECONDS},
+            # THE READER-COUNT RELAY (0.2.67), in the door an operator asks. Same keys
+            # here and in `section()`, so the verb and a rank file cannot disagree about
+            # whether anything was ever relayed on this boot.
+            "read_threads_relay": relay_section(),
             "hook": hook_section(include_fingerprint=False),
             "retained": retained_view()}
 
@@ -4622,6 +5608,136 @@ def _op_gpu_write(body: dict) -> dict:
             "gpu_write": disk_gpu_write.status()}
 
 
+def _op_read_threads(body: dict) -> dict:
+    """THE READER-THREAD COUNT: read this process's posture, or resize its pool.
+
+    `{"op":"read-threads"}` alone READS (`read_threads`: the count, where it came from,
+    the last ask, the refusal tally). `{"op":"read-threads","threads":6}` RESIZES - the
+    same grammar as `shadow`/`gpu-shadow`/`restore-verify`/`gpu-write` above: a key that
+    is PRESENT is an instruction, a key that is absent is a question, and a value that
+    is not an integer in `[1, disk_read.MAX_READ_THREADS]` is refused with
+    `nothing changed` and the accepted range named. The route refuses the same shapes
+    with a 400 before this op ever runs (`endpoint.ARG_SPECS`, whose bound is pinned
+    equal to the engine's by a test), so a bad number costs a caller a refusal twice
+    and never a moved pool.
+
+    WHY IT EXISTS: the count used to be `VLLM_E2_TIER_DISK_READ_THREADS` and nothing
+    else, and the only way to move it was an engine restart - downtime, and the
+    previous arm's counters wiped, so every comparison rested on a short window. Both
+    directions now work in one boot: a raise spawns the missing slots, a lowering sets
+    the live count and lets each surplus slot finish the read it is holding and exit at
+    its next poll (`disk_read.set_read_threads`). A shrink is therefore ASYNCHRONOUS,
+    and `resize.surplus_draining` says so at the instant of the ask instead of implying
+    a pool that has not changed yet.
+
+    TWO BOUNDARIES, SAID IN THE ANSWER, because a knob that quietly implies more reach
+    than it has is the failure shape this verb could ship:
+      * PER BOOT. `per_boot: true`, `survives_restart: false`. The launcher's env value
+        remains the boot-time source of truth and the `DISK[read]` announce line stays
+        the proof of what a boot was given; `read_threads.env_requested` keeps the
+        boot's ask even after a resize, and `read_threads.source` says who owns the
+        live count. This verb does not replace the launcher, and neither does the relay.
+      * PER PROCESS, RELAYED. The pool is process state, so the in-process call moves
+        exactly one pool - the process holding the engine call, which on a real boot is
+        the EngineCore and does not read a spill file at all. The WORKERS are reached
+        through `RESIZE_REQUEST_FILE`, the same request-file idiom `spill-one` exists
+        for, and every claim about them in the answer is a RECEIPT VERDICT rather than
+        an assumption: `relay.ranks_applied` lists only ranks whose own counters agree
+        with what they claim, `relay.ranks_refused` the ones that said no,
+        `relay.ranks_pending` the ones that have not spoken. Before 0.2.67 this verb
+        could only say "the ranks are unreachable"; the relay is what turned that
+        sentence into an action.
+      * THE WAIT IS POST-AND-RETURN. This handler runs on the EngineCore loop
+        thread and a rank polls the channel on a step that loop dispatches, so
+        waiting here waits on what it stops:
+        `RESIZE_WAIT_SECONDS_DEFAULT` is 0.0 and any `wait_s` is honoured only up
+        to `_resize_wait_ceiling()` - the door's own `config.timeout_seconds()`
+        minus `DOOR_MARGIN_SECONDS`, itself capped by a 1.0 s grace - with the
+        decision reported in `wait_requested` / `wait_capped` / `wait_cap.why`.
+        The flow is: post, serve, read. See `_finish_resize_relay` for the
+        statuses that carry it.
+    """
+    # `disk_restore` imports THIS module at its own module scope, so the cycle forces
+    # it to be reached lazily here. `disk_read` has no cycle and is lazy only to match
+    # every other engine module this door reaches: one dict lookup per call on a path
+    # an operator drives by hand.
+    from . import disk_read, disk_restore  # noqa: PLC0415
+    body = body if isinstance(body, dict) else {}
+    asked = "threads" in body
+    # THE LOCAL HALF FIRST, and it is the half that can be finished synchronously: this
+    # process either moved its pool or refused to. The relay then asks the SAME question
+    # of the ranks, through the same `set_read_threads`, so no second copy of the count
+    # exists anywhere to disagree with this one.
+    verdict = disk_read.set_read_threads(body["threads"]) if asked else None
+    posture = disk_read.threads_posture()
+    out = {"ok": True, "reason": None,
+           "read_threads": posture,
+           # `local` is a PROJECTION of the posture above (one computation, two names),
+           # because the axis this op lives on is "this process versus the ranks" and an
+           # operator comparing the two should not have to remember which of five keys
+           # inside a 20-key block holds the count.
+           "local": {key: posture.get(key) for key in
+                     ("configured", "alive", "surplus_draining", "source",
+                      "last_resize")},
+           "per_boot": True, "survives_restart": False,
+           "process": f"pid {os.getpid()}",
+           "scope": {"answered_by": f"pid {os.getpid()} (the process that answered "
+                                   f"this engine call)",
+                     "role": disk_restore.role_here(),
+                     "this_process_reads_spill_files": bool(
+                         disk_restore.worker_fitted_here()),
+                     "workers_reachable_over_this_door": True,
+                     "reach": ("the in-process call for THIS process, and the "
+                               f"{RESIZE_REQUEST_FILE} ask file for the workers - the "
+                               "same channel idiom `spill-one` uses, because a worker "
+                               "has no utility door to answer"),
+                     "pool_scope": "per process, relayed to every rank that polls",
+                     "note": ("a reader pool is PROCESS state, so THIS process was "
+                              "moved directly and every worker that polls the relay "
+                              "moves its own; `relay.ranks_applied` names the ranks "
+                              "that PROVED it from their own counters, "
+                              "`relay.ranks_pending` the ones that have not spoken, "
+                              "and each rank's own file publishes "
+                              "readers.configured / readers.threads_source / "
+                              "readers.last_resize as the fleet's witness.")},
+           "note": ("the resize applies to THIS PROCESS for THIS BOOT, and to every "
+                    "WORKER THAT POLLS the relay for its own boot: "
+                    f"{config.ENV_DISK_READ_THREADS} remains the boot-time source of "
+                    "truth and a restart restores it, while each rank file remains the "
+                    "witness of what that rank was actually running.")}
+    if asked:
+        out["resize"] = verdict
+    relay = (_resize_relay(body, asked=True,
+                           refused_local=not bool(verdict.get("ok")))
+             if asked else _resize_relay_read())
+    out["relay"] = relay
+    # THE COMPOSITION, in one place: the verb is `ok` when the local half succeeded AND
+    # the relay half has no blocking verdict. A relay that was merely not asked about
+    # (`not requested`), merely not waited on (`not yet answered`), or merely
+    # unverifiable (`answered_unverifiable`) does not fail a caller that did nothing
+    # wrong - but a
+    # relay that nobody answered, or that was refused, or that only half the ranks have
+    # answered, NEVER reports as a success.
+    problems = []
+    if asked and not bool(verdict.get("ok")):
+        problems.append(str(verdict.get("reason")))
+    # THE ONE EXCEPTION, and it is about intent. Two refusals describe a MISSING
+    # CAPABILITY rather than a failed ask: no diagnostics directory, or the tier
+    # unarmed. Either has a stated cause and a stated fix, and the local half of the
+    # call genuinely succeeded, so failing the whole verb would bury the number that DID
+    # move under a complaint about a number that could not be moved. A caller that ASKED
+    # for the ranks by name (`"ranks": true`) gets the failure it asked for - which is
+    # why this reads the body and not only the status. Every other relay failure
+    # (`relay_unwritable`, `relay_no_answer`, `rank_refused`) blocks unconditionally:
+    # those are asks that were made and did not land.
+    if asked and relay["status"] in RELAY_BLOCKING_STATUSES and not (
+            relay["refusal"] in RELAY_CAPABILITY_REFUSALS and "ranks" not in body):
+        problems.append(str(relay["reason"]))
+    out["ok"] = not problems
+    out["reason"] = " | ".join(problems) if problems else None
+    return out
+
+
 def _op_identities(body: dict) -> dict:
     """The OTHER SIDE OF THE DIFF: what the index believes, per rank, digests only.
 
@@ -4696,7 +5812,11 @@ _DISK_OPS = {"status": _op_status, "arm": _op_arm, "disarm": _op_disarm,
              # spill queue (0.2.66), the primitive behind a shutdown drain and behind
              # any caller that wants to know the backlog reached NVMe before it
              # proceeded.
-             "flush": _op_flush}
+             "flush": _op_flush,
+             # LAST, for the same in-order reason: the runtime reader-thread count
+             # (0.2.67). It is in `MUTATING_DISK_OPS`, so a GET that names it is a 405
+             # at the route and a refusal here.
+             "read-threads": _op_read_threads}
 
 
 def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG001 - the factory binds it as a method; see the docstring
@@ -5547,6 +6667,7 @@ def section() -> dict:
                           "fulfilled": int(_state["fulfilled"]),
                           "poll_interval_seconds": POLL_INTERVAL_SECONDS,
                           "ttl_seconds": REQUEST_TTL_SECONDS},
+            "read_threads_relay": relay_section(),
             "wiring": ("THE ENGINE CALLS THIS. `bind_connector_metadata` remembers "
                        "each step's (slot, block hash) pairs and `get_finished` spills "
                        "them when the store event completes; both compose with "

@@ -102,6 +102,22 @@ the file contract the proxy host's reader expects):
                                       positive integer means "the operator said
                                       nothing", i.e. one thread, and is reported in
                                       `read.threads.env_problems`.
+                                      THIS VALUE IS THE BOOT-TIME SOURCE OF TRUTH:
+                                      since 0.2.67 `POST
+                                      /plugins/kvtier/disk {"op":"read-threads",
+                                      "threads":N}` moves the count at runtime, in
+                                      both directions, and RELAYS the ask to the
+                                      worker ranks through `disk-read-threads.json`
+                                      (a worker answers no door, which is why
+                                      `spill-one` writes a request file - the relay is
+                                      the same idiom, its own channel). It is still
+                                      PER PROCESS and PER BOOT: a restart reverts every
+                                      rank to this variable, and `relay.ranks_applied`
+                                      is the only claim about who obeyed. Each rank
+                                      publishes `read.threads_source` (which of the two
+                                      owns the live count), `env_requested` (what the
+                                      launcher gave the boot) and `last_resize` in its
+                                      rank file.
   VLLM_E2_TIER_DISK_READ_BUFFER_BYTES the bounce-buffer pool's byte ceiling. UNSET
                                       = `disk_read.MAX_BUFFERS_BYTES` (96 MiB),
                                       today's value. INCREASING IT COSTS HOST RAM

@@ -65,6 +65,24 @@ is then the buffer's only owner, so cancel/finish and the reader can never both 
 the same buffer back to the pool (that was reachable with one thread and is more
 reachable with four; see `_handle_read`).
 
+THE COUNT IS A RUNTIME LEVER TOO (0.2.67), AND ONLY FOR THIS PROCESS
+--------------------------------------------------------------------
+`set_read_threads()` moves the reader count in place, up and down, repeatedly, from a
+dev verb - because moving it used to mean an engine restart (a couple of minutes down,
+the previous arm's counters wiped, every comparison left resting on a short window).
+Two boundaries come with it and both are published rather than implied:
+
+* PER BOOT. The override lives in this process's memory and dies at a restart; the
+  launcher's `VLLM_E2_TIER_DISK_READ_THREADS` stays the boot-time source of truth and
+  the `DISK[read]` announce line stays the proof of what a boot was given.
+  `threads_source` says which of the two owns the count right now.
+* PER PROCESS. A reader pool is process state, and the `/disk` door is answered by the
+  process that holds the engine call - a worker is unreachable over it, which is why
+  `spill-one` writes a request file a worker polls instead. So this verb moves ONE
+  process's pool, and the ranks that apply restores are usually not it. Each rank
+  publishes its own `readers.threads_configured` / `threads_source` / `last_resize` in
+  its rank file, and that is the only fleet-wide witness.
+
 Stdlib only. Bounded in every direction: one bounded queue, a bounded pool, a bounded
 thread count, a bounded arrival-order sample per batch. Threads are created lazily on
 the first accepted read (`disk_spill`'s discipline: nothing at import).
@@ -128,6 +146,13 @@ MAX_READ_THREADS = 16                 # a ceiling on that request, not a suggest
                                       # the box has 48 cores and four ranks, and a
                                       # reader that is not reading costs nothing, so
                                       # the cap only has to stop a typo
+# THE RESIZE REFUSAL VOCABULARY (0.2.67). A CLOSED set, deliberately NOT `REFUSALS`:
+# that tuple is the READ path's vocabulary (`buffer_cap`, `thread_dead`, ...) and is
+# mirrored by `disk_store` and by the rank file; a resize refusal counted in the same
+# dict would make `refused.bad_call` mean two different operator mistakes. These three
+# say what an operator did at a verb, and nothing else.
+RESIZE_REFUSALS = ("bad_type", "out_of_range", "in_progress")
+RESIZE_REASON_CHARS = 120             # CHARS of a resize reason kept in the record
 MAX_COMPLETION_ORDER = 512            # JOB IDS one batch may keep in completion order
 MAX_THREAD_REPORT = MAX_READ_THREADS  # SLOTS one report may name
 MAX_POOLED_BUFFERS = 256              # POOLED BUFFERS the free list may hold: an
@@ -239,6 +264,15 @@ _state: dict = {
     "recency_promotions": 0,
     "recency_promotions_throttled": 0,
     "recency_promotion_failures": 0,
+    # THE RUNTIME LEVER (0.2.67). `reader_threads_retired` counts surplus slots that
+    # exited on their own after a shrink - the number that proves a lowering actually
+    # happened rather than being a label on threads that kept polling. `resize_refused`
+    # is the refusal tally BY KIND (the closed `RESIZE_REFUSALS`), and `last_resize` is
+    # the last ASK: from, to, wall ts, ok, reason. A refusal is recorded too, because
+    # "the operator asked for 99 and was told no" is part of what this boot did.
+    "reader_threads_retired": 0,
+    "resize_refused": {kind: 0 for kind in RESIZE_REFUSALS},
+    "last_resize": None,
     "last_reason": None,
     "last_error": None,
     "last_path": None,
@@ -268,6 +302,20 @@ _slots: list = []            # slot -> per-thread witness dict, same bound
 _limits: dict = {}           # the resolved pool/thread limits in force
 _limits_resolved = False
 _thread_lock = threading.Lock()
+# THE RUNTIME COUNT (0.2.67). `_threads_override` is the count a verb asked for, or
+# None when the environment still owns it; `_reader_want` is the same number as the
+# reader LOOP sees it - a slot at or above it is surplus and exits at its next loop
+# top. Two names because they answer different questions: the override is POLICY (what
+# the operator asked for, which must survive every re-bind of `_ensure_thread`) and
+# `_reader_want` is LIFETIME (who may poll right now). Both are plain module ints, and
+# that is load-bearing: a reader thread reads `_reader_want` with no lock, so a resize
+# rebinds the name and never mutates anything in place.
+# `_resize_gate` is the single-flight token, acquired NON-BLOCKING: a second resize is
+# refused rather than queued, because a queue of pending resizes is a queue of
+# surprises on a serving box.
+_threads_override: int | None = None
+_reader_want = 0
+_resize_gate = threading.Lock()
 _notices: set = set()        # once-per-boot log lines, the repo's own idiom
 _logger = logging.getLogger("kvtier_dev_plugin.disk_read")
 
@@ -297,10 +345,14 @@ def reset_state_for_tests() -> None:
     or cancelled, so a test that wants a real shutdown still calls `stop_reader`.
 
     The limits are marked unresolved so the next `begin_batch` re-reads them from the
-    environment the next test actually set.
+    environment the next test actually set, and the RUNTIME RESIZE is dropped with them
+    (0.2.67): the override and the live reader count go back to None/0, so a fresh boot
+    is owned by the environment again exactly as a fresh process would be.
     """
     global _batches, _buffers, _queue, _reader_thread, _threads, _slots
-    global _limits, _limits_resolved
+    global _limits, _limits_resolved, _threads_override, _reader_want
+    _threads_override = None
+    _reader_want = 0
     with _state_lock:
         _batches = {}
         _buffers = []
@@ -321,6 +373,14 @@ def reset_state_for_tests() -> None:
             "completions_recorded": 0, "completions_out_of_order": 0,
             "recency_promotions": 0, "recency_promotions_throttled": 0,
             "recency_promotion_failures": 0,
+            # THE RUNTIME LEVER GOES BACK WITH THE REST OF THE BOOT (0.2.67). No
+            # override, no record, no tally - and `_reader_want` drops to 0 below, so a
+            # thread a previous boot left behind finds every slot surplus and retires.
+            # This is the assertion behind "the resize is per boot, and the launcher's
+            # env value is the boot-time source of truth".
+            "reader_threads_retired": 0,
+            "resize_refused": {kind: 0 for kind in RESIZE_REFUSALS},
+            "last_resize": None,
         })
         _limits = _default_limits()
         _limits_resolved = False
@@ -339,9 +399,15 @@ def reset_state_for_tests() -> None:
 
 
 def _default_limits() -> dict:
-    """Today's behaviour, as data: one reader, the pool it has always had."""
+    """Today's behaviour, as data: one reader, the pool it has always had.
+
+    `threads_source`/`threads_override` are here too, because a degraded resolution
+    (an environment that could not be read) must still ship the same key set as a
+    healthy one - a payload whose keys float is a payload every reader guesses at.
+    """
     return {"threads": DEFAULT_READ_THREADS,
             "threads_requested": None, "threads_clamped": False,
+            "threads_override": None, "threads_source": "env",
             "buffer_bytes": MAX_BUFFERS_BYTES,
             "buffer_bytes_requested": None, "buffer_bytes_clamped": False,
             "problems": []}
@@ -379,6 +445,18 @@ def _resolve_limits() -> dict:
         limits["buffer_bytes_requested"] = int(pooled)
         limits["buffer_bytes"] = max(1, min(MAX_BUFFERS_BYTES_CEILING, int(pooled)))
         limits["buffer_bytes_clamped"] = int(pooled) > MAX_BUFFERS_BYTES_CEILING
+    # THE RUNTIME OVERRIDE BEATS THE ENVIRONMENT (0.2.67), and this is the ONLY place
+    # it is applied. `_ensure_thread` re-reads this function on every bind, so putting
+    # the override here - rather than in `set_read_threads`, which would have to
+    # remember every future reader of `limits["threads"]` - is what makes a runtime
+    # count survive a re-bind instead of silently reverting to the boot value on the
+    # next step. `threads_requested` keeps the ENV's number: the boot's ask and the
+    # live count are different facts and both belong in a payload.
+    override = _threads_override
+    if override is not None:
+        limits["threads_override"] = int(override)
+        limits["threads"] = max(1, min(MAX_READ_THREADS, int(override)))
+        limits["threads_source"] = "verb"
     _limits = limits
     _limits_resolved = True
     _announce_limits(limits)
@@ -473,6 +551,12 @@ def counters() -> dict:
     out["threads_requested"] = limits["threads_requested"]
     out["threads_configured"] = int(limits["threads"])
     out["threads_clamped"] = bool(limits["threads_clamped"])
+    # WHERE THE COUNT CAME FROM (0.2.67). `threads_requested` stays the ENV's number,
+    # so a payload shows the boot's ask and the live count side by side instead of one
+    # having to overwrite the other.
+    out["threads_source"] = str(limits["threads_source"])
+    out["threads_override"] = limits["threads_override"]
+    out["resize_refusals"] = int(sum((out.get("resize_refused") or {}).values()))
     out["threads_alive"] = thread_alive_count()
     out["thread_alive"] = thread_alive()
     out["env_problems"] = list(limits["problems"])
@@ -813,8 +897,18 @@ def _ensure_thread() -> bool:
     life comes back on the next bind instead of silently reducing the reader count
     forever. `threads_alive` is refreshed on every call, so a payload's count is
     never older than the last batch that opened.
+
+    THE RUNTIME OVERRIDE IS WHY THIS RE-READ DOES NOT REVERT A RESIZE (0.2.67). The
+    `limits["threads"]` it reads has already had the verb's override applied to it by
+    `_resolve_limits`, so the number this re-read yields IS the live one. Reading the
+    environment here and the override somewhere else is the shape that would make a
+    runtime knob silently become the boot value on the next step.
     """
-    global _reader_thread, _queue
+    # THE `global` ON `_reader_want` IS NOT DECORATION: assigning it below without the
+    # declaration makes it a local for the whole function and this line an
+    # UnboundLocalError - the `global` shadowing class that has crashed this codebase
+    # twice (`test_global_shadowing.py`).
+    global _reader_thread, _queue, _reader_want
     with _thread_lock:
         _grow_witnesses()
         # THE QUEUE IS CREATED HERE, not by the threads. Every reader is handed the
@@ -839,6 +933,11 @@ def _ensure_thread() -> bool:
             _state["last_error"] = f"{type(exc).__name__}"[:MAX_STRING_CHARS]
             limits = _limits if _limits_resolved else _default_limits()
         wanted = max(1, min(MAX_READ_THREADS, int(limits["threads"])))
+        # PUBLISH THE LIVE COUNT BEFORE SPAWNING (0.2.67): a reader's surplus test is
+        # `slot >= _reader_want`, so a new slot spawned before this line would retire
+        # on its first loop top. `limits["threads"]` is where the runtime override is
+        # applied (`_resolve_limits`), which is why a resize survives this re-read.
+        _reader_want = int(wanted)
         alive = 0
         for slot in range(wanted):
             if not _slot_alive(slot):
@@ -957,6 +1056,213 @@ def throughput() -> dict:
                      "with one reader, ~N when N readers truly read together.")}
 
 
+def _read_threads_argument(value) -> tuple:
+    """(the count to apply, the refusal kind). Grammar only; the clamp is the caller's.
+
+    THE `bool` TEST COMES FIRST AND IS NOT PARANOIA: `bool` IS a subclass of `int` in
+    Python, so `isinstance(True, int)` is True and a verb that resized the reader pool
+    because a caller sent `true` would be a verb whose argument grammar nobody could
+    predict. A string is refused rather than coerced, too: the route's `int` rule has
+    already coerced a query string by the time an op runs, so a string reaching here
+    came through a door that did not validate it, which is a reason to refuse and not
+    to improvise.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, "bad_type"
+    if value < 1 or value > MAX_READ_THREADS:
+        return None, "out_of_range"
+    return int(value), None
+
+
+def _range_reason(value) -> str:
+    """The refusal text, naming the ACCEPTED RANGE. A refusal that does not say what
+    would have been accepted makes the operator guess at a verb on a serving box."""
+    return (f"threads must be an integer in [1, {MAX_READ_THREADS}], got "
+            f"{value!r} ({type(value).__name__}): nothing changed")
+
+
+def _resize_refused(kind: str, value, reason: str) -> dict:
+    """Count a refused resize, record it, and answer it. Changes nothing else.
+
+    The record is written for a REFUSAL too, and `to` carries the rejected value when
+    it was an int (`None` for a non-int, whose text is in `reason`): the question the
+    rank file has to answer afterwards is "what was this boot asked to do", and a
+    silently-dropped bad ask is the version of that question nobody can answer.
+    """
+    name = kind if kind in RESIZE_REFUSALS else "bad_type"
+    asked = (int(value) if isinstance(value, int) and not isinstance(value, bool)
+             else None)
+    text = str(reason)[:RESIZE_REASON_CHARS]
+    with _state_lock:
+        _state["resize_refused"][name] += 1
+        _state["last_reason"] = text
+        _state["last_resize"] = {"from": int(_limits_now()["threads"]),
+                                 "to": asked, "ts": round(time.time(), 6),
+                                 "ok": False, "reason": text}
+        record = dict(_state["last_resize"])
+    return {"ok": False, "reason": text, "reason_kind": name, "changed": False,
+            "from": record["from"], "to": asked, "configured": record["from"],
+            "alive": thread_alive_count(), "surplus_draining": 0, "spawned": 0,
+            "ceiling": MAX_READ_THREADS}
+
+
+def set_read_threads(value) -> dict:
+    """Make the reader pool this size, in THIS process, now, in both directions.
+
+    WHY BOTH DIRECTIONS NEED NEW MACHINERY, AND WHY ONE DIRECTION HAD IT BY ACCIDENT:
+    `_ensure_thread` re-reads the limit at every bind and spawns any slot below it that
+    is not alive, so raising a count was already reachable; nothing ever JOINED a
+    surplus slot, so a lowering was unreachable at all without a restart. A raise here
+    therefore spawns the missing slots. A lowering sets the live count and lets each
+    surplus slot notice at its next loop top - after the job it is holding has been
+    read, settled and its buffer returned (`_reader_loop`'s surplus exit). Nothing is
+    cancelled, nothing is waited for, and no job changes owner.
+
+    WHY IT NEVER WAITS ON A THREAD: this runs on a caller's thread, which on a worker
+    can be the engine's step thread. A `join()` on a reader parked inside a kernel read
+    would be a step that stops for the length of a file read, which is the one thing
+    this module's whole design forbids. So a shrink is ASYNCHRONOUS BY CONTRACT, and
+    the answer says so (`alive` and `surplus_draining` at the instant of the ask) and
+    the rank file shows the count coming down within one `READ_POLL_SECONDS`.
+
+    THE OVERRIDE BEATS THE ENVIRONMENT FOR THE REST OF THE BOOT, and the way that is
+    structurally guaranteed is that this function only sets `_threads_override`: the
+    count is applied inside `_resolve_limits`, the single place `_ensure_thread` reads
+    from on every bind. A future reader of `limits["threads"]` cannot miss it.
+
+    ONE RESIZE AT A TIME, REFUSED RATHER THAN QUEUED. The gate is acquired
+    non-blocking, so a concurrent ask gets an `in_progress` refusal in microseconds
+    instead of a second resize that could interleave with the first; and every exit
+    from the `try` releases the gate, because a leaked gate would brick this lever for
+    the rest of the boot.
+
+    THE ONE ASYMMETRY A SHREWD READER WILL SPOT, and the reason it is left alone: a
+    surplus slot exits at a loop top WITHOUT consuming a `_STOP` sentinel, so a
+    `stop_reader()` that raced a shrink can leave a sentinel nobody consumed. Its whole
+    cost is that the next respawned reader takes it and dies, and `_ensure_thread`
+    respawns that dead slot at the following bind - one wasted thread start, one short
+    `threads_alive` for one step, self-healing and never a lost job (a sentinel is not a
+    job, and a surplus exit never holds one). The pre-existing unpublished-reader exit
+    has always had the same shape. Do NOT "fix" it by draining the queue: a
+    `get_nowait`/`put_nowait` pair would move a real job from the head to the TAIL and
+    break the FIFO dispatch guarantee this module's whole ordering argument rests on.
+    """
+    global _threads_override, _reader_want, _queue
+    from . import config  # noqa: PLC0415 - config owns the env, this module must not
+    if not _resize_gate.acquire(blocking=False):
+        return _resize_refused("in_progress", value,
+                               "a resize is already in flight in this process: only "
+                               "one may run at a time, and this one was refused "
+                               "rather than queued")
+    try:
+        wanted, problem = _read_threads_argument(value)
+        if problem is not None:
+            return _resize_refused(problem, value, _range_reason(value))
+        with _thread_lock:
+            # The tables and the queue are built here for the same reason
+            # `_ensure_thread` builds them: a slot must exist before a thread can be
+            # published into it, and a thread handed no queue object would create one
+            # that `_state` never hears about. Inlined because `_get_queue()` takes
+            # `_thread_lock`, which this function already holds. THE `global _queue` ON
+            # THE DEF LINE IS WHAT MAKES THIS ASSIGNMENT NOT A SHADOW: without it the
+            # read above is an UnboundLocalError, the `global` class that has crashed
+            # this codebase twice.
+            _grow_witnesses()
+            if _queue is None:
+                _queue = queue.Queue(maxsize=MAX_QUEUE_DEPTH)
+            before = max(1, min(MAX_READ_THREADS, int(_limits_now()["threads"])))
+            _threads_override = int(wanted)
+            _resolve_limits()      # replaces the cache: every door now sees `wanted`
+            # PUBLISH THE LIVE COUNT BEFORE SPAWNING: a slot at or above `_reader_want`
+            # retires at its first loop top, so a new slot spawned before this line
+            # would exit as surplus the moment it was scheduled.
+            _reader_want = int(wanted)
+            spawned = 0
+            if wanted > before:
+                # A RAISE FILLS EVERY SLOT BELOW THE NEW COUNT, not just the ones above
+                # the old one. The `range(before, wanted)` shape looked right and was
+                # wrong on the realistic sequence "boot, POST the count, THEN serve":
+                # with no bind yet, slot 0 has no thread either, so a POST of 6 to an
+                # idle process reported `configured: 6, alive: 5` and stayed one short
+                # until traffic arrived. `_slot_alive` first keeps this from ever
+                # double-spawning a live slot, and it means a resize also repairs a
+                # slot whose thread died - the same contract `_ensure_thread` owns at a
+                # bind, reached one moment earlier.
+                for slot in range(wanted):
+                    if _slot_alive(slot):
+                        continue
+                    if _spawn_reader(slot):
+                        spawned += 1
+            alive = thread_alive_count()
+            _state["threads_alive"] = int(alive)
+            _state["thread_alive"] = bool(alive)
+            _state["last_resize"] = {"from": before, "to": int(wanted),
+                                     "ts": round(time.time(), 6), "ok": True,
+                                     "reason": None}
+            record = dict(_state["last_resize"])
+            _notice_once(f"resize:{before}->{wanted}",
+                         f"DISK[read] reader threads resized {before} -> {wanted} by "
+                         f"a dev request in pid {os.getpid()}. This is PER BOOT: the "
+                         f"boot value still comes from "
+                         f"{config.ENV_DISK_READ_THREADS} and a restart restores it.")
+        return {"ok": True, "reason": None, "reason_kind": None,
+                "changed": bool(wanted != before), "from": before,
+                "to": int(wanted), "configured": int(wanted), "alive": int(alive),
+                "surplus_draining": max(0, int(alive) - int(wanted)),
+                "spawned": int(spawned), "ceiling": MAX_READ_THREADS,
+                "record": record,
+                "note": ("a shrink is ASYNCHRONOUS: a surplus slot finishes the read "
+                         "it is holding and exits at its next poll, so `alive` can sit "
+                         "above `configured` for one `reader_poll_seconds` - that is "
+                         "the shrink landing, not a refusal of one")}
+    finally:
+        _resize_gate.release()
+
+
+def threads_posture() -> dict:
+    """The reader pool's posture: what it is, where that came from, what was last asked.
+
+    Built for the dev verb, and deliberately its own small shape rather than
+    `counters()`: a verb answer that a human reads should not carry a 40-key ledger, a
+    per-thread table and a buffer pool. Every field here has one question behind it -
+    `configured`/`alive` (is the pool I asked for the pool I have), `source`/`override`
+    (who owns the number), `env_requested` (what the launcher gave this boot, which a
+    resize does NOT overwrite), `last_resize`/`resize_refusals` (what was asked, and
+    how many times it was refused).
+    """
+    from . import config  # noqa: PLC0415 - config owns the env, this module must not
+    limits = _limits_now()
+    with _state_lock:
+        refused = dict(_state["resize_refused"])
+        record = (_state["last_resize"]
+                  if _state["last_resize"] is None else dict(_state["last_resize"]))
+        retired = int(_state["reader_threads_retired"])
+    configured = int(limits["threads"])
+    alive = thread_alive_count()
+    return {"configured": configured,
+            "alive": alive,
+            "surplus_draining": max(0, alive - configured),
+            "source": str(limits["threads_source"]),
+            "override": limits["threads_override"],
+            "env_requested": limits["threads_requested"],
+            "env_clamped": bool(limits["threads_clamped"]),
+            "env_var": config.ENV_DISK_READ_THREADS,
+            "default": DEFAULT_READ_THREADS,
+            "ceiling": MAX_READ_THREADS,
+            "reader_poll_seconds": READ_POLL_SECONDS,
+            "retired": retired,
+            "resize_refusals": int(sum(refused.values())),
+            "resize_refused": refused,
+            "last_resize": record,
+            "env_problems": list(limits["problems"]),
+            "note": ("`source` is `env` when the launcher's "
+                     f"{config.ENV_DISK_READ_THREADS} still owns this process's count "
+                     "and `verb` when a runtime resize does. A resize is PER BOOT and "
+                     "dies at a restart, and it is PER PROCESS: it does not replace "
+                     "the launcher, and the boot line plus `env_requested` remain the "
+                     "proof of what a boot was given.")}
+
+
 def _reader_loop(slot: int) -> None:
     """The drain loop. N of these exist and they are the only place a file is read.
 
@@ -973,6 +1279,31 @@ def _reader_loop(slot: int) -> None:
     """
     local = _get_queue()
     while True:
+        if slot >= _reader_want:
+            # THE SURPLUS EXIT (0.2.67), and the reason a SHRINK is possible at all.
+            # `_ensure_thread` spawns surplus slots at a raised limit but nothing ever
+            # joined them, so raising worked by accident and lowering was impossible
+            # without a restart. The exit is the SAME cooperative rule the unpublished
+            # reader already obeyed (see the `_witness is None` branch below): the
+            # thread notices at a loop top, after the job it was holding has been
+            # read, settled and its buffer returned, and then returns. So a shrink
+            # cannot abandon an in-flight read, and it cannot take the LAST reader
+            # either, because `set_read_threads` refuses a count below 1.
+            #
+            # WHY A FLAG AND NOT A `_STOP` SENTINEL: the sentinel is UNADDRESSED.
+            # A queue cannot hand an item to slot 7 specifically, so a sentinel posted
+            # for a surplus slot is a sentinel any reader may consume - including one
+            # the operator did not ask to stop. An addressed exit has to be a
+            # condition the slot reads about itself, which is what `_reader_want` is.
+            #
+            # Counted ONLY when `_witness(slot)` still recognises the caller: a thread
+            # left behind by `reset_state_for_tests()` sees `_reader_want` 0 and exits
+            # through here too, and its exit belongs to a boot that no longer exists -
+            # counting it would put a dead boot's retirement in a fresh boot's ledger.
+            if _witness(slot) is not None:
+                with _state_lock:
+                    _state["reader_threads_retired"] += 1
+            return
         try:
             job = local.get(timeout=READ_POLL_SECONDS)
         except queue.Empty:
@@ -1826,6 +2157,12 @@ def section() -> dict:
     snapshot_state["threads_configured"] = int(limits["threads"])
     snapshot_state["threads_default"] = DEFAULT_READ_THREADS
     snapshot_state["threads_clamped"] = bool(limits["threads_clamped"])
+    # WHERE THE COUNT CAME FROM (0.2.67), beside the count itself: `env` until a
+    # resize, `verb` after one, with the boot's own ask kept in `threads_requested`.
+    snapshot_state["threads_source"] = str(limits["threads_source"])
+    snapshot_state["threads_override"] = limits["threads_override"]
+    snapshot_state["resize_refusals"] = int(
+        sum((snapshot_state.get("resize_refused") or {}).values()))
     snapshot_state["env_problems"] = list(limits["problems"])
     snapshot_state["threads"] = thread_report()
     snapshot_state["throughput"] = throughput()
@@ -1870,6 +2207,11 @@ def section() -> dict:
     snapshot_state["concurrency"] = {
         "threads_configured": int(limits["threads"]),
         "threads_alive": int(snapshot_state["threads_alive"]),
+        # THE SOURCE, next to the two numbers it explains: `env` means the launcher's
+        # value, `verb` means an operator moved it in this process this boot.
+        "threads_source": str(limits["threads_source"]),
+        "surplus_draining": max(0, int(snapshot_state["threads_alive"])
+                                - int(limits["threads"])),
         "units_in_flight": int(snapshot_state["units_in_flight"]),
         "units_in_flight_peak": int(snapshot_state["units_in_flight_peak"]),
         "reader_starved_polls": int(snapshot_state["reader_starved_polls"]),
@@ -1895,6 +2237,10 @@ def section() -> dict:
     }
     snapshot_state["refused"] = dict(snapshot_state["refused"])
     snapshot_state["failed"] = dict(snapshot_state["failed"])
+    # A COPY, for the same reason as the two above: the payload must not hand out the
+    # live dict a later resize writes into.
+    snapshot_state["resize_refused"] = dict(
+        snapshot_state.get("resize_refused") or {})
     snapshot_state["caps"] = {
         "max_queue_depth": MAX_QUEUE_DEPTH, "max_batches": MAX_BATCHES,
         "max_jobs_per_batch": MAX_JOBS_PER_BATCH,
@@ -1925,6 +2271,10 @@ def section() -> dict:
         "thread_started": "reader threads this process has started",
         "thread_spawn_failures": "Thread.start() refusals",
         "reader_starved_polls": "polls that waited on an empty queue",
+        "reader_threads_retired": "surplus reader slots that exited after a runtime "
+                                  "shrink (0.2.67)",
+        "resize_refusals": "runtime resize asks refused, by the closed RESIZE_REFUSALS "
+                           "vocabulary",
         "units_in_flight": "reads inside the kernel right now",
         "units_in_flight_peak": "the most reads ever seen inside the kernel at once",
         "completions_recorded": "job answers given a completion sequence number",

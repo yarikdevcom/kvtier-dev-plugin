@@ -92,7 +92,7 @@ Nothing activates yet - see the switches below.
 | `VLLM_E2_TIER_DIAG_RANK` | pin this rank's id (`PP<n>_TP<m>`) instead of deriving it from the already-imported `vllm.distributed.parallel_state`. An illegal value means **no file at all**, because the reader refuses a file whose `rank` does not match its own name. |
 | `VLLM_E2_TIER_DISK_SETTLE_MS` | **how long one apply point may wait for the bytes it is about to apply, in milliseconds. Unset = `5000` since 0.2.32** (it was unset-means-never-wait through 0.2.31, which is why a default boot used to lose every raced read); `0` = never wait, and that is still reachable. It is a FLAT allowance - `min(SETTLE_MS, the load's own remaining deadline)` - and no arithmetic on bytes or throughput takes part in it; see *The restore race, measured, and the wait that stopped guessing* below. It is an allowance and NOT an arm - the restore path still needs the disk root, both arms, this boot's offer switch and a proven worker before it reads a byte. A value that will not parse falls back to the 5,000 ms default, says so in the log and on the payload (`env_problems`), and only that line names the variable that was ignored. |
 | ~~`VLLM_E2_TIER_DISK_SETTLE_READ_BYTES_PER_S`~~, ~~`VLLM_E2_TIER_DISK_PREFILL_TOKENS_PER_S`~~ | **DELETED in 0.2.32.** These two fed the settle formula (`SETTLE_READ_BPS_DEFAULT`, `PREFILL_TOKENS_PER_S_DEFAULT`, `SETTLE_SAFETY_MARGIN`, `SETTLE_MIN_MS` are gone with them); the rule is flat now, so there is nothing left for a throughput assumption to compute. Reading them is a no-op - they were guesses, and the box proved it. See *The restore race, measured, and the wait that stopped guessing*. |
-| `VLLM_E2_TIER_DISK_READ_THREADS` | **how many threads issue spill reads at once (0.2.24). Unset or `1` = ONE thread**, which is every boot before 0.2.24, byte-identically and pinned by a test. Clamped to `[1, 16]`; anything that is not a positive integer means "the operator said nothing" and is reported in `read.env_problems`. It is a thread count and nothing else - the queue stays FIFO, so dispatch order is submission order. **Raise the pool with it or it buys nothing on a big prompt**: in-flight bytes are bounded by the pool, not by the threads. See *Reading the spill in parallel*. |
+| `VLLM_E2_TIER_DISK_READ_THREADS` | **how many threads issue spill reads at once (0.2.24). Unset or `1` = ONE thread**, which is every boot before 0.2.24, byte-identically and pinned by a test. Clamped to `[1, 16]`; anything that is not a positive integer means "the operator said nothing" and is reported in `read.env_problems`. It is a thread count and nothing else - the queue stays FIFO, so dispatch order is submission order. **Raise the pool with it or it buys nothing on a big prompt**: in-flight bytes are bounded by the pool, not by the threads. Since 0.2.67 the count is *also* a runtime lever (`POST /disk {"op":"read-threads","threads":N}`), relayed to the worker ranks through `disk-read-threads.json` and still **per process and per boot** - so this variable remains the boot-time source of truth (a restart restores it on every rank), while `read.threads_source` says which owns the live count in a given process. See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | the bounce-buffer pool's byte ceiling, PER PROCESS. **Unset = `disk_read.MAX_BUFFERS_BYTES` = 96 MiB**, today's value, which holds **8** units of 11,468,800 B (7 of the 12,902,400 B width). This is what actually bounds in-flight work: a buffer is taken at *issue* and only returned at the apply point, so **one offer needs the pool to hold the whole offer at once** - and a big-prompt offer is 10 units, so the default misses it by two. **128 MiB (134217728) is the smallest setting that holds a whole 10-unit offer on both widths.** HOST-RAM COST: the pool is per process and every engine rank is a process, so 128 MiB here is 512 MiB of resident bytes on a 4-rank boot. Clamped at 8 GiB and says so (`pool.clamped`). See *Reading the spill in parallel*. |
 | `VLLM_E2_TIER_DISK_CEILING_BUDGET_SECONDS` | **how many seconds one capacity-enforcement pass may spend (0.2.29). Unset = `disk_spill.CEILING_PASS_BUDGET_SECONDS` = 1.5 s.** The pass runs on the spill WRITER thread - the only thing draining the 256-job / 256 MiB spill queue - and before this release its worst case (100,000 directory entries read twice, 20,000 `stat`s, up to 4,096 unlinks) was bounded in files but not in TIME, so a full store could stall the queue and DROP spills at the moment the disk was fullest. When the budget expires the pass stops early and says so (`spill.ceiling_measurement.deadline_hit`, `plan_truncated`), and the next committed spill continues - a partial pass is this tier's normal shape, not an error. **`0` is refused** (a pass that does nothing reads as a configured ceiling that is not one) and a value that will not parse means the shipped default, reported in `env_problems`. See *The eviction clock is a touch clock, and nobody's neighbour is capacity*. |
 | `VLLM_E2_TIER_DISK_EVICT_THREADS` | **how many threads `unlink()` at once inside one ceiling pass (0.2.29). Unset or `1` = ONE, the serial behaviour of every release before 0.2.29, and the shipped default.** Clamped to `[1, 8]`; the pool is built once per process (a restart is needed to change it, and `evict_pool.evict_threads_requested` beside `evict_threads_configured` shows when they disagree). It changes WHICH thread unlinks and nothing else: the plan is PARTITIONED by shard directory across the workers, so no path is ever attempted twice and the pass sheds the same files and bytes at 1 worker and at 4. **It defaults to 1 because parallel unlink measured ~38% SLOWER here** - see *The eviction clock is a touch clock*. |
@@ -1860,6 +1860,126 @@ case the offer path can reach. With N readers the queue drains N-at-a-time, whic
 *less* likely to bind, never more; `queue_depth_peak` and `refused.queue_full` are
 published so that claim can be checked instead of asserted.
 
+**Changing the reader count without a restart (0.2.67).**
+`POST /plugins/kvtier/disk {"op":"read-threads","threads":6}` moves the count in place,
+in **both** directions, as often as you like, in one boot. It exists because the only
+lever was `VLLM_E2_TIER_DISK_READ_THREADS`, and every move of 8 -> 16 -> 6 cost an engine
+restart: a couple of minutes down, the previous arm's counters wiped, and every
+comparison left resting on a short window. `{"op":"read-threads"}` alone **reads** the
+posture (the house grammar of every mutating `/disk` op: a key present is an
+instruction, a key absent is a question), and a `threads` that is not an integer in
+`[1, 16]` is refused at the wire with a 400 and again by the verb, naming the range and
+changing nothing; asking for the count the pool already has is an idempotent success;
+only one resize may be in flight, and a second is refused rather than queued.
+
+A **raise** spawns the missing slots. A **shrink is cooperative and therefore
+asynchronous**: a surplus slot finishes the read it is holding, settles it, returns its
+buffer, and exits at its next loop top - nothing is cancelled, no job changes owner, and
+`resize.surplus_draining` says how many slots have not exited yet (`configured` 1 with
+`alive` 4 for one `reader_poll_seconds` is a shrink landing, not a shrink refused). The
+exit is a condition the slot reads about itself (`slot >= _reader_want`) and **cannot**
+be a `_STOP` sentinel, because a sentinel is unaddressed: a queue cannot hand an item to
+slot 7 specifically, so a sentinel posted for a surplus slot is one any reader may
+consume - including one nobody asked to stop. `_ensure_thread` re-reads the limit at
+every bind, so the override is applied inside `_resolve_limits` (the single place that
+read goes through), which is what makes the count survive a re-bind instead of reverting
+to the boot value on the next step - pinned by `test_the_runtime_count_survives_a_re_bind`.
+
+**Two boundaries, and the verb says both in its own answer.** PER BOOT: a restart
+restores the launcher's environment, `read_threads.env_requested` keeps what the boot
+was given, `read_threads.source` is `env` or `verb`, and the `DISK[read]` announce line
+stays the proof of what a boot was given - this verb does not replace the launcher, and
+neither does the relay. PER PROCESS, RELAYED: a reader pool is process state, and this
+door is answered by the process that holds the engine call - on a real boot the
+EngineCore, which **never reads a spill file**. A worker is reachable by no door (that is
+why `spill-one` writes a request file a worker polls), so 0.2.67 relays the ask the same
+way, over its own file, and the ranks that apply restores are the processes it matters to
+reach.
+
+**The relay, and why a receipt is a proof rather than an acknowledgement.** The ask goes
+into `disk-read-threads.json` in the diagnostics directory - a SECOND channel, never
+`spill-one`'s, because a spill ask is an event and a resize ask would silently overwrite
+a pending one; each reader requires its own `role`/`op`, so a record from the other
+channel is malformed data and never an instruction. A newer ask SUPERSEDES an unanswered
+older one (the opposite of `spill-one`'s refusal to share, and right for a statement
+about a count). A worker picks it up on the `get_finished` poll, under the same arm gate
+and the same `POLL_INTERVAL_SECONDS` budget - **no new poller, thread or timer**, and on
+a boot that never uses the relay the branch costs one failed `getsize` per poll.
+
+The worker calls the SAME `set_read_threads` the in-process verb calls, so there is no
+second copy of the count that a later bind could disagree with, and then writes
+`disk-read-threads-receipt-<rank>.json` carrying **its own live counters read back after
+the apply** (`configured`, `alive`, `surplus_draining`, `threads_source`). The caller does
+not believe `refused: false`: it re-derives the verdict from those numbers, so a receipt
+whose count does not equal the count it was asked for is reported `applied: false` with
+the contradiction named. That is the difference between "a rank received it" and "a rank
+applied it", and only the second one is counted.
+
+`relay.status` is one of eight named answers, and the two that exist to refuse to lie are
+`not yet answered` (the default — nothing is claimed because nothing was waited for) and
+`answered_unverifiable` (ranks applied it and none refused, but no capacity handshake was
+recorded in this process, so nobody can say who is missing - it is NOT the same answer as
+`complete`). `ranks_answered`, `ranks_applied`, `ranks_refused` and `ranks_pending` split
+the fleet four ways, and a rank that never spoke is kept apart from a rank that answered
+`no`. `ok` is false whenever an ask was made and did not land (`no_rank_answered`,
+`answered_refused`, `partial`) - **never a success that means "nobody saw it"** - with one
+exception: a relay that could not be attempted at all (`no_channel`, `not_armed`) reports
+its refusal without failing a call whose local half succeeded, unless you asked for the
+ranks by name with `"ranks": true`, which gets the failure it asked for. A process with no
+rank id (the asker) writes no receipt, so it can never answer its own ask.
+
+**THE WAIT POLICY, and why the default is zero.** `/disk` dispatches this verb on the
+EngineCore loop thread, and a rank reads the relay channel on its **step path** — a step
+the same loop dispatches. So a wait in this handler waits on the very thing it is
+stopping, and each second of it is serving that is not happening. (The first production
+resize proved it: `no_rank_answered` at exactly the 3.0 s default, with every receipt
+already on disk microseconds later.) Hence:
+
+- **`wait_s` defaults to 0** — the ask is posted, the call returns at once with
+  `ranks_pending` naming the silence, and a later `{"op":"read-threads"}` read of the
+  receipts finishes the story. That read is the flow, not a fallback.
+- **A wait is capped to the door's own budget** minus a margin, derived from
+  `config.timeout_seconds()` (`_resize_wait_ceiling()`) — not a second hardcoded number,
+  which is exactly how a 30 s ceiling came to sit against an 8 s door and answer
+  `504 engine did not answer within 8.0s` over a resize all four ranks had applied.
+  On top of that it is capped to a 1.0 s **grace**, the most a wait can ever be worth
+  here: it can only catch a rank whose step was already in flight when the ask landed.
+- **The cap is reported, never applied silently**: `wait_requested`, `wait_s` (what was
+  honoured), `wait_capped` and `wait_cap.{requested,honoured,ceiling,why}`, plus
+  `door_budget_seconds` / `wait_ceiling_seconds` so the numbers behind the decision are
+  readable from the answer rather than from the source.
+
+```bash
+# READ the posture of the process that answers, plus who has answered the last ask
+# (the read never relays: the channel carries instructions, and a rank's own count is
+# already in its rank file):
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads"}' $B/disk
+# RAISE or LOWER it, as often as you like, in one boot. `threads` outside [1, 16],
+# or not an integer, is a 400 at the wire and a refusal here, and it changes nothing:
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":16}' $B/disk
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6}' $B/disk
+# ASK the fleet to move. The default posts the ask and returns at once (`wait_s: 0`),
+# because a wait here holds the loop that dispatches the steps the ranks need to poll on.
+# Read the receipts back with the plain `read-threads` call above:
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6}' $B/disk
+# the same request as a query string works too (POST honours BOTH halves):
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" "$B/disk?op=read-threads&threads=6"
+# `wait_s` (integer seconds) is accepted up to the wire's 30 but HONOURED only up to the
+# door's budget minus a margin, and to a 1.0 s grace, and the answer says what it did
+# (`wait_capped`, `wait_cap.why`). Ask for 15 and you get the cap in the response, not a
+# 504 over a resize that worked. `ranks: false` skips the workers and says so;
+# `ranks: true` makes an impossible relay fail the call:
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6,"wait_s":15}' $B/disk
+curl -s -X POST -H "x-kvtier-dev-token: $TOK" -d '{"op":"read-threads","threads":6,"ranks":false}' $B/disk
+# and what each WORKER is actually running is its own rank file, not this answer:
+#   readers.configured / readers.threads_source / readers.last_resize
+```
+
+A partial answer is normal on a busy box and is reported as such: it names the ranks that
+have not answered, and reading `{"op":"read-threads"}` again later finishes the story,
+because the receipts on disk are the record and the ask they belong to is named by the ask
+file rather than by one process's memory of writing it.
+
 **What to read on the next live run**, all of it under `restore.read`:
 
 | field | the question it answers |
@@ -1872,7 +1992,7 @@ published so that claim can be checked instead of asserted.
 | `pool.held_bytes` / `peak_bytes` / `headroom_bytes` / `units_of_11468800` | was the pool the limit, and how many units could it ever hold? || `pool.measured_unit_bytes` / `units_of_measured_unit`, `concurrency.threads_useful_max` | the unit size this boot actually read and the thread count that pool could feed - `threads_configured` above this number is dead weight, and the field says so instead of a reader doing the division |
 | `refused.buffer_cap` / `reader_starved_polls` / `concurrency.starved_on` | **starved on buffers** vs **starved on queue** vs (neither) - i.e. disk-bound |
 | `units_in_flight_peak`, `queue_depth_peak` | the high-water marks for the whole boot |
-| `disk_restore.worker_report()["readers"]` (rank file) | the same five facts from the only process that actually reads: `configured`, `alive`, `peak_units`, `starved_polls`, `buffer_refusals`, `out_of_order` |
+| `disk_restore.worker_report()["readers"]` (rank file) | the facts from the only process that actually reads: `configured`, `alive`, `peak_units`, `starved_polls`, `buffer_refusals`, `out_of_order`, the three recency-promotion counters, **the three rates** (`bytes_per_reader_second`, `bytes_per_second_wall`, `parallel_efficiency`), and since 0.2.67 `threads_source` / `last_resize` / `resize_refusals`. The rates were added because the rank file carried the *inputs* to a throughput arithmetic and not the arithmetic: deriving a rate from `bytes_per_file x reads / (read_seconds_avg x threads)` silently assumes every configured thread stayed busy, which is the one thing `parallel_efficiency` exists to falsify |
 | `disk_restore.worker_report()["spans"]` (rank file) | `seen` / `whole` / `partial` / `empty` / `hole_in_middle`, the span shape of what survived the apply point |
 
 **The lock discipline, kept with N threads.** `_state_lock` is a plain (non-reentrant)

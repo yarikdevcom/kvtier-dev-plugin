@@ -421,7 +421,11 @@ ARG_SPECS: dict[str, dict] = {
                                           # test and this enum is derived from the same
                                           # tuple: `flush` waits BOUNDED for this
                                           # process's spill queue (0.2.66).
-                                          "flush")},
+                                          "flush",
+                                          # LAST, for the same reason: the runtime
+                                          # reader-thread count (0.2.67), whose own
+                                          # argument is the `threads` rule below.
+                                          "read-threads")},
                         # `op=flush` (0.2.66): how long the caller is willing to wait
                         # for the spill queue. Bounded at the ceiling the ENGINE
                         # enforces (`disk_spill.FLUSH_BUDGET_SECONDS_MAX`) for the
@@ -462,6 +466,40 @@ ARG_SPECS: dict[str, dict] = {
                         "which": {"kind": "str", "max_chars": 16},
                         "fingerprint": {"kind": "str", "max_chars": 32},
                         "seconds": {"kind": "int", "min": 1, "max": 7200},
+                        # `op=read-threads` (0.2.67): how many spill-reader threads THIS
+                        # process should run. The bound is pinned equal to the ENGINE's
+                        # (`disk_read.MAX_READ_THREADS`, default 1) for the standing
+                        # reason on this route: a wire bound looser than the engine's
+                        # only moves the refusal to a place where it reads as a verb
+                        # bug, and a tighter one lies about what the verb can do. The
+                        # floor is 1 and is not negotiable at either layer: a pool of 0
+                        # readers is the `thread_dead` refusal path, so a typo must not
+                        # be able to stop every later restore in this process.
+                        "threads": {"kind": "int", "min": 1, "max": 16},
+                        # `op=read-threads` (0.2.67), the RELAY half. `ranks: false`
+                        # asks the local process only. `wait_s` is how long the handler
+                        # will sit before answering, and for read-threads THE DEFAULT IS
+                        # ZERO (post the ask, return, read the receipts later) because
+                        # this handler runs ON THE ENGINECORE LOOP THREAD while the
+                        # answer can only arrive on a step that same loop dispatches - a
+                        # wait waits on what it is stopping, and every second of it is
+                        # serving not happening. The wire bound stays the [0, 30] window
+                        # `spill-one` has always offered, because this key is shared by
+                        # both ops and narrowing it would remove spill-one's reachable
+                        # range; read-threads clamps the number IT honours to the door's
+                        # own budget (`_disk_relay._resize_wait_ceiling()`, derived from
+                        # `config.timeout_seconds()` minus a margin) and says so in
+                        # `relay.wait_cap`, since a wait that outlives
+                        # `asyncio.wait_for` at `endpoint.py:315` answers 504 over a
+                        # resize every rank has already applied. Reported as
+                        # PRE-EXISTING and NOT changed here: `spill-one` still offers
+                        # its full 30 s against that same door, on that same thread,
+                        # with that same self-deadlock, and its default is 3.0 s of
+                        # sleep. `wait_s` also makes `spill-one`'s own engine-side
+                        # window reachable from the wire, which it never was: absent
+                        # from this spec, and an unknown key is a 400.
+                        "ranks": {"kind": "bool"},
+                        "wait_s": {"kind": "int", "min": 0, "max": 30},
                         "limit": {"kind": "int", "min": 1, "max": 200},
                         # `op=offers` and `op=authority`: this boot's two disk
                         # switches. A real boolean, validated here so a typo is a 400
@@ -1407,8 +1445,9 @@ async def route_disk_post(request: Request):
     """THE SSD SPILL TIER - write path and restore path, arm-gated, off by default.
 
     `{op: status|arm|disarm|spill-one|ls|contains|offers|authority|failures,
-    identities, slot?, key?, fingerprint?, seconds?, limit?, shard?, after?, rank?,
-    which?, enabled?}` - `op=identities` (0.2.46) is the paged, digest-only enumeration
+    identities, read-threads, slot?, key?, fingerprint?, seconds?, limit?, shard?,
+    after?, rank?, which?, enabled?, threads?}` - `op=identities` (0.2.46) is the paged,
+    digest-only enumeration
     of what the index believes PER RANK (`after` is its cursor, `rank` and `which` the
     filters), the other half of the diff against `op=ls`. KV slots evicted from
     the RAM tier are spilled to
@@ -1511,6 +1550,26 @@ async def route_disk_post(request: Request):
         and `rank` are rank-local. A non-empty `fingerprint` that disagrees with a
         rank's own digest is a counted `fingerprint_mismatch` refusal for that rank,
         never a silent override.
+      * `read-threads` (0.2.67) reads or resizes the SPILL-READER THREAD COUNT of
+        the process that answers: `{"op":"read-threads"}` alone answers the posture,
+        `{"op":"read-threads","threads":6}` moves it, in both directions, in one boot,
+        instead of costing an engine restart. It is MUTATING and POST-only for the
+        same reason as the four latching ops above - it starts and stops threads. A
+        shrink is cooperative and therefore ASYNCHRONOUS: a surplus slot finishes the
+        read it is holding and exits at its next poll, so `resize.surplus_draining`
+        says what has not happened yet. `threads` outside `[1,
+        disk_read.MAX_READ_THREADS]`, or not an integer, is a 400 at the wire and a
+        refusal here, and it changes nothing. TWO BOUNDARIES, both in the answer:
+        per BOOT (a restart reverts to `VLLM_E2_TIER_DISK_READ_THREADS`, which stays
+        the boot-time source of truth) and per PROCESS - and since 0.2.67 the workers
+        ARE reached, by a relay of their own (`disk-read-threads.json`, a second channel
+        because a resize must never overwrite a pending `spill-one` ask), so
+        `relay.ranks_applied` lists the ranks whose OWN counters prove they moved,
+        `relay.ranks_pending` the ones that have not answered, and `scope
+        .this_process_reads_spill_files` still says whether the process you resized
+        directly is one that ever reads a spill file at all. Each rank publishes
+        `readers.configured` / `readers.threads_source` / `readers.last_resize` in its
+        own rank file.
       * `ls` is read-only and bounded (`limit` <= `disk_store.MAX_LS_FILES`, plus a
         response-byte ceiling that trims and SAYS so); `status` reports this
         process's own counters and the wiring's state, and `ls` is what walks the
