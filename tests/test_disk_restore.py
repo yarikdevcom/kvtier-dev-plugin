@@ -1915,6 +1915,182 @@ def test_a_worker_attested_read_counts_even_with_the_scheduler_at_zero(armed):
     assert evidence["source"] == "worker rank file"
 
 
+def _rank_file(directory, section: dict, rank="PP0_TP0") -> None:
+    """One worker's rank file, stamped NOW, carrying the section the test names.
+
+    THE SECOND TRANSPORT, as a worker leaves it: `worker_diag` writes this file on the
+    heartbeat and on steps, and `_rank_file_proves_restore` refuses one that is not
+    freshly stamped. `reads_applied` is the worker's own boot counter and
+    `applied_slots` the slots behind it (0.2.60), so a file naming both is a worker
+    attesting a read it really applied.
+    """
+    document = {"version": 1, "epoch": "aabbccdd", "ts": round(time.time(), 6),
+                "role": "worker", "rank": rank, "arena": {}, "counters": {},
+                "writer": {"epoch_scope": "process"}, "disk_restore": section}
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"rank-{rank}.json").write_text(json.dumps(document))
+
+
+def _a_boot_that_adopted_one_load(**counters) -> None:
+    """The witness's input state for an adoption that reported, with nothing else.
+
+    Set directly because the fault this pins is in the VERDICT, not in the ledger: what
+    a reader needs pinned is that a boot whose counters say "one load was adopted and
+    one load reported disk bytes back" is judged on the read evidence that EXISTS, in
+    whichever process published it.
+    """
+    disk_restore._state["sched_fitted"] = True
+    for name, value in counters.items():
+        disk_restore._state[name] = value
+
+
+def test_a_restore_the_cached_transport_could_not_see_is_still_confirmed(armed):
+    """THE 13:24 COLD BOOT, as a regression: `REFUTED reads_applied=0` on a restore
+    whose worker had applied 228 reads, minutes before the same rank files said so.
+
+    The witness fires on events (the end of an offer, the end of a completion batch),
+    and it computed its read evidence from `_state["ranks_reads_applied"]` - whatever
+    the LAST `worker_proof()` read left behind. The scheduler never reads a file itself,
+    the worker's counter crosses the process boundary only through a rank file written
+    on cadence, and `note_reported` had ALREADY proved this very load from that file
+    (`applied_read_evidence_for` reads it fresh) while the boot-wide view the verdict
+    used was still reading zero. Two readers of one file, one verdict, one lie: the
+    request reused 110,592 of 110,888 prompt tokens on a box that had just cold-booted,
+    so those bytes came off NVMe and the line said nothing had been read.
+
+    The witness now consults the live transport when every cached source says zero, so
+    the evidence that the completion path could see, the verdict can see.
+    """
+    fill(armed, blocks=1)
+    manager = Manager(reqs_to_load={"req-1": object()})
+    offer(manager, Req(request_id="req-1", blocks=1))
+    slots = merged_cpu(manager)
+    disk_restore.build_load_paths(manager, Meta(load_event=1, cpu=slots,
+                                                gpu=list(range(len(slots))),
+                                                reqs={1: ["req-1"]}))
+    _rank_file(config.diagnostics_dir(),
+               {"installed": True, "armed": True, "worker_fitted": True,
+                "reads_applied": 228, "applied_slots": slots[:8]})
+    output = fakes_debug.Obj(name="KVConnectorOutput", finished_recving={"req-1"},
+                             finished_sending=set())
+    # The worker's read reached a CPU slot: the completion is a restoration, proved
+    # per-load from the rank file's applied-slot window.
+    assert disk_restore.note_reported(manager, output)["restorations"] == 1
+    # And BOTH of this process's own counters are still 0, because a scheduler has no
+    # fingers - which is exactly the state the old verdict pronounced REFUTED.
+    assert disk_restore._state["reads_applied"] == 0
+    assert disk_restore._state["disk_reads_applied"] == 0
+    view = disk_restore.witness_verdict()
+    assert view["verdict"] == "CONFIRMED", view["reason"]
+    assert view["reads_applied"] == 228, "the worker's attested reads ARE the evidence"
+    assert "worker rank file" in view["reads_from"]
+    line = disk_restore.witness_line()
+    assert "verdict=CONFIRMED" in line and "reads_applied=228" in line
+    assert "adopted_without_a_read" not in line, \
+        "a healthy boot must never be told its restore was not a restore"
+
+
+def test_a_boot_with_no_read_in_either_transport_is_still_refuted(armed):
+    """THE FAULT THE WITNESS EXISTS FOR, kept: an adoption, a report, and no read.
+
+    A fix that made the witness polite would be worse than the bug: the 2026-10-05
+    livelock (`verdict=CONFIRMED reads_applied=0`, 8,244 times, zero disk bytes served)
+    is only catchable because REFUTED is cheap to believe. So the genuinely-broken
+    shape - slots adopted, a load reported finished, and BOTH transports (this process
+    and the live rank files, which are here and say `reads_applied: 0`) reporting
+    nothing - still has to come out REFUTED, with the reason naming the missing read.
+    """
+    _rank_file(config.diagnostics_dir(),
+               {"installed": True, "armed": True, "worker_fitted": True,
+                "reads_applied": 0})
+    _a_boot_that_adopted_one_load(offers=1, adopted=1, restorations=1)
+    view = disk_restore.witness_verdict()
+    assert view["verdict"] == "REFUTED"
+    assert view["kind"] == "adopted_without_a_read", view["reason"]
+    assert view["reads_applied"] == 0
+    line = disk_restore.witness_line()
+    assert "verdict=REFUTED" in line and "reads_applied=0" in line
+    assert "reason=adopted_without_a_read" in line
+
+
+def test_a_refuted_about_reads_stamps_what_it_asked_and_when(armed):
+    """The line that says "no read has EVER been applied" says how it knows.
+
+    The same witness has now printed a CONFIRMED that outran its evidence (2026-10-05)
+    and a REFUTED that outran it (the 13:24 cold boot), and both times the line read as
+    a claim about the BOOT when it was a claim about one instant. A zero is still a
+    verdict - see the test above - but it is a timestamped one: the reason names the
+    live read behind it, the count that read returned, and how many rank files answered.
+    The stamp sits EARLY in the reason because the line clips it to
+    `MAX_BOOT_LINE_CHARS`, and it adds no colon before the category's own, so the
+    dedupe key cannot move with it.
+    """
+    _rank_file(config.diagnostics_dir(),
+               {"installed": True, "armed": True, "worker_fitted": True,
+                "reads_applied": 0})
+    _a_boot_that_adopted_one_load(offers=1, adopted=1, restorations=1)
+    reason = disk_restore.witness_verdict()["reason"]
+    assert reason.startswith("adopted_without_a_read:")
+    assert "rank transport read for this line" in reason, reason
+    assert "0 applied read(s) over 1 live rank file(s)" in reason, reason
+
+
+def test_the_witness_reads_the_rank_transport_once_per_floor_not_once_per_verdict(
+        armed):
+    """The fresh read is bounded, counted, and only taken when every source says zero.
+
+    The witness rides the scheduler's step path (`offer`, `note_reported`) on a box
+    serving real traffic, so closing the cadence lag may not put an unbounded file read
+    there: one read per `WITNESS_RANK_READ_MIN_SECONDS`, at most
+    `MAX_RANK_FILES_PROBED` byte-capped files, and none at all once evidence exists - a
+    boot that already has a read never pays for the lookup, and the boot-wide question
+    asked by the PER-LOAD predicate keeps using its own throttled reprobe
+    (`fresh=False`, `APPLIED_SLOT_REPROBE_MIN_SECONDS`).
+    """
+    _a_boot_that_adopted_one_load(offers=1, adopted=1, restorations=1)
+    for _ in range(10):
+        disk_restore.witness_verdict()
+    assert disk_restore.counters()["witness_rank_reads"] == 1, \
+        "10 verdicts, one live read: the floor is what keeps the witness cheap"
+    # A boot WITH evidence pays nothing at all: the cached sources answer, no read runs.
+    disk_restore._state["reads_applied"] = 3
+    before = disk_restore.counters()["witness_rank_reads"]
+    for _ in range(5):
+        disk_restore.applied_reads_evidence()
+    assert disk_restore.counters()["witness_rank_reads"] == before
+    # And the per-load fallback's boot-wide question never asks live, whatever the
+    # counters say: that path's rank reads belong to its own throttle.
+    disk_restore._state["reads_applied"] = 0
+    disk_restore._state["disk_reads_applied"] = 0
+    disk_restore._state["ranks_reads_applied"] = 0
+    for _ in range(5):
+        disk_restore.applied_reads_evidence(fresh=False)
+    assert disk_restore.counters()["witness_rank_reads"] == before
+
+
+def test_the_read_stamp_cannot_move_the_dedupe_key(armed, caplog):
+    """One verdict, one line - even when the stamp's numbers move every time.
+
+    The flood fix keyed the witness on `(verdict, kind)` after keying it on the line put
+    it in the log 1,048 times a second. A stamp that quoted an age would re-issue a
+    "changed" verdict every read the way `offered_tokens` did, so `kind` - the text
+    before the first colon - must be stamp-proof. Forcing the throttle to expire between
+    emissions makes the stamp's age change on purpose and demands one line anyway.
+    """
+    _a_boot_that_adopted_one_load(offers=1, adopted=1, restorations=1)
+    with caplog.at_level(logging.WARNING,
+                         logger="kvtier_dev_plugin.disk_restore"):
+        for _ in range(6):
+            disk_restore._witness_rank_reads["mono"] = (
+                time.monotonic() - disk_restore.WITNESS_RANK_READ_MIN_SECONDS - 1.0)
+            disk_restore.emit_witness()
+    lines = [record.getMessage() for record in caplog.records
+             if "restore-witness" in record.getMessage()]
+    assert len(lines) == 1, f"6 verdicts emitted {len(lines)} lines: the stamp moved"
+    assert disk_restore.counters()["witness_kind"] == "adopted_without_a_read", \
+        "the dedupe key is the reason's NAME, and the stamp must not move it"
+
+
 def test_the_witness_is_not_re_emitted_while_the_verdict_is_unchanged(armed, caplog):
     """THE FLOOD FIX: the dedupe key is (verdict, reason), not the whole line.
 

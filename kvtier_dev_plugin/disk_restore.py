@@ -1184,6 +1184,22 @@ MAX_APPLIED_SLOTS_PUBLISHED = 32     # ...of those, how many cross the rank file
 MAX_APPLIED_SLOTS_MATCHED = 1024     # CPU slots of ONE load the evidence may scan
 APPLIED_SLOT_REPROBE_MIN_SECONDS = 1.0  # SECONDS between the fresh rank-file reads the
                                        # completion path is allowed to ask for
+# THE WITNESS'S OWN FRESH READ OF THE RANK TRANSPORT. `ranks_reads_applied` is
+# whatever the LAST proof read left behind (`worker_proof`, cached
+# `PROOF_CACHE_SECONDS`) and a rank file is rewritten on cadence, so at the instant a
+# verdict is computed the boot can have applied 228 reads while the cached transport
+# still says 0 - the shape that pronounced a healthy cold boot `verdict=REFUTED
+# reason=adopted_without_a_read`. One bounded read (`MAX_RANK_FILES_PROBED` files, each
+# capped at `MAX_RANK_FILE_BYTES`, and only when every cached source says zero) closes
+# that lag; the floor keeps it off the step path. 1.0 s is the budget this module
+# already spends on the same eight byte-capped files twice over
+# (`PROOF_CACHE_SECONDS` for the offer gate, `APPLIED_SLOT_REPROBE_MIN_SECONDS` for the
+# completion reprobe), so the witness asks no more of the filesystem than the gate does
+# - and the walk the completion path already makes feeds the transport for free on the
+# way past (`_note_rank_reads_seen`), so a verdict about the load that path just judged
+# does not depend on this floor at all.
+WITNESS_RANK_READ_MIN_SECONDS = 1.0  # SECONDS between live reads of the rank files
+                                     # made for a VERDICT
 MAX_RACE_REOFFERS_PER_REQUEST = 1    # RE-OFFERS one request may claim after a load it
                                      # LOST A RACE (0.2.32): a spent allowance, never
                                      # refilled, so a race costs at most two offers
@@ -2140,7 +2156,7 @@ _state: dict = {
     # `ranks_reads_applied`, not a second count of them) and `applied_slot_reprobes` is
     # how often the completion path had to read the rank files fresh because the cached
     # window did not contain the load's own slots - the cadence lag, measured.
-    "ranks_applied_slots": 0, "applied_slot_reprobes": 0,
+    "ranks_applied_slots": 0, "applied_slot_reprobes": 0, "witness_rank_reads": 0,
     # `offer_clamped` (0.2.31 and earlier) is DELETED with the fixed 32,000-token cap:
     # with no configured cap there is no clamp to count. See the note at
     # MAX_RESTORE_BLOCKS_PER_OFFER.
@@ -2368,6 +2384,13 @@ _ranks_applied_slots: dict = {}
 # legitimately find nothing; one fresh, bounded, throttled read closes that lag without
 # turning the scheduler's step path into a file reader.
 _applied_reprobe: dict = {"mono": None}
+# When the WITNESS last read the rank files for the boot-wide applied-read count, and
+# what that read saw. Same reason `_applied_reprobe` exists a few lines above: a verdict
+# computed from the cached transport is a verdict about the last proof read, not about
+# this boot, and the line has to be able to say how recently it looked. `reads`/`ranks`
+# are what the last live read reported, so the as-of stamp can still speak on a cycle
+# the throttle skipped.
+_witness_rank_reads: dict = {"mono": None, "reads": 0, "ranks": 0}
 # Scheduler side: request id -> how its load LEFT THE LEDGER without a report (which
 # sweep branch, whether the slots had reached a worker, whether a disk read had been
 # applied, and how many GPU blocks it had mapped). The `_burned` idiom applied to the
@@ -2887,6 +2910,7 @@ def reset_state_for_tests() -> None:
     _applied_slots = {}
     _ranks_applied_slots = {}
     _applied_reprobe["mono"] = None
+    _witness_rank_reads.update({"mono": None, "reads": 0, "ranks": 0})
     _logged_lines = []
     _install_refusal_lines = []
     _sched_cls_seen = None
@@ -2929,6 +2953,7 @@ def reset_state_for_tests() -> None:
             "ranks_proven": 0, "proof_reads": 0, "no_read": 0,
             "disk_reads_applied": 0, "ranks_reads_applied": 0,
             "ranks_applied_slots": 0, "applied_slot_reprobes": 0,
+            "witness_rank_reads": 0,
             "binds": 0, "disk_binds": 0, "reads_started": 0, "reads_applied": 0,
             "bytes_applied": 0, "dma_unsettled_entries": 0, "invalid_reports": 0,
             "finished_released": 0, "worker_watchdog_fires": 0,
@@ -3577,6 +3602,16 @@ def counters_view(out: dict) -> dict:
                                  "`APPLIED_SLOT_REPROBE_MIN_SECONDS`, and a growing "
                                  "number says the cadence (or the file's absence) is "
                                  "what hides applied reads, not the workers",
+        "witness_rank_reads": "live rank-file reads made to answer the BOOT-WIDE "
+                              "read question (`applied_reads_evidence`), i.e. the ones "
+                              "a verdict is decided on: taken only when every cached "
+                              "source says zero, and throttled to one per "
+                              "`WITNESS_RANK_READ_MIN_SECONDS` (unit: reads, not files "
+                              "opened - compare `proof_reads`). Without it the witness "
+                              "judges a boot on whatever the last proof read left "
+                              "behind, which is how a healthy cold boot was pronounced "
+                              "`REFUTED reason=adopted_without_a_read` while its rank "
+                              "files carried 228 applied reads",
         "offers_enabled": "this boot's gap-fill switch: False until the dev verb "
                           "raises it, so an armed spill tier alone cannot put a "
                           "disk offer in front of live traffic. Up on its own it "
@@ -10537,6 +10572,20 @@ def witness_verdict() -> dict:
     gate never opened, nothing was offered, offers were not adopted (the
     3,200-token floor or a clamp), an adopted load never reported, or it reported
     without a single disk byte behind it.
+
+    A REFUTED THAT OUTRAN ITS OWN EVIDENCE (the 13:24 cold boot). This witness fires on
+    EVENTS - the end of an offer (`offer`) and the end of a completion batch
+    (`note_reported`) - not once per boot, so it re-judges the same boot as often as the
+    engine gives it an event. What it judged with was the problem: `reads_applied` came
+    from the cached rank transport, that transport is written on cadence, and a restore
+    that had served 169,600 tokens on a box that had just cold-booted was pronounced
+    `REFUTED reason=adopted_without_a_read reads_applied=0` because the worker's rank
+    file had not been read since its counter moved (the same files reported 228 applied
+    reads minutes later). So the read evidence is now consulted LIVE at the instant the
+    verdict is computed - one throttled, bounded read, only when every cached source
+    says zero - and a REFUTED about reads carries a stamp naming what the transport was
+    asked and when. `CONFIRMED` is unaffected: it still needs BOTH facts, and the fresh
+    read can only ever make the evidence MORE complete, never manufactured.
     """
     refused = {name: int(count) for name, count in _state["refused"].items()
                if count}
@@ -10615,7 +10664,130 @@ def witness_now() -> dict:
                 "stale_as_of_emission": False}
 
 
-def applied_reads_evidence() -> dict:
+def _rank_reads_age_seconds():
+    """Seconds since the witness last read the rank transport live; None if never.
+
+    The STAMP'S CLOCK. A verdict about "no read has EVER been applied in this boot" is
+    only as young as the read behind it, and the line has to be able to say so.
+    """
+    last = _witness_rank_reads.get("mono")
+    if isinstance(last, (int, float)):
+        return round(time.monotonic() - float(last), 3)
+    return None
+
+
+def _note_rank_reads_seen(reads: int, ranks: int) -> None:
+    """Record what a rank-file walk just saw, and raise the transport to it.
+
+    THE FREE RIDE, and the reason the witness's evidence is not only as good as its last
+    scheduled lookup: the walk the COMPLETION PATH already performs
+    (`_read_applied_slots_from_ranks`, one bounded read per
+    `APPLIED_SLOT_REPROBE_MIN_SECONDS`) holds every rank's `reads_applied` while it
+    collects the applied SLOTS, because both halves live in the same file section. A
+    reader that was already there says what it saw, so the read that proves a load's own
+    bytes IS the read that proves the boot's counter - no second lookup, and no verdict
+    about the load being reported left waiting on a throttle's timing.
+
+    Monotone, like the fact: a walk that sees fewer reads (a rank file that went stale,
+    unreadable or unfitted) never un-applies a read the boot already attested.
+    """
+    try:
+        seen = max(0, int(reads or 0))
+        _witness_rank_reads["mono"] = time.monotonic()
+        _witness_rank_reads["reads"] = seen
+        _witness_rank_reads["ranks"] = max(0, int(ranks or 0))
+        if seen > int(_state["ranks_reads_applied"] or 0):
+            _state["ranks_reads_applied"] = seen
+    except Exception as exc:  # noqa: BLE001 - a stamp never breaks a read
+        snapshot._error(exc, "disk_restore note rank reads")
+
+
+def _live_rank_applied_reads(force: bool = False) -> dict:
+    """What the LIVE rank files attest right now: `{reads, ranks, read_now, age}`.
+
+    WHY THIS EXISTS. `_state["ranks_reads_applied"]` is the transport's CACHED value -
+    whatever the last `worker_proof()` read left behind, and that read is itself cached
+    `PROOF_CACHE_SECONDS`. A rank file is rewritten on the 60 s heartbeat and on steps,
+    so the cached number can trail the boot by longer than a witness should be allowed
+    to wait: on the 13:24 cold boot the witness printed
+    `verdict=REFUTED reads_applied=0 reason=adopted_without_a_read` for a restore that
+    had in fact served 169,600 tokens, and those same rank files read
+    `ranks_reads_applied=228` minutes later. The verdict was computed from a transport
+    that had not caught up with the boot it was judging.
+
+    WHAT THIS IS NOT. It is not `worker_proof()`: that function drives the OFFER gate,
+    writes its transition line, and SKIPS a rank's counter whenever the gate refuses
+    that rank - and a verdict must never be able to move a gate. This asks one question
+    of the same bounded, clipped, freshness-checked reader
+    `_read_applied_slots_from_ranks()` uses, takes the counter whether or not the rank
+    would serve an offer, and touches nothing else. Throttled to one read per
+    `WITNESS_RANK_READ_MIN_SECONDS` and bounded by `MAX_RANK_FILES_PROBED` files at
+    `MAX_RANK_FILE_BYTES` each, so the witness cannot become a file reader on the step
+    path.
+
+    A read that finds FEWER reads than the cached transport already reported never
+    lowers it: a rank file that went stale, unreadable or unfitted does not un-apply a
+    read that was attested. The boot-wide claim this feeds is monotone, so the transport
+    that answers it is treated as monotone too.
+    """
+    out = {"reads": int(_witness_rank_reads["reads"] or 0),
+           "ranks": int(_witness_rank_reads["ranks"] or 0),
+           "read_now": False, "age_seconds": _rank_reads_age_seconds()}
+    try:
+        now = time.monotonic()
+        last = _witness_rank_reads.get("mono")
+        if (not force and isinstance(last, (int, float))
+                and (now - float(last)) < WITNESS_RANK_READ_MIN_SECONDS):
+            return out
+        _witness_rank_reads["mono"] = now
+        _state["witness_rank_reads"] = int(_state["witness_rank_reads"] or 0) + 1
+        reads, ranks = 0, 0
+        directory = config.diagnostics_dir()
+        if directory is not None:
+            names = sorted(name for name in os.listdir(directory)
+                           if name.startswith(RANK_FILE_PREFIX)
+                           and name.endswith(RANK_FILE_SUFFIX))
+            for name in names[:MAX_RANK_FILES_PROBED]:
+                said = _rank_file_proves_restore(directory / name)
+                if said is None:
+                    continue
+                ranks += 1
+                reads += int(said["reads_applied"] or 0)
+        _note_rank_reads_seen(reads, ranks)
+        out.update({"reads": reads, "ranks": ranks, "read_now": True,
+                    "age_seconds": 0.0})
+        return out
+    except Exception as exc:  # noqa: BLE001 - a source that cannot speak stays silent
+        snapshot._error(exc, "disk_restore witness rank reads")
+        return out
+
+
+def _rank_reads_as_of(reads: dict) -> str:
+    """The stamp a REFUTED-about-reads owes the reader: what was asked, and when.
+
+    Kept short and placed EARLY in the reason, because the line clips the reason to
+    `MAX_BOOT_LINE_CHARS`: a stamp at the end of a 240-character sentence is a stamp
+    nobody reads. It adds no colon BEFORE the reason's own category colon, so `kind`
+    (the text before the first colon) - the witness's dedupe key - is unchanged and the
+    emission volume cannot move with the stamp's numbers.
+    """
+    try:
+        age = reads.get("rank_reads_age_seconds")
+        seen = int(reads.get("rank_reads_seen") or 0)
+        files = int(reads.get("rank_files_read") or 0)
+        if reads.get("rank_reads_live"):
+            when = "read for this line"
+        elif isinstance(age, (int, float)):
+            when = f"last read {age:.1f}s ago"
+        else:
+            when = "not read at this verdict"
+        return (f"rank transport {when}: {seen} applied read(s) over "
+                f"{files} live rank file(s)")
+    except Exception:  # noqa: BLE001 - a stamp is never worth a missing verdict
+        return "rank transport unreadable"
+
+
+def applied_reads_evidence(fresh: bool = True) -> dict:
     """Applied disk reads this boot, from either process, with the source named.
 
     The scheduler never reads a file itself - the worker does - so its own counter is
@@ -10627,6 +10799,16 @@ def applied_reads_evidence() -> dict:
     THIS IS THE BOOT-WIDE VIEW, and since 0.2.60 it is NOT what a completion report is
     judged with - `applied_read_evidence_for` answers that, per load. What this one is
     for is the witness and the payload: "did disk reads ever happen on this boot".
+
+    `fresh=True` (the witness and the payload) closes the transport's own cadence lag:
+    when EVERY cached source says zero, one live read of the rank files is taken before
+    the answer is given - and before a verdict that says "no read has ever been
+    applied" is allowed to be believed. `fresh=False` keeps the pure cached read and is
+    what the per-load predicate uses for its mixed-version fallback, so that path's own
+    throttled reprobe (`APPLIED_SLOT_REPROBE_MIN_SECONDS`) stays the only rank read it
+    makes. The stamp (`rank_reads_live`, `rank_reads_age_seconds`, `rank_reads_seen`,
+    `rank_files_read`) says which of the two answered, so a zero is always readable as
+    "looked now and found none" or "looked recently".
     """
     local = int(_state["reads_applied"] or 0) + int(_state["disk_reads_applied"] or 0)
     ranks = int(_state["ranks_reads_applied"] or 0)
@@ -10645,19 +10827,37 @@ def applied_reads_evidence() -> dict:
         delivered = int(disk_gpu_write.counters().get("delivery_writes") or 0)
     except Exception as exc:  # noqa: BLE001 - a source that cannot speak stays silent
         snapshot._error(exc, "disk_restore delivery evidence")
+    # THE STAMP, and the live read that a zero answer cannot be asked without. Every
+    # cached source having said 0 is exactly the moment a REFUTED-about-reads becomes
+    # possible, so that is the only moment the transport is asked again: a boot that
+    # already holds evidence never pays for the read.
+    live = {"reads": ranks, "ranks": int(_witness_rank_reads["ranks"] or 0),
+            "read_now": False, "age_seconds": _rank_reads_age_seconds()}
+    if fresh and not local and not delivered and not ranks:
+        live = _live_rank_applied_reads()
+        ranks = max(ranks, int(live["reads"]))
+    stamp = {"rank_reads_live": bool(live["read_now"]),
+             "rank_reads_age_seconds": live["age_seconds"],
+             "rank_reads_seen": int(live["reads"]),
+             "rank_files_read": int(live["ranks"])}
     if local > 0:
-        return {"reads_applied": local, "source": "this process"}
+        return {"reads_applied": local, "source": "this process", **stamp}
     if delivered > 0:
         return {"reads_applied": delivered,
                 "source": ("this process's disk_gpu_write delivery writes (a delivered "
                            "disk->GPU copy is a read that reached the engine; it also "
-                           "passes the apply point, so it counts once, not twice)")}
+                           "passes the apply point, so it counts once, not twice)"),
+                **stamp}
     if ranks > 0:
-        return {"reads_applied": ranks, "source": "worker rank file"}
+        return {"reads_applied": ranks,
+                "source": ("worker rank file (read for this verdict)"
+                           if live["read_now"] else "worker rank file"),
+                **stamp}
     return {"reads_applied": 0,
             "source": ("nothing has applied a disk read in this boot"
                        if _state["sched_fitted"] else
-                       "this process runs neither half")}
+                       "this process runs neither half"),
+            **stamp}
 
 
 def _load_cpu_block_ids(record) -> list:
@@ -10720,14 +10920,21 @@ def _read_applied_slots_from_ranks() -> list:
         names = sorted(name for name in os.listdir(directory)
                        if name.startswith(RANK_FILE_PREFIX)
                        and name.endswith(RANK_FILE_SUFFIX))
+        reads, ranks = 0, 0
         for name in names[:MAX_RANK_FILES_PROBED]:
             said = _rank_file_proves_restore(directory / name)
             if said is None:
                 continue
+            ranks += 1
+            reads += int(said["reads_applied"] or 0)
             for slot in said.get("applied_slots") or ():
                 if slot not in ids:
                     ids.append(int(slot))
         _remember_ranks_applied_slots(ids)
+        # THE COUNTER RIDES WITH THE SLOTS: this walk holds both halves of the same file
+        # section, and the boot-wide transport the witness judges with has no reason to
+        # be staler than the per-load evidence read out of it a millisecond ago.
+        _note_rank_reads_seen(reads, ranks)
     except Exception as exc:  # noqa: BLE001 - an unreadable window is no window
         snapshot._error(exc, "disk_restore rank applied slots")
     return ids
@@ -10785,7 +10992,7 @@ def applied_read_evidence_for(record) -> dict:
             # window this branch is unreachable, which is what stops the fallback from
             # becoming the defect again - a counter that excuses every load after the
             # first read, in both directions.
-            boot = applied_reads_evidence()
+            boot = applied_reads_evidence(fresh=False)
             if int(boot["reads_applied"] or 0) > 0:
                 return {"applied": True,
                         "source": ("the boot-wide read counter: no live rank has "
@@ -10910,8 +11117,9 @@ def _refuted_reason(refused: dict, reads: dict) -> str:
                 "signature of slots that were allocated and never filled ("
                 f"{_clip(reads['source'], 60)})")
     if not reads["reads_applied"]:
-        return (f"adopted_without_a_read: {_state['adopted']} load(s) reached the "
-                "worker with no applied disk read anywhere in this boot "
+        return (f"adopted_without_a_read: {_rank_reads_as_of(reads)}; "
+                f"{_state['adopted']} load(s) reached the worker with no applied "
+                "disk read anywhere in this boot "
                 f"({_clip(reads['source'], 60)}) - the reports the fork makes for "
                 "its own host-RAM blocks are not evidence of a restore")
     # Reached only when a partial restoration happened and something else is still

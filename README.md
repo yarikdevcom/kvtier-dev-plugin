@@ -1470,6 +1470,24 @@ carries `reads_applied=` and `no_read=`. The witness is emitted once per
 it 1,048 times a second on the incident boot, and `witness_suppressed` counts the
 withheld lines so a quiet log is not mistaken for a dead module.
 
+**The witness is asked about reads at the instant it answers (the 13:24 cold boot).**
+It fires on events - the end of an offer and the end of a completion batch - and it used
+to compute `reads_applied` from `ranks_reads_applied`, whatever the last `worker_proof()`
+read left behind. A rank file is rewritten on the heartbeat and on steps, so a boot that
+had just served 169,600 tokens was pronounced
+`verdict=REFUTED reads_applied=0 reason=adopted_without_a_read` while the same rank files
+reported 228 applied reads minutes later: the verdict had outran its evidence, which is
+the second time (`verdict=CONFIRMED reads_applied=0`, 2026-10-05, was the first). So the
+worker-attested transport is now consulted live at verdict time - the walk the completion
+path already makes reports the counter it was holding anyway
+(`_note_rank_reads_seen`), and a verdict whose every cached source says zero takes one
+bounded read per `WITNESS_RANK_READ_MIN_SECONDS`, counted as `witness_rank_reads`, with no
+read at all once evidence exists. `CONFIRMED` still needs a restoration AND a read, and a
+REFUTED about reads now stamps what it asked and when
+(`rank transport read for this line: 0 applied read(s) over 4 live rank file(s)`) - the
+stamp sits before the reason's tail because the line clips it to 160 characters, and it
+adds no colon of its own, so the dedupe key cannot move with it.
+
 **Why nothing was restored is one HTTP call.** `GET /plugins/kvtier/disk` (and the
 `disk_restore` section of `/snapshot`) reports the SCHEDULER's own verdict - the layer
 fitted in that process, the gate and its reason, the index size and its source, the
