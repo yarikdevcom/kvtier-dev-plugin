@@ -421,8 +421,27 @@ def _on_worker_report(connector) -> None:
     `register()` has already been written by then (and at a level the engine's log
     does not even carry), so the handshake verdict was the only place the truth
     existed and it was discarded.
+
+    THE LOOP IS FOLLOWED BY ONE PRIME BEAT (0.2.69), and the ORDER of this function
+    is what makes that safe: writing a proof before `disk_restore.install()` has
+    raised `worker_fitted` produces a file the gate verdicts `no_restore_section`,
+    which is the same `no_worker_proof` the outage produced. See
+    `_prime_worker_proof` for why the first request after a cold boot cannot wait an
+    interval for it.
     """
     outcomes = []
+    # THE HANDLER IS NOTED BEFORE THE INSTALLS START, not inside the prime below.
+    # `worker_diag.install()` starts the heartbeat supervisor, and since 0.2.69 that
+    # supervisor's FIRST tick is due immediately - so a beat can be issued while the
+    # three installs after it are still running, and a beat that has no handler yet
+    # publishes `arena.bytes_total: 0`: a false number, not an omission, in the field
+    # a capacity reader divides by. `connector.worker_handler` is real at this moment
+    # (this hook is the handshake, and `register_kv_caches` has already filled it), so
+    # one weakref here costs nothing and removes the race entirely.
+    try:
+        worker_diag.note_handler(getattr(connector, "worker_handler", None))
+    except Exception as exc:  # noqa: BLE001 - a note never breaks a handshake
+        snapshot._error(exc, "worker handler note")
     for hook in (worker_diag.ensure_installed, blockdump.ensure_installed,
                  disk_store.ensure_installed, disk_restore.ensure_installed):
         name = getattr(hook, "__name__", "listener")
@@ -436,6 +455,64 @@ def _on_worker_report(connector) -> None:
         _worker_report_lines.append(line)
         del _worker_report_lines[:-4]
         logger.warning(line)
+    # THE PROOF IS WRITTEN HERE, NOT ONE INTERVAL LATER. See `_prime_worker_proof`.
+    _prime_worker_proof()
+
+
+def _prime_worker_proof() -> None:
+    """Write the FIRST rank-file proof at the handshake, in the WORKER process.
+
+    WHY THIS EXISTS. The scheduler may only offer a disk restore on a fresh rank
+    proof (`disk_restore.worker_proof`, freshness bound `RANK_FILE_FRESH_SECONDS`),
+    and the only writers of that file are `worker_diag`'s step path and its
+    heartbeat. Neither has produced anything by the time the first request after a
+    cold boot arrives: `install()` starts the heartbeat and that loop's first beat
+    was scheduled a FULL INTERVAL later, while `install()` itself writes nothing.
+    Measured on three boots after a long suspend: the gate came open 14.2 s, 17.6 s
+    and 19.9 s AFTER the box did, and the request that lost the race got
+    `refused=no_worker_proof` and paid a 61 s cold prefill on 231,392 tokens. About
+    35 of ~38 boots hide this because a previous boot's file is still under 900 s.
+
+    WHY HERE, AND WHY IN THE WORKER. This hook is the one moment a worker process
+    definitely has an offload handler, and it runs AFTER all four installs - so
+    `disk_restore.install()` has already raised `worker_fitted` and registered its
+    contribution, which is what makes the document carry a `disk_restore` section
+    instead of being verdicted `no_restore_section` (a fresh file with no section is
+    as useless to the gate as a stale one). The handler was noted before the installs
+    started, so the arena this measures is measured and never zero. And it must be
+    the WORKER that writes: the EngineCore's own gate can only read files another
+    process wrote, so a proof written from there would be exactly the attestation the
+    design refuses to trust.
+
+    `force=True` because the supervisor's first tick is due immediately and can beat
+    from inside `install()`; without the bypass the floor would refuse this write and
+    leave a mid-install document standing for a whole interval. See
+    `worker_diag.heartbeat_once`.
+
+    STRICTLY BEST-EFFORT. A prime that raises must not cost a worker its handshake,
+    so everything below is contained and the only consequence of a failure is one log
+    line; the heartbeat's own beats are the backstop. A tier with no diagnostics
+    directory refuses inside `heartbeat_once` and creates nothing, so an inert boot
+    still creates no files.
+    """
+    try:
+        if worker_diag.counters()["installed"] is not True:
+            # Nothing is fitted in this process, so there is nothing to attest - and
+            # a pre-fit rank file would report `not fitted` and veto the other ranks.
+            return
+        beat = worker_diag.heartbeat_once(force=True, primed=True)
+        line = ("kvtier-dev-plugin: worker proof primed written="
+                f"{bool(beat.get('written'))} handler={bool(beat.get('handler'))} "
+                f"reason={beat.get('reason') or 'ok'}")
+        if line not in _worker_prime_lines:
+            _worker_prime_lines.append(line)
+            del _worker_prime_lines[:-4]
+            # WARNING, like the install line beside it: the engine's own log does not
+            # carry INFO, and this is the only place a worker can say whether the
+            # cold-boot proof came up - once per process, never once per beat.
+            logger.warning(line)
+    except Exception as exc:  # noqa: BLE001 - a prime never breaks a worker startup
+        snapshot._error(exc, "worker proof prime")
 
 
 def _brief_report(report) -> str:
@@ -468,6 +545,10 @@ def _brief_report(report) -> str:
 
 
 _worker_report_lines: list = []
+
+# The prime line's own memory, kept apart from the install line's so the two cannot
+# evict each other out of the bounded list. See `_prime_worker_proof`.
+_worker_prime_lines: list = []
 
 
 def register() -> None:

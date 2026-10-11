@@ -320,11 +320,34 @@ def test_the_gate_reeopens_after_a_suspend_with_no_request_arriving(box,
     """
     directory = box["dir"]
     handler = box["handler"]
-    monkeypatch.setattr(worker_diag, "HEARTBEAT_MIN_INTERVAL_SECONDS",
-                        worker_diag.HEARTBEAT_MIN_INTERVAL_DEFAULT)
-    assert wait_for(lambda: beat_writes(directory) >= 1), (
+    # THE QUIET WINDOW THIS TEST ALWAYS IMPLICITLY REQUIRED, stated instead of hoped for.
+    # A beat that is in the air when the box sleeps reaches its write after the wake, and
+    # that write is an honest proof (its document is built and stamped post-wake): it can
+    # leave the gate OPEN at the wake, invalidating the "the proof was already dead"
+    # precondition below, and it can reopen the gate before the resume detector has been
+    # polled. At the fixture's 0.2 s interval such a beat exists every 200 ms, and since
+    # 0.2.69 this test arrives at the suspend with one already launched - the boot's prime
+    # satisfies the wait that used to complete on a beat that had just FINISHED (measured:
+    # 0/10 failures at 0.2.68, 2/10 on the 0.2.69 tree with the original setup). So: restart
+    # the supervisor behind a long deadline and drain the air. The mechanism under test is
+    # untouched - a resume is detected per poll, not per interval - and every assertion
+    # below is exactly the one this test has always made. THE FLOOR IS RESTORED AFTER the
+    # window is opened, because the shipped 5 s floor would (correctly) refuse this very
+    # restart's own first beat, and the window would never open.
+    monkeypatch.setattr(worker_diag, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
+    worker_diag.stop_heartbeat()
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0), (
+        f"a beat thread will not finish: {worker_diag.heartbeat_status()}")
+    assert worker_diag.start_heartbeat()["started"] is True
+    writes0 = int(worker_diag.counters()["heartbeat_writes"])
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_writes"])
+                    >= writes0 + 1), (
         "the heartbeat never wrote at all before the suspend: this test is about a "
         "worker whose proof was already dead, not about a suspend")
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0), (
+        f"a beat is still in the air at the suspend: {worker_diag.heartbeat_status()}")
+    monkeypatch.setattr(worker_diag, "HEARTBEAT_MIN_INTERVAL_SECONDS",
+                        worker_diag.HEARTBEAT_MIN_INTERVAL_DEFAULT)
     proven = disk_restore.worker_proof(force=True)
     assert proven["count"] >= 1, proven
     assert handler.step_calls == 0
@@ -351,11 +374,87 @@ def test_the_gate_reeopens_after_a_suspend_with_no_request_arriving(box,
         "first request to arrive would be refused a disk restore with "
         f"`no_worker_proof` - {heartbeat_block(directory)}")
 
+    # THE RESUME IS IN THE ARTIFACT - waited for rather than read once. Even with the air
+    # drained above, the write that reopens the gate and the write that carries the
+    # attribution are two different threads' work, and a test that reads the file at the
+    # instant the gate flips is asking a beat that has not been issued yet about itself
+    # (measured on this tree: 2 runs in 10 before the setup was tightened, 0 in 10 at
+    # 0.2.68). What stays asserted is unchanged and still specific: the detector beats
+    # after the wake, the rank file says so, and no step did any of it. (The production
+    # half of keeping that fast is the resume beat's floor exemption in `_issue_beat`,
+    # pinned by `test_a_resume_beat_is_not_locked_out_by_a_write_that_raced_the_sleep`
+    # below: with a warm floor the attribution is missing for its whole 5 s, which is longer
+    # than any reasonable wait and is a defect in the artifact an operator reads.)
+    assert wait_for(lambda: int(heartbeat_block(directory).get("resumes") or 0) >= 1), (
+        f"the resume never reached the rank file: {heartbeat_block(directory)}")
     block = heartbeat_block(directory)
-    assert block["resumes"] >= 1, block
     assert block["beats_after_resume"] >= 1, block
     assert handler.step_calls == 0, (
         "a step served as the beat's starter: the whole point is that nothing arrived")
+
+
+def test_a_resume_beat_is_not_locked_out_by_a_write_that_raced_the_sleep(box,
+                                                                         monkeypatch):
+    """THE WARM FLOOR BELONGS TO THE BEAT THAT RACED THE SLEEP, NOT TO THE WAKE (0.2.69).
+
+    THE STATE, BUILT WITHOUT A RACE. A supervisor is started post-wake, so its first tick
+    (due immediately since 0.2.69) writes a document whose stamp is the post-wake clock -
+    which is exactly what a beat already in the air when the box slept leaves behind. That
+    write is now the floor's reference, and the shipped 5 s floor is warm. The beat whose
+    entire job is to say "the box came back" therefore arrives to a floor that a beat from
+    the previous sleep spent, and before 0.2.69 it was refused: with this exemption removed
+    THIS test fails 12 runs in 12, and the wake test above failed 2 runs in 10 on the
+    0.2.69 tree where it had failed 0 in 10 at 0.2.68 - the attribution missing for the
+    floor's whole 5 s, reporting `resumes: 0` beside a gate that had already reopened. The
+    artifact an operator reads to debug suspend behaviour, saying the resume was never
+    beaten when it was.
+
+    SO THE RESUME BEAT IS EXEMPT FROM THE FLOOR, and only from the floor, and only for that
+    cause: the ordinary beat asked for immediately afterwards is refused by the same warm
+    floor, which is the assertion that keeps this a scoping rather than a bypass.
+    """
+    directory = box["dir"]
+    monkeypatch.setattr(worker_diag, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
+    monkeypatch.setattr(worker_diag, "HEARTBEAT_MIN_INTERVAL_SECONDS",
+                        worker_diag.HEARTBEAT_MIN_INTERVAL_DEFAULT)
+    worker_diag.stop_heartbeat()
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0)
+    # THE SLEEP, then a supervisor that starts after it: a new supervisor's clock pair is
+    # post-wake, so it detects no resume of its own and cannot beat for one. Every beat
+    # from here is one this test asked for.
+    box["clock"].suspend(SUSPEND_SECONDS)
+    assert worker_diag.start_heartbeat()["started"] is True
+    writes0 = int(worker_diag.counters()["heartbeat_writes"])
+    # THE WRITE THAT RACED THE SLEEP, and the floor it spends.
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_writes"])
+                    >= writes0 + 1), (
+        f"the restarted supervisor's own first beat never wrote: "
+        f"{worker_diag.heartbeat_status()}")
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0)
+    warm = worker_diag.heartbeat_once()
+    assert warm["written"] is False and "floor" in (warm["reason"] or ""), (
+        f"the floor is not warm, so this test would assert nothing: {warm}")
+
+    # THE RESUME BEAT WRITES ANYWAY. The wait is on the FILE, not on `heartbeat_writes`:
+    # a beat is counted before it writes (0.2.51's ordering, so the first beat's own file
+    # never reads `beats: 0`), so the counter can run ahead of the document by the length
+    # of one write.
+    before = worker_diag.counters()
+    launched = worker_diag._issue_beat("resume")
+    assert launched["launched"] is True, launched
+    resume_target = int(before["heartbeat_beats_after_resume"]) + 1
+    assert wait_for(lambda: int(heartbeat_block(directory).get("beats_after_resume")
+                                or 0) >= resume_target), (
+        f"the resume beat was refused by a warm floor: {worker_diag.counters()}")
+    assert beat_writes(directory) >= int(before["heartbeat_writes"]) + 1, (
+        f"the rank file reports no write for the resume beat: "
+        f"{heartbeat_block(directory)}")
+
+    # AND THE EXEMPTION IS SCOPED TO THE CAUSE: the next ordinary beat meets the same warm
+    # floor and is refused by it.
+    again = worker_diag.heartbeat_once()
+    assert again["written"] is False and "floor" in (again["reason"] or ""), (
+        f"the floor stopped rate-limiting ordinary beats: {again}")
 
 
 def test_a_suspend_is_named_in_the_log_once(box, caplog):
@@ -442,6 +541,15 @@ def test_a_beat_lands_with_zero_steps_and_a_rank_nobody_handed_it(box):
     assert wait_for(lambda: rank_document(directory) is not None, seconds=4.0), (
         "no rank file with zero engine steps: the proof would exist only as a side "
         "effect of a step")
+    # THE FIRST FILE IS THE PRIME'S (0.2.69), and a prime is not a clock beat. Waiting for
+    # `beat_writes >= 1` therefore returns while the supervisor's own first beat is still
+    # on its way, and the counter this test exists to read - `beats_from_clock`, the beat
+    # the supervisor issued because ITS CLOCK EXPIRED - is honestly 0 in that first file.
+    # So wait for the counter itself, which is what the assertion is about.
+    assert wait_for(lambda: int(heartbeat_block(directory).get(
+        "beats_from_clock") or 0) >= 1, seconds=4.0), (
+        "no supervisor-clock beat ever reached the file with zero engine steps: "
+        f"{heartbeat_block(directory)}")
     assert wait_for(lambda: beat_writes(directory) >= 1, seconds=4.0)
     document = rank_document(directory)
     assert document["writer"]["rank_source"] == "parallel_state", document["writer"]
@@ -451,8 +559,31 @@ def test_a_beat_lands_with_zero_steps_and_a_rank_nobody_handed_it(box):
     # supervisor's own clock expiring, with the engine taking no steps at all.
     assert block["beats_from_clock"] >= 1, block
     assert block["beats_from_step"] == 0, block
-    assert block["ticks"] >= block["beats"], block
-    assert block["cadence_clock"] == worker_diag.HEARTBEAT_CADENCE_CLOCK, block
+    assert block["beats_after_resume"] == 0, block
+    # THE PARTITION, with the one term 0.2.69 had to add. Read from a SETTLED artifact: the
+    # supervisor is stopped and the air drained first, because `heartbeat_state()` reads
+    # each key separately and a beat counted between the `ticks` read and the cause reads
+    # makes the sum momentarily outrun the ticks - a torn read, not a broken invariant, and
+    # an identity must not be asserted across a torn read.
+    #
+    # `beats_from_prime` is the boot proof the handshake wrote, and it is the ONLY beat no
+    # tick issued: keeping it out of `beats_from_clock`/`beats_after_resume` is what keeps
+    # the suspend/resume statistics describing suspends and resumes rather than a boot. The
+    # two inequalities are the README's own identity with the prime term added:
+    # `beat_writes` may not outrun the beats that were decided, and the beats decided are
+    # the ticks plus the prime.
+    worker_diag.stop_heartbeat()
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0), (
+        f"a beat was still in flight when the identity was read: "
+        f"{worker_diag.heartbeat_status()}")
+    settled = heartbeat_block(directory)
+    assert settled["beats_from_prime"] == 1, settled
+    assert (settled["beats_from_clock"] + settled["beats_from_step"]
+            + settled["beats_after_resume"] == settled["ticks"]), settled
+    assert settled["beats"] <= settled["ticks"] + settled["beats_from_prime"], settled
+    assert (settled["beat_writes"]
+            <= settled["ticks"] + settled["beats_from_prime"]), settled
+    assert settled["cadence_clock"] == worker_diag.HEARTBEAT_CADENCE_CLOCK, settled
     assert handler.step_calls == 0
 
 
@@ -505,25 +636,76 @@ def test_a_step_wakes_a_beat_early_and_the_beat_never_runs_on_the_step(box,
                                                                        monkeypatch):
     """The desirable half of the design, and the 0.2.47 property kept.
 
-    The interval is long (30 s) so the supervisor's own clock CANNOT be the cause of any
-    beat this test observes; `due` is then pushed into the past, which is exactly the
-    state a supervisor is in when a box has just woken under it or the thread has been
+    The interval is long (30 s) so the supervisor's own clock cannot be the cause of any
+    beat THIS TEST'S STEP produces; `due` is then pushed into the past, which is exactly
+    the state a supervisor is in when a box has just woken under it or the thread has been
     starved. One engine step then asks for a beat, and the beat must land on the beat
     thread - never inline on the thread that serves the engine, which is the defect
     0.2.47 removed and this new wake channel must not reintroduce.
+
+    WHAT 0.2.69 CHANGED HERE is the arithmetic, not the property. This test used to
+    restart the supervisor and assert `beat_writes(directory) == 0`, which rested on two
+    accidents: that the counter started at zero for the whole process, and that a
+    restarted supervisor wrote nothing for a whole interval. Neither is true now - the
+    fixture's boot has already primed a proof and beaten at 0.2 s, and the first tick of
+    a restarted supervisor is due immediately - so the assertion is stated as the exact
+    account it always meant: the restart's own immediate first beat, one write, and then
+    silence while the deadline is 30 s away. A loose `<= 1` would let an unattributed
+    second write through, which is the thing this test exists to forbid. The count is kept
+    in the process counters rather than in the rank file, because the file is written AFTER
+    a beat is counted and two beats in flight can publish out of order - a lag an exact
+    assertion cannot be built on once boot has two writers by design.
     """
     directory = box["dir"]
     handler = box["handler"]
     monkeypatch.setattr(worker_diag, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
     worker_diag.stop_heartbeat()
+    # DRAIN THE AIR BEFORE THE ACCOUNT IS OPENED, and give the old supervisor the length of
+    # a poll to leave. `stop_heartbeat()` closes the launch gate and joins the thread, but a
+    # loop that had already decided to beat can still be inside `_issue_beat`, and a beat
+    # already launched has its own thread and its own write; either one landing inside the
+    # window below would charge the restarted supervisor for a beat it never issued.
+    time.sleep(0.2)                     # more than one HEARTBEAT_RESUME_POLL_SECONDS
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0), (
+        f"a beat thread will not finish: {worker_diag.heartbeat_status()}")
     started = worker_diag.start_heartbeat()
     assert started["started"] is True, started
 
-    # With a 30 s deadline and nothing else to prompt it, an idle worker gets no beats.
+    # THE ACCOUNT IS KEPT IN THE PROCESS COUNTERS, not in the rank file. The file lags by a
+    # write by construction - a beat is counted BEFORE it writes (0.2.51, so the first
+    # beat's own file never reads `beats: 0`) and two beats in flight can publish out of
+    # order - and 0.2.69 makes concurrent beats at boot the normal case: the handshake
+    # prime and the immediately-due first tick are two writers by design. Keeping an exact
+    # count off a lagging artifact is what made this assertion un-exact (measured: 1 run in
+    # 15 read 3 writes where 1 beat had been issued).
+    def counter(key: str) -> int:
+        return int(worker_diag.counters()[key])
+
+    writes0 = counter("heartbeat_writes")
+    clock0 = counter("heartbeat_beats_clock")
+    step0 = counter("heartbeat_beats_step")
+
+    # THE ONE BEAT THE RESTART OWNS: the first tick, due immediately since 0.2.69. It is
+    # counted as a CLOCK beat, which is the truth - the supervisor's own deadline issued
+    # it - and the assertion after the wait is that nothing else follows.
+    assert wait_for(lambda: counter("heartbeat_writes") >= writes0 + 1), (
+        f"the restarted supervisor never issued its first beat: "
+        f"{worker_diag.heartbeat_status()}")
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0), (
+        f"the restart's own beat never finished: {worker_diag.heartbeat_status()}")
+    # With the next deadline 30 s away and nothing else to prompt it, an idle worker gets
+    # no further beats: not one more write, and none from any other cause.
     time.sleep(0.4)
-    assert beat_writes(directory) == 0, (
-        "a beat arrived with the clock set to 30 s away: something other than the "
-        "deadline is issuing beats, and `beats_from_step` below would be meaningless")
+    assert counter("heartbeat_writes") == writes0 + 1, (
+        f"expected exactly one beat after the restart - the first tick the restarted "
+        f"supervisor is immediately due ({writes0} + 1) - and found "
+        f"{counter('heartbeat_writes')}: something other than the deadline is issuing "
+        "beats, and `beats_from_step` below would be meaningless")
+    assert counter("heartbeat_beats_clock") == clock0 + 1, (
+        f"more than the first tick came from the supervisor's own clock: "
+        f"{worker_diag.counters()}")
+    assert counter("heartbeat_beats_step") == step0, (
+        "a step-caused beat with zero steps taken")
 
     # Where a resumed or starved supervisor is found: behind its own deadline.
     worker_diag._heartbeat["due"] = 0.0
@@ -541,12 +723,15 @@ def test_a_step_wakes_a_beat_early_and_the_beat_never_runs_on_the_step(box,
     result = handler.get_finished(set())     # ONE ENGINE STEP
     assert result == (set(), None), result   # the fork's own answer, untouched
     assert handler.step_calls == 1
-    assert wait_for(lambda: beat_writes(directory) >= 1), (
+    assert wait_for(lambda: counter("heartbeat_beats_step") >= step0 + 1), (
         f"a step found the supervisor behind its deadline and no beat landed: "
         f"{worker_diag.heartbeat_status()}")
-    block = heartbeat_block(directory)
-    assert block["beats_from_step"] >= 1, block
-    assert block["beats_from_clock"] == 0, block
+    assert wait_for(lambda: int(worker_diag.counters()["heartbeat_inflight"]) == 0)
+    assert counter("heartbeat_writes") >= writes0 + 2, (
+        f"the step's beat wrote nothing: {worker_diag.counters()}")
+    assert counter("heartbeat_beats_clock") == clock0 + 1, (
+        "a beat the step woke was attributed to the supervisor's clock")
+    assert counter("heartbeat_beats_step") >= step0 + 1
     assert seen_on.get("thread", "").startswith(
         worker_diag.HEARTBEAT_BEAT_THREAD_NAME), (
         f"the beat's producer ran on {seen_on.get('thread')!r}: a beat executed inline "

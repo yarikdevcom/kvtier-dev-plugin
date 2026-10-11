@@ -815,30 +815,77 @@ def test_the_heartbeat_block_is_declared_once_and_stays_within_its_budget(booted
 # ===========================================================================
 
 def test_the_boot_says_which_side_the_proof_gate_started_on(booted, caplog):
-    """`GATE AT BOOT`, once. The posture that must not be mistaken for a closure.
+    """`GATE AT BOOT`, once, on whichever side it started - and never a closure.
 
-    The complaint this answers is exact: one `no_worker_proof` in the request log cannot
+    THE COMPLAINT THIS ANSWERS is exact: one `no_worker_proof` in the request log cannot
     be told apart from a gate that has been shut since the boot, because the counter
-    says how many and never when. The first read therefore reports a POSTURE and never
-    a transition - and it is the posture as measured, including the honest `open=False`
-    of a scheduler asked before any worker had taken its first beat.
+    says how many and never when. The first read therefore reports a POSTURE and never a
+    transition, and the load-bearing assertions are that ONE line exists and that it was
+    not manufactured into a `GATE CLOSED`.
+
+    WHICH SIDE IT STARTS ON IS A 0.2.69 FACT, and this is where it is pinned. The old
+    posture was honestly `open=False rank_files=0`: the only writers of a rank proof were
+    an engine step and a heartbeat whose FIRST beat was due a full interval after
+    install, so a scheduler asked at boot had nothing to read - the very state that cost
+    the first request after a suspend `refused=no_worker_proof` and a 61 s cold prefill
+    on 231,392 tokens. Since 0.2.69 the worker primes its proof at the handshake, so an
+    untouched boot reads OPEN with a fresh file: the fix's whole point is a boot that
+    proves itself before the first request, and an assertion of `open=False` here would
+    now be an assertion of the outage.
+
+    THE CLOSED POSTURE IS STILL A REAL BOOT STATE - a prime that failed, a scheduler
+    asked ahead of every worker - so act 2 makes it observable again rather than dropping
+    its coverage: the proofs are removed, the per-process transition memory is re-armed,
+    and the next read must say `open=False rank_files=0` exactly once and still not call
+    it a closure. Act 3 then earns the `GATE OPEN` line the old boot got for free, from a
+    beat that writes.
     """
     directory = booted["dir"]
-    disk_restore.worker_proof(force=True)      # a read with no rank file on disk yet
+    disk_restore.worker_proof(force=True)      # the boot's first read
+    boot_lines = [line for line in proof_gate_lines(caplog) if "GATE AT BOOT" in line]
+    assert len(boot_lines) == 1, proof_gate_lines(caplog)
+    # THE 0.2.69 POSTURE, named: open, on the strength of this boot's own proof.
+    assert "open=True" in boot_lines[0], boot_lines[0]
+    assert "rank_files=1" in boot_lines[0] and "fresh=1" in boot_lines[0], (
+        boot_lines[0])
+    assert "reason_kind=open" in boot_lines[0], boot_lines[0]
+    assert not [line for line in proof_gate_lines(caplog) if "GATE CLOSED" in line], (
+        "the first read is a posture, not a closure: an operator must not count it as "
+        "an outage that began and ended between two reads")
+
+    for _ in range(3):
+        disk_restore.worker_proof(force=True)
+    lines = [line for line in proof_gate_lines(caplog) if "GATE AT BOOT" in line]
+    assert len(lines) == 1, f"the boot posture is said once per process: {lines}"
+    assert not [line for line in proof_gate_lines(caplog) if "GATE CLOSED" in line], (
+        "a gate that was never closed must not report a closure")
+
+    # ACT 2: the closed posture, still honest and still one line. `_proof_transition` is
+    # the once-per-process memory itself, so re-arming it is the only way to watch a
+    # second boot in one process; with the proofs gone the read measures nothing, which
+    # is exactly what a boot whose prime failed measures.
+    worker_diag.stop_heartbeat()
+    for name in rank_files(directory):
+        os.remove(os.path.join(str(directory), name))
+    disk_restore._proof_transition.update(
+        {"open": None, "since_mono": None, "boot_line": None})
+    caplog.clear()
+    verdict = disk_restore.worker_proof(force=True)
+    assert verdict["count"] == 0, verdict
     boot_lines = [line for line in proof_gate_lines(caplog) if "GATE AT BOOT" in line]
     assert len(boot_lines) == 1, proof_gate_lines(caplog)
     assert "open=False" in boot_lines[0] and "rank_files=0" in boot_lines[0], (
         boot_lines[0])
     assert not [line for line in proof_gate_lines(caplog) if "GATE CLOSED" in line], (
-        "the first read is a posture, not a closure: an operator must not count it as "
-        "an outage that began and ended between two reads")
+        "a posture is not an episode: the closure lines belong to the neighboring "
+        "tests, and a boot that merely read nothing must not be counted as one")
 
-    assert wait_for(lambda: rank_document(directory) is not None)
-    disk_restore.worker_proof(force=True)
-    disk_restore.worker_proof(force=True)
-    disk_restore.worker_proof(force=True)
-    lines = [line for line in proof_gate_lines(caplog) if "GATE AT BOOT" in line]
-    assert len(lines) == 1, proof_gate_lines(caplog)
+    # ACT 3: the opening is earned by a beat that writes, once.
+    assert worker_diag.start_heartbeat()["started"] is True
+    assert wait_for(lambda: disk_restore.worker_proof(force=True)["ok"] is True), (
+        "the beat never wrote, so there is no opening to log")
+    for _ in range(3):
+        disk_restore.worker_proof(force=True)
     openings = [line for line in proof_gate_lines(caplog) if "GATE OPEN" in line]
     assert len(openings) == 1, proof_gate_lines(caplog)
     assert "fresh=1" in openings[0], openings[0]

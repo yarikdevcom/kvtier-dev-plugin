@@ -19,7 +19,7 @@ contract, and the reason every field here is either a real reading or absent.
 FILE NAMING (must match `kv_tier_diagnostics.writer_filename` exactly)
 ---------------------------------------------------------------------
     <VLLM_E2_TIER_DIAG>/rank-PP<pp>_TP<tp>.json        one file per rank
-    <VLLM_E2_TIER_DIAG>/.rank-PP<pp>_TP<tp>.json.<pid>.<seq>.tmp   the tmp half
+    <VLLM_E2_TIER_DIAG>/.rank-PP<pp>_TP<tp>.json.<pid>.<tid>.<ns>.tmp  the tmp half
 
 The rank id is `PP<pp_rank>_TP<tp_rank>` - the reader's `_is_worker_id` accepts
 that shape and nothing else, and it is the fork's own handshake key
@@ -140,8 +140,8 @@ Which fields the reader REQUIRES, and what this writer can honestly supply:
       "floor_skips": int, "respawns": int, "writer_pid": int,
       "cadence_clock": "boottime"|"monotonic", "ticks": int,
       "beats_from_clock": int, "beats_from_step": int,
-      "beats_after_resume": int, "refusals": int, "resumes": int,
-      "last_error": str|null}
+      "beats_after_resume": int, "beats_from_prime": int, "refusals": int,
+      "resumes": int, "last_error": str|null}
 
  HOW TO READ IT: `beating` in a file whose `ts` is old means the writer stopped AFTER
  writing (the process died, or its supervisor did); `alive_not_beating` means the
@@ -151,6 +151,19 @@ Which fields the reader REQUIRES, and what this writer can honestly supply:
  named by `refusals` and by `state_reason`; `never_started` names what refused it;
  `not_applicable` says this process is not a worker rank-file writer. `writer_pid`
  distinguishes two writers of one file name.
+
+ THE PRIME IS NOT A TICK (0.2.69). `beats_from_clock + beats_from_step +
+ beats_after_resume == ticks` still holds, because the three of them remain a partition
+ of the SUPERVISOR'S ticks and nothing else adds to them. What 0.2.69 adds is a beat no
+ tick issued at all: the cold-boot proof `engine_side._prime_worker_proof` writes from
+ the worker handshake. It is counted, under its own name, so the file can still explain
+ itself - without it the file reads `beat_writes: 1, ticks: 0, from_clock: 0`, a beat
+ with no cause and no tick, which is exactly the unaccountable artifact 0.2.51's whole
+ cause scheme exists to prevent. `beat_writes <= ticks + beats_from_prime`, and the
+ suspend/resume counters (`beats_from_clock`, `beats_after_resume`, `resumes`) are
+ UNAFFECTED by a prime: a prime is not a clock beat and not a resume, and counting it as
+ either would make the numbers this repo debugs suspends with say something that did not
+ happen.
 
  IS THE IDLE PATH ALIVE? Read `beats_from_clock`. It counts the beats the supervisor
  issued because ITS OWN CLOCK EXPIRED with no help from the engine, which is the only
@@ -369,6 +382,14 @@ _state: dict = {
     "heartbeat_beats_clock": 0,
     "heartbeat_beats_step": 0,
     "heartbeat_beats_after_resume": 0,
+    # THE ONE BEAT NO TICK ISSUED (0.2.69): the cold-boot proof the worker handshake
+    # writes through `engine_side._prime_worker_proof`. It is deliberately NOT folded
+    # into `heartbeat_beats_clock`: the three cause keys are a partition of the ticks and
+    # `resumes`/`beats_after_resume` are how suspend behaviour is debugged in production,
+    # so a prime counted as either would make those numbers describe an event that did not
+    # happen. It lives beside them, named, so `beat_writes` never exceeds
+    # `ticks + beats_from_prime` and a file that has written cannot fail to say who wrote.
+    "heartbeat_beats_prime": 0,
     "heartbeat_refusals": 0,
     "heartbeat_resumes": 0,
     # THE 0.2.47 ADDITIONS: the beat's own health, not just its count.
@@ -432,6 +453,7 @@ def reset_state_for_tests() -> None:
                    "heartbeat_ticks": 0, "heartbeat_beats_clock": 0,
                    "heartbeat_beats_step": 0,
                    "heartbeat_beats_after_resume": 0,
+                   "heartbeat_beats_prime": 0,
                    "heartbeat_refusals": 0, "heartbeat_resumes": 0,
                    "heartbeat_writes": 0, "heartbeat_inflight": 0,
                    "heartbeat_stalled": 0, "heartbeat_jammed": 0,
@@ -716,6 +738,7 @@ def section() -> dict:
         "heartbeat_beats_step": int(_state["heartbeat_beats_step"]),
         "heartbeat_beats_after_resume": int(
             _state["heartbeat_beats_after_resume"]),
+        "heartbeat_beats_prime": int(_state["heartbeat_beats_prime"]),
         "heartbeat_refusals": int(_state["heartbeat_refusals"]),
         "heartbeat_resumes": int(_state["heartbeat_resumes"]),
         "heartbeat_cadence_clock": HEARTBEAT_CADENCE_CLOCK,
@@ -1085,8 +1108,20 @@ def write_snapshot(handler, rank, rank_source) -> dict:
             return report
         filename = f"rank-{rank}.json"
         os.makedirs(directory, exist_ok=True)
+        # THE TEMP NAME IS PER WRITE, NOT PER RANK FILE, and that distinction became load
+        # bearing in 0.2.69. The old name was `.{name}.{pid}.{writes}.tmp`, and `writes` is
+        # a COMPLETED-WRITE COUNTER: two beats in flight at the same instant read the same
+        # value, write the same path, and the loser's `os.replace` raises FileNotFoundError
+        # because the winner already renamed the file out from under it. Before 0.2.69 one
+        # process wrote this file from one thread at a time and the clash was theoretical;
+        # now the handshake prime and the supervisor's immediately-due first tick write at
+        # the same moment by design - the two writers whose race this release exists to
+        # win - and a colliding loser is a cold-boot proof that silently did not land.
+        # Thread ident plus a nanosecond stamp makes the name unique per call, which is
+        # what `os.replace` needs to stay an atomic swap between strangers.
         tmp = os.path.join(str(directory),
-                           f".{filename}.{os.getpid()}.{_state['writes']}.tmp")
+                           f".{filename}.{os.getpid()}.{threading.get_ident()}"
+                           f".{time.time_ns()}.tmp")
         final = os.path.join(str(directory), filename)
         with open(tmp, "wb") as handle:
             handle.write(raw)
@@ -1306,7 +1341,8 @@ HEARTBEAT_FILE_KEYS = ("state", "state_reason", "alive", "started", "beats",
                        "errors", "fatal_beats", "stalled_beats", "jammed_beats",
                        "floor_skips", "respawns", "writer_pid",
                        "cadence_clock", "ticks", "beats_from_clock",
-                       "beats_from_step", "beats_after_resume", "refusals",
+                       "beats_from_step", "beats_after_resume",
+                       "beats_from_prime", "refusals",
                        "resumes", "last_error")
 
 # WHICH COUNTER EACH BEAT CAUSE ADDS. An unknown cause lands on `clock` rather than
@@ -1414,7 +1450,7 @@ def _note_beat_refusal(reason: str) -> None:
             reason, MAX_STRING_CHARS)
 
 
-def heartbeat_once() -> dict:
+def heartbeat_once(force: bool = False, primed: bool = False) -> dict:
     """One beat: rewrite the rank file if the floor allows it.
 
     IT GOES THROUGH THE SAME WRITE PATH A STEP USES, not a second writer. That is what
@@ -1423,6 +1459,33 @@ def heartbeat_once() -> dict:
     step-written one, and a mixed-version fleet's reader sees the keys it expects. A
     separate "heartbeat.json" would have been the obvious implementation and a second
     source of truth about who is alive.
+
+    `force` skips THE WRITE FLOOR AND NOTHING ELSE, and from 0.2.69 it has exactly two
+    callers, each for a reason the floor was never written to cover. (a) The cold-boot
+    prime in `engine_side._prime_worker_proof`: since the first tick is due immediately, a
+    beat the supervisor launches inside `install()` can reach this function BEFORE the
+    prime does, and if it wins the floor would refuse the prime for
+    `HEARTBEAT_MIN_INTERVAL_SECONDS` - leaving whatever that beat measured (a handler not
+    yet noted, a `disk_restore` contribution not yet registered) as the file the gate reads
+    for the next interval. (b) THE RESUME BEAT, from `_issue_beat` (0.2.69): a beat already
+    in the air when the box slept can reach its write after the wake, and that write stamps
+    `heartbeat_last_beat_time` - so the floor, kept on the cadence clock precisely so a
+    sleep expires it, would then refuse the one beat 0.2.51 exists to issue, and the rank
+    file would report `resumes: 0` / `beats_after_resume: 0` for the floor's whole 5 s
+    beside a gate that had already reopened. Measured on this tree: with the exemption
+    removed, the dedicated wake-race test
+    (`test_a_resume_beat_is_not_locked_out_by_a_write_that_raced_the_sleep`) fails 12 runs
+    in 12. The floor rate-limits writes to a directory the scheduler also reads; one proof
+    per process at handshake and one per wake are not what it is for. Every other caller
+    leaves it False, so the cadence and the floor are unchanged for the supervisor, the
+    step wake, and the tests that pin them.
+
+    `primed` ATTRIBUTES THIS BEAT (0.2.69) to `beats_from_prime` instead of leaving it
+    uncaused, and only `engine_side._prime_worker_proof` sets it. It is not a synonym for
+    `force`: the two say different things - "the floor may not refuse this" and "no tick
+    issued this" - and a future caller could want one without the other. The count is
+    taken where the beat is counted, so like the three supervisor causes it records a beat
+    that was ISSUED, and it survives a later refusal for the same reason they do.
     """
     out = {"written": False, "reason": None, "handler": False}
     directory = config.diagnostics_dir()
@@ -1443,7 +1506,8 @@ def heartbeat_once() -> dict:
     # "too soon after the last write", by a last write that happened before the sleep.
     # The floor exists to rate-limit writes to a directory the scheduler also reads, and
     # a directory untouched for the whole of a sleep has not been rate-limited at all.
-    if isinstance(last, (int, float)) and (_cadence_now() - float(last)) < floor:
+    if (not force and isinstance(last, (int, float))
+            and (_cadence_now() - float(last)) < floor):
         with _state_lock:
             _state["heartbeat_floor_skips"] = int(_state["heartbeat_floor_skips"]) + 1
             # NAMED as well as counted (0.2.51): a `floor_skips` with no reason
@@ -1475,6 +1539,9 @@ def heartbeat_once() -> dict:
         _state["heartbeats"] = int(_state["heartbeats"]) + 1
         _state["heartbeat_writes"] = int(_state["heartbeat_writes"]) + 1
         _state["heartbeat_last_beat_time"] = began
+        if primed:
+            _state["heartbeat_beats_prime"] = int(
+                _state["heartbeat_beats_prime"]) + 1
     try:
         report = write_snapshot(handler, rank, rank_source)
     except BaseException:
@@ -1514,16 +1581,19 @@ def _uncount_beat() -> None:
         snapshot._error(exc, "worker diag beat rollback")
 
 
-def _contained_heartbeat() -> dict:
+def _contained_heartbeat(cause: str = "clock") -> dict:
     """One heartbeat that CANNOT kill the thread.
 
     Copied from `disk_gpu_write._contained`, for the reason that module learned it: a
     contributor's producer, a config read or a filesystem can raise, and a heartbeat
     loop that dies on it stops proving silently - which is indistinguishable from the
     defect this thread exists to fix, just quieter. Every failure is a counter.
+
+    `cause` rides along from `_issue_beat` for ONE decision: a beat the supervisor issued
+    because the box came back is exempt from the write floor (see `heartbeat_once`).
     """
     try:
-        return heartbeat_once()
+        return heartbeat_once(force=(cause == "resume"))
     except Exception as exc:  # noqa: BLE001 - the loop outlives any single beat
         with _state_lock:
             _state["heartbeat_errors"] = int(_state["heartbeat_errors"]) + 1
@@ -1535,7 +1605,7 @@ def _contained_heartbeat() -> dict:
         return {"written": False, "reason": f"{type(exc).__name__}"}
 
 
-def _run_beat_guarded() -> None:
+def _run_beat_guarded(cause: str = "clock") -> None:
     """ONE BEAT, on its own short-lived thread, that cannot end the proof (0.2.47).
 
     TWO JOBS, and both are the reason the beat no longer runs inline in the loop.
@@ -1558,7 +1628,7 @@ def _run_beat_guarded() -> None:
     """
     began = time.monotonic()
     try:
-        _contained_heartbeat()
+        _contained_heartbeat(cause)
     except KeyboardInterrupt:  # pragma: no cover - not that thread
         raise
     except BaseException as exc:  # noqa: BLE001 - nothing a beat does ends the proof
@@ -1596,6 +1666,11 @@ def _issue_beat(cause: str = "clock") -> dict:
     means the box came back from a suspend and the stamp is stale on arrival. A refusal
     at this point (closed, or at the in-flight bound) is counted by its own key, so a
     counted cause is a beat that was actually launched.
+
+    `"resume"` ALSO EXEMPTS THE BEAT FROM THE WRITE FLOOR (0.2.69), which is the only
+    place a cause changes anything but a counter: a beat already in the air when the box
+    slept can stamp `heartbeat_last_beat_time` after the wake, and the floor would then
+    refuse the beat whose whole job is to say the box came back. See `heartbeat_once`.
     """
     out = {"launched": False, "reason": None, "cause": cause}
     with _heartbeat_lock:
@@ -1615,8 +1690,9 @@ def _issue_beat(cause: str = "clock") -> dict:
             _state.get(_BEAT_CAUSE_KEYS.get(cause, "heartbeat_beats_clock"),
                        0)) + 1
     try:
-        threading.Thread(target=_run_beat_guarded,
-                         name=HEARTBEAT_BEAT_THREAD_NAME, daemon=True).start()
+        threading.Thread(target=_run_beat_guarded, args=(cause,),
+                         name=HEARTBEAT_BEAT_THREAD_NAME,
+                         daemon=True).start()
     except Exception as exc:  # noqa: BLE001 - no thread is a refusal, not a fault
         with _state_lock:
             _state["heartbeat_inflight"] = max(
@@ -1656,13 +1732,28 @@ def _heartbeat_loop(stop) -> None:
       * a detected resume beats at once rather than waiting for the deadline, because a
         box that has slept for longer than the freshness window arrives with a stale
         stamp whatever the deadline says, and the first request after a wake is the one
-        that wants the disk.
+        that wants the disk. Since 0.2.69 that beat is also exempt from the write floor:
+        a beat that was already in the air when the box slept can write after the wake and
+        spend the floor against it.
 
     The rule for this loop stays absolute: NOTHING a beat can do may end it, and nothing
     a beat can do may delay it. Both halves are tested, because both were false here.
+
+    THE FIRST TICK IS DUE IMMEDIATELY (0.2.69), and the sentence above is what licenses
+    it. The deadline used to be `BOOTTIME + interval`, so a worker that installed at
+    model-load time proved NOTHING for a full 60 s - and the first request after a cold
+    boot arrives inside that gap, where the scheduler's restore gate still needs a rank
+    file (`disk_restore.worker_proof`) and gets `no_worker_proof` instead. Measured on
+    three boots: the gate came open 14.2 s, 17.6 s and 19.9 s after the box did, and the
+    request that lost that race paid a 61 s cold prefill on 231,392 tokens. The wait is
+    still `stop.wait()` FIRST and the beat is still delegated to its own thread, so this
+    writes no file inside `install()` and no beat runs inline; the first write simply
+    stops waiting for a clock nobody is using yet. `engine_side` primes the proof at the
+    handshake as well, and this is the belt behind that braces: a beat that fires within
+    milliseconds of the supervisor starting is the only defence a worker whose handshake
+    prime failed can have.
     """
-    interval = max(0.001, float(HEARTBEAT_INTERVAL_SECONDS))
-    deadline = _cadence_now() + interval
+    deadline = _cadence_now()
     _heartbeat["due"] = deadline
     pair = _clock_pair()
     while True:
@@ -1988,6 +2079,7 @@ def _heartbeat_state_shell(state: str, reason) -> dict:
             "beats_from_clock": 0,
             "beats_from_step": 0,
             "beats_after_resume": 0,
+            "beats_from_prime": 0,
             "refusals": 0,
             "resumes": 0,
             "writer_pid": int(os.getpid()),
@@ -2051,6 +2143,7 @@ def heartbeat_state() -> dict:
         out["beats_from_clock"] = int(_state["heartbeat_beats_clock"])
         out["beats_from_step"] = int(_state["heartbeat_beats_step"])
         out["beats_after_resume"] = int(_state["heartbeat_beats_after_resume"])
+        out["beats_from_prime"] = int(_state["heartbeat_beats_prime"])
         out["refusals"] = int(_state["heartbeat_refusals"])
         out["resumes"] = int(_state["heartbeat_resumes"])
         duration = _state["heartbeat_last_duration_seconds"]
@@ -2131,6 +2224,7 @@ def heartbeat_status(*, force: bool = False) -> dict:
             "beats_from_clock": int(_state["heartbeat_beats_clock"]),
             "beats_from_step": int(_state["heartbeat_beats_step"]),
             "beats_after_resume": int(_state["heartbeat_beats_after_resume"]),
+            "beats_from_prime": int(_state["heartbeat_beats_prime"]),
             "cadence_clock": HEARTBEAT_CADENCE_CLOCK,
             "errors": int(_state["heartbeat_errors"])}
 
@@ -2369,9 +2463,14 @@ def install(cls=None) -> dict:
         # unreachable), and the same shape here is the idle-worker defect itself: a
         # heartbeat begun by an engine step can never begin on a worker that is idle -
         # and an idle worker is exactly the one whose proof would otherwise age out.
-        # Starting it allocates nothing: the thread waits its interval before its first
-        # write, and with no diagnostics directory `start_heartbeat` refuses rather than
-        # writing, so an inert tier neither spawns a thread nor creates a file.
+        # Starting it allocates nothing: with no diagnostics directory
+        # `start_heartbeat` refuses rather than writing, so an inert tier neither
+        # spawns a thread nor creates a file. It no longer waits an interval before
+        # its FIRST write (0.2.69): the first tick is due the moment the supervisor
+        # starts, because a worker that installs at model-load time and proves
+        # nothing for 60 s leaves the scheduler's restore gate shut for the first
+        # cold request. The beat is still delegated to its own thread after a
+        # bounded wait, so install() itself still writes no file.
         if report["installed"]:
             heartbeat = start_heartbeat()
             report["heartbeat"] = heartbeat

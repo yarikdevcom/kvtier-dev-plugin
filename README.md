@@ -3316,9 +3316,14 @@ it*: `cadence_clock` (the short name of the clock the deadline is kept on - `boo
 or `monotonic` on a host without it), `ticks` (wake-ups that led to a beat), and
 `beats_from_clock` / `beats_from_step` / `beats_after_resume` - a partition of the ticks,
 so `beats_from_clock + beats_from_step + beats_after_resume == ticks` holds while this
-build is the writer. `beat_writes` is NOT part of that identity: an attributed beat can
-still be refused by the write floor, so `beat_writes <= ticks`, and the gap between them
-is how many beats were decided and then not written. `refusals` counts the times the beat had something to write and
+build is the writer. Since 0.2.69 there is ONE BEAT NO TICK ISSUED - the cold-boot proof
+the worker handshake writes (`engine_side._prime_worker_proof`) - and it is counted under
+its own name, `beats_from_prime`, rather than folded into a cause that would make the
+suspend statistics describe an event that did not happen: the partition above is
+UNCHANGED, and `beat_writes` is bounded by `ticks + beats_from_prime`. `beat_writes` is
+NOT part of the partition identity: an attributed beat can still be refused by the write
+floor, so `beat_writes <= ticks + beats_from_prime`, and the gap between them is how many
+beats were decided and then not written. `refusals` counts the times the beat had something to write and
 could not (no directory, no rank), and `resumes` the resumes the cadence clock has
 noticed. Every one of these is `0` rather than absent when nothing has happened, and the
 key SET is identical in every state - including the shell of a file written before this
@@ -3338,6 +3343,14 @@ DISK[proof] GATE OPEN again after 0.4s closed; ranks=2/2 rank_files=2 fresh=2 st
 DISK[proof] GATE CLOSED reason_kind=no_worker_proof ranks=0/0 rank_files=2 fresh=0 stale=2 \
     youngest=965.2s last_proof_written=2026-10-08T23:34:11 (965.2s ago); reason: ...
 ```
+
+**The boot posture changed in 0.2.69.** The first line above is what a boot prints when
+nothing has proved itself yet, and before 0.2.69 EVERY boot printed it, because the first
+rank proof was due a full interval after install. A worker now primes its proof at the
+handshake, so an ordinary boot prints `GATE AT BOOT open=True reason_kind=open rank_files=1
+fresh=1 ...`; the closed posture is still the true reading of a boot whose prime failed, or
+of a scheduler asked ahead of every worker, and it is still one line and never a `GATE
+CLOSED`.
 
 A rank file that is too OLD to count and a rank file that is FRESH BUT SAYS NOTHING (no
 `disk_restore` section: a contributor raised, overran its byte cap, or the restore layer
@@ -3479,7 +3492,9 @@ can trust.
 kernel has no BOOTTIME - it names the clock every age in the block is kept on), `ticks`
 (the supervisor's own wakeups), `beats_from_clock`, `beats_from_step`,
 `beats_after_resume`, `refusals` (a beat that reached its write and declined it, now
-named in `state_reason`), `resumes`.
+named in `state_reason`), `resumes`. 0.2.69 adds `beats_from_prime` beside them, in the
+same block and in every state: the count of rank proofs written by the cold-boot prime,
+which is the one write no supervisor tick issued (see the identity above).
 
 > **Is the idle path alive? Read `beats_from_clock`.** It counts only the beats the
 > supervisor issued because its OWN CLOCK EXPIRED. `beats` totals every cause and
@@ -3538,11 +3553,104 @@ killed loop reports nothing; and the thread is gone. A note is formatting plus w
 its arguments read, which is exactly as fallible as a write, so it is guarded like one
 and the failure is reported through `snapshot._error` instead of swallowed.
 
-Tests: `tests/test_heartbeat_beats_on_a_clock_the_suspend_cannot_freeze.py` (14 tests:
-the cold start with a DERIVED rank, the gate reopening after a suspend with nothing
-arriving, the quiet period longer than the freshness window, the step that wakes a beat
-off the stepping thread, the refusals that used to vanish, the partition of the ticks,
-and a raising log line that must cost a line and nothing else).
+Tests: `tests/test_heartbeat_beats_on_a_clock_the_suspend_cannot_freeze.py` (15 tests:
+the cold start with a DERIVED rank - waiting for the supervisor's OWN clock beat, since
+the first file on disk is the prime's - the gate reopening after a suspend with nothing
+arriving (in a quiet window: the supervisor restarted behind a long deadline and the air
+drained, so the resume detector is the only thing that can reopen the gate), a resume beat
+not locked out by a floor a racing write spent, the quiet period longer than the freshness
+window, the step
+that wakes a beat off the stepping thread (counted as deltas around the restart's own
+immediate first beat), the refusals that used to vanish, the partition of the ticks plus
+the prime's term, and a raising log line that must cost a line and nothing else).
+
+## The proof that arrived too late: a cold boot's first request found the gate shut (0.2.69)
+
+THE MEASUREMENT. Three boots after a suspend longer than the freshness window came up
+with the scheduler-side restore gate CLOSED, and the first request behind each got
+`refused=no_worker_proof` and paid a **61 s cold prefill on 231,392 tokens**. The
+measured close-to-open lag, from the box being up to the gate proving restorable: **14.2
+s, 17.6 s, 19.9 s**. Roughly 35 of ~38 boots look fine only because the previous boot's
+rank file was still under 900 s old - the defect is invisible on a box that restarts
+inside the window and expensive on one that does not.
+
+THE CAUSE, IN ONE LINE. The only writers of a rank proof are `worker_diag`'s step path
+and its heartbeat, and on a cold boot neither had written anything by the time the first
+request arrived: `install()` starts the heartbeat, and that loop's first beat was
+scheduled a **full interval later** (`deadline = BOOTTIME + interval`, 60 s), while
+`install()` itself writes nothing on purpose. So for the first minute of every boot the
+worker is alive, fitted, armed, and believed to be nothing.
+
+WHAT A NAIVE EARLY WRITE WOULD HAVE LIED ABOUT, and what this fix therefore does not do.
+Two false statements were available, and the fix is built to avoid both. (1) `install()`
+runs FIRST inside the worker handshake loop, before `disk_restore.install()` raises
+`worker_fitted` and registers its contribution - so a proof written there carries no
+`disk_restore` section, which the reader verdicts `no_restore_section` and the gate
+still reports as `no_worker_proof`: an early write in the wrong place is a proof that
+proves nothing. (2) The handler is normally captured from `get_finished`, so a beat fired
+before any step would publish `arena.bytes_total: 0` - not an omission but a **false
+number**, in the one field a capacity reader divides by. Both are asserted against, not
+merely avoided.
+
+THE FIX, TWO LINES. **(a)** `engine_side._prime_worker_proof` runs after the worker
+handshake loop has installed all four facilities, notes the connector's
+`worker_handler` - which is REAL by handshake time, because `register_kv_caches` fills
+`num_cpu_blocks` before the handshake is collected - and fires one contained
+`heartbeat_once()`. It is strictly best-effort: a prime that raises costs one log line
+and cannot break a worker startup, and with no diagnostics directory it refuses and
+creates nothing, so an inert boot stays inert. It runs in the **worker** and nowhere
+else, because the EngineCore's gate can only read a proof another process wrote; a
+proof written from the scheduler would be exactly the attestation the design refuses to
+trust. **(b)** the heartbeat's first tick is due immediately (`deadline = _cadence_now()`),
+which is the belt behind that braces: `stop.wait()` still comes FIRST and the beat is
+still delegated to its own thread, so `install()` writes no file inline and no beat runs
+on the handshake thread - the first write simply stops waiting for a clock nobody is
+using yet. The interval between beats is unchanged at 60 s, so the fifteen-beats-inside
+900 margin is exactly as it was.
+
+**A boot with zero requests now ends up with a gate-open proof on disk.** The prime is
+not driven by a request, a step, or the heartbeat: a worker that boots, fits, and is
+armed writes a fresh, `disk_restore`-bearing, arena-measuring rank file at handshake and
+the gate proves restorable before the first token of the first request is scheduled.
+
+**The prime is counted, and counted separately.** A rank file at boot therefore reads
+`beat_writes: 1, ticks: 0, beats_from_clock: 0` unless something names that write, which
+is the unaccountable artifact 0.2.51's cause scheme exists to prevent - so it is named,
+as `beats_from_prime`, and NOT folded into `beats_from_clock` or `beats_after_resume`:
+those two, with `resumes`, are how suspend behaviour is debugged in production, and a
+prime is neither a clock beat nor a resume. The documented partition
+(`clock + step + after_resume == ticks`) is untouched; `beat_writes` is bounded by
+`ticks + beats_from_prime`.
+
+**One consequence of an immediate first tick: a beat can be in the air when the box
+sleeps.** Such a beat reaches its write AFTER the wake, and its document is built and
+stamped post-wake, so it is an honest proof that earns the gate - but it was DECIDED before
+the sleep, so it carries no resume attribution, and it stamps `heartbeat_last_beat_time`,
+so the shipped 5 s write floor then refuses the beat whose whole job is to say the box came
+back. Two halves fix it. **(a) production:** `_issue_beat` exempts the `"resume"` cause from
+the floor and nothing else (`heartbeat_once(force=...)`); with that exemption removed, the
+dedicated test fails 12 runs in 12. **(b) the suite:** the wake test opens a quiet window
+before it suspends (restart behind a 30 s deadline, drain `heartbeat_inflight`) and waits
+for the attribution in the rank file instead of reading it once at the instant the gate
+flips. Measured: 0/10 failures at 0.2.68, 2/10 on the 0.2.69 tree with the original setup,
+20/20 after.
+
+**Two writers at boot is the design now, so the temp name had to stop being shared.** An
+atomic replace is `write a temp file, then rename it`, and the temp file used to be named
+`.rank-<rank>.json.<pid>.<writes>.tmp` - where `writes` counts COMPLETED writes. Two beats
+in flight read the same value, write the same path, and the loser's `os.replace` raises
+`FileNotFoundError` because the winner renamed the file out from under it. One process,
+one writer at a time, made that theoretical; the prime and the immediately-due first tick
+make it a boot-time race that this release loses on purpose - and the loser is a cold-boot
+proof that silently did not land, with a rank file whose `state_reason` is a
+`FileNotFoundError`. The name now carries the thread ident and a nanosecond stamp, so it is
+unique per write (measured: 6 of 8 runs lost a write before, 0 of 8 after).
+
+Tests: `tests/test_cold_boot_primes_the_rank_proof.py` - a fitted worker plus the
+worker-report hook with ZERO steps must satisfy `disk_restore.worker_proof(force=True)`
+on the spot (the old code answers `no_worker_proof`); the primed file must carry a
+NONZERO arena and a `disk_restore` section; and a prime that raises must not reach worker
+startup while the loop's later beats still write.
 
 ## Does the GPU still hold what the arena spilled? (`disk_shadow.py`, 0.2.36)
 
@@ -6886,7 +6994,8 @@ The debugger verbs add six files:
 | `tests/test_quiet_rank_bytes_are_not_dead_bytes.py` | 12 | a rank that has not written for 300 s keeps its bytes while its worker is alive and publishing that digest (the defect, on a real filesystem); the peer map dropping a quiet rank's digest is not evidence of death; liveness from the RANK FILES, not the digest map; `stale_geometry` reclaim still runs and still runs ahead of this rank's own cold bytes; `stale_geometry_removed` and `peer_files_removed_live` separate the two doctrines; an empty peer map claims nothing, so no identity may be called dead on it; `identity_known`/`liveness_source` name the evidence a pass had |
 | `tests/test_index_forgets_no_bytes_on_disk.py` | 13 | eviction is LRU-by-TOUCH and not insertion order (a just-restored identity is the last to leave, and on the unpatched tree it was the first); a read that promotes a file touches the index on the throttled path too; `VLLM_E2_TIER_DISK_INDEX_ENTRIES` configures the cap and a bad value falls back and reports; `entries_dropped` balances its three reason counters exactly; `entries_dropped_file_present` counts the index forgetting a live file and never guesses at an unchecked one (`unverified`); `note_restored_path` re-admits an identity a restore proved |
 | `tests/test_idle_engine_keeps_its_disk_proof_alive.py` | 10 | install alone with ZERO engine steps produces and refreshes the rank file (the defect: only a step used to write it); `disk_restore.worker_proof` stays open across an idle spell and re-opens after a forced-stale file with no step in sight; the heartbeat starts at `install()` and never stacks a thread; it is a daemon with a findable name; the handler is held WEAKLY and a beat with no handler still writes; the write floor bounds forced beats; no `VLLM_E2_TIER_DIAG` means no thread and no file; the shipped interval fits the 900 s window with four beats to spare (pinned against the UNPATCHED default); the payload reports age and margin; a dead thread is respawned and counted |
-| `tests/test_idle_worker_proof_stays_alive_and_legible.py` | 24 | THE 0.2.47 SUITE, driven from `engine_side.register()` plus the handshake hook exactly as a worker walks them (the plugin-load install must DECLINE there, the handshake must land it), with zero engine steps and the READER's clock moved so a test can wait fifteen minutes: the gate stays open across two idle spells nearly the length of the window and still closes on a beat that stopped, on a future-stamped file, and on a file whose `disk_restore` section is gone; a contributor wedged for three budgets cannot stop the rank file moving; a beat raising `SystemExit` cannot kill the supervisor; a `SystemExit` contributor costs its own section only; the in-flight bound says `jammed` instead of leaking threads; `writer.heartbeat` in all five states with one key set inside its byte budget; `GATE AT BOOT` / `GATE CLOSED` / `GATE OPEN again` once per flip, naming the reason, the per-file counts and the freshest file's age AND wall clock, and distinguishing `stale=` from `sectionless=`; the refusal that never started is said once at WARNING; the shipped cadence is pinned against the UNPATCHED default |
+| `tests/test_idle_worker_proof_stays_alive_and_legible.py` | 24 | THE 0.2.47 SUITE, driven from `engine_side.register()` plus the handshake hook exactly as a worker walks them (the plugin-load install must DECLINE there, the handshake must land it), with zero engine steps and the READER's clock moved so a test can wait fifteen minutes: the gate stays open across two idle spells nearly the length of the window and still closes on a beat that stopped, on a future-stamped file, and on a file whose `disk_restore` section is gone; a contributor wedged for three budgets cannot stop the rank file moving; a beat raising `SystemExit` cannot kill the supervisor; a `SystemExit` contributor costs its own section only; the in-flight bound says `jammed` instead of leaking threads; `writer.heartbeat` in all five states with one key set inside its byte budget; `GATE AT BOOT` / `GATE CLOSED` / `GATE OPEN again` once per flip, naming the reason, the per-file counts and the freshest file's age AND wall clock, and distinguishing `stale=` from `sectionless=`; the BOOT posture itself - OPEN on an untouched 0.2.69 boot, and still `open=False rank_files=0` (a posture, never a closure) for a boot whose proofs are gone - and the `GATE OPEN` line earned by a beat that writes; the refusal that never started is said once at WARNING; the shipped cadence is pinned against the UNPATCHED default |
+| `tests/test_cold_boot_primes_the_rank_proof.py` | 5 | THE 0.2.69 FIX, on the SHIPPED 60 s cadence so the supervisor's own beat cannot be what satisfies an assertion: a fitted worker plus the handshake hook with ZERO engine steps must satisfy `disk_restore.worker_proof(force=True)` on the spot (the old code answers `no_worker_proof`, which cost a 61 s cold prefill on 231,392 tokens); the primed file must carry the fork's EXACT arena (`bytes_total: 4096`, because a beat with no handler yet publishes a zero, and a zero is a false number rather than an empty one) AND a `disk_restore` section with `worker_fitted` raised (a section-less fresh file is verdicted `no_restore_section` and still reads as no proof, which is why the prime runs after the install loop); a prime raising inside `heartbeat_once` must cost one counted containment and one log line, never the handshake, and the loop's later beats must still write the file; no `VLLM_E2_TIER_DIAG` means the prime declines before the beat - no rank file, no thread, no prime line; and a boot that receives NO REQUEST AT ALL ends with the gate `open`, this boot's file counted fresh, and zero sectionless rank files; and eight CONCURRENT writes of one rank file lose NO proof - since 0.2.69 the handshake prime and the immediately-due first tick write at the same instant by design, and the temp half of the atomic replace used to be named with a completed-write counter, so two beats in flight shared a path and the loser's `os.replace` raised `FileNotFoundError` (6 of 8 runs lost a write; the name now carries the thread ident and a nanosecond stamp) |
 | `tests/test_routes_dev_verbs.py` | 57 | every argument rule twice (GET query and POST body) against one table, an unknown key `400`-ing without reaching the engine, a `413` before any parse, bool-is-not-int and int-is-not-bool, control characters refused, the route->method map being un-hijackable by a body, the empty body sending no positional argument, `guard`/`trace` never mutating the policy module, the `/status` mirror staying `null` until an engine speaks |
 | `tests/test_dev_surface_e2e.py` | 29 | the routes wired to the REAL engine-side verbs on a fake engine, with the fork's own `len(args) <= len(parameters)` assert reproduced on the wire: every verb driven with and without an argument, every payload surviving JSON, a block/request read against the production-shaped geometry, a captured fault agreeing with the ring, the snapshot and the `/status` mirror, disarm restoring the fork's functions, and the guard composing with this package's own tier wrapper instead of leaving the fault-prone methods unguarded |
 | `tests/test_boot_journal_drain.py` | 12 | THE 0.2.65 FIX: a journal of the incident's shape (4 ranks x 110k real `<seq> <+\|-> <key16> <bytes> <group>` lines, ~16 MB, built once per module, digest-pinned as READ-ONLY) drained on a clock that advances by `bytes read / 2.2 MB/s`, the box's measured throughput - a wall-clock deadline timed in this host's time (it reads the same journal ~4.5x faster) measures the host, not the box. The headline test asserts its OWN fixture is deeper than the retired 5.0 s boot budget and shallower than the shipped 45 s, then requires `converged: true` with `lag_bytes: 0` and an `elapsed_seconds` ABOVE the retired bound (the same drain the old deadline stopped blind); the deadline and the byte budget each stop a deeper journal, are REPORTED as `stopped_at: deadline` / `byte_budget` with the bound in force, do not raise, and leave the rest draining one bounded pass per refresh on the request path; an unparseable env value leaves each default standing with `*_source: env_ignored` and quotes the variable and its raw value back in `problems`, while a well-formed one lands and is the number the next refresh honours; UNSET is today's numbers, the steady-state cap still 512 KiB and the line cap still 8,192; the record and its limits reach `restore.index` beside `converged`/`blind` and carry their own `units`; no arm, no posture, no switch moves - behaviourally AND as an AST fact about `disk_index.py` and about the boot's own `_boot_journal_drain`; a drain that raises is counted, logged once, recorded as `error` and leaves `boot_drained: false`, while `KeyboardInterrupt` propagates; and the fork's own `create_connector` (the `scheduler.py:164` shape, fake factory in `sys.modules`) returns a connector whose index is ALREADY drained - with the drain's state captured DURING construction proving the fork's constructor ran first - the BOOT line carrying `JOURNAL_DRAIN[converged]` without disturbing the restart verifier's `tier=` last-match; an inert boot reads no journal byte at all |

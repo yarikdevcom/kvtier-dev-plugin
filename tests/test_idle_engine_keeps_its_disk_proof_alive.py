@@ -179,11 +179,17 @@ def test_an_idle_worker_keeps_its_own_rank_file_fresh(diag_dir, fork_worker):
     installed = worker_diag.install(cls=fork_worker)
     assert installed["installed"] is True, installed
 
-    # THE FIRST PROOF, WITH NO STEP EVER CALLED. `install()` itself does not write the
-    # file (only the write path does, and the thread waits its interval before its first
-    # beat), so a file appearing here can only have come from the heartbeat - which is
-    # the whole defect in one line: before 0.2.45 this directory stayed empty until the
-    # engine stepped.
+    # THE FIRST PROOF, WITH NO STEP EVER CALLED. `install()` itself still does not
+    # write the file (only the write path does); what changed in 0.2.69 is WHEN the
+    # supervisor's first beat is due - immediately, not one interval later - because a
+    # worker that installs at model-load time and proves nothing for 60 s leaves the
+    # scheduler's restore gate shut for the first cold request. So a file appearing
+    # here can only have come from the heartbeat, which is the whole defect in one
+    # line: before 0.2.45 this directory stayed empty until the engine stepped, and
+    # between 0.2.45 and 0.2.69 it stayed empty for the first interval after every
+    # boot. (In production the handshake prime in `engine_side._prime_worker_proof`
+    # writes it even earlier; this fixture calls `install()` directly, so what this
+    # test observes is the supervisor's own first beat.)
     def written() -> bool:
         return read_document(diag_dir) is not None
 
