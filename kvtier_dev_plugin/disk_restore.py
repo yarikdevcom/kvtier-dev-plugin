@@ -1538,6 +1538,9 @@ that question the payload has `serving_as`, and the log has the one
 the writer set, and that no configuration vocabulary names this switch.
 """
 
+REFUSAL_SLOT_PACKED = "slot_packed_group"
+REFUSAL_MIXED_REPLICATION = "mixed_replication_group"
+
 OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   "bad_result", "unaligned_local_prefix", "skip_read_requested",
                   "no_tokens_left", "no_block_hashes", "no_key_helpers",
@@ -1570,7 +1573,15 @@ OFFER_REFUSALS = ("not_configured", "disarmed", "tier_disarmed", "bad_call",
                   # engine computing a prompt normally is the correct answer to "the cap
                   # is full", and a step thread that waits on an asynchronous copy is
                   # the answer that killed the engine on 2026-10-12.
-                  "no_staging_rows")
+                  "no_staging_rows",
+                  # NOT POOL-BLOCK-ADDRESSABLE, and MIXED-REPLICATION MERGES (0.2.71).
+                  # The v2.5 side-cache layout (fork patch 0088) can put BOTH shapes in
+                  # front of a connector it was designed to exclude, and each of them
+                  # mis-addresses memory rather than failing. See the CONTRACT_* block:
+                  # a slot-packed group's block ids are slot ids, and a folded group's
+                  # layers do not share one page shape. Both refuse; neither is skipped
+                  # quietly, because a skipped group is a claim made without it.
+                  REFUSAL_SLOT_PACKED, REFUSAL_MIXED_REPLICATION)
 
 # --- what a group's blocks ARE, as a claim reads them (0.2.27) ----------------
 #
@@ -1620,7 +1631,39 @@ CONTRACT_UNSTABLE = "unstable"
 CONTRACT_GEOMETRY = "geometry"
 CONTRACT_OUTSIDE = "outside"
 CONTRACT_UNKNOWN = "unknown"
+# NOT POOL-BLOCK-ADDRESSABLE (the v2.5 side-cache layout). A slot-packed group cuts
+# every pool block into `slots_per_block` equal slots and hands out SLOTS: the fork's
+# `RingSlotPool` builds a block id as `pool_block_id * slots_per_block + slot` and
+# `KVCacheConfig.num_blocks_of` returns `num_blocks * tensor.slots_per_block`, so the
+# group's block ids are SLOT ids. The fork's own scheduler says it plainly at
+# `v1/core/sched/scheduler.py` (v2.5 patch 0088), where the zeroing walk skips such a
+# manager: "its block ids are slot ids, not pool block ids". Every address this tier
+# forms is `block_id * slot_width` into the group's region, so for a slot-packed group
+# it would land in the WRONG memory while every counter still read success - the exact
+# shape of this project's signature incident (plausible output, not an error). It is
+# therefore a contract this module DOES NOT have, named so a payload can say so.
+CONTRACT_SLOT_PACKED = "slot_packed"
+# MIXED TP REPLICATION inside one group. The v2.5 PLE fold merges a TP-replicated
+# Mamba group into a sharded one and builds the container DIRECTLY, because
+# `is_uniform_type` rejects mixed `tp_replicated` "on purpose (NIXL), and connectors
+# never reach this path" - a sentence written for the fork's own connectors that ours
+# DOES reach. A group like this has no single page shape: reading the mode or the width
+# off `first_spec` would price a 13-layer group by one of its layers. We cannot price
+# it, so we refuse it, which is the same move `incomplete_group_set` already makes.
+CONTRACT_MIXED_REPLICATION = "mixed_replication"
 CONTRACTS_IMPLEMENTABLE = (CONTRACT_POSITIONAL, CONTRACT_BOUNDARY)
+
+# The fork's signal that a group's blocks are slots: `slots_per_block` on the group
+# spec / tensor / manager, and `CircularBufferManager.slot_pool` (non-None only after
+# `enable_slot_packing`). Both spellings are tried because the coordinator sets the
+# manager's pool and the KVCacheConfig sets the group's field, and a boot can carry one
+# without the other being reachable from here.
+SLOTS_PER_BLOCK_ATTR = "slots_per_block"
+SLOT_POOL_ATTR = "slot_pool"
+
+# Refusal names for the two shapes above are declared just above `OFFER_REFUSALS`
+# (`REFUSAL_SLOT_PACKED`, `REFUSAL_MIXED_REPLICATION`): that tuple is built at import
+# time, so a name defined after it is a NameError, not a forward reference.
 
 # The one value of `MambaSpec.mamba_cache_mode` the fork reads as "I hand off
 # boundary states" (`single_type_kv_cache_manager.py:1497`, `:1516`, `:1703`,
@@ -1788,6 +1831,52 @@ OFFER_REFUSAL_WHY = {
                        "comes back when the load ends - on a positive report or "
                        "because the load is terminal without one - and `staging_cap` "
                        "publishes whether the cap is the binding constraint.",
+    "slot_packed_group": "THE GROUP'S BLOCK IDS ARE NOT POOL BLOCK IDS (0.2.71). The "
+                         "v2.5 side-cache layout (fork patch 0088, "
+                         "`kv_cache_utils._choose_ring_slots` + "
+                         "`single_type_kv_cache_manager.RingSlotPool`) cuts every pool "
+                         "block of a ring group into `slots_per_block` slots and hands "
+                         "out slots: a slot's block id is "
+                         "`pool_block_id * slots_per_block + slot`, and "
+                         "`KVCacheConfig.num_blocks_of` returns "
+                         "`num_blocks * slots_per_block`. The fork's own scheduler "
+                         "skips such a manager because 'its block ids are "
+                         "slot ids, not "
+                         "pool block ids' - and every address this tier forms is "
+                         "`block_id * slot width` into that group's region tensor, so "
+                         "against a slot-packed group it would read and write the "
+                         "WRONG "
+                         "memory while every counter reported success. REFUSED, not "
+                         "skipped: a group silently dropped from the eligible set is a "
+                         "claim made for a group nobody filled, which is the "
+                         "2026-10-06 "
+                         "00:08 failure. The gate opened for a folded layout only once "
+                         "the fork relaxed `_side_cache_layout_enabled` for this "
+                         "connector; until then no connector-bearing boot can reach "
+                         "this refusal, and it reports zero on every current boot.",
+    "mixed_replication_group": "THE GROUP'S LAYERS DO NOT SHARE ONE PAGE SHAPE "
+                               "(0.2.71). v2.5's PLE fold merges a TP-replicated Mamba "
+                               "group into a sharded one and builds the container "
+                               "DIRECTLY, with the fork's own comment saying "
+                               "`is_uniform_type` rejects mixed `tp_replicated` 'on "
+                               "purpose (NIXL), and connectors never reach this path'. "
+                               "That last clause is about the fork's connectors: ours "
+                               "does reach it, so a merged group can be "
+                               "prefix-cacheable "
+                               "here with 12 sharded layers and 1 replicated one "
+                               "inside "
+                               "it. No single page width, span cost or byte count "
+                               "describes such a group, and taking the first spec's "
+                               "values for the whole group would price 13 layers by "
+                               "one "
+                               "of them - a number that reads as a plan and is a "
+                               "guess. "
+                               "REFUSED because we cannot price it, which is the same "
+                               "move `incomplete_group_set` already makes for a group "
+                               "with no implementable contract. The honest fix, if "
+                               "this "
+                               "ever has to be served, is a per-LAYER contract in the "
+                               "group arithmetic - not a first_spec shortcut.",
     "no_read_queue": "the reader's job queue (disk_read.MAX_QUEUE_DEPTH) cannot carry "
                      "even ONE job of this offer's shape, so no offer is made at all. "
                      "The same fail-closed rule as `no_pool_budget`, from the other "
@@ -5283,6 +5372,14 @@ def _group_serviceability(manager, block_size: int, sizes: list,
         "has_positionally_stable_blocks": contracts[group]["stable"]
         if group in contracts else None,
         "mamba_cache_mode": contracts[group]["mamba_cache_mode"]
+        if group in contracts else None,
+        # THE TWO v2.5 LAYOUT ANSWERS, published per group for the same reason the
+        # other two are: a reader of the payload should not have to know what a
+        # `RingSlotPool` is to learn that a group's block ids are slot ids. `None`
+        # means "the engine did not say", which is a different fact from 1.
+        "slots_per_block": contracts[group].get("slots_per_block")
+        if group in contracts else None,
+        "tp_replicated_values": contracts[group].get("tp_replicated_values")
         if group in contracts else None}
         for group in list(contracts)[:16]}
     return _ok(prefix_cacheable_group_ids=list(wanted)[:16],
@@ -5513,11 +5610,25 @@ def _eligible_groups(manager, block_size: int,
         # tuple, which nobody does. Clamp-to-nothing and refuse-because-nothing end up
         # in the same place; only the refusal says why in the witness. The per-group
         # requirement table below is what a future reader needs to re-derive that.
+        kinds = set((serviceability.get("blocked_kinds") or {}).values())
+        # THE REFUSAL NAME IS THE MOST SPECIFIC FACT, not always `incomplete_group_set`.
+        # "Some cacheable group is not restorable" is true of a slot-packed group and of
+        # an unimplementable one, but the two need different remedies and a reader who
+        # sees only the shared name cannot tell them apart from the `refused` map. A
+        # boot with neither shape takes the `else` branch and is unchanged, counter name
+        # included - which is the no-regression rule, pinned by
+        # `tests/test_disk_slot_packed_groups.py`. Decided HERE, before anything reads
+        # it, because `refused_as` and the counter must name the same reason.
+        if CONTRACT_SLOT_PACKED in kinds:
+            refusal_name = REFUSAL_SLOT_PACKED
+        elif CONTRACT_MIXED_REPLICATION in kinds:
+            refusal_name = REFUSAL_MIXED_REPLICATION
+        else:
+            refusal_name = "incomplete_group_set"
         required = _groups_required(serviceability, claim_blocks or 1)
         required["offered"] = False
-        required["refused_as"] = "incomplete_group_set"
+        required["refused_as"] = refusal_name
         _state["last_groups_required"] = required
-        kinds = set((serviceability.get("blocked_kinds") or {}).values())
         why_bits = []
         if CONTRACT_UNSTABLE in kinds:
             # KEPT SHORT ON PURPOSE: the whole sentence is clipped at 160 characters
@@ -5532,13 +5643,19 @@ def _eligible_groups(manager, block_size: int,
             why_bits.append("its block_size is not the scheduler's")
         if CONTRACT_OUTSIDE in kinds:
             why_bits.append("it is outside the group table")
+        if CONTRACT_SLOT_PACKED in kinds:
+            # KEPT SHORT: the sentence is clipped at 160 characters and the group ids
+            # must survive the cut alongside the verdict.
+            why_bits.append("its block ids are slot ids, not pool block ids")
+        if CONTRACT_MIXED_REPLICATION in kinds:
+            why_bits.append("its layers do not share one page shape")
         short = "; ".join(why_bits) or "not restorable"
         listed = ", ".join(str(item) for item in blocked)
         notice_once(
-            "incomplete_group_set",
+            refusal_name,
             f"DISK[restore] this model cannot be served from disk: "
-            f"prefix-cacheable groups {blocked} are not restorable while only "
-            f"{groups} are, and an offer claims EVERY prefix-cacheable group "
+            f"prefix-cacheable groups {blocked} are not restorable ({short}) while "
+            f"only {groups} are, and an offer claims EVERY prefix-cacheable group "
             "because get_num_new_matched_tokens skips prefill model-wide while "
             "update_state_after_alloc silently skips the group that has no entry. "
             "Refusing every disk offer on this geometry; recompute is the only "
@@ -5554,7 +5671,7 @@ def _eligible_groups(manager, block_size: int,
                      f"group(s) {listed} cannot be restored ({short}), so offering "
                      f"the restorable subset {groups} alone would claim them as "
                      "computed",
-                     reason_kind="incomplete_group_set",
+                     reason_kind=refusal_name,
                      blocked_group_ids=blocked[:16],
                      blocked_kinds=dict(serviceability.get("blocked_kinds") or {}),
                      blocked_why=dict(serviceability.get("blocked_why") or {}),
@@ -5571,6 +5688,138 @@ def _eligible_groups(manager, block_size: int,
                                      if contracts.get(str(group))
                                      == CONTRACT_POSITIONAL],
                group_block_sizes=[int(sizes[group]) for group in groups])
+
+
+def _slot_packing(entry) -> dict:
+    """Is this group addressed by SLOTS of shared pool blocks? Read from the engine.
+
+    WHY A SEPARATE QUESTION FROM THE BLOCK CONTRACT. The contract answers "how many
+    blocks of this group does a claimed run COST"; this answers "is a block id from this
+    group even a POOL BLOCK ID". Slot packing breaks the second question, and it breaks
+    it underneath the first: a slot-packed group could be perfectly positional and
+    perfectly whole-block-sized and still be unaddressable by us, because the tier
+    forms every GPU address as `block_id * slot width` into the group's region tensor
+    and a slot-packed group's `block_stride` is ONE SLOT while its ids run to
+    `num_blocks * slots_per_block`.
+
+    THE SIGNALS ARE THE FORK'S OWN (v2.5 patch 0088), tried in order of directness:
+      * `manager.slot_pool` is not None - the property `CircularBufferManager`
+        gains from `enable_slot_packing`, and the fork's own scheduler skips a manager
+        on exactly this test (`v1/core/sched/scheduler.py`: "its block ids are slot
+        ids, not pool block ids"). Its `.slots_per_block` is the width.
+      * `slots_per_block > 1` on the manager, or on the group's spec/tensor - the field
+        `KVCacheGroupSpec`/`KVCacheTensor` carry, set by `_choose_ring_slots`.
+
+    POSITIVE SIGNAL ONLY. Absent attributes, a value of 1, a non-int and a read that
+    raises all answer "not slot-packed as far as this process can tell", which is the
+    pre-0088 world and keeps every current boot byte-for-byte as it was. A guess in the
+    other direction would refuse a working tier; a guess in THIS direction is the one
+    that must never happen, so the only way to be refused is for the engine to say so.
+    CONTAINED, like every other read on this path: a manager entry is a fork
+    object and a
+    renamed attribute can RAISE rather than return None, and a witness that faults the
+    step thread is not a witness. A raising read answers "no signal", and the
+    group's own
+    contract read still answers `unknown` for a flag it cannot read - which is already a
+    refusal.
+    """
+    try:
+        return _slot_packing_read(entry)
+    except Exception as exc:  # noqa: BLE001 - an unreadable entry reports no signal
+        snapshot._error(exc, "disk_restore slot-packing read")
+        return {"packed": False, "slots_per_block": None, "signal": None,
+                "reason": None}
+
+
+def _slot_packing_read(entry) -> dict:
+    """The read itself, with no containment: see `_slot_packing` for the policy."""
+    pool = getattr(entry, SLOT_POOL_ATTR, None)
+    if pool is not None:
+        slots = getattr(pool, SLOTS_PER_BLOCK_ATTR, None)
+        if not _plain_int(slots) or slots < 1:
+            # A pool that exists but will not say how many slots: the fork renamed the
+            # width, not the fact. The fact is enough to refuse on.
+            slots = None
+        return {"packed": True,
+                "slots_per_block": slots,
+                "signal": f"{SLOT_POOL_ATTR} is a "
+                          f"{type(pool).__name__} (the fork's own skip test)",
+                "reason": "the group's manager hands out slots of shared pool blocks "
+                          "(RingSlotPool), so its block ids are slot ids, not pool "
+                          "block ids"}
+    for label, holder in ((f"manager.{SLOTS_PER_BLOCK_ATTR}", entry),
+                          (f"kv_cache_spec.{SLOTS_PER_BLOCK_ATTR}",
+                           getattr(entry, "kv_cache_spec", None))):
+        value = getattr(holder, SLOTS_PER_BLOCK_ATTR, None) if holder is not None \
+            else None
+        if _plain_int(value) and value > 1:
+            return {"packed": True,
+                    "slots_per_block": int(value),
+                    "signal": f"{label} == {value}",
+                    "reason": f"{label} is {value}, so the group's view holds "
+                              f"{value} slots per pool block and its block ids are "
+                              "slot ids"}
+    return {"packed": False, "slots_per_block": 1, "signal": None, "reason": None}
+
+
+def _replication_uniformity(entry) -> dict:
+    """Do this group's LAYERS share one TP-replication answer? Never a first_spec guess.
+
+    WHY THIS IS ASKED AT ALL. The v2.5 PLE fold merges the TP-replicated PLE Mamba
+    group into a sharded GDN group and builds the container directly, with the fork's
+    comment recording WHY the normal constructor refuses it: `is_uniform_type` rejects
+    mixed `tp_replicated` "on purpose (NIXL), and connectors never reach this path".
+    Ours does reach it. Such a group has no single page shape, so its span cost and its
+    bytes per block are not one number, and pricing 13 layers from `first_spec` is a
+    guess dressed as arithmetic.
+
+    `disk_store._sub_specs` is reused rather than re-derived - it is the one place this
+    package knows both container spellings (`kv_cache_specs`, then `first_spec`). Its
+    `first_spec` fallback is DEGRADED HERE, not believed: one layer read from a
+    thirteen-layer container cannot show a disagreement, and it cannot prove the absence
+    of one. So `uniform=None` ("cannot tell from the accessor that answered") is
+    reported, and this function returns `mixed=True` ONLY on two distinct boolean
+    answers from a real `kv_cache_specs` walk - the same positive-signal rule as
+    `_slot_packing`, for the same reason.
+    """
+    try:
+        spec = getattr(entry, "kv_cache_spec", None)
+    except Exception as exc:  # noqa: BLE001 - an unreadable entry shows no disagreement
+        snapshot._error(exc, "disk_restore replication read")
+        return {"mixed": False, "uniform": None, "values": [], "accessor": None,
+                "reason": None}
+    if spec is None:
+        return {"mixed": False, "uniform": None, "values": [], "accessor": None,
+                "reason": None}
+    try:
+        subs, accessor = disk_store._sub_specs(spec)
+    except Exception as exc:  # noqa: BLE001 - an unreadable container is not a verdict
+        snapshot._error(exc, "disk_restore replication walk")
+        return {"mixed": False, "uniform": None, "values": [], "accessor": None,
+                "reason": None}
+    if not subs or accessor != "kv_cache_specs":
+        # A plain per-layer spec (the usual scheduler-side group) has ONE answer by
+        # construction; a container reachable only through `first_spec` is unknown.
+        return {"mixed": False,
+                "uniform": True if not subs or accessor is None else None,
+                "values": [], "accessor": accessor, "reason": None}
+    values = []
+    for sub in subs:
+        flag = getattr(sub, "tp_replicated", None)
+        if isinstance(flag, bool) and flag not in values:
+            values.append(flag)
+    if len(values) > 1:
+        return {"mixed": True,
+                "uniform": False,
+                "values": values,
+                "accessor": accessor,
+                "signal": (f"{len(subs)} layers via {accessor} disagree on "
+                           f"tp_replicated: {values}"),
+                "reason": (f"the group's layers disagree on tp_replicated {values}, "
+                           "so no single page shape, span cost or bytes-per-block "
+                           "describes it")}
+    return {"mixed": False, "uniform": bool(values) is False or True,
+            "values": values, "accessor": accessor, "reason": None}
 
 
 def _group_contract(manager, group: int) -> dict:
@@ -5629,6 +5878,27 @@ def _group_contract(manager, group: int) -> dict:
     if stable is None:
         spec = getattr(entry, "kv_cache_spec", None)
         stable = getattr(spec, "has_positionally_stable_blocks", None)
+    # IS A BLOCK ID FROM THIS GROUP A POOL BLOCK ID AT ALL? Asked BEFORE the contract
+    # question, because slot packing invalidates the addressing the contract assumes: a
+    # slot-packed group can be positionally stable, whole-block-sized and perfectly
+    # nameable and still be unaddressable by `block_id * slot width`. See
+    # `_slot_packing` for the signals and for why only a positive signal counts.
+    packing = _slot_packing(entry)
+    if packing["packed"]:
+        return _ok(contract=CONTRACT_SLOT_PACKED, stable=stable,
+                   mamba_cache_mode=None, slots_per_block=packing["slots_per_block"],
+                   slot_packed_signal=packing["signal"],
+                   reason=f"not pool-block-addressable: {packing['reason']}")
+    # DO THE GROUP'S LAYERS SHARE ONE PAGE SHAPE? A v2.5 PLE-fold merge says no, and
+    # `first_spec` would price the whole group by one layer. Refused, not repriced.
+    replication = _replication_uniformity(entry)
+    if replication["mixed"]:
+        return _ok(contract=CONTRACT_MIXED_REPLICATION, stable=stable,
+                   mamba_cache_mode=None,
+                   tp_replicated_values=replication["values"],
+                   replication_signal=replication["signal"],
+                   reason=f"layers do not share one page shape: "
+                          f"{replication['reason']}")
     mode = getattr(entry, "mamba_cache_mode", None)
     if not isinstance(mode, str):
         mode = getattr(getattr(entry, "kv_cache_spec", None), "mamba_cache_mode",

@@ -1,0 +1,139 @@
+# DRAFT - NOT A PATCH YET, NOT IN `series`, AND NOT APPLIABLE.
+#
+# WHY IT LIVES HERE AND NOT IN `patches/0005-...`: `apply-kvtier-patches.sh` dies on
+# any `[0-9][0-9][0-9][0-9]-*/` directory the `series` file does not list ("an unlisted
+# patch is a patch nobody applies"), and `tests/test_patch_series.py` asserts
+# `entries == on_disk` and `len(entries) == 4`. A numbered draft directory would break
+# both - i.e. a draft that is not ready would disable the tool that keeps the engine
+# honest. `drafts/` is invisible to both by construction. To promote this: build the
+# `.patch`, compute the post-image through the tool's own build path, move the directory
+# to `patches/0005-<name>/`, add it to `series`, and let the tests judge it.
+#
+# Every field is either read from source I actually read, or UNKNOWN. Where a hash
+# belongs to the v2.5.1 tree and I could verify it, I say WHERE and WHEN I read it.
+
+draft_id=side-cache-layout-for-kvtier
+title="v2.5 side-cache layout: let OUR connector opt in, by name, instead of being excluded by the blanket gate"
+upstream_issue="none (fork-local; the gate is the fork's own, patch 0088 of the v2.5 series)"
+upstream_pr="none (fork-local)"
+
+# ---- WHY THIS PATCH WOULD EXIST ---------------------------------------------
+# Measured on one host, same --kv-cache-memory 4100000000, same --block-size 4096:
+#   v2.2 + our tier                     806,792 tokens
+#   v2.5.1 + our tier                   764,843
+#   v2.5.1, tier OFF, --use-replayssm   924,993
+# The gate that costs us the difference is
+# `vllm/v1/core/kv_cache_utils.py::_side_cache_layout_enabled`, which returns False
+# whenever `kv_transfer_config is not None` - blanket, no connector-name check, no
+# capability flag - and `VLLM_E2_SIDE_CACHE_LAYOUT` only switches the layout OFF. There
+# is no override, so a boot carrying our connector can never run the layout, and the
+# layout is the fork's own answer to the two side caches that "hold 6 of the 103 blocks
+# a 262K request needs".
+#
+# WHAT THIS DRAFT WOULD DO, AND ONLY THIS: inside that predicate, treat OUR connector as
+# an opt-in instead of a veto - match the connector by name, not by "is any connector
+# present" - so a boot with SimpleCPUOffloadConnector still gets the PLE fold and ring
+# slot packing while every foreign connector (NIXL, P/D, HiSparse) keeps the old layout
+# exactly as the fork wrote it.
+#
+# THE PRECONDITION, WHICH IS WHY THIS IS A DRAFT AND NOT A PATCH: the layout puts two
+# new shapes in front of a connector it was designed to exclude - a SLOT-PACKED ring
+# group (block ids are slot ids: `RingSlotPool` forms `pool_block_id * slots_per_block +
+# slot`, and the fork's own scheduler skips such a manager because "its block ids are
+# slot ids, not pool block ids") and a MERGED group with MIXED `tp_replicated` layers
+# (the fork builds it directly because "is_uniform_type rejects mixed tp_replicated on
+# purpose (NIXL), and connectors never reach this path"). The plugin must recognise both
+# and REFUSE them by name before this relaxation is applied, or the tier would address a
+# slot-packed group at `block_id * slot width` - the wrong memory, reported as success.
+# That prerequisite is DONE in 0.2.71: `disk_restore.CONTRACT_SLOT_PACKED`,
+# `CONTRACT_MIXED_REPLICATION`, the refusal names `slot_packed_group` and
+# `mixed_replication_group` (scheduler AND worker maps), and
+# `tests/test_disk_slot_packed_groups.py`.
+
+# ---- which tree this entry describes ----------------------------------------
+# THE FORK GATE THIS PATCH TOUCHES IS v2.5-ONLY. `_side_cache_layout_enabled` does not
+# exist in the v2.2 tree at all (it arrives with fork patch 0088), so there is no v2.2
+# record to write and inventing one would be a fabricated reference - the exact thing
+# `verify` exists to refuse. So only v2.5.1 is listed. If the tool needs the default tree
+# to be present in `trees=`, this line is the first thing to re-check on promotion.
+trees="v2.5.1"
+tree_default=v2.5.1
+
+# ---- what is patched, and where ---------------------------------------------
+# The five values a verdict is computed from (TARGET_ABS, GIT_ROOT, ENGINE_PYTHON,
+# FILE_SHA_PRE, FILE_SHA_POST) are NEVER inherited from the flat keys, so all five are
+# written explicitly for v2.5.1 below. Anything else is shared structure and lives flat.
+module=vllm.v1.core.kv_cache_utils
+klass=UNKNOWN   # module-level function, not a method; kvtier-patch.sh wants a klass
+git_rel=vllm/v1/core/kv_cache_utils.py
+target_mode=UNKNOWN
+
+# Read on the box 2026-10-22, read-only, in the tree the v2.5 engine imports:
+#   grep -c "def _side_cache_layout_enabled" -> 1 (the function exists there)
+tree_v2_5_1_target_abs=/home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/core/kv_cache_utils.py
+tree_v2_5_1_git_root=/home/user/vllm-38-next-v2.5/vllm-v2.5
+tree_v2_5_1_engine_python=/home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+# `git -C /home/user/vllm-38-next-v2.5/vllm-v2.5 rev-parse HEAD`, read 2026-10-22.
+tree_v2_5_1_file_sha_pre=7610e4e5618a425e81f77b7f0b72acc6dc6cb9e39593efeae36f3fbaa13a3dda
+# NOT BUILT, so NOT A GUESS: no `.patch` bytes exist yet, so no post-image exists.
+tree_v2_5_1_file_sha_post=UNKNOWN
+# The KEY CASE IS LOAD-BEARING, so it was checked in the tool and not trusted from the
+# brief: `TREE_FIELDS` at kvtier-patch.sh:328 spells every field LOWERCASE and
+# `tree_field()` at :355 builds `local v="tree_$1_$2"` from that field name. So a slug
+# written with an upper-cased field suffix is a key nobody looks up, and the tree would
+# answer `UNKNOWN PROVENANCE ... no recorded reference` - a typo dressed as a missing
+# reference. The worked example is 0003-kvtier-disk-restore-meta/patch.manifest:117-130.
+tree_v2_5_1_target_mode=UNKNOWN
+# 0003 and 0004 now carry v2.5.1 records too (trees="v2.2 v2.5.1", tree_default=v2.2),
+# so the v2.5.1 disk-tier substrate is no longer a gap: 0003's v2.5.1 post-image is
+# 4b4b8ddd..., byte-identical to its v2.2 post-image. This entry is the SECOND v2.5.1
+# claim, and the first one that changes serving behaviour if it is ever applied.
+fork_pin_head=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+fork_version=UNKNOWN   # the v2.5 tree does not report 0.30.0; do not copy that value here
+
+# ---- the patch itself: NOT BUILT --------------------------------------------
+# A fabricated hash is worse than an admission of ignorance, and `kvtier-patch.sh`
+# refuses on a hash matching neither pre nor post - so the built-artifact fields stay
+# empty until someone builds the hunk and runs it through the tool's own build path
+# (`git apply --check -p1`, then `git apply -p1` at zero offset, then py_compile with
+# the ENGINE interpreter, then sha256 of the result).
+patch_file=UNKNOWN
+patch_sha256=UNKNOWN
+patch_hunks=UNKNOWN
+patch_added=UNKNOWN
+patch_removed=UNKNOWN
+
+# ---- whole-file fingerprints -------------------------------------------------
+# They live per tree, above: tree_v2_5_1_file_sha_pre is `sha256sum
+# vllm/v1/core/kv_cache_utils.py` in /home/user/vllm-38-next-v2.5/vllm-v2.5 at the HEAD
+# above, read 2026-10-22 - NOT a guess, and NOT v2.2's hash. It is the pre-image on the
+# assumption that no kvtier patch has ever touched this file (true today: patches
+# 0001-0004 target manager.py and metadata.py only). It is also a NON-PRODUCTION tree, so
+# applying to it is not an operator action.
+file_bytes_pre=UNKNOWN
+file_bytes_post=UNKNOWN
+file_lines_pre=UNKNOWN
+file_lines_post=UNKNOWN
+
+# ---- per-method fingerprints -------------------------------------------------
+# `_side_cache_layout_enabled` is a module-level FUNCTION, and kvtier-patch.sh's verifier
+# hashes METHOD bodies of `klass` with `ast`. Whether it can fingerprint a module-level
+# function is UNKNOWN and must be answered before this is promoted; if it cannot, the
+# manifest needs a real class's method as a canary (the pattern 0003 uses with
+# `aggregate`) and the hunk's own correctness then rests on the whole-file hashes alone.
+methods=UNKNOWN
+methods_pre_sha256=UNKNOWN
+methods_post_sha256=UNKNOWN
+
+# ---- WHAT THIS DELIBERATELY DOES NOT BUY ------------------------------------
+# The 924,993 figure is NOT this patch's. `--use-replayssm` is refused by a SEPARATE
+# validation, `vllm/config/vllm.py::validate_mamba_cached_kernel`, which raises
+#   "--use-replayssm is incompatible with KV connectors
+#    (P/D disaggregation, KV cache offload)"
+# when `kv_transfer_config.is_kv_transfer_instance` - and our launcher passes
+# `kv_role: "kv_both"` (serve-v2.2.sh:628), which IS in `KVRole`, so it fires for us.
+# That is draft 0006, and it carries its own safety question. This draft buys, at most,
+# the fork's 806,792 -> 853,994 step.
+
+state_dir=UNKNOWN
+backup_dir=UNKNOWN

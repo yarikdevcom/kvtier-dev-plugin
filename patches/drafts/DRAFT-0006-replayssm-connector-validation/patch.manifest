@@ -1,0 +1,168 @@
+# DRAFT - **DO NOT APPLY.** Not a patch, not in `series`, and its header states the
+# reason: an unanswered question about a state race sits underneath it, and the failure
+# mode it would open is plausible output rather than an error - this project's signature
+# incident class (`Register Register Register...` at temperature=0, 2026-10-06 00:08).
+#
+# Lives in `patches/drafts/` for the same reason as DRAFT-0005: a numbered directory the
+# `series` file does not list makes `apply-kvtier-patches.sh` die and breaks
+# `tests/test_patch_series.py`.
+
+draft_id=replayssm-connector-validation
+title="v2.5: let --use-replayssm coexist with OUR connector (the KV-connector clause of the RecoverSSM validator)"
+upstream_issue="none (fork-local validation, v2.5 series patches 0071/0072/0085/0091)"
+upstream_pr="none (fork-local)"
+
+# ---- SAFETY VERDICT: DO NOT APPLY UNTIL THE QUESTION BELOW IS ANSWERED ------
+# Below is what I read, then the one question, then what a YES and a NO each mean. A
+# reader who wants to apply this should not be able to miss this section.
+
+# ---- WHAT THE VALIDATION ACTUALLY IS (read from the installed tree) ---------
+# `vllm/config/vllm.py::validate_mamba_cached_kernel`, the LAST clause of it:
+#
+#     if (self.kv_transfer_config is not None
+#             and self.kv_transfer_config.is_kv_transfer_instance):
+#         raise ValueError("--use-replayssm is incompatible with KV connectors "
+#                           "(P/D disaggregation, KV cache offload)")
+#
+# `is_kv_transfer_instance` (`config/kv_transfer.py:143`) is
+#     kv_connector is not None and kv_role in get_args(KVRole)
+# with KVRole = {"kv_producer", "kv_consumer", "kv_both"}. Our launcher passes
+# `kv_role: "kv_both"` (`serve-v2.2.sh:628`), so the clause FIRES FOR US. It is not a
+# P/D-only guard in effect, whatever the parenthetical says.
+#
+# EVIDENCE OF CONSERVATISM, WHICH IS WHY THIS DRAFT EXISTS AT ALL:
+#   * The clause sits OUTSIDE the `if self.cache_config.use_recoverssm:` branch, so it
+#     also vetoes the plain ReplaySSM path - the one whose own commit message calls its
+#     checkpoint READ-ONLY. A guard that catches a read-only path is not scoped to the
+#     mechanism it names.
+#   * It is not inside the architecture-specific block either: the validator takes care
+#     to separate Qwen4Exp GDN/PLE from Kimi-K3 KDA and from the backends, then applies
+#     this one check to everything.
+#   * The fork's own reasoning is SILENT. Not one of the four RecoverSSM commit messages
+#     (0071 share the kernels, 0072 "RecoverSSM for Qwen GDN and the PLE short conv",
+#     0085 "use-replayssm without MTP falls back to the stock GDN path", 0091 pass
+#     use_replayssm to the graph fallback) mentions a connector, an offload tier, or why
+#     one would break. Compare 0085, which explains its own relaxation in full.
+
+# ---- WHAT THE FORK SAYS RECOVERSSM DOES (0072's own words) ------------------
+# "With --use-replayssm and speculative decoding, Gated DeltaNet layers verify the draft
+#  window from a READ-ONLY CHECKPOINT and keep a PER-TOKEN REPLAY RECORD; after sampling
+#  ONE COMMIT replays the accepted tokens and WRITES THE RECURRENT STATE ONCE. The PLE
+#  short conv gets the same treatment."
+# So per step, per live request row: a checkpoint read, a replay record written, and one
+# deferred commit that writes the recurrent state. The validator's own PP comment names
+# the machinery again: "Model Runner V2 defers the commit with a snapshot of its inputs
+# (RecoverSSMState.detach_step) and masks freed rows".
+
+# ---- THE FAILURE MODE THIS WOULD OPEN, STATED EXACTLY -----------------------
+# Our connector restores host-RAM/disk bytes into GPU blocks inside the step
+# (`start_load_kv`, which blocks the engine step - the settle window runs there too).
+# RecoverSSM holds per-ROW scratch (the replay record and a deferred commit) whose
+# authority is the state the step itself computed. If a load ever writes a recurrent-state
+# row that RecoverSSM has a live deferred commit for, the two orderings differ only in
+# which one wins the block - and BOTH orderings produce a plausible continuation, not an
+# exception: either the commit overwrites the restored state with one derived from a
+# checkpoint that predates the load, or the load overwrites a state the commit had
+# already advanced. Nothing in either engine would report it. That is the incident class
+# this repo has live evidence for, and it is why "it booted and answered" is not a test.
+
+# ---- THE QUESTION, WHICH IS ANSWERABLE AND HAS NOT BEEN ANSWERED ------------
+# CAN A CONNECTOR LOAD EVER TARGET A REQUEST ROW THAT RECOVERSSM HOLDS LIVE SCRATCH FOR?
+# The shape that makes it impossible is the one our tier relies on today: a restore is
+# admitted at SCHEDULING time for a request that has not run a decode step, so the row
+# has no checkpoint, no replay record and no deferred commit. The shape that makes it
+# possible is any path where a load lands on a row that is already live - a preempted and
+# resumed request, a recompute after a failed load (`kv_load_failure_policy: recompute`,
+# which our own launcher sets), or a second connector pass on an admitted request.
+# Answer it by READING, not by reasoning: enumerate the call sites of `start_load_kv` and
+# of the RecoverSSM commit in the installed tree, and ask whether any request is in both
+# sets in one step. A test on a boot with BOTH flags and a `kvtier_disk_restore`-flagged
+# request on a prompt with a planted code word - graded on greedy equality against the
+# recomputed answer, never on `offers`/`adopted`/`reads_applied` - is the witness.
+
+# ---- if the answer is NO ----------------------------------------------------
+# Then the clause is a conservatism guard for our case and the patch is: move the clause
+# inside a test that excludes OUR connector by NAME (leaving every foreign connector
+# vetted exactly as the fork vetted them), keep every other clause untouched, and require
+# the graded equality test above as the acceptance evidence. Re-measure the pool then:
+# the 853,994 -> 924,993 distance is this draft's, and the 806,792 -> 853,994 step is
+# DRAFT-0005's. Neither number is owed to either patch until a boot reports it.
+
+# ---- which tree this entry describes ----------------------------------------
+# v2.5.1 ONLY: `--use-replayssm`, RecoverSSM and `validate_mamba_cached_kernel`'s
+# KV-connector clause are v2.5 concepts (fork patches 0071/0072/0085/0091). There is no
+# v2.2 record to write, and inventing one would be a fabricated reference.
+trees="v2.5.1"
+tree_default=v2.5.1
+
+# ---- what is patched, and where ---------------------------------------------
+# The five verdict-bearing values (TARGET_ABS, GIT_ROOT, ENGINE_PYTHON, FILE_SHA_PRE,
+# FILE_SHA_POST) are NEVER inherited from the flat keys, so all five are explicit below.
+module=vllm.config.vllm
+klass=VllmConfig
+git_rel=vllm/config/vllm.py
+target_mode=UNKNOWN
+tree_v2_5_1_target_abs=/home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/config/vllm.py
+tree_v2_5_1_git_root=/home/user/vllm-38-next-v2.5/vllm-v2.5
+tree_v2_5_1_engine_python=/home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+# `sha256sum vllm/config/vllm.py`, read read-only on the box 2026-10-22 at the HEAD
+# below. NOT a production file: this is the v2.5 experiment tree, and the engine actually
+# serving is the v2.2 tree at /home/user/vllm-38-next/vllm-workspace.
+tree_v2_5_1_file_sha_pre=c2a70ce5dd70e2b8e71b29f5cdd5a153693b651058cf7d4a760bbf2465ce030a
+# NOT BUILT, so NOT A GUESS.
+tree_v2_5_1_file_sha_post=UNKNOWN
+# Lowercase is not a style choice: `TREE_FIELDS` (kvtier-patch.sh:328) spells the fields
+# lowercase and `tree_field()` (:355) looks up `tree_<slug>_<field>` built from them, so
+# an uppercase key is a key the tool never reads and the tree reports "no recorded
+# reference". Worked example: 0003/.../patch.manifest:117-130.
+# `git -C /home/user/vllm-38-next-v2.5/vllm-v2.5 rev-parse HEAD`, read 2026-10-22.
+fork_pin_head=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+fork_version=UNKNOWN
+
+# ---- the v2.5.1 disk-tier substrate: CORRECTED, and how it was got wrong ------
+# An earlier revision of this draft claimed the v2.5.1 port was blocked because "0004
+# cannot be re-anchored onto `prefix_cacheable_group_ids` without porting 0001". That
+# sentence was FALSE, and it came from a brief that was not checked against the bytes.
+# Re-derived from the tracked patch files and the installed tree, 2026-10-22:
+#   `grep -c prefix_cacheable patches/0004-kvtier-disk-restore/manager.py.patch` -> 0.
+#     0004's store loop keys EVERY entry unconditionally off
+#     `_store_key_pool.blocks[store_gpu[_i]].block_hash` and never consults a group set.
+#     The name belongs to 0001, where it occurs 5 times.
+#     (0004 has no metadata.py.patch at all - the metadata half is 0003's.)
+#   `grep -c prefix_cacheable_group_ids\|prefix_cacheable_groups
+#      vllm/v1/kv_cache_interface.py` on the installed v2.5.1 tree -> 3, with
+#     `prefix_cacheable` properties at :165, :422, :455. The concept is NATIVE to
+#     v2.5.1; only `manager.py` lacks it, because 0001 is not applied there.
+#   The substrate itself has since LANDED: 0003 is applied to the v2.5.1 tree
+#   (metadata.py +22, manager.py +32, `git apply --check` clean at a uniform -6 offset,
+#   `py_compile` under the engine interpreter, an AST check proving the field is declared
+#   AND passed to the constructor). Both trees' metadata.py post-images are byte-identical
+#   at 4b4b8ddd..., which is 0003's flat `file_sha_post` AND its
+#   `tree_v2_5_1_file_sha_post`. Inert until Boot 1; the engine is still pid 326471.
+# So nothing here blocks DRAFT-0005, and this entry's own blocker is the open question
+# below, not a missing substrate.
+
+patch_file=UNKNOWN
+patch_sha256=UNKNOWN
+patch_hunks=UNKNOWN
+patch_added=UNKNOWN
+patch_removed=UNKNOWN
+
+# Per tree, above: tree_v2_5_1_file_sha_pre was read with `sha256sum` on the box, not
+# guessed. The post-image does not exist because no `.patch` bytes exist.
+file_bytes_pre=UNKNOWN
+file_bytes_post=UNKNOWN
+file_lines_pre=UNKNOWN
+file_lines_post=UNKNOWN
+
+# The clause is the LAST statement of `validate_mamba_cached_kernel`; the model_validator
+# methods of `VllmConfig` are what kvtier-patch.sh's `ast` fingerprinter can hash. The
+# The pre-hash of `validate_mamba_cached_kernel` on THIS tree is UNKNOWN - it must be
+# computed with the tool against the file named by the v2.5.1 target_abs key above, and
+# this draft must not guess it.
+methods=validate_mamba_cached_kernel
+methods_pre_sha256=UNKNOWN
+methods_post_sha256=UNKNOWN
+
+state_dir=UNKNOWN
+backup_dir=UNKNOWN

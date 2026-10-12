@@ -520,7 +520,14 @@ REFUSAL_REASONS = ("no_key_for_slot", "key_count_mismatch", "bad_key_text",
                    # above are REUSED, not restated: they already mean "no channel to a
                    # worker" and "the gate is down", and a second word for the same
                    # operational statement is how a refusal table grows two answers.
-                   "relay_unwritable", "relay_no_answer", "rank_refused")
+                   "relay_unwritable", "relay_no_answer", "rank_refused",
+                   # NOT POOL-BLOCK-ADDRESSABLE, and MIXED-REPLICATION MERGES (0.2.71).
+                   # The SAME two names the scheduler side counts, spelled the same way
+                   # on purpose: a spill refusal and an offer refusal about the same
+                   # group are one fact, and two vocabularies for it is how a rank file
+                   # and a scheduler payload disagree about the same boot. See
+                   # `disk_restore.CONTRACT_SLOT_PACKED` for what each one means.
+                   "slot_packed_group", "mixed_replication_group")
 
 # --- SPAN COMPLETENESS AT THE HAND-OFF ----------------------------------------
 #
@@ -611,6 +618,16 @@ SPAN_SHAPE_ID_CHARS = 32
 # than two module globals because this module has already been crashed twice by a
 # `global` declared in the wrong place (`test_global_shadowing.py`).
 _span_shape_cache: dict = {"config": None, "shapes": None}
+
+# The fork's field name for "this group's view holds N slots per pool block", on both
+# `KVCacheGroupSpec` and `KVCacheTensor` (v2.5 patch 0088). Spelled once here and once
+# in `disk_restore`, where the same fork field is read from the scheduler's side.
+SLOTS_PER_BLOCK_ATTR = "slots_per_block"
+
+# The cached addressing view, keyed on the config object's identity like the span-shape
+# cache above, and for the same reason: the group table is boot-stable and this is read
+# on the step thread.
+_addressing_cache: dict = {"config": None, "view": None}
 
 _state: dict = {
     # the hook
@@ -797,6 +814,8 @@ def reset_state_for_tests() -> None:
     _state["handled"] = {}
     _span_shape_cache["config"] = None
     _span_shape_cache["shapes"] = None
+    _addressing_cache["config"] = None
+    _addressing_cache["view"] = None
     _logged_lines.clear()
     _retained.clear()
 
@@ -827,6 +846,11 @@ def _int(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _plain_int(value) -> bool:
+    """A real int, and not a bool wearing one (a spec's `slots_per_block` is an int)."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _clip(text, chars: int = MAX_STRING_CHARS):
@@ -1803,6 +1827,96 @@ def _span_basis(resolved: dict, from_sub_specs: list,
     return basis
 
 
+def _group_addressing_view(handler) -> dict:
+    """Which cacheable groups this tier CANNOT address, read from the worker's
+    own table.
+
+    THE v2.5 SIDE-CACHE LAYOUT, ASKED OF THE OBJECT THE WORKER ACTUALLY HOLDS. Fork
+    patch 0088 puts two new shapes in a group table, and both are invisible to a reader
+    that only asks `prefix_cacheable` and `mamba_cache_mode`:
+      * `KVCacheGroupSpec.slots_per_block > 1` (and the matching
+        `KVCacheTensor.slots_per_block`, with `KVCacheConfig.num_blocks_of` returning
+        `num_blocks * slots_per_block`): the group's block ids are SLOTS of shared pool
+        blocks - `pool_block_id * slots_per_block + slot` - which the fork's own
+        scheduler states when it skips such a manager: "its block ids are slot ids, not
+        pool block ids".
+      * a group whose per-layer specs DISAGREE on `tp_replicated`, which is exactly what
+        the PLE fold builds ("is_uniform_type rejects mixed tp_replicated on purpose
+        (NIXL), and connectors never reach this path" - ours does reach it).
+
+    WHY IT IS READ HERE AND NOT ONLY ON THE SCHEDULER. Spilling happens on the WORKER,
+    from the group id baked into the key's 4-byte suffix, and the bytes it copies are
+    taken from the region tensor at a slot offset. A slot-packed group's offsets are not
+    pool-block offsets, so the file it writes would be a well-named file of the wrong
+    bytes - the one artifact this tier must never produce, because a mis-named file
+    reads back as plausible KV rather than as an error.
+
+    POSITIVE SIGNALS ONLY, the same rule as `disk_restore._slot_packing`: an absent
+    attribute or a value of 1 answers "addressable as always", so a pre-0088 boot gets
+    empty lists and nothing downstream changes.
+    """
+    out = {"ok": True, "reason": None, "slot_packed": [], "mixed_replication": [],
+           "groups": 0, "signals": {}}
+    groups = getattr(getattr(handler, "kv_cache_config", None),
+                     "kv_cache_groups", None)
+    if not groups:
+        return {**out, "ok": False,
+                "reason": "kv_cache_config.kv_cache_groups is absent, so no group's "
+                          "addressing could be checked"}
+    try:
+        listed = list(groups)
+    except Exception:  # noqa: BLE001 - an unreadable table says nothing
+        return {**out, "ok": False, "reason": "kv_cache_groups is not iterable"}
+    out["groups"] = len(listed)
+    for index, group in enumerate(listed):
+        spec = getattr(group, "kv_cache_spec", None)
+        packed = getattr(group, SLOTS_PER_BLOCK_ATTR, None)
+        where = "kv_cache_group.slots_per_block"
+        if not (_plain_int(packed) and packed > 1):
+            packed = getattr(spec, SLOTS_PER_BLOCK_ATTR, None)
+            where = "kv_cache_spec.slots_per_block"
+        if _plain_int(packed) and packed > 1:
+            out["slot_packed"].append(index)
+            out["signals"][str(index)] = f"{where} == {packed}"
+            continue
+        subs, accessor = _sub_specs(spec) if spec is not None else ([], None)
+        if accessor != "kv_cache_specs":
+            # A plain per-layer spec, or a container reachable only through
+            # `first_spec`: neither can SHOW a disagreement, and `first_spec` is the
+            # exact shortcut this check exists to refuse. Silence here is not a pass:
+            # the scheduler-side contract still refuses a group it cannot price.
+            continue
+        values = []
+        for sub in subs:
+            flag = getattr(sub, "tp_replicated", None)
+            if isinstance(flag, bool) and flag not in values:
+                values.append(flag)
+        if len(values) > 1:
+            out["mixed_replication"].append(index)
+            out["signals"][str(index)] = (f"{len(subs)} layers via {accessor} "
+                                          f"disagree on tp_replicated: {values}")
+    return out
+
+
+def unaddressable_group_ids(handler) -> dict:
+    """The cached `_group_addressing_view()` for one boot's boot-stable group table.
+
+    Cached on the config object's identity for the same reason `_span_shapes_for` is:
+    the group table does not move within a boot, this runs on the step thread, and a
+    FAILURE is not cached so a worker that binds before its config exists heals on the
+    next completion rather than believing an old "absent".
+    """
+    config_object = getattr(handler, "kv_cache_config", None)
+    cache = _addressing_cache
+    if cache["config"] is config_object and config_object is not None:
+        return cache["view"]
+    view = _group_addressing_view(handler)
+    if view["ok"]:
+        cache["config"] = config_object
+        cache["view"] = view
+    return view
+
+
 def span_shape_state(handler) -> dict:
     """Which prefix-cacheable groups must be in a run, and which supply its anchor.
 
@@ -2327,12 +2441,41 @@ def on_store_completed(handler, before) -> dict:
             # number
             # genuinely moves as this tick's jobs are queued.
             mirror_on = spill_on_store_verdict()["enabled"]
+            # THE ADDRESSING GATE, read ONCE per event like the mirror posture: the
+            # group table is boot-stable, so asking it per pair would put a fifteen-
+            # attribute walk on the step thread to learn the same answer 64 times.
+            addressing = unaddressable_group_ids(handler)
             ceiling_closed = None
             refused_ceiling = 0
             refused_queue = 0
             refused_other = 0
             disabled_refused = 0
             for slot, key in record["pairs"]:
+                # NOT POOL-BLOCK-ADDRESSABLE, AND NOT ONE PAGE SHAPE: refuse the pair by
+                # NAME before any byte is copied. The group id comes from the key's own
+                # 4-byte suffix (`disk_layout.split_block_key`), the same split that
+                # names the file, so the refusal is about the group this pair IS rather
+                # than about a table someone hoped was aligned. The reason a silent skip
+                # is not acceptable here is the same reason it was not acceptable on the
+                # offer door: a spilled file of a slot-packed group is a well-named file
+                # of the WRONG BYTES, and a restore that reads it back answers plausibly
+                # instead of failing. A named counter is the only witness that will ever
+                # say "the tier saw that group and would not touch it".
+                if addressing["slot_packed"] or addressing["mixed_replication"]:
+                    split = disk_layout.split_block_key(key)
+                    group_id = (int(split["group_id"])
+                                if split.get("ok") else None)
+                    refused_as = ("slot_packed_group" if group_id in
+                                  addressing["slot_packed"] else
+                                  "mixed_replication_group" if group_id in
+                                  addressing["mixed_replication"] else None)
+                    if refused_as is not None:
+                        _count(refused_as,
+                               f"group {group_id} of store event {event} is "
+                               f"{addressing['signals'].get(str(group_id))}, so its "
+                               "bytes are not addressed by pool block id and spilling "
+                               "them would write a well-named file of the wrong bytes")
+                        continue
                 if handed >= MAX_SLOTS_PER_TICK:
                     remaining = len(record["pairs"]) - spilled_here
                     _state["slots_capped"] = int(_state["slots_capped"]) + remaining
