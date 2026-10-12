@@ -8,6 +8,16 @@ version = "0.2.71"
 description = "Development plugin for a live vLLM host-RAM KV-cache tier: loopback-or-allowlist scheduler-side diagnostics (token-gated off-box) and hot reload of a local policy module."
 readme = "README.md"
 requires-python = ">=3.10"
+# Apache-2.0. LICENSE is the byte-exact canonical text (only the appendix's copyright
+# line is filled in) and NOTICE carries the third-party attributions - the patch series
+# quotes code from vLLM, itself Apache-2.0, which is why this licence was chosen rather
+# than a permissive-but-different one: it cannot conflict with the trees this plugin
+# patches. Kept to fields older setuptools will not reject, because this package is
+# installed into a LIVE venv and a metadata error there is an outage, not a nuisance.
+# No `License ::` classifier on purpose: with a PEP 639 expression present, setuptools
+# rejects one outright (`InvalidConfigError: License classifiers have been superseded by
+# license expressions`) - the expression is the licence declaration now, not a duplicate.
+license = "Apache-2.0"
 # Deliberately empty. `fastapi`/`starlette` arrive with vllm, and pinning them
 # here would let a `pip install -e .` churn the serving venv's package set.
 # This plugin must be installable into a running vllm venv without changing any

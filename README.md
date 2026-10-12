@@ -7148,3 +7148,20 @@ copy of either method. The fork's own tier suite is unaffected: `84 passed`
 * `502` vs `504` on a route: `504` means the engine never answered within
   `VLLM_E2_TIER_DEV_TIMEOUT`; `502` means the engine answered with a failure.
   Neither cancels anything in the engine, and neither retries.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE), which is the canonical text byte for
+byte with only the appendix's copyright line filled in, and [NOTICE](NOTICE) for the
+third-party attributions.
+
+The licence was chosen for compatibility rather than preference. This package is not a
+fork of vLLM and vendors none of it, but it patches vLLM at runtime
+(`kvtier_dev_plugin/backport.py`) and carries a patch series (`patches/`) whose hunks are
+authored against forked vLLM trees and quote vLLM code in their context. vLLM is
+Apache-2.0, so an Apache-2.0 licence here cannot conflict with the trees this plugin is
+built to run against; a different permissive licence could.
+
+This licence covers this repository only. It conveys nothing about the engine trees it
+patches, the launcher scripts it is driven by, the host configuration it assumes, or any
+model weight — all of which stay under whatever terms their own owners set.
