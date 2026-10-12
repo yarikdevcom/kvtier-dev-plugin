@@ -63,14 +63,18 @@ so these routes answer between requests.
 ### From git - what a serving venv should carry
 
 ```bash
-venv/bin/pip install "kvtier-dev-plugin @ git+https://github.com/yarikdevcom/kvtier-dev-plugin.git"
+venv/bin/pip install "kvtier-dev-plugin @ git+https://github.com/yarikdevcom/kvtier-dev-plugin.git@v0.2.71"
 venv/bin/pip check
 ```
 
-Add `@v0.2.71` to that URL to pin it **once that tag exists**: no release tag has
-been pushed yet, so the command above installs whatever the default branch is at
-clone time. Cut the tag (`git tag -a v0.2.71 -m ... && git push <remote> v0.2.71`)
-before recommending a pinned install to anyone.
+Pin the ref in a serving venv. `v0.2.71` is a tag, and this command was run against
+the public repository to confirm it resolves (`pip download --no-deps` of that exact
+URL produced `kvtier-dev-plugin-0.2.71.zip`). An un-pinned URL installs whatever the
+default branch happens to point at when the clone happens, which for a package that
+wraps engine methods at import time is not a version you can reason about later.
+
+`pip check` is not decoration: the package declares NO dependencies on purpose, so a
+silent resolution that touches the serving venv's other pins is the failure to watch.
 
 ### Editable checkout - the development path
 
