@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+import re
 import sys
 import types
 
@@ -427,3 +428,278 @@ def test_the_guard_module_never_touches_the_engine_internals_it_refuses():
     for banned in ("import torch", "from vllm", "import vllm", "disk_spill",
                    "disk_restore", "disk_store"):
         assert banned not in source, banned
+
+
+# --- 5. THE BOOT LINE: `SSM[what]`, the verdict the log can actually show ------
+#
+# WHY THESE TESTS EXIST, AND WHY THEY LOOK LIKE THE LOAD_POLICY ONES
+# ------------------------------------------------------------------
+# The guard's SATISFIED case was one `logger.info`. Measured on the live engine
+# 2026-10-22, plugin INFO on the connector-hook path does not reach
+# `/tmp/vllm-serve.log` AT ALL: the hook's own INFO line (`connector hook saw a tier
+# connector`) had 0 occurrences in a log carrying 2,775 plugin lines, and `SSM BOOT
+# GUARD` had 0 too. So `SSM BOOT GUARD: clear` was un-readble in the one place an
+# operator looks, and a boot where the guard ran and found no SSM was
+# indistinguishable from a boot where the guard is not installed - the same class of
+# defect this repo has now been bitten by twice (gates that could not be seen to work).
+#
+# The fix is the mechanism the boot line already uses for two other facts
+# (`LOAD_POLICY[what:who]`, `MAMBA_ANCHOR[patched]`): a bracketed token on the WARNING
+# line that DOES land, rendering the record the step wrote THIS boot. Hence these tests
+# mirror `test_backport.py`'s LOAD_POLICY boot-line tests in structure: drive the real
+# hook, read the line, and - the part that matters - prove the token follows the stored
+# record rather than a constant. A token that always printed `clear` would satisfy every
+# other kind of check and tell an operator the exact opposite of the truth.
+
+def _guard_config(cache=None):
+    """A `vllm_config` in the factory's shape, with or WITHOUT a `cache_config`.
+
+    `cache=None` is the no-config shape the hook tolerates (a foreign caller, an older
+    test), and it is how the `no-config` verdict is reached through the real path.
+    """
+    return types.SimpleNamespace(cache_config=cache, kv_transfer_config=None)
+
+
+def _boot_with_guard(monkeypatch, config=None, **flags):
+    """Boot through the REAL connector hook and report what the boot line said.
+
+    Returns `(the guard's record from the boot payload, the boot line)`. `(None, line)`
+    is the `not_run` answer: a boot that never handed the guard a tier connector.
+    """
+    cls = TB._six_group_class()
+    factory, connector_cls, _built = TB._fake_vllm_modules(monkeypatch, cls)
+    backport.install_connector_hook()
+    if config is None:
+        config = _boot_config(**flags)
+    connector = factory.create_connector(
+        config=config, role=types.SimpleNamespace(name="SCHEDULER"),
+        kv_cache_config="KVC")
+    assert isinstance(connector, connector_cls), "the engine still got its connector"
+    boot = backport.section()["boot"]
+    return boot.get("ssm_guard"), boot["line"]
+
+
+def test_a_clean_boot_prints_ssm_clear_on_the_boot_line(monkeypatch):
+    """THE FINDING THIS FIX ANSWERS: the healthy boot must be READABLE, not just safe.
+
+    Before the token, a boot with no SSM flag logged nothing an operator could see and
+    the log could not answer "did the guard run?". Now the one line the boot writes
+    carries `SSM[clear]`, and the record behind it is in the payload.
+    """
+    record, line = _boot_with_guard(monkeypatch, use_replayssm=False,
+                                    use_kda_recoverssm=False)
+    assert record["verdict"] == ssm_guard.VERDICT_CLEAR, record
+    assert "SSM[clear]" in line, line
+    assert "SSM[not_run]" not in line
+
+
+def test_a_boot_that_never_ran_the_guard_says_not_run_and_still_prints(monkeypatch):
+    """A boot with no tier connector renders `not_run`, never the guard's own hope.
+
+    The shape of `test_the_boot_reports_the_policy_without_the_step_claiming_anything`
+    exactly: `boot_from_connector` is also called directly (the harness in
+    `tests/test_auto_boot.py`), and a line that rendered `SSM[clear]` for a boot whose
+    guard never ran would be the
+    false provenance this token exists to avoid.
+    """
+    cls = TB._six_group_class()
+    manager = TB._production_manager(cls)
+    report = backport.install(cls, TB.our_shape_config(), manager)
+    boot = backport.boot_from_connector(cls, report, manager)
+    assert boot["ssm_guard"] is None, "the payload key is present-but-null"
+    assert "SSM[not_run]" in boot["line"], boot["line"]
+
+
+def test_a_foreign_connector_boot_says_not_run(monkeypatch):
+    """The other never-ran path: the guard's predicate is OUR connector, so a foreign
+    one produces no record and the note line says so rather than reading as a pass."""
+    module = types.ModuleType("vllm.distributed.kv_transfer.kv_connector.v1.lmcache")
+
+    class LMCacheConnectorV1:
+        pass
+
+    LMCacheConnectorV1.__module__ = module.__name__
+    module.LMCacheConnectorV1 = LMCacheConnectorV1
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    factory_module = types.ModuleType(backport.CONNECTOR_FACTORY_MODULE)
+
+    class KVConnectorFactory:
+        @classmethod
+        def create_connector(cls, config, role, kv_cache_config):  # noqa: ARG003
+            return LMCacheConnectorV1()
+
+    factory_module.KVConnectorFactory = KVConnectorFactory
+    monkeypatch.setitem(sys.modules, backport.CONNECTOR_FACTORY_MODULE, factory_module)
+    backport.install_connector_hook()
+    KVConnectorFactory.create_connector(config=_boot_config(use_replayssm=True),
+                                        role=types.SimpleNamespace(name="SCHEDULER"),
+                                        kv_cache_config=None)
+    line = backport.section()["boot"]["line"]
+    assert "SSM[not_run]" in line, line
+    assert "SSM[clear]" not in line
+
+
+def test_a_refused_inert_boot_prints_ssm_refused_inert_on_the_boot_line(monkeypatch):
+    """The refusal the guard does NOT raise, on the line that survives: `refused-inert`.
+
+    Reached through the real hook with `VLLM_E2_TIER_DEV_BOOT_INERT` set, so this is a
+    boot that installs and stops there - the verdict the operator must be able to see
+    without reading a warning in a wall of engine output.
+    """
+    monkeypatch.setenv(config.ENV_BOOT_INERT, "1")
+    record, line = _boot_with_guard(monkeypatch, use_replayssm=True)
+    assert record["verdict"] == ssm_guard.VERDICT_REFUSED_INERT, record
+    assert "SSM[refused-inert]" in line, line
+
+
+def test_an_unreadable_flag_prints_ssm_indeterminate_on_the_boot_line(monkeypatch):
+    """The fail-open is now visible. A fail-open nobody can see is an unlogged risk.
+
+    A flag whose read raised leaves the boot installing, and the token says
+    `indeterminate` - never `clear`, which would be a claim the guard did not make.
+    """
+    record, line = _boot_with_guard(
+        monkeypatch, config=_guard_config(CacheConfig(raises=("use_recoverssm",))))
+    assert record["verdict"] == ssm_guard.VERDICT_INDETERMINATE, record
+    assert "SSM[indeterminate]" in line, line
+    assert "SSM[clear]" not in line
+
+
+def test_a_boot_with_no_cache_config_prints_ssm_no_config(monkeypatch):
+    """No `cache_config` in reach is its own answer, on the line and in the payload."""
+    record, line = _boot_with_guard(monkeypatch, config=_guard_config(None))
+    assert record["verdict"] == ssm_guard.VERDICT_NO_CONFIG, record
+    assert "SSM[no-config]" in line, line
+    assert "SSM[clear]" not in line
+
+
+def test_a_refused_record_reaches_the_boot_line_when_a_boot_runs(monkeypatch):
+    """`SSM[refused]` renders from the guard's OWN refused record.
+
+    A refusing boot normally dies before any line (the ValueError escapes the hook -
+    proven above), which is the point of the guard. But the record is what the payload
+    and any line built from it carry, and the worker-role refusal reaches the operator
+    through the executor as a worker error rather than as this exception, so the
+    verdict must be renderable from the record and not only from the traceback. The
+    record here is `probe()`'s own, never a hand-written dict.
+    """
+    record = ssm_guard.probe(_boot_config(use_recoverssm=True))
+    assert record["verdict"] == ssm_guard.VERDICT_REFUSED
+    cls = TB._six_group_class()
+    manager = TB._production_manager(cls)
+    report = backport.install(cls, TB.our_shape_config(), manager)
+    boot = backport.boot_from_connector(cls, report, manager, ssm_record=record)
+    assert boot["ssm_guard"]["flag"] == "use_recoverssm", boot["ssm_guard"]
+    assert "SSM[refused]" in boot["line"], boot["line"]
+
+
+@pytest.mark.parametrize("verdict", list(ssm_guard.VERDICTS))
+def test_the_token_follows_the_record_and_never_a_constant(verdict):
+    """THE TEST THAT KILLS A CONSTANT TOKEN, for every verdict in the vocabulary.
+
+    Writes a chosen verdict into an otherwise realistic record and asserts the boot line
+    carries THAT token and no other - so a token that always printed `clear`, or read
+    the environment at print time, fails here for at least one of the five. The token is
+    produced through the same read-back path the boot line uses (`ssm_guard_token`, then
+    `boot_line`), not by calling the renderer's private helper.
+    """
+    record = ssm_guard._empty()
+    record["verdict"] = verdict
+    assert backport.ssm_guard_token({"ssm_guard": record}) == f"SSM[{verdict}]"
+    line = backport.boot_line({"mode": "auto", "ssm_guard": record})
+    assert f"SSM[{verdict}]" in line, line
+    others = [v for v in ssm_guard.VERDICTS if v != verdict]
+    for other in others:
+        assert f"SSM[{other}]" not in line, (verdict, other, line)
+
+
+def test_an_unnameable_verdict_renders_indeterminate_never_clear():
+    """A record whose verdict is outside the closed vocabulary is not a pass.
+
+    The pessimistic rule `lookup_ledger_token` states outright: the honest reading of a
+    verdict this module cannot name is "it did not work". `SSM[clear]` over a corrupt
+    record is the one wrong answer this token must never give.
+    """
+    for broken in ({"verdict": "patched"}, {"verdict": None}, {}, "not-a-record",
+                   None, []):
+        token = backport.ssm_guard_token({"ssm_guard": broken})
+        assert token in ("SSM[not_run]", "SSM[indeterminate]"), (broken, token)
+    assert backport.ssm_guard_token({}) == "SSM[not_run]"
+
+
+def test_the_ssm_token_is_bracketed_and_never_a_candidate_tier_match():
+    """The token shape rule every sibling token pins, for the same reason.
+
+    The restart verifier in the llm-api repo pulls its PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, so a new token must carry no `=` and must
+    not become the LAST `tier=`-shaped match on the line. `SSM[clear]` satisfies both: a
+    bare `tier=ARMED` is still the last match with the token on the line.
+    """
+    line = backport.boot_line({"mode": "auto", "tier": True,
+                               "ssm_guard": {"verdict": "clear"}})
+    assert "SSM[clear]" in line
+    assert "SSM=" not in line
+    assert re.findall(r"tier=[A-Za-z_]+", line)[-1] == "tier=ARMED", line
+
+
+def test_the_record_is_stored_in_the_boot_dict_not_reprinted_from_a_constant():
+    """The provenance claim, tested: the token reads the boot's record, not the flag.
+
+    Two moves make this a test and not an assertion. (1) Boot with no SSM flag and
+    OVERWRITE the stored record with a different verdict: the next line rendered from
+    that boot dict follows the record, proving print time reads the record. (2) Boot a
+    config that DOES carry a flag the guard refuses - the guard's own probe path - and
+    confirm the record's `flag` field is the one it read, which a constant could not
+    produce.
+    """
+    cls = TB._six_group_class()
+    manager = TB._production_manager(cls)
+    report = backport.install(cls, TB.our_shape_config(), manager)
+
+    clean = ssm_guard.probe(_boot_config())
+    boot = backport.boot_from_connector(cls, report, manager, ssm_record=clean)
+    assert "SSM[clear]" in boot["line"]
+    boot["ssm_guard"]["verdict"] = ssm_guard.VERDICT_INDETERMINATE
+    tampered = backport.boot_line(boot)
+    assert "SSM[indeterminate]" in tampered, tampered
+    assert "SSM[clear]" not in tampered, "the token followed the record, not a constant"
+
+    read = ssm_guard.probe(_boot_config(use_kda_recoverssm=True))
+    boot2 = backport.boot_from_connector(cls, report, manager, ssm_record=read)
+    assert boot2["ssm_guard"]["flag"] == "use_kda_recoverssm"
+    assert "SSM[refused]" in backport.boot_line(boot2)
+
+
+def test_the_token_appears_once_and_the_line_stays_one_bounded_line():
+    """One token per boot line, and the line's own bounds still hold.
+
+    `tests/test_auto_boot.py` pins that every `=`-shaped field name appears exactly
+    once; this pins the same for the token, on a real boot line, and re-checks the
+    no-newline / length bounds that keep the line greppable in an engine log.
+    """
+    cls = TB._six_group_class()
+    manager = TB._production_manager(cls)
+    report = backport.install(cls, TB.our_shape_config(), manager)
+    boot = backport.boot_from_connector(cls, report, manager,
+                                        ssm_record=ssm_guard.probe(_boot_config()))
+    line = boot["line"]
+    assert line.count("SSM[") == 1, line
+    assert "\n" not in line and len(line) < 2000, line
+
+
+def test_a_worker_role_boot_line_carries_the_guard_verdict_too(monkeypatch):
+    """The worker builds a tier connector and DOES run the guard, so its note line must
+    carry the verdict - `not_run` there would be a line that lies by omission, which is
+    the exact defect this token exists to remove.
+    """
+    cls = TB._six_group_class()
+    factory, _connector_cls, built = TB._fake_vllm_modules(
+        monkeypatch, cls, with_scheduler=False)
+    backport.install_connector_hook()
+    factory.create_connector(config=_boot_config(use_replayssm=False),
+                             role=types.SimpleNamespace(name="WORKER"),
+                             kv_cache_config="KVC")
+    assert len(built) == 1, "the worker still got its connector"
+    line = backport.section()["boot"]["line"]
+    assert "SSM[clear]" in line, line
+    assert "SSM[not_run]" not in line

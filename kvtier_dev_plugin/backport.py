@@ -1929,7 +1929,7 @@ def _boot_restore(cls) -> dict:
 
 
 def boot_from_connector(cls, install_report, manager,
-                        load_failure_policy=None) -> dict:
+                        load_failure_policy=None, ssm_record=None) -> dict:
     """THE BOOT, run by the connector-creation hook. Never raises.
 
     Three verdicts and one log line: `backport` (the fix fully installed AND the
@@ -1987,6 +1987,19 @@ def boot_from_connector(cls, install_report, manager,
             "load_failure_policy": (load_failure_policy
                                     if isinstance(load_failure_policy, dict)
                                     else None),
+            # THE SSM BOOT GUARD'S VERDICT (0.2.73): the record the guard WROTE during
+            # this boot's connector-creation hook, stored here and read back at print
+            # time - never re-derived from the environment and never a constant, because
+            # this repo has been misled by a log line whose stated provenance was not
+            # its source. Its token exists because the guard's SATISFIED case used to be
+            # one `logger.info`, and plugin INFO on this path never reaches
+            # `/tmp/vllm-serve.log` (measured live 2026-10-22: 0 occurrences of the
+            # hook's own INFO line in a log with 2,775 plugin lines), so "the guard ran
+            # and found no SSM" was indistinguishable from "the guard is not installed".
+            # `None` means this boot produced no record: the hook was never fitted, or
+            # the connector was not ours, and the token then says `SSM[not_run]` rather
+            # than guessing. REPORTING, never a refusal: it never joins `refusals`.
+            "ssm_guard": (ssm_record if isinstance(ssm_record, dict) else None),
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -2425,6 +2438,13 @@ def boot_line(boot: dict) -> str:
     # boot that had silently inherited upstream's `fail` used to be indistinguishable
     # from a boot that was told to use it. Reporting, so it is NOT part of `refused=`.
     parts.append(load_failure_policy_token(boot))
+    # THE SSM BOOT GUARD'S VERDICT, in the same bracketed-token shape and for the same
+    # reason as the four above it: `SSM[clear]` answers "did this boot run the guard,
+    # and what did it conclude?" in one glance - the question the guard's INFO line
+    # could not answer, because plugin INFO on the connector-hook path never reaches the
+    # engine log. `SSM[not_run]` is the honest fourth answer: no record from this boot.
+    # Reporting, so it is NOT part of `refused=`.
+    parts.append(ssm_guard_token(boot))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2480,6 +2500,7 @@ def boot_section() -> dict:
                 "install_reason": None, "manager": None, "restore": None,
                 "arena": None, "disk_boot": None, "journal_drain": None,
                 "lookup_ledger": None, "load_failure_policy": None,
+                "ssm_guard": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "
@@ -2686,7 +2707,30 @@ def load_failure_policy_token(boot: dict) -> str:
         return "LOAD_POLICY[not_run]"
 
 
-def boot_note(reason: str) -> dict:
+def ssm_guard_token(boot: dict) -> str:
+    """The BOOT line's `SSM[what]` token, from THIS boot's own guard record.
+
+    Bracketed, not `key=value`, and read from the BOOT DICT rather than module state -
+    both for the reasons `load_failure_policy_token()` and `lookup_ledger_token()` give:
+    the restart verifier in the llm-api repo pulls its PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, and a line must describe the boot that
+    produced it. The record is the one the guard wrote in the connector-creation hook
+    (the guard runs OUTSIDE this function, outside the contained region, because a
+    refusal that cannot raise is theatre - see `ssm_guard.py`); this function only reads
+    it back. A boot that produced no record renders `SSM[not_run]`, exactly as
+    `LOAD_POLICY[not_run]` means it, and an unreadable record renders
+    `SSM[indeterminate]` - never the guard's own hope.
+    """
+    try:
+        from . import ssm_guard  # noqa: PLC0415 - lazy by idiom
+        return ssm_guard.boot_token(
+            boot.get("ssm_guard") if isinstance(boot, dict) else None)
+    except Exception as exc:  # noqa: BLE001 - a token is never worth a lost line
+        snapshot._error(exc, "backport ssm guard token")
+        return "SSM[not_run]"
+
+
+def boot_note(reason: str, ssm_record=None) -> dict:
     """The BOOT line for a process that has NO tier to boot. Same format.
 
     A worker (no `scheduler_manager`) and a connector nested inside a
@@ -2702,14 +2746,22 @@ def boot_note(reason: str) -> dict:
             "live_check": None, "manager": None, "install_reason": None,
             "restore": None, "arena": None, "disk_boot": None,
             "journal_drain": None, "lookup_ledger": None,
-            "load_failure_policy": None, "line": None}
+            "load_failure_policy": None,
+            # The guard's own verdict, when this boot has one. A worker-role tier
+            # connector DOES run the guard (the predicate is our own connector, not the
+            # scheduler role), and a note that dropped the record would print
+            # `SSM[not_run]` over a guard that ran and cleared - a line that lies by
+            # omission is the defect this token exists to fix. A foreign connector hands
+            # in nothing, and `not_run` there is the truth.
+            "ssm_guard": (ssm_record if isinstance(ssm_record, dict) else None),
+            "line": None}
     boot["line"] = boot_line(boot)
     _state["boot_line"] = boot["line"]
     logger.warning("kvtier-dev-plugin: %s", boot["line"])
     return boot
 
 
-def _after_connector_created(connector, vllm_config=None) -> None:
+def _after_connector_created(connector, vllm_config=None, ssm_record=None) -> None:
     """The install moment. Contained: the engine ALWAYS gets its connector.
 
     Nothing here may raise into `create_connector`, and nothing here may swap the
@@ -2722,6 +2774,12 @@ def _after_connector_created(connector, vllm_config=None) -> None:
     load-failure-policy step below has to write that field before the caller reads it
     at `scheduler.py:147`. A caller that hands in nothing (an older test, a foreign
     caller) leaves it None and the step reports `no-config` rather than guessing.
+
+    `ssm_record` is the verdict the SSM guard reached for THIS connector, in the wrapper
+    above - it is passed in as DATA, never re-probed here, because the guard must stay
+    outside this contained region (a refusal it cannot raise is theatre). A worker-role
+    boot carries it into its note line; a foreign connector's note has none, and the
+    token says `not_run`.
     """
     try:
         _state["hook_calls"] += 1
@@ -2767,7 +2825,7 @@ def _after_connector_created(connector, vllm_config=None) -> None:
                         "with no scheduler_manager (worker role) - normal, "
                         "nothing installed")
             boot_note("tier: not armed, this process builds no scheduler_manager "
-                      "(worker role: it runs no tier scheduler code)")
+                      "(worker role: it runs no tier scheduler code)", ssm_record)
             return
         _state["hook_tier_connectors"] += 1
         cls = type(manager)
@@ -2842,7 +2900,8 @@ def _after_connector_created(connector, vllm_config=None) -> None:
         # thing the boot writes and the one line an operator reads. Contained:
         # the engine still got its connector whatever happens here.
         boot_from_connector(cls, report, manager,
-                            load_failure_policy=policy_verdict)
+                            load_failure_policy=policy_verdict,
+                            ssm_record=ssm_record)
     except Exception as exc:  # noqa: BLE001 - a hook must never break a connector
         _state["hook_errors"] += 1
         _state["hook_last"] = f"hook raised {type(exc).__name__}: {exc}"[:200]
@@ -2864,6 +2923,10 @@ def _make_create_connector_hook(original):
         config_arg = kwargs.get("config")
         if config_arg is None and args:
             config_arg = args[0]
+        # The guard's record for THIS connector, handed to the boot as data so the BOOT
+        # line can carry `SSM[what]`. `None` here means no probe ran (a foreign
+        # connector), which the token reports as `not_run` rather than as a pass.
+        ssm_record = None
         # THE SSM BOOT GUARD: the ONE place this plugin raises into the engine on
         # purpose, and deliberately HERE rather than inside `_after_connector_created`.
         # That hook runs inside its own `try/except Exception` ("nothing here may raise
@@ -2884,8 +2947,8 @@ def _make_create_connector_hook(original):
         # else's boot would be this plugin over-reaching past its own tier.
         if _is_tier_connector(connector):
             from . import ssm_guard  # noqa: PLC0415 - lazy by idiom
-            ssm_guard.boot_check(config_arg)
-        _after_connector_created(connector, config_arg)
+            ssm_record = ssm_guard.boot_check(config_arg)
+        _after_connector_created(connector, config_arg, ssm_record)
         return connector
 
     setattr(create_connector, HOOK_ATTR, HOOK_TAG)

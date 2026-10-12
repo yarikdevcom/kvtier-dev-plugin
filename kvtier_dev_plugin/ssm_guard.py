@@ -127,6 +127,14 @@ VERDICT_NO_CONFIG = "no-config"
 VERDICTS = (VERDICT_CLEAR, VERDICT_REFUSED, VERDICT_REFUSED_INERT,
             VERDICT_INDETERMINATE, VERDICT_NO_CONFIG)
 
+# NOT a probe verdict - `probe()` can never return it - and so deliberately absent from
+# `VERDICTS`. It is the BOOT LINE's rendering of "no guard record exists for this boot"
+# (the connector hook was never fitted, or the connector was not ours, so no probe ever
+# ran), the same fact `load_failure_policy.VERDICT_NOT_RUN` and
+# `lookup_ledger.VERDICT_NOT_RUN` carry for their tokens. Absence has to be SAYable, or
+# a missing token is read as the satisfied case.
+VERDICT_NOT_RUN = "not_run"
+
 # The engine's own validator, named in the refusal so a reader can find the guard that
 # was relaxed. Never a claim that it RAN - only that it normally would have.
 ENGINE_VALIDATOR = "VllmConfig.validate_mamba_cached_kernel"
@@ -293,6 +301,43 @@ def refusal_message(record: dict) -> str:
         f"--use-kda-recoverssm, whichever this boot was given), or do not install the "
         f"tier. There is deliberately no environment variable that lets this boot "
         f"through: an opt-out would reintroduce the hazard this guard exists to close.")
+
+
+def boot_token(record) -> str:
+    """The BOOT line's `SSM[what]` token, from THIS boot's own record.
+
+    Bracketed and never `key=value`, for the reason `mamba_anchor.boot_token()` gives in
+    full: the restart verifier in the llm-api repo pulls its PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, and a token with no `=` can never become a
+    candidate match. Read from the BOOT DICT (the `JOURNAL_DRAIN` / `LOOKUP_LEDGER` /
+    `LOAD_POLICY` discipline), so the line describes the boot that produced it.
+
+    WHY THE TOKEN EXISTS. The guard's SATISFIED case used to be a single `logger.info`,
+    and a plugin INFO line on the connector-hook path does not reach
+    `/tmp/vllm-serve.log` at all (measured on the live engine 2026-10-22: the hook's own
+    INFO line had 0 occurrences in a log carrying 2,775 plugin lines, and `SSM BOOT
+    GUARD` had 0 too). So an operator reading a boot could not tell "the guard ran and
+    found no SSM" from "the guard is not installed" - a safety control invisible when
+    satisfied. The BOOT line is a WARNING and DOES land, so the verdict rides there. It
+    is REPORTING, never a refusal: this token never joins `refusals`.
+
+    `not_run` is the honest rendering of "this boot produced no record", exactly as
+    `LOAD_POLICY[not_run]` means it. A record whose verdict this module cannot name
+    renders `indeterminate` and NEVER `clear` - a verdict we cannot read is literally
+    "the posture is not established", while `refused` would claim an action this record
+    does not show happened.
+    """
+    try:
+        if not isinstance(record, dict):
+            return f"SSM[{VERDICT_NOT_RUN}]"
+        verdict = record.get("verdict")
+        if verdict == VERDICT_NOT_RUN:
+            return f"SSM[{VERDICT_NOT_RUN}]"
+        if verdict not in VERDICTS:
+            return f"SSM[{VERDICT_INDETERMINATE}]"
+        return f"SSM[{verdict}]"
+    except Exception:  # noqa: BLE001 - a token is never worth a lost boot line
+        return f"SSM[{VERDICT_INDETERMINATE}]"
 
 
 def boot_check(vllm_config) -> dict:

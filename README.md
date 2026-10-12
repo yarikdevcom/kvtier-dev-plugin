@@ -447,6 +447,22 @@ The engine's own `BOOT[auto]` log line carries no version string and
 `/plugins/kvtier/version` does not exist (both re-checked on the live box on
 2026-10-09); the three reads above are the whole answer.
 
+**The bracketed tokens on that line are the only per-boot witnesses that reliably reach the log.**
+Measured on the live box on 2026-10-12: plugin `logger.info` output never reaches
+`/tmp/vllm-serve.log` at all — the connector hook's INFO line and the SSM guard's satisfied-case INFO
+line both had **0 occurrences** in a log holding 2,775 plugin lines. So anything an operator needs to
+know about a boot has to ride a WARNING, and the `BOOT[...]` line is that WARNING. Since 0.2.73 it ends:
+
+```
+… LOOKUP_LEDGER[armed] LOAD_POLICY[recompute:operator] SSM[clear] …
+```
+
+`SSM[…]` is the SSM boot guard's verdict read back from the record it wrote this boot: `clear`,
+`indeterminate`, `no-config`, `refused-inert`, or `not_run` when the guard never ran. `refused` exists in
+the vocabulary but can never appear on a boot line, because a refused boot dies on the `ValueError`
+before the line is written. So a **missing** `SSM[…]` token means the plugin predates 0.2.73 or the
+connector hook was not fitted — it does not mean the box is in SSM recovery mode.
+
 ### Before 0.2.50: the fallback stays necessary
 
 An engine booted on an older build publishes none of these fields, so its running

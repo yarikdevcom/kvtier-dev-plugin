@@ -4486,3 +4486,40 @@ suite total moved 3397 → **3426**, which is 27 + 2 and those 2 are the package
 add up is worth chasing to an explanation rather than accepting. Full suite green with ≥2.7 GB of tmpfs free; an
 intermediate run showed 39 failures at 1.6 GB free, all `no_free_space`, correctly reported as environment and not
 worked around. Commit `75983f1`.
+
+## Seen or invisible: the SSM verdict joins the boot line - 0.2.73
+
+**A control that is silent when satisfied is barely a control.** After shipping the SSM boot guard we went
+looking for its line in the live engine log and found none. Not "missing" - *impossible*: plugin
+`logger.info` output never reaches `/tmp/vllm-serve.log` at all. The proof is a control, not an absence:
+the connector hook's INFO line sits on the path that must run for the tier to arm, the tier armed, and that
+line still had **0 occurrences** in a log containing 2,775 plugin lines - as did `SSM BOOT GUARD`. So on a
+healthy boot nobody could tell "the guard ran and saw no SSM flag" from "the guard is not installed", and
+the only thing that would have made the difference is a witness that reaches the operator. The same
+mechanism had already hidden the guard's absence-of-refusal case for a whole release cycle.
+
+The fix is the plugin's existing idiom rather than a new logging scheme: the `BOOT[...]` line is a WARNING,
+so it does reach the log, and it already carries `LOAD_POLICY[what:who]` and `MAMBA_ANCHOR[patched]`. The
+guard's verdict now rides it as `SSM[…]`, read back from the record `boot_check()` wrote this boot - the
+record is passed as **data** through `_after_connector_created` into `boot_from_connector` and stored in the
+boot dict, so no new module-level state exists and `tests/conftest.py` needed no new reset. A non-dict or
+missing record yields `not_run`; a verdict outside the vocabulary yields `indeterminate` and never `clear`,
+so the token cannot fail into optimism.
+
+**The tests were falsified before they were trusted.** A throwaway pytest plugin pinned `boot_token` to a
+constant `"SSM[clear]"` and **12 tests failed** - which is the only meaningful evidence that the token
+follows the record rather than a constant. Each per-verdict test reaches its verdict through the real hook
+and `probe()`, not a hand-written dict. Two honest limits recorded here rather than smoothed: `SSM[refused]`
+can never appear on a production boot line, because a refused boot dies on the `ValueError` before the line
+is written (so a *missing* token means pre-0.2.73 or an unfitted hook, never "we are in SSM mode"); and
+`test_the_contained_hook_does_not_call_the_guard` is a substring check, which makes the parameter name
+`ssm_record` load-bearing - it is commented because a rename there would silently widen a safety test.
+
+**Operational finding worth remembering: `/tmp` is a shared resource across repositories.** Two agents
+running suites in two different repos - no shared files, deliberately run in parallel - still interfered,
+because the tmpfs is 7.7 GB and the suites write ~1.2 GB each. The visible symptom was 7 failures in
+llm-api's `test_vacuum_flag.py`, which failed on `insufficient free space` against a hard
+`size_before + 2 GiB` floor in `_autovacuum_db`: they passed 17/17 with 2.7 GB free. Attribution required
+re-running with headroom, not reading the diff - a green suite you cannot attribute is worth nothing, and a
+red one you can is worth a lot. Numbers: 17 new tests, suite total **3443 passed** (3426 + 17), ruff clean
+on all touched files.
