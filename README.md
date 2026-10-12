@@ -206,6 +206,21 @@ Engine: `vllm serve <model-dir>` on v2.5.1, the tier mounted, with
 0.05 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector",
 "kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`.
 
+> **You no longer have to pass `kv_load_failure_policy` to keep a failed restore from killing the
+> request (0.2.72).** The ENGINE default is `"fail"` — a failed load ends the request with an error.
+> Since 0.2.72 the plugin sets `"recompute"` itself when your `--kv-transfer-config` JSON does not name
+> the field, so a failed restore costs tokens (the prefix is recomputed) instead of costing the user
+> their request. **An explicit value is never overridden — including an explicit `"fail"`.** The plugin
+> distinguishes "absent" from "present" by reading the operator's own `--kv-transfer-config` JSON in
+> `argv`, because the config object itself cannot answer the question; when that witness is unavailable
+> it declines to write anything and reports `unresolved` rather than guessing. Read the posture from the
+> boot line's `LOAD_POLICY[what:who]` token — it reports the value read BACK after the write, and who
+> decided it. Opt out with `VLLM_E2_TIER_DISK_LOAD_FAILURE_POLICY_DEFAULT=off`; a malformed value is
+> reported, not ignored. What keeps "recompute" from becoming the reschedule loop that starved this box
+> once is the tier's own bound: at most two offers per request that made no progress
+> (`MAX_RACE_REOFFERS_PER_REQUEST`), while DATA-kind failures (`file_missing`, an unattributable report)
+> still take the permanent request-and-span fuse.
+
 > **`--max-num-seqs` appears TWICE on the live command line: `8` first, then `4`.**
 > argparse is last-wins, so the effective value is **4**. A reader who greps the first
 > match reports a number the running engine does not obey. `--max-num-batched-tokens`,

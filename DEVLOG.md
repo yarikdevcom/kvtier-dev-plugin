@@ -4390,3 +4390,51 @@ plus `/guard`'s `armed` spelling, the engine-side refusal for all five verbs ask
 directly, a test that the two layers read the same list (`/disk`'s included), the AST
 no-header test, the retired-allowlist-is-inert sweep over every route x four values x two
 peers, and the real-socket tests inverted to assert the LAN peer is **served**.
+
+## The default that had to be earned: `kv_load_failure_policy` (`load_failure_policy.py`) - 0.2.72
+
+**The engine's default kills the request, and we had been asking operators to undo it by hand.**
+`vllm/config/kv_transfer.py` declares `kv_load_failure_policy: Literal["recompute","fail"] = "fail"`,
+and it is read exactly once — `Scheduler.__init__` sets `self.recompute_kv_load_failures` from it,
+which decides `finish_requests(…, FINISHED_ERROR)`, `_handle_invalid_blocks`'s `should_fail`, and the
+`sync_blocks_to_evict` branch. The plugin never read or wrote it; `README.md` simply told the operator
+to put `"kv_load_failure_policy":"recompute"` in the connector JSON. The upstream owner named this in
+review, and the correct fix was to stop depending on a flag nobody remembers to pass.
+
+**"Did the operator choose this?" is a question the config object cannot answer.** `KVTransferConfig`
+is a pydantic dataclass and exposes no `model_fields_set` / `__pydantic_fields_set__` — verified on
+pydantic 2.13 for both the constructor and `validate_json` — so an absent field and an explicit
+`"fail"` are indistinguishable on the object, and EngineCore receives a pickle rather than a fresh
+parse. So the witness is the operator's own text: the `--kv-transfer-config` JSON in `sys.argv`, key
+presence via `json.loads`. Confidence is high for a CLI boot because argparse feeds that string to
+`TypeAdapter(KVTransferConfig).validate_json` and spawn restores the parent's argv — and
+`test_the_witness_survives_the_process_boundary…` fails if that ever stops being true. An unparseable
+value is **not** evidence of absence (`reliable: false`). With no witness at all the code falls back to
+value-vs-engine-default, reading the default live through `dataclasses.fields` instead of hardcoding
+it, and that comparison is deliberately **one-directional: it can only ever say "chosen", so it never
+authorises a write** — the verdict is `unresolved`, the field is left alone, and the remedy is printed.
+Nine verdicts in total (`plugin-set`, `operator`, `operator-value`, `engine-already`, `unresolved`,
+`opted-out`, `inert`, `no-config`, `write-refused`), and the boot line's `LOAD_POLICY[what:who]` token
+reports the value read BACK after the write, never the value intended.
+
+**The recompute default was audited against the loop that starved this box, not assumed safe.** A
+2026-10-05 incident produced 123,474 offers in 3.9 minutes, and "recompute" is exactly the policy that
+makes the engine reset and reschedule. The bound is the tier's own and it holds: `_offered_at[request_id]`
+refuses any re-ask at the same-or-lower computed value, and `MAX_RACE_REOFFERS_PER_REQUEST = 1` is spent
+via a `setdefault` that never refills — a hard cap of **two offers per request that made zero progress**.
+DATA-kind and `unknown` kinds still get the permanent request-and-span fuse from `_fuse_or_spare()`, so
+the classification was left untouched. The honest leak, recorded rather than smoothed: the
+`_suppressed` / `_suppressed_spans` / `_offered_at` tables evict oldest-first (4096 / 1024), so a boot
+with more failing requests than that can pay one extra offer per evicted key.
+
+**Two environment findings that cost time and should not be rediscovered.** First, three suites —
+`test_disk_index.py`, `test_disk_layout.py`, `test_disk_spill.py` — **pass on a tmpfs basetemp and fail
+on an ext4 one**, because they assert the real filesystem type of their own scratch directory; they fail
+identically at HEAD, so three red tests there are not a regression. The consequence is that this suite is
+pinned to `/tmp`, which is a 7.7 GB tmpfs, and a full run with insufficient headroom produced **39
+failures that were all `OSError: [Errno 28]`**. Second, an implementing agent ran `rm -rf
+/tmp/pytest-of-user` to free that space. That path is the **shared per-UID `tmp_path` root**, so removing
+it destroys scratch belonging to concurrent sessions — it was disclosed, steered away from, and is
+recorded here because the temptation is structural: a suite that demands a nearly-full tmpfs will keep
+producing this mistake. Green gate for the change: 224 targeted tests, then **3397 passed** full-suite
+with ≥2.7 GB of tmpfs free. Commits `732d65b` (the access-model change) and `53670e0` (this one).
