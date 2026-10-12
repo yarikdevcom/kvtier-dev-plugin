@@ -842,6 +842,20 @@ _DISK_BOOT_ON_WORDS = frozenset({"1", "true", "yes", "on"})
 # (`MAMBA_ANCHOR[patched]` versus `MAMBA_ANCHOR[env-refused]`).
 ENV_MAMBA_ANCHOR_PATCH = "VLLM_E2_TIER_DEV_MAMBA_ANCHOR_PATCH"
 
+# THE KV LOAD-FAILURE POLICY DEFAULT (`load_failure_policy.py`, 0.2.73): the switch
+# over the boot step that gives the ENGINE's own `kv_load_failure_policy` the value
+# `recompute` when nothing in the operator's configuration named that field. THE
+# UPSTREAM DEFAULT IS `fail`, which fails the request outright on a KV load that could
+# not be served - for the SSD tier that turns a capacity eviction or an unreadable
+# spill file into a user-visible error instead of a slower, correct recompute.
+#
+# THIS IS AN OPT-OUT, NOT A FORCE. `off` means the plugin does not touch the field at
+# all and the engine's own value stands, whatever it is; it cannot make the field
+# `fail`, and it cannot make it anything. The step it turns off already refuses to
+# override a value the operator wrote (see `load_failure_policy.decide`), so this is
+# the SECOND veto, not a replacement for the first.
+ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT = "VLLM_E2_TIER_DISK_LOAD_FAILURE_POLICY_DEFAULT"
+
 ENV_MISS_LOG = "VLLM_E2_TIER_MISS_LOG"
 
 logger = logging.getLogger("kvtier_dev_plugin.config")
@@ -1187,6 +1201,50 @@ def lookup_ledger_boot_arm() -> dict:
     return {"enabled": True, "source": "env" if recognised else "default",
             "raw": raw, "recognised": recognised, "problems": problems,
             "env_var": ENV_LOOKUP_LEDGER_BOOT_ARM}
+
+
+def disk_load_failure_policy_default() -> dict:
+    """The KV LOAD-FAILURE POLICY boot step, read by `load_failure_policy.py`. The
+    SAME grammar as `mamba_anchor_patch()` (unset is ENABLED, a disable word is the
+    rollback, a value in neither vocabulary stays ENABLED and reports
+    `recognised: False`), with one extra state an on word buys.
+
+    THREE STATES, because this switch sits over a step that refuses to override an
+    explicit operator choice and therefore has one case it will not act on:
+      * UNSET - the step runs and writes `recompute` only where it can PROVE the field
+        was never named (the operator's own `--kv-transfer-config` JSON does not
+        mention it). Where the provenance is unresolved it leaves the field alone.
+      * A DISABLE WORD - the step does nothing at all: the engine's own value stands,
+        `fail` included. This is the rollback, and the only thing `off` is for.
+      * AN ENABLE WORD - the step runs AND is allowed to write where the provenance is
+        unresolved (`force`): the operator is asserting he did not set the field, which
+        is the one fact the plugin could not read off a Python-constructed config.
+        A typo cannot reach this state, so this state cannot be entered by accident.
+
+    WHY THE DEFAULT IS THE RUNNING STATE, in one line: the field's upstream default is
+    `fail`, and `fail` is the direction that turns a capacity eviction on the SSD tier
+    into a failed request - so the direction a typo can move in is the one that keeps
+    the safe value being applied, and `off` is the explicit rollback.
+    """
+    raw = os.environ.get(ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT, "")
+    word = raw.strip()
+    if not word:
+        return {"enabled": True, "force": False, "source": "default", "raw": None,
+                "recognised": True, "problems": [],
+                "env_var": ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT}
+    lowered = word.lower()
+    if lowered in _DISK_BOOT_OFF_WORDS:
+        return {"enabled": False, "force": False, "source": "env", "raw": raw,
+                "recognised": True, "problems": [],
+                "env_var": ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT}
+    recognised = lowered in _DISK_BOOT_ON_WORDS
+    problems = ([] if recognised else
+                [f"{ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT}={raw!r} is neither an "
+                 f"enable word ({sorted(_DISK_BOOT_ON_WORDS)}) nor a disable word "
+                 f"({sorted(_DISK_BOOT_OFF_WORDS)}) - the step runs as if unset"])
+    return {"enabled": True, "force": recognised, "source": "env" if recognised
+            else "default", "raw": raw, "recognised": recognised,
+            "problems": problems, "env_var": ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT}
 
 
 def disk_shutdown_flush_env() -> dict:

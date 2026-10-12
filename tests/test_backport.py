@@ -17,6 +17,7 @@ Two kinds of test live here, and the distinction matters:
 from __future__ import annotations
 
 import inspect
+import json
 import linecache
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from kvtier_dev_plugin import (
     config,
     engine_side,
     guard_mode,
+    load_failure_policy,
     pr56810_sources,
     snapshot,
 )
@@ -1958,3 +1960,424 @@ def test_a_geometry_veto_still_fits_the_wrappers(reset_dev_state):
     assert isinstance(cls.build_connector_meta(mgr, None), EmptyMetadata)
     assert calls == []
     assert backport.set_armed(True)["kind"] == "geometry"
+
+
+# --- 5d. THE KV LOAD-FAILURE POLICY, decided at connector creation -------------
+#
+# `KVTransferConfig.kv_load_failure_policy` defaults to `fail` upstream, and the
+# scheduler latches it EIGHT LINES AFTER it calls `create_connector`
+# (`scheduler.py:140` -> `:147`), so the connector-creation hook is the last moment
+# the field is still a choice. With `fail`, a spill file that was capacity-evicted
+# between the lookup and the read is a user-visible error instead of a recompute -
+# which is why the boot now sets it, and why every one of these tests is about the ONE
+# thing that makes that safe: not overriding a value somebody chose.
+#
+# A `KVTransferConfig` is a pydantic dataclass and records NOTHING about whether the
+# field was passed to its constructor, so "explicitly set" is witnessed in the
+# operator's own command line, not read off the object. These tests drive the whole
+# connector-creation path with an argv, which is what the EngineCore process actually
+# has (`multiprocessing.spawn` restores the parent's argv, a fork inherits it).
+
+CONNECTOR_JSON_UNSET = ('{"kv_connector":"SimpleCPUOffloadConnector",'
+                        '"kv_role":"kv_both"}')
+
+# What `KVTransferConfig.kv_load_failure_policy` declares upstream, as the engine
+# process would report it. Handed to the tests that exercise the SECONDARY witness, so
+# the suite does not silently depend on `vllm` being importable here.
+ENGINE_DEFAULT_FAIL = {"default": "fail", "source": "kv_transfer_config",
+                       "reason": None}
+ENGINE_DEFAULT_UNREADABLE = {"default": None, "source": "unreadable",
+                             "reason": "no vllm in this test process"}
+
+# Distinguishes "the caller did not pass an engine default" from "the caller passed
+# None", which are different experiments here.
+_MISSING = object()
+
+
+def _kv_config(policy="fail"):
+    """A `KVTransferConfig` stand-in with the field and NOTHING else load-bearing."""
+    return types.SimpleNamespace(kv_load_failure_policy=policy)
+
+
+def _vllm_config(ktc):
+    return types.SimpleNamespace(kv_transfer_config=ktc)
+
+
+def _boot_with_policy(monkeypatch, cls, *, argv, policy="fail", env=None,
+                      ktc=None, engine_default=_MISSING):
+    """Boot through the real hook with a command line, and report what it decided.
+
+    Returns `(the KVTransferConfig the engine holds, the boot verdict, the boot line)`.
+    `argv` is patched because it IS the witness; `env` is the step's opt-out name;
+    `engine_default` stands in for the engine's own default, which only the SECONDARY
+    witness reads - in the suite `vllm` is not importable, so a test that wants that
+    witness has to hand over the value the real engine process always can read.
+    """
+    factory, connector_cls, _built = _fake_vllm_modules(monkeypatch, cls)
+    backport.install_connector_hook()
+    monkeypatch.setattr(sys, "argv", list(argv))
+    if engine_default is not _MISSING:
+        monkeypatch.setattr(load_failure_policy, "engine_default",
+                            lambda: dict(engine_default))
+    if env is not None:
+        monkeypatch.setenv(config.ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT, env)
+    ktc = _kv_config(policy) if ktc is None else ktc
+    connector = factory.create_connector(
+        config=_vllm_config(ktc), role=types.SimpleNamespace(name="SCHEDULER"),
+        kv_cache_config="KVC")
+    assert isinstance(connector, connector_cls), "the engine still got its connector"
+    boot = backport.section()["boot"]
+    return ktc, boot["load_failure_policy"], boot["line"]
+
+
+def _serve_argv(policy=None):
+    """The launcher's own command-line shape, with or without the policy in its JSON."""
+    blob = CONNECTOR_JSON_UNSET if policy is None else (
+        '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both",'
+        f'"kv_load_failure_policy":"{policy}"}}')
+    return ["vllm", "serve", "/models/Qwen", "--kv-transfer-config", blob]
+
+
+def test_a_policy_nobody_named_becomes_recompute_before_the_scheduler_reads_it(
+        monkeypatch):
+    """THE FINDING THIS FIX ANSWERS, upstream's own words: "the default
+    kv_load_failure_policy is \"fail\", not \"recompute\", so a failed restore kills
+    the request unless that's set." The engine reads the field at `scheduler.py:147`;
+    the hook has already run by then, so the value it reads is the value the boot
+    decided, and the decision is RECOMPUTE when nobody named the field.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=_serve_argv())
+    assert ktc.kv_load_failure_policy == load_failure_policy.POLICY_RECOMPUTE, \
+        "the field the scheduler is about to read"
+    assert policy["decision"] == load_failure_policy.VERDICT_PLUGIN_SET
+    assert policy["applied"] is True
+    assert policy["before"] == "fail", "the upstream default it replaced"
+    assert policy["after"] == "recompute", "READ BACK, not the value we intended"
+    assert policy["witness"] == "cli" and policy["operator_names_field"] is False
+    assert "LOAD_POLICY[recompute:plugin]" in line
+
+
+def test_an_explicit_fail_is_left_exactly_where_the_operator_put_it(monkeypatch):
+    """`fail` written out by hand is a CHOICE, and the plugin may not reverse it.
+
+    This is the case that a value-only check gets wrong: the value is identical to the
+    default, so the ONLY thing that can distinguish it is the operator's text. A
+    feature that overrode it here would have to be reverted, which is why this test is
+    the one the whole design is built around.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=_serve_argv("fail"), policy="fail")
+    assert ktc.kv_load_failure_policy == "fail", "the operator's own answer stands"
+    assert policy["decision"] == load_failure_policy.VERDICT_OPERATOR
+    assert policy["applied"] is False
+    assert policy["operator_names_field"] is True
+    assert policy["operator_value"] == "fail"
+    assert "LOAD_POLICY[fail:operator]" in line
+
+
+def test_an_explicit_recompute_is_reported_as_the_operators_and_not_ours(monkeypatch):
+    """The SAME value, attributed to the one who chose it.
+
+    `recompute` the operator wrote and `recompute` this boot wrote are the same engine
+    behaviour and a DIFFERENT fact for whoever reads the log at 3am: one has a
+    launcher variable to go and look at, the other does not. `applied: false` is the
+    other half - a boot that wrote nothing must not claim it wrote something.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=_serve_argv("recompute"),
+                                          policy="recompute")
+    assert ktc.kv_load_failure_policy == "recompute"
+    assert policy["decision"] == load_failure_policy.VERDICT_OPERATOR
+    assert policy["applied"] is False, "nothing was written here"
+    assert "LOAD_POLICY[recompute:operator]" in line
+    assert "LOAD_POLICY[recompute:plugin]" not in line
+
+
+def test_the_opt_out_env_name_leaves_the_field_alone_entirely(monkeypatch):
+    """THE ROLLBACK, and the only thing `off` does: the engine's own value stands.
+
+    Note what it does NOT do - it does not force `fail`. The step it turns off already
+    refuses to override an explicit choice, so this is the second veto over the same
+    write, and the field is untouched either way.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=_serve_argv(), policy="fail",
+                                          env="off")
+    assert ktc.kv_load_failure_policy == "fail", "untouched"
+    assert policy["decision"] == load_failure_policy.VERDICT_OPTED_OUT
+    assert policy["applied"] is False
+    assert policy["witness"] is None, "the opt-out is checked BEFORE the witness"
+    assert "LOAD_POLICY[untouched:opted-out]" in line
+
+
+def test_an_inert_boot_writes_no_engine_state_at_all(monkeypatch):
+    """`VLLM_E2_TIER_DEV_BOOT_INERT` promises "this plugin changed nothing", and a
+    write to an engine config field would break that promise in the one place nobody
+    thought to check. The verdict is INERT rather than an absence, so the payload
+    shows the promise was made and kept.
+    """
+    monkeypatch.setenv(config.ENV_BOOT_INERT, "1")
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=_serve_argv())
+    assert ktc.kv_load_failure_policy == "fail"
+    assert policy["decision"] == load_failure_policy.VERDICT_INERT
+    assert policy["applied"] is False
+    assert "LOAD_POLICY[untouched:inert]" in line
+
+
+def test_a_python_built_config_is_left_alone_and_the_reason_is_printable(monkeypatch):
+    """NO WITNESS, so NO WRITE - the case a value-based heuristic would get wrong.
+
+    With no `--kv-transfer-config` in the command line there is nothing that can tell
+    "defaulted" from "hand-written as `fail` in Python", and the honest reading of a
+    `fail` this process cannot prove was not chosen is that it WAS chosen. The reason
+    is the point as much as the verdict is: it names the one variable that resolves the
+    ambiguity, so the boot is a dead end for nobody.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=["vllm", "serve", "/models/Qwen"])
+    assert ktc.kv_load_failure_policy == "fail", "not proven unset, so not written"
+    assert policy["decision"] == load_failure_policy.VERDICT_UNRESOLVED
+    assert policy["witness"] == "no-cli-witness"
+    assert config.ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT in policy["reason"]
+    assert "LOAD_POLICY[fail:unresolved]" in line
+
+
+def test_an_enable_word_asserts_what_the_witness_could_not(monkeypatch):
+    """`VLLM_E2_TIER_DISK_LOAD_FAILURE_POLICY_DEFAULT=1` means "I did not set it".
+
+    The one state that lets the write through WITHOUT a CLI witness, and therefore the
+    one state a typo must never reach: a value that is neither an enable word nor a
+    disable word runs the cautious default and says so. That half is tested here too,
+    because the difference between the two is whether the plugin writes an engine field
+    it cannot prove is unset.
+    """
+    ktc, policy, _line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                           argv=["vllm", "serve", "/models/Qwen"],
+                                           env="1")
+    assert ktc.kv_load_failure_policy == "recompute"
+    assert policy["decision"] == load_failure_policy.VERDICT_PLUGIN_SET
+    assert policy["forced"] is True
+
+    ktc2, policy2, _l2 = _boot_with_policy(monkeypatch, _six_group_class(),
+                                           argv=["vllm", "serve", "/models/Qwen"],
+                                           env="flase")
+    assert ktc2.kv_load_failure_policy == "fail", "a typo does not force a write"
+    assert policy2["decision"] == load_failure_policy.VERDICT_UNRESOLVED
+    assert policy2["forced"] is False
+
+
+def test_a_non_default_value_is_a_choice_however_it_arrived(monkeypatch):
+    """THE SECONDARY WITNESS, and the direction it is allowed to point in.
+
+    A value that is not the engine's own default cannot be an accident, so it is
+    reported as chosen and left alone. This witness can say "someone chose this" and
+    can NEVER say "nobody chose this", which is why it never authorises a write - a
+    heuristic that read it the other way would be this module's worst failure. Even
+    `force` does not outvote it: the operator asserting he did not set a field does not
+    make a non-default value into a default.
+    """
+    ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                          argv=["vllm", "serve", "/models/Qwen"],
+                                          policy="recompute",
+                                          engine_default=ENGINE_DEFAULT_FAIL,
+                                          env="1")
+    assert ktc.kv_load_failure_policy == "recompute"
+    assert policy["decision"] == load_failure_policy.VERDICT_OPERATOR_VALUE
+    assert policy["applied"] is False
+    assert policy["engine_default"] == "fail"
+    assert "LOAD_POLICY[recompute:operator]" in line
+
+
+def test_an_unreadable_engine_default_leaves_a_recompute_alone_too(monkeypatch):
+    """The pessimistic half of the same rule: no reference value, and still no write.
+
+    With the engine's default unreadable (a vllm this plugin cannot import, a renamed
+    field) the value-vs-default comparison cannot run at all. Nothing is written either
+    way - the only write this module performs is one where the field reads `fail` and
+    something proves nobody chose it, so losing the secondary witness can only cost a
+    recompute, never override a choice.
+    """
+    ktc, policy, _line = _boot_with_policy(
+        monkeypatch, _six_group_class(), argv=["vllm", "serve", "/models/Qwen"],
+        policy="recompute", engine_default=ENGINE_DEFAULT_UNREADABLE, env="1")
+    assert ktc.kv_load_failure_policy == "recompute", "untouched"
+    assert policy["applied"] is False
+    assert policy["decision"] == load_failure_policy.VERDICT_ALREADY
+
+
+def test_a_write_that_does_not_land_is_reported_as_a_refusal(monkeypatch):
+    """READ IT BACK, or the log line is a wish.
+
+    The config here accepts the write and does nothing with it (a property, a
+    validator, a frozen slot - all real shapes for a config class). A step that
+    reported `recompute` because that is what it SET would be the 2026-10-06
+    `cap_ms` provenance line again, and the reader would go looking for an engine flag
+    that was never in force.
+    """
+    class StubbornConfig:
+        """`kv_load_failure_policy` that ignores every write."""
+
+        def __init__(self):
+            self._value = "fail"
+
+        @property
+        def kv_load_failure_policy(self):
+            return self._value
+
+        @kv_load_failure_policy.setter
+        def kv_load_failure_policy(self, value):
+            pass
+
+    stubborn = StubbornConfig()
+    _ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                           argv=_serve_argv(), ktc=stubborn)
+    assert stubborn.kv_load_failure_policy == "fail", "the engine's view never changed"
+    assert policy["decision"] == load_failure_policy.VERDICT_WRITE_REFUSED
+    assert policy["applied"] is False
+    assert policy["before"] == "fail" and policy["after"] == "fail", \
+        "the report says what the object says, not what we tried to do"
+    assert "LOAD_POLICY[fail:refused]" in line
+
+
+def test_a_write_the_object_refuses_outright_is_also_contained(monkeypatch):
+    """A config class that RAISES on the write costs a verdict and nothing else.
+
+    The hook is inside the fork's own connector construction, so a refused write has
+    to end as a payload entry - and the connector still gets built, which is what the
+    assert in the helper proves for every path here.
+    """
+    class ReadOnlyConfig:
+        """The field is a property with no setter: setting it raises."""
+
+        @property
+        def kv_load_failure_policy(self):
+            return "fail"
+
+    _ktc, policy, line = _boot_with_policy(monkeypatch, _six_group_class(),
+                                           argv=_serve_argv(),
+                                           ktc=ReadOnlyConfig())
+    assert policy["decision"] == load_failure_policy.VERDICT_WRITE_REFUSED
+    assert policy["applied"] is False
+    assert "refused" in policy["reason"] or "raised" in policy["reason"]
+    assert "LOAD_POLICY[" in line
+
+
+def test_a_connector_with_no_kv_transfer_config_says_none_and_harms_nothing(
+        monkeypatch):
+    """The config the factory was handed may carry no KVTransferConfig at all (a
+    foreign caller, a test, a future factory that passes something else). `none` is a
+    third answer - not "the field is fine" and not "the step failed".
+    """
+    factory, connector_cls, _built = _fake_vllm_modules(monkeypatch,
+                                                        _six_group_class())
+    backport.install_connector_hook()
+    monkeypatch.setattr(sys, "argv", _serve_argv())
+    connector = factory.create_connector(
+        config=types.SimpleNamespace(kv_transfer_config=None),
+        role=types.SimpleNamespace(name="SCHEDULER"), kv_cache_config="KVC")
+    assert isinstance(connector, connector_cls)
+    policy = backport.section()["boot"]["load_failure_policy"]
+    assert policy["decision"] == load_failure_policy.VERDICT_NO_CONFIG
+    assert policy["applied"] is False
+    assert "LOAD_POLICY[none]" in backport.section()["boot"]["line"]
+
+
+def test_the_witness_parses_the_forms_argparse_accepts():
+    """`--kv-transfer-config JSON` and `--kv-transfer-config=JSON` are the same flag.
+
+    A witness that understood one shape would answer "nobody named it" about a boot
+    that named it, which is the ONE wrong answer this module may give: it is the
+    answer that overrides an operator. A value that will not parse is likewise not
+    evidence of absence - `reliable` stays false and the field is left alone.
+    """
+    unset = load_failure_policy.operator_witness(
+        ["vllm", "serve", "m", "--kv-transfer-config", CONNECTOR_JSON_UNSET])
+    assert unset["reliable"] is True and unset["names_field"] is False
+
+    named = load_failure_policy.operator_witness(
+        ["vllm", "serve", "m", "--kv-transfer-config="
+         + '{"kv_role":"kv_both","kv_load_failure_policy":"fail"}'])
+    assert named["reliable"] is True and named["names_field"] is True
+    assert named["operator_value"] == "fail"
+
+    bare = load_failure_policy.operator_witness(["vllm", "serve", "m"])
+    assert bare["flag_seen"] is False and bare["reliable"] is False
+
+    broken = load_failure_policy.operator_witness(
+        ["vllm", "serve", "--kv-transfer-config", "{not json"])
+    assert broken["flag_seen"] is True and broken["reliable"] is False, \
+        "an unparseable value is not proof that the field was absent"
+
+
+def test_the_witness_survives_the_process_boundary_it_has_to_survive(monkeypatch,
+                                                                      tmp_path):
+    """THE LOAD-BEARING ASSUMPTION, tested rather than asserted in a docstring.
+
+    The scheduler's `create_connector` runs in the EngineCore PROCESS, so a witness
+    read from `sys.argv` is only a witness if a child process still has the parent's
+    command line. `multiprocessing.spawn` restores it and a fork inherits it - and this
+    is the mechanism the engine's own core process is launched by, so if that ever
+    stops being true the witness must be replaced, not trusted.
+    """
+    script = tmp_path / "argv_child.py"
+    script.write_text("import json, sys\nprint(json.dumps(sys.argv))\n")
+    out = subprocess.run([sys.executable, "-c",  # noqa: S603 - this interpreter, fixed
+                          "import multiprocessing as mp, runpy, sys; "
+                          "mp.set_start_method('spawn'); "
+                          "p = mp.Process(target=runpy.run_path, "
+                          f"args=({str(script)!r},)); p.start(); p.join()",
+                          "--kv-transfer-config", CONNECTOR_JSON_UNSET],
+                         capture_output=True, text=True, timeout=60, check=True)
+    child_argv = [line for line in out.stdout.splitlines() if line.startswith("[")]
+    assert child_argv, out.stdout
+    seen = json.loads(child_argv[-1])
+    assert "--kv-transfer-config" in seen, "spawn handed the child the parent's argv"
+    w = load_failure_policy.operator_witness(seen)
+    assert w["reliable"] is True and w["names_field"] is False
+
+
+def test_the_boot_reports_the_policy_without_the_step_claiming_anything(monkeypatch):
+    """A boot that never ran the step renders `not_run`, never a guess.
+
+    The payload's key is present-but-null and the line says `not_run`: `boot_from_
+    connector` is also called directly (by the harness in `tests/test_auto_boot.py`),
+    and a line that rendered `recompute:plugin` for a boot that wrote nothing would be
+    the false provenance this module exists to avoid.
+    """
+    cls = _six_group_class()
+    manager = _production_manager(cls)
+    report = backport.install(cls, our_shape_config(), manager)
+    boot = backport.boot_from_connector(cls, report, manager)
+    assert boot["load_failure_policy"] is None
+    assert "LOAD_POLICY[not_run]" in boot["line"]
+
+
+def test_the_policy_verdict_carries_one_key_set_on_every_path():
+    """Every verdict - including the ones reached by an exception - has the same keys.
+
+    A payload whose keys move between the good path and the bad one makes a dashboard
+    render an absent key as `false`, which is how a plugin that never ran gets
+    reported as a plugin that decided.
+    """
+    paths = [
+        # a step that never ran, a write, no config at all, and the no-witness branch.
+        load_failure_policy._empty(),
+        load_failure_policy.decide(_kv_config("fail"), witness={
+            "reliable": True, "names_field": False, "operator_value": None,
+            "source": "cli", "problems": []}),
+        load_failure_policy.decide(None),
+        load_failure_policy.decide(_kv_config("fail"),
+                                  env={"enabled": True, "force": False, "raw": None,
+                                       "recognised": True, "problems": []},
+                                  witness=None, default={"default": None,
+                                                         "source": "unreadable",
+                                                         "reason": "test"}),
+    ]
+    keys = {tuple(sorted(path)) for path in paths}
+    assert len(keys) == 1, keys
+    for path in paths:
+        assert path["decision"] in load_failure_policy.VERDICTS, path["decision"]
+        assert isinstance(path["token"], str) and path["token"].startswith(
+            "LOAD_POLICY[")

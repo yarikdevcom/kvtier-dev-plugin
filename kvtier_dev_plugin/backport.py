@@ -1928,7 +1928,8 @@ def _boot_restore(cls) -> dict:
         return out
 
 
-def boot_from_connector(cls, install_report, manager) -> dict:
+def boot_from_connector(cls, install_report, manager,
+                        load_failure_policy=None) -> dict:
     """THE BOOT, run by the connector-creation hook. Never raises.
 
     Three verdicts and one log line: `backport` (the fix fully installed AND the
@@ -1975,6 +1976,17 @@ def boot_from_connector(cls, install_report, manager) -> dict:
             # diagnostic
             # is not a tier that declined to serve. `None` means the step never ran.
             "lookup_ledger": None,
+            # WHO DECIDES THE ENGINE'S KV LOAD-FAILURE POLICY (0.2.73): the verdict of
+            # the step that gives `kv_load_failure_policy` the value `recompute` when
+            # nothing in the operator's own configuration named it. `None` means the
+            # step never ran in this boot; a dict is the verdict, and its `after` is
+            # what the engine will ACTUALLY do with a KV load that cannot be served -
+            # read back off the config object, never the value this plugin intended to
+            # write. Reporting, never a refusal: `fail` here is a posture somebody chose
+            # or could not be located, not a tier that declined to serve.
+            "load_failure_policy": (load_failure_policy
+                                    if isinstance(load_failure_policy, dict)
+                                    else None),
             "install_reason": report.get("reason"), "line": None}
     try:
         mode, why = boot_mode()
@@ -2404,6 +2416,15 @@ def boot_line(boot: dict) -> str:
     # that declined to serve, and putting it there would make the one list an operator
     # triages on lie about what actually went wrong.
     parts.append(lookup_ledger_token(boot))
+    # WHO DECIDES WHAT A FAILED KV LOAD COSTS THE USER (0.2.73), in the same
+    # bracketed-token shape and for the same reason as the three above it: `LOAD_POLICY
+    # [recompute:plugin]` answers "if a spill file is unreadable, does my user get an
+    # answer or an error, and who decided that?" in one glance, and the WHO half is the
+    # point - `fail:operator` means a human chose it, `fail:unresolved` means nobody can
+    # prove that and the plugin will not guess, and the two have different remedies. A
+    # boot that had silently inherited upstream's `fail` used to be indistinguishable
+    # from a boot that was told to use it. Reporting, so it is NOT part of `refused=`.
+    parts.append(load_failure_policy_token(boot))
     if boot.get("nested"):
         parts.append("guard_over={}".format(
             ",".join(list(boot["nested"])[:MAX_BOOT_ITEMS])))
@@ -2458,7 +2479,7 @@ def boot_section() -> dict:
                 "not_covered": [], "nested": [], "live_check": None,
                 "install_reason": None, "manager": None, "restore": None,
                 "arena": None, "disk_boot": None, "journal_drain": None,
-                "lookup_ledger": None,
+                "lookup_ledger": None, "load_failure_policy": None,
                 "line": _state.get("boot_line"),
                 "faults_now": guard_mode_faults(),
                 "note": ("no tier connector has been built in this process yet, so "
@@ -2644,6 +2665,27 @@ reading of a verdict this module cannot name is "it did not work".
         return "LOOKUP_LEDGER[not_run]"
 
 
+def load_failure_policy_token(boot: dict) -> str:
+    """The BOOT line's `LOAD_POLICY[what:who]` token, from THIS boot's own record.
+
+    Bracketed, not `key=value`, and read from the BOOT DICT rather than module state -
+    both for the reasons `mamba_anchor.boot_token()` and `lookup_ledger_token()` give:
+    the restart verifier in the llm-api repo pulls its PASS criterion with
+    `grep -oE "tier=[A-Za-z_]+" | tail -1`, and a line must describe the boot that
+    produced it. The token renders the two facts the upstream finding asked for and
+    nothing else: the policy the engine will actually run, and who decided it.
+    `not_run` is the honest rendering of "this boot never reached the step", and a
+    record this module cannot name renders `refused`, never the plugin's own hope.
+    """
+    try:
+        from . import load_failure_policy  # noqa: PLC0415 - sibling layer, lazy
+        return load_failure_policy.boot_token(
+            boot.get("load_failure_policy") if isinstance(boot, dict) else None)
+    except Exception as exc:  # noqa: BLE001 - a token is never worth a lost line
+        snapshot._error(exc, "backport load failure policy token")
+        return "LOAD_POLICY[not_run]"
+
+
 def boot_note(reason: str) -> dict:
     """The BOOT line for a process that has NO tier to boot. Same format.
 
@@ -2659,19 +2701,27 @@ def boot_note(reason: str) -> dict:
             "refusals": [reason], "not_covered": [], "nested": [],
             "live_check": None, "manager": None, "install_reason": None,
             "restore": None, "arena": None, "disk_boot": None,
-            "journal_drain": None, "lookup_ledger": None, "line": None}
+            "journal_drain": None, "lookup_ledger": None,
+            "load_failure_policy": None, "line": None}
     boot["line"] = boot_line(boot)
     _state["boot_line"] = boot["line"]
     logger.warning("kvtier-dev-plugin: %s", boot["line"])
     return boot
 
 
-def _after_connector_created(connector) -> None:
+def _after_connector_created(connector, vllm_config=None) -> None:
     """The install moment. Contained: the engine ALWAYS gets its connector.
 
     Nothing here may raise into `create_connector`, and nothing here may swap the
     object the caller asked for: a diagnostic that can break connector
     construction is a worse outage than an unpatched tier.
+
+    `vllm_config` is the FIRST ARGUMENT the fork's `create_connector` was called with
+    (`scheduler.py:140`: `config=self.vllm_config`), passed through untouched. It is
+    the only handle on `kv_transfer_config` this hook will ever have, and the
+    load-failure-policy step below has to write that field before the caller reads it
+    at `scheduler.py:147`. A caller that hands in nothing (an older test, a foreign
+    caller) leaves it None and the step reports `no-config` rather than guessing.
     """
     try:
         _state["hook_calls"] += 1
@@ -2721,6 +2771,29 @@ def _after_connector_created(connector) -> None:
             return
         _state["hook_tier_connectors"] += 1
         cls = type(manager)
+        # THE ENGINE'S KV LOAD-FAILURE POLICY, decided HERE and BEFORE EVERYTHING ELSE
+        # IN THIS BRANCH, because this is the last moment it is still a choice.
+        # `Scheduler.__init__` calls `create_connector` at `scheduler.py:140` and reads
+        # `kv_transfer_config.kv_load_failure_policy` EIGHT LINES LATER at `:147`,
+        # latching `recompute_kv_load_failures` for the life of the process; the
+        # upstream default is `fail`, which fails a request outright on a KV load that
+        # cannot be served (`scheduler.py:1928`, and `should_fail` in
+        # `_handle_invalid_blocks`). With the SSD tier under this connector, a capacity
+        # eviction or an unreadable spill file would therefore be a user-visible error
+        # instead of a recompute - and until now one launcher variable was all that
+        # stood between the two, with nothing in the boot saying which one this was.
+        #
+        # WHY FIRST, AHEAD OF THE INSTALL: the policy is a fact about the engine's
+        # error handling and does not depend on our patch landing, so an install that
+        # fails must not also cost the boot the policy. WHY ONLY HERE AND NOT IN
+        # `register()`: the worker role returns above, and a worker process never reads
+        # the field, so writing it there would be a side effect nothing asked for.
+        # WHY IT CANNOT OVERRIDE AN OPERATOR: see `load_failure_policy.py` - the write
+        # needs a witness that nobody named the field, and the boot line prints what
+        # the engine will do AND who decided it. Contained twice over: the step never
+        # raises, and this whole hook is inside a try.
+        from . import load_failure_policy  # noqa: PLC0415 - lazy by idiom
+        policy_verdict = load_failure_policy.boot_step(vllm_config)
         report = install(cls, getattr(manager, "kv_cache_config", None),
                          manager)
         wrapped = sum(1 for v in report["switch"].values() if v.get("wrapped"))
@@ -2768,7 +2841,8 @@ def _after_connector_created(connector) -> None:
         # After the install verdict lines above, so the BOOT line is the last
         # thing the boot writes and the one line an operator reads. Contained:
         # the engine still got its connector whatever happens here.
-        boot_from_connector(cls, report, manager)
+        boot_from_connector(cls, report, manager,
+                            load_failure_policy=policy_verdict)
     except Exception as exc:  # noqa: BLE001 - a hook must never break a connector
         _state["hook_errors"] += 1
         _state["hook_last"] = f"hook raised {type(exc).__name__}: {exc}"[:200]
@@ -2782,7 +2856,15 @@ def _make_create_connector_hook(original):
         # HMA/`kv_transfer_config` ValueErrors it raises are the engine's story,
         # not ours to swallow). Only a SUCCESSFUL construction gets inspected.
         connector = original(cls, *args, **kwargs)
-        _after_connector_created(connector)
+        # THE VLLM CONFIG, picked out of the arguments the fork was handed and passed
+        # along as a second, purely informational parameter. Both call shapes are read
+        # because the factory's signature is positional while `scheduler.py:140` calls
+        # it with `config=` as a keyword: a hook that understood only one would answer
+        # "no config" about a boot that had one.
+        config_arg = kwargs.get("config")
+        if config_arg is None and args:
+            config_arg = args[0]
+        _after_connector_created(connector, config_arg)
         return connector
 
     setattr(create_connector, HOOK_ATTR, HOOK_TAG)

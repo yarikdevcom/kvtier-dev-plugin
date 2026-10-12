@@ -194,7 +194,16 @@ ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
             # claim is that a fresh boot arms the ring. A suite that inherited `0` would
             # have every ledger test finding a disarmed ring it did not disarm, and the
             # boot-line token tests reading `[env-refused]` where they assert `[armed]`.
-            config.ENV_LOOKUP_LEDGER_BOOT_ARM)
+            config.ENV_LOOKUP_LEDGER_BOOT_ARM,
+            # THE KV LOAD-FAILURE POLICY STEP (0.2.73). Default ENABLED, and its
+            # `force` state is the one thing in this file that lets a boot write an
+            # engine field the plugin would otherwise leave alone. A suite that
+            # inherited `=off` would be testing the rollback while believing it tested
+            # the shipped posture (and every "it became recompute" assertion would
+            # fail confusingly); a suite that inherited `=1` would be writing where the
+            # code deliberately refuses to guess. Deleting it makes "unset = the
+            # cautious default" the fact every test measures.
+            config.ENV_DISK_LOAD_FAILURE_POLICY_DEFAULT)
 
 
 def _isolate(state: dict) -> dict:
