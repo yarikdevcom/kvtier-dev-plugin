@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560" role="img" aria-labelledby="t d">
+  <title id="t">KV tier architecture: request path, three storage tiers, the group rule, and the separate observability door</title>
+  <desc id="d">A request goes client, to the API server, to EngineCore (the scheduler, which owns the connector metadata and runs get_num_new_matched_tokens and update_state_after_alloc), to the worker ranks. Below that sit three tiers: the GPU KV pool, the pinned host-RAM arena behind SimpleCPUOffloadConnector, and the NVMe spill store plus its journal. Spill runs downward and is solid; restore runs upward - solid from the RAM tier, which production serves on, and dashed from NVMe, whose gate stays boot-closed until the worker ranks prove their reads. What is restorable is decided by the group rule: group 5 at every block, groups 0-3 at the run's last block (the anchor), group 4 never spilled, so one hole forfeits every token behind it. The /plugins/kvtier/* dev routes and the per-rank diagnostic files are observability, kept separate from the data path.</desc>
+
+  <defs>
+    <marker id="aSpill" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 z" fill="#b45309"/>
+    </marker>
+    <marker id="aRam" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 z" fill="#047857"/>
+    </marker>
+    <marker id="aFlow" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 z" fill="#334155"/>
+    </marker>
+    <marker id="aObs" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="560" fill="#ffffff"/>
+
+  <text x="20" y="26" font-family="monospace, monospace" font-size="18" font-weight="bold" fill="#0f172a">kvtier-dev-plugin: KV tiers under a live vLLM engine</text>
+  <text x="20" y="46" font-family="monospace, monospace" font-size="12" fill="#334155">Solid arrows are paths production serves on. Dashed arrows are the disk restore and the</text>
+  <text x="20" y="60" font-family="monospace, monospace" font-size="12" fill="#334155">observability door: real, but not a proven always-on serving route. Names, not addresses.</text>
+
+  <g font-family="monospace, monospace" font-size="12" fill="#0f172a">
+    <rect x="20" y="76" width="96" height="52" rx="4" fill="#f8fafc" stroke="#475569"/>
+    <text x="30" y="98">client</text>
+    <text x="30" y="116" fill="#334155">HTTP</text>
+
+    <rect x="140" y="76" width="150" height="52" rx="4" fill="#f8fafc" stroke="#475569"/>
+    <text x="150" y="98">API server</text>
+    <text x="150" y="116" fill="#334155">endpoint plugin</text>
+
+    <rect x="316" y="72" width="254" height="96" rx="4" fill="#eef2ff" stroke="#4338ca" stroke-width="1.5"/>
+    <text x="326" y="92" font-weight="bold">EngineCore (scheduler)</text>
+    <text x="326" y="110" fill="#334155">owns the connector meta</text>
+    <text x="326" y="128" fill="#334155">get_num_new_matched_tokens</text>
+    <text x="326" y="146" fill="#334155">update_state_after_alloc</text>
+
+    <rect x="596" y="76" width="180" height="88" rx="4" fill="#f8fafc" stroke="#475569"/>
+    <text x="606" y="96" font-weight="bold">worker ranks x4</text>
+    <text x="606" y="114" fill="#334155">PP0,PP1 x TP0,TP1</text>
+    <text x="606" y="132" fill="#334155">apply point:</text>
+    <text x="606" y="148" fill="#334155">start_load_kv</text>
+
+    <line x1="116" y1="102" x2="138" y2="102" stroke="#334155" stroke-width="1.5" marker-end="url(#aFlow)"/>
+    <line x1="290" y1="102" x2="314" y2="102" stroke="#334155" stroke-width="1.5" marker-end="url(#aFlow)"/>
+    <line x1="570" y1="102" x2="594" y2="102" stroke="#334155" stroke-width="1.5" marker-end="url(#aFlow)"/>
+  </g>
+
+  <g font-family="monospace, monospace" font-size="12">
+    <text x="20" y="172" font-weight="bold" fill="#334155">THE THREE TIERS</text>
+
+    <rect x="20" y="180" width="604" height="58" rx="4" fill="#eef2ff" stroke="#4338ca"/>
+    <text x="32" y="202" font-weight="bold" fill="#0f172a">GPU KV pool   --block-size 4096 geometry</text>
+    <text x="32" y="222" fill="#334155">prefix-match-unit 64; the restore landing point (gpu_block_id)</text>
+
+    <rect x="20" y="266" width="604" height="70" rx="4" fill="#ecfdf5" stroke="#047857"/>
+    <text x="32" y="288" font-weight="bold" fill="#0f172a">host-RAM arena   SimpleCPUOffloadConnector</text>
+    <text x="32" y="306" fill="#334155">KV_OFFLOAD_SIZE GiB, server-wide (divided by world size per rank)</text>
+    <text x="32" y="324" fill="#047857">PINNED: no LimitMEMLOCK=infinity and the pin fails SILENTLY</text>
+
+    <rect x="20" y="366" width="604" height="74" rx="4" fill="#fffbeb" stroke="#b45309"/>
+    <text x="32" y="386" font-weight="bold" fill="#0f172a">NVMe spill store</text>
+    <text x="32" y="404" fill="#334155">VLLM_E2_TIER_DISK_ROOT</text>
+    <text x="32" y="422" fill="#334155">one file per block per rank;</text>
+    <text x="32" y="436" fill="#334155">ceiling VLLM_E2_TIER_DISK_BYTES</text>
+
+    <rect x="392" y="372" width="226" height="62" rx="4" fill="#fef3c7" stroke="#b45309"/>
+    <text x="402" y="390" font-weight="bold" fill="#0f172a">journal (persistent)</text>
+    <text x="402" y="408" fill="#334155">the ONLY file to block map</text>
+    <text x="402" y="426" fill="#334155">lost at boot: index entries 0</text>
+
+    <line x1="28" y1="240" x2="28" y2="262" stroke="#b45309" stroke-width="2" marker-end="url(#aSpill)"/>
+    <line x1="28" y1="340" x2="28" y2="362" stroke="#b45309" stroke-width="2" marker-end="url(#aSpill)"/>
+    <line x1="596" y1="262" x2="596" y2="240" stroke="#047857" stroke-width="2" marker-end="url(#aRam)"/>
+    <line x1="596" y1="362" x2="596" y2="340" stroke="#b45309" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#aSpill)"/>
+
+    <text x="44" y="256" fill="#b45309">spill down</text>
+    <text x="140" y="256" fill="#047857">restore up from RAM: SOLID, the path production serves on</text>
+    <text x="44" y="354" fill="#b45309">spill down | RESTORE from disk = DASHED (disk_authority; gate closed)</text>
+  </g>
+
+  <g font-family="monospace, monospace" font-size="12" fill="#0f172a">
+    <rect x="640" y="180" width="304" height="270" rx="4" fill="#f1f5f9" stroke="#64748b" stroke-dasharray="6,4"/>
+    <text x="650" y="200" font-weight="bold">OBSERVABILITY: not a data path</text>
+    <text x="650" y="222" fill="#334155">GET/POST /plugins/kvtier/*</text>
+    <text x="650" y="240" fill="#334155">status snapshot kvconfig</text>
+    <text x="650" y="256" fill="#334155">block request tier guard</text>
+    <text x="650" y="272" fill="#334155">trace lookups blockdump disk</text>
+    <text x="650" y="296" fill="#334155">handlers run ON the EngineCore</text>
+    <text x="650" y="312" fill="#334155">loop thread: a handler that</text>
+    <text x="650" y="328" fill="#334155">sleeps STALLS SERVING</text>
+    <text x="650" y="352" fill="#334155">a worker has no channel, so it</text>
+    <text x="650" y="368" fill="#334155">reports by FILE:</text>
+    <text x="650" y="384" fill="#334155">/tmp/kv-tier-diagnostics/</text>
+    <text x="650" y="400" fill="#334155">rank-PP&lt;n&gt;_TP&lt;m&gt;.json</text>
+    <text x="650" y="424" fill="#334155">fleet = SUM over the rank files;</text>
+    <text x="650" y="440" fill="#334155">the answering process reads 0</text>
+
+    <line x1="540" y1="168" x2="646" y2="179" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aObs)"/>
+    <line x1="624" y1="300" x2="638" y2="300" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aObs)"/>
+  </g>
+
+  <g font-family="monospace, monospace" font-size="12">
+    <rect x="20" y="462" width="924" height="90" rx="4" fill="#fafafa" stroke="#94a3b8"/>
+    <text x="32" y="480" font-weight="bold" fill="#0f172a">The group rule decides what is restorable - and one hole forfeits EVERYTHING behind it</text>
+    <text x="32" y="502" fill="#0f172a">g5    required at EVERY block of a run</text>
+    <text x="32" y="518" fill="#0f172a">g0-g3 required at the run's LAST block only: the ANCHOR</text>
+    <text x="32" y="534" fill="#0f172a">g4    never spilled, excluded from every predicate</text>
+    <text x="536" y="502" fill="#334155">restore reads the CONTIGUOUS prefix:</text>
+    <text x="536" y="518" fill="#334155">g5 g5 g5 HOLE g5 g5  gives 3 spans</text>
+    <text x="536" y="534" fill="#334155">and recomputes all 31,845 behind it</text>
+  </g>
+</svg>

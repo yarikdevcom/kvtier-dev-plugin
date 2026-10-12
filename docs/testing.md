@@ -3,7 +3,7 @@
 Moved from `README.md`. The per-file ledger of `tests/`. How to run the suite is
 in `README.md` ("Tests"); the suites of the newer modules are described here.
 
-2867 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
+3182 tests, no engine and no vllm required (`.venv/bin/python -m pytest -q`; the
 count in this README is a snapshot - trust `pytest --collect-only`). The shadow
 verifier is `tests/test_disk_shadow.py`: that the default reads no device memory, that
 the sampling and the per-bind-window cap throttle instead of queueing, that a moving GPU

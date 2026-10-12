@@ -371,3 +371,343 @@ stand-in read wakes up calling the NEXT test's stand-in and charges its read to 
 boot's counters, which is how the barrier test first went red with 3 reads attributed and
 `reads_completed == 4`.
 
+
+## Spilling parked KV to the engine's own disk (`disk_store.py` + `disk_spill.py`)
+
+The host-RAM tier can only grow to what the box has. The SSD tier is the write side
+of the next step down: when a store into a CPU slot **completes**, that slot's bytes
+can be written to one file on the engine's own filesystem, named so that a
+configuration change makes the old files un-findable rather than mis-readable:
+
+```
+<VLLM_E2_TIER_DISK_ROOT>/<key16[0:2]>/kvslot-<key16>-g<group>-<geodigest12>.bin
+```
+
+* The group id is **part of the identity**. Two KV-cache groups can hash the same
+  token chain, so a `key16` alone does not say whose bytes a file holds; the older
+  2-field shape `kvslot-<key16>-<geodigest12>.bin` named ONE file for two different
+  payloads and is now refused as malformed (`disk_layout`).
+
+* `key16` is the first 16 hex chars of the engine's block hash for that slot (the
+  contract's `store_keys`, index-aligned with `store_cpu_blocks`; a slot the engine
+  could not hash arrives as `""` and costs that one slot, never the batch).
+* `geodigest12` is a digest of the fingerprint **the worker builds for itself**: the
+  slot width it measures from its own region tensors and the rank it resolves, plus
+  the rank-invariant facts read off `vllm_config`/`kv_cache_config` and the fork's
+  `get_none_hash_seed()`. One scheduler cannot broadcast one digest that is four
+  ranks' digests (`total_bytes_per_block` is 11,468,800 B on PP0 and 12,902,400 B on
+  PP1), so the rank-local fields are read per rank - and that is what keeps a PP1
+  worker from being able to form a PP0 file's name. `store_fingerprint` is an
+  optional **cross-check**: `""` (what the engine sends today) means nothing, and a
+  non-empty value that disagrees with a rank's own digest is a counted refusal.
+
+**Off, twice over.** `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the tmpfs
+roots are refused by `disk_layout`) **and** this boot must have armed the tier. Since
+0.2.33 the boot does arm it by default (`KVTIER_DISK_BOOT_ENABLE`, ON unless the operator
+turned it off - see *The SSD tier's boot default*); what has not changed is that **no
+runtime knob reaches the arm except the `/disk` verb**, and that since 0.2.35 the arm is a
+**LATCH** - it does not expire, it is lowered by `{"op":"disarm"}` and by nothing else, and
+it gates SERVING from disk as well as writing to it. Unarmed, the two wrapped methods cost two `os.environ.get`
+calls per step: no stat, no open, no copy, no queue, no writer thread.
+
+**It needs the engine patch, and says whether it has it.** A file needs a key, and
+today's `SimpleCPUOffloadMetadata` (`vllm/v1/simple_kv_offload/metadata.py`) carries
+none. Every entry point then refuses with a reason, counts it, and writes zero bytes;
+`engine_fields` in every answer says `present` / `absent` / `unknown` for this boot,
+read from the metadata **type**, so the question is answerable without generating a
+store. `no_key_for_slot` in the refusal table is that state, counted.
+
+```bash
+B=http://127.0.0.1:8000/plugins/kvtier
+# what can this boot do?
+ssh llm "curl -s $B/disk" | python3 -m json.tool
+# arm the tier, then prove the path writes real bytes for one slot. SINCE 0.2.35 THE ARM
+# IS A LATCH: `seconds` is still accepted (an existing caller must not start failing) and
+# does nothing - the verdict answers `seconds_ignored: true`. It comes down on `disarm`.
+curl -s -X POST -d '{"op":"arm"}' $B/disk
+# `key` is the engine's GROUP-QUALIFIED block hash: the 16-hex `key16` plus the
+# group id as 8 hex chars (`key16 + f"{group:08x}"`, so 24 hex). A bare 16-hex key is
+# refused - it cannot say which group's bytes these are. Find both halves with
+# `GET /plugins/kvtier/block?block_id=<cpu slot>`: `tier_cpu_slot.block` carries
+# `hash_hex` and `hash_group_id`, and any CPU slot is nameable up to the CPU pool's
+# size (which is larger than the GPU pool's - the id is bounded per pool).
+curl -s -X POST -d '{"op":"spill-one","slot":170,"key":"a3f0b7c1d4e5f60700000003"}' $B/disk
+curl -s -X POST -d '{"op":"ls","limit":20}' $B/disk
+# ONE IDENTITY, NOT THE WHOLE STORE (since 0.2.21). "Did the span I park actually land,
+# and for WHICH RANKS?" - answered from the replayed journals in memory, never by
+# walking the store (that is `ls`). One park span is one file PER RANK, so the answer is
+# a set of ranks: `ranks_present: 2` on a boot with 4 armed ranks is a half-written span.
+curl -s -X POST -d '{"op":"contains","key":"a3f0b7c1d4e5f60700000003"}' $B/disk
+# the query-string form does the same thing (and since 0.2.21, so does every other op)
+curl -s -X POST "$B/disk?op=contains&key=a3f0b7c1d4e5f60700000003"
+# name the four rank FILES of one span without listing the whole store: `shard` is the
+# first two hex of the key16 (the filter has always existed; 0.2.21 whitelists the key)
+curl -s -X POST "$B/disk?op=ls&shard=a3f0&limit=20"
+ssh llm "curl -s -X POST -d '{"op":"disarm"}' $B/disk"
+```
+
+**`contains` answers "I cannot answer" as its own verdict, with `present: null`.** Five
+of its verdicts are not a "no": a key that cannot name an identity (a `400` at the route,
+never a `present: false`), a process with no journal directory, an index that has replayed
+nothing since boot, a replay that named no file at all, and a check that raised. That
+distinction is the most valuable field on the verb: on 2026-10-05 `entries: 0` was read as
+"my span is not on disk" for a whole afternoon when the fact was that nothing had been
+replayed into that process yet. A present answer carries the entry's `bytes`, the journal
+file it came from, and one row per rank (`rank`, `bytes`, `journal`, `seq`) - which is how
+you tell a complete span from a partial one. Since 0.2.46 an identity that SOME ranks hold
+and others do not is its own verdict, `partial_ranks`: `present: false` and `offerable:
+false` because a restore reads one file per rank, with `ranks_missing` naming which, and
+the surviving entry's `bytes`/`journal`/`rank` rows beside it - "three ranks hold this and
+PP1_TP1 does not" is a different fact from "nothing holds this", and the offer path's
+predicate is now the intersection over the ranks that have to read. What it cannot say is
+each rank's geometry digest: the journal line is `<seq> <+|-> <key16> <bytes> <group>` and
+names no digest, so naming the actual files is `op=ls` with a `shard` - or the index's own
+claim list, `op=identities` - and the answer says so.
+
+**No fsync, on purpose.** The spill writes are buffered: `write_committed_file`
+keeps the `.part` + `O_CREAT|O_EXCL` + `os.replace` commit ordering (so *a committed
+name means a complete file* against a torn write) but fsyncs nothing, so the page
+cache owns device ordering and the writer thread never stalls on a platter. These KV
+bytes are a cache, not a system of record, and the safety net is on the read side: a
+journal entry whose bytes never reached the device is classified `file_missing` (or
+`size_mismatch` / `short_read`) by `disk_read`, reported to the engine, and pruned out
+of the DMA before a stale byte is copied. **False presence costs a recompute, never
+wrong bytes.** `directory_synced: false` in a spill answer is therefore the normal
+state, not a fault. (`sync=` stays as a capability for any caller that genuinely
+wants a durable file; the spill tier does not use it.)
+
+**The restore path exists (`disk_restore.py`, since 0.2.14) and it does not touch the
+hash index.** A prefix hit is resolved in the scheduler's
+`cached_block_hash_to_block`, and only scheduler-side store-completion publishes into
+it (the fork calls `_process_store_completion` at `manager.py:1028-1032` on the
+deployed in-tree-fixed build, at `manager.py:988-992` at the fork HEAD 10b8e07 this
+suite's fixture is generated from). A restore therefore does not try to make a lookup
+hit: on a host-RAM shortfall the SCHEDULER offers the SSD's continuation as external
+tokens, appends the CPU slots it allocated to the fork's own pending-hit tuple, and
+the fork's `update_state_after_alloc` / `start_load_kv` do the pinning and the DMA.
+A restored block helps exactly the request that paid for it; the next request reads
+the file again (~10 ms per 3,200-token span against ~3.2 s to recompute it). The
+worker rebuilds each name with its **own** digest, and a disagreement is a counted
+failure, not a guess.
+
+**A boot with the tier env set serves from disk, and one POST changes who is served.**
+Since 0.2.33 the boot default raises the serve posture for you (`KVTIER_DISK_BOOT_ENABLE`,
+ON unless the operator turned it off - see *The SSD tier's boot default*); the switches
+themselves stay dev-verb only, per boot, and unreachable by a config file or the spill
+arm, and `KVTIER_DISK_BOOT_ENABLE=0` restores the pre-0.2.33 posture where **a fresh boot
+serves nothing from disk until you POST**:
+
+```bash
+curl -s -X POST -d '{"op":"authority"}' $B/disk  # read
+curl -s -X POST \
+     -d '{"op":"authority","enabled":true}' $B/disk        # EVERY request from SSD
+curl -s -X POST \
+     -d '{"op":"offers","enabled":true}' $B/disk           # RAM first, disk fills gaps
+```
+
+`op=authority` is the global **disk-authority** switch: every request's host-RAM hit is
+treated as **zero tokens** for the offer arithmetic and released back to the pool, so the
+disk index - not the RAM tier - decides where each request's prefix starts. It opens the
+offer gate by itself, so that one POST is the whole change: no second command, no client
+change, and no restart needed to turn it back off.
+
+`op=offers` is the cheaper posture: RAM first, the disk extending only what the host-RAM
+tier left short. With both up, authority wins - the disk decides.
+
+Both start **false** in a process - a boot that *honours* the default raises one of them
+by calling this module's own setter, and a boot that does not (or a box where the flag is
+`0`) leaves them down - and `restore.serving_as` names the resulting posture as one word
+(`off` / `disk_authority` / `ram_first_gap_fill`). Why the spill arm is not one of these:
+on 2026-10-05 a spill arm raised for a write experiment was enough to put 123,474
+un-requested 160,000-token offers in front of live traffic. Arming says bytes may be
+*written*; these two say requests may be *served*.
+
+**No request field decides any of this (0.2.31).** Until then the authority rule was
+carried by a client-supplied marker, `kv_transfer_params.kvtier_disk_restore`, and a
+`scope` argument (`optin` / `all`) chose whether that marker was required. A request body
+must not decide whether its KV comes off NVMe - it is a payload the caller writes, and a
+measurement rig had to make every probe carry it to get the behaviour an operator wanted.
+So the marker, the `scope` argument and the fields it fed (`flagged`,
+`skipped_no_marker`, `marker_key`, `requests_seen`) are retired: the route refuses
+`scope` as an unsupported request key, `disk_restore` no longer reads
+`request.kv_transfer_params` at all, and a client can neither ask for disk authority nor
+decline it. Sending the old marker is a no-op that changes nothing.
+
+**Why nothing was restored is one HTTP call.** `GET /plugins/kvtier/disk` (and the
+`disk_restore` section of `/snapshot`) reports the SCHEDULER's own verdict - the layer
+fitted in that process, the gate and its reason, the index size and its source, the
+worker proof, and every offer refusal with its meaning - under `restore`, with
+`restore.why_no_restore` naming the first missing link. The boot's **posture** is in
+that section as fields, not only as text in the boot line: `disk_authority`,
+`offers_enabled`, `serving_as`, `per_boot`/`survives_restart`,
+`disk_authority_changes`/`offer_switch_changes`, the per-offer block bound
+(`offer_block_cap_blocks`/`offer_block_cap_tokens`, which replaced the retired
+`offer_cap` when 0.2.32 deleted the fixed 32,000-token cap),
+`ranks_armed`/`ranks_seen`, the fuse counters
+`suppressed_hits`/`suppressed_spans`/`suppressed_requests`/`suppressions`, and what the
+last failure reports decided - `races_not_fused`, `fuses_on_data_kinds`,
+`fuses_on_unknown_kinds`, `race_reoffers_granted`, `last_fuse_decision` and the
+`failure_kind_classes` partition itself, so "why did this one fuse?" is a payload read. A rank file's
+`disk_restore.installed: true` describes a WORKER and cannot start a restore; only
+the scheduler's half can, and `BOOT[auto] ... restore=YES|NO restore_gate=open|closed`
+is that verdict at boot.
+
+**Running the experiment.** Boot as usual and read `apply_window.windows.bind_to_apply_ms`
+- that distribution is the answer to "how big is the window", and since 0.2.32 the
+default boot gathers it *while waiting*, so the same boot answers both "how big is the
+race" and "did the wait win". Read `wait.settled_after_wait` against
+`wait.dropped_after_wait`, `wait.bound` and `wait.allowance_spent`. A loss that is
+`dropped_queued` is the wait doing its job late; a loss that is `dropped_running` with
+`allowance_spent` true is a device slower than the allowance, and `settle_bound_deadline`
+rising with it says the read's own expiry, not the cap, ended the wait.
+
+### Reading the spill in parallel: threads, the pool, and the ordering question (0.2.24)
+
+The read path used to run on exactly one thread (`kvtier-disk-read`), and the box says
+what that costs: `dd bs=4M iflag=direct` over 50 spill files (610.7 MiB, read-only)
+measured **1.32 GB/s with one reader and 5.14 GB/s with four** - 3.9x. The live engine
+agreed from the inside: `reads_started=36`, `reads_applied=36`,
+`read_seconds_max=0.0138`, i.e. 11,468,800 B / 13.8 ms ~ **0.83 GB/s per unit**,
+serialized 36 deep inside a rank before the step could proceed. There are already four
+ranks reading at once; within a rank the units were serial, and now they need not be.
+
+**Two switches, both inert.** `VLLM_E2_TIER_DISK_READ_THREADS` (default **1**) and
+`VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` (default **96 MiB**). With both unset the boot is
+the 0.2.23 boot: one thread named `kvtier-disk-read`, the same queue, the same pool,
+the same bytes - and `test_defaults_reproduce_the_single_thread_boot_exactly` pins it.
+
+**The pool, not the threads, is the constraint - do the arithmetic before the threads.**
+A job takes its bounce buffer at *issue* (`request_read`) and gives it back at the
+*apply point* (`finish_batch`), so one offer needs the pool to hold that offer's units
+**at the same time**. The arithmetic has two inputs, and both come from the code:
+
+* **units per offer per rank = spans x eligible groups.** `per_block =
+  len(groups['groups'])` (`disk_restore.py:2260`), and on the live boot that
+  is **1**, not 5: g4 fails the block-size match and g0-g3 are excluded by
+  `_group_positionally_stable`, so the offer names g5 alone (`last_offer.groups = [5]`).
+  Spans are bounded by `MAX_RESTORE_BLOCKS_PER_OFFER = 128` blocks (0.2.35 raised it from
+  64 so the backstop sits above a 1 GiB pool's ~93 buffers; 0.2.32 deleted the
+  fixed `MAX_OFFER_TOKENS_PER_OFFER = 32_000`-token cap: the pool budget below is the
+  bound that actually protects the engine, and the block walk is the principled one -
+  how many spans one offer can name and stream inside its deadline). In practice neither
+  number is what limits a live offer: the deepest contiguous run the store held on the
+  boot the operator measured was **~11 spans**, because spill follows RAM-tier parking
+  and the CPU arena is ~187 blocks per rank, so a rank is asked for ~11 units - one file
+  per span. If g0-g3 return to positional stability, `per_block` becomes 5 and the same
+  offer becomes 50 units; everything below says which number moves.
+* **bytes per unit** = one rank's CPU slot: 11,468,800 B (the 3,200-token groups) or
+  12,902,400 B otherwise. The live `bytes_applied / reads_applied` = 412,876,800 / 36 =
+  **11,468,800 B exactly**, so the running geometry is the narrow one.
+
+The pool is a byte ceiling, so what it buys in units is `floor(pool / unit)`:
+
+| `VLLM_E2_TIER_DISK_READ_BUFFER_BYTES` | units of 11,468,800 B | units of 12,902,400 B | host RAM at 4 ranks |
+|---|---|---|---|
+| 100,663,296 (96 MiB, **the default**) | **8** | 7 | 384 MiB |
+| 134,217,728 (128 MiB) | 11 | **10** | 512 MiB |
+| 201,326,592 (192 MiB) | 17 | 15 | 768 MiB |
+
+A 10-unit offer needs 114,688,000 B (109.4 MiB) on the narrow width and 129,024,000 B
+(123.0 MiB) on the wide one, so **the default pool misses the big-prompt case by two
+units - not by an order of magnitude.** That is the whole of the live failure:
+`buffer_cap = 6` is 2 refusals per rank on 3 batches, and `incomplete = 24` is those
+batches' **accepted** entries - 3 x 8 = 24 units that were read correctly and already
+memmoved into their CPU slots - forfeited because `incomplete` is a batch-level flag
+(`disk_restore.py:3674-3678`: one sibling's bind-time `buffer_cap` refusal adds
+`failed.setdefault(job_id, "incomplete")` to every job in the batch). Nothing failed to
+read; work that had already landed was discarded. **This release does not change that
+rule** - the fix is up-front offer clamping plus per-entry (not per-batch) poison
+inheritance, and that belongs in its own change with its own tests.
+
+**The pool is the byte bound; `MAX_QUEUE_DEPTH` is the reader's JOB bound (256 since
+0.2.35, 64 before).** These are different currencies and the smaller governs: the pool says
+how many buffers exist (`floor(pool / unit)`, the row above) and the queue says how many
+reads the process will accept at all. Since 0.2.35 the offer path prices
+`min(pool jobs, queue jobs)` and `bounded_by` names which one cut it (`pool_budget` /
+`read_queue`) - the ordered bound table sits with the disk-authority switches above. The queue is 256 because the
+offer's own job ceiling is 256 CPU slots (one read per slot), so a maximum 128-span offer -
+128 + 4 = 132 jobs - is submittable; a shallower queue does not shorten a restore, it
+**holes** it at the first refused job. A queued job *does* hold its buffer, but that buffer
+is billed to the pool's byte ceiling, so the queue's own cost is ~1.2 KB of descriptor per
+slot (**~0.3 MB per rank process at 256 slots**), not a second RAM budget.
+
+**Maximum useful thread count, from the code.** Threads do not create units. A buffer is
+held from issue until the apply point, so the number of units that can sit in flight at
+once is `floor(pool / unit)` **per worker process, across every open batch and at any
+thread count** - and today's 96 MiB pool puts that at **8 (7 on the wide width)**. A
+ninth thread has nothing to read and only adds `reader_starved_polls`, so **8 is the
+maximum useful thread count on the default pool**. At **128 MiB** the ceiling is **11
+narrow / 10 wide**, which is the whole offer; at **192 MiB** it is **17 / 15**. The other
+ceiling is the offer itself: one request contributes 10 units, so threads above 10 only
+help when several requests bind in the same step and share the pool - which is why 4 is
+the sane first setting and 16 is a clamp, not a target.
+
+What that buys in wall time, from the live `read_seconds_max = 0.0138 s` as the
+per-unit bound: a 10-unit offer serialised is at most **138 ms**, 8 units issued at 96
+MiB is at most 110 ms of reading that the step waits through, and four readers cut that
+to about **28-35 ms** (the two refused units are lost at bind no matter how many threads
+exist, which is why the pool is the first knob and not the second).
+
+**What to set.** For the live big-prompt case, set the pool to 134,217,728 bytes
+(128 MiB) and the threads to 4: 128 MiB is the smallest
+power-of-two that holds a whole 10-unit offer on **both** widths (11 narrow, exactly 10
+wide), costs 512 MiB of resident bytes across four worker processes on a box that
+reported 99,646 MiB available with the 120 GB pinned tier already up, and the default
+stays 96 MiB - an unset environment is still the 0.2.23 boot. 192 MiB is the setting for
+a future 5-eligible-group offer (50 units needs 645,120,000 B, i.e. 640 MiB per rank,
+2.5 GiB across four). Four threads, not eight: the box's own `dd iflag=direct` sweep
+measured 3.9x at four readers, so four is where the array was still scaling; going past
+the measured point is a decision to make from `parallel_efficiency`, not from a knob.
+
+**The queue cap stays 64 and does not need to move.** The largest legal offer names 10
+units today (50 if `per_block` reaches 5), under the cap, and a 96 MiB pool refuses the
+NINTH unit long before the queue refuses the 65th - so the pool binds first in every
+case the offer path can reach. With N readers the queue drains N-at-a-time, which makes the cap strictly
+*less* likely to bind, never more; `queue_depth_peak` and `refused.queue_full` are
+published so that claim can be checked instead of asserted.
+
+**Changing the reader count without a restart (0.2.67).**
+`POST /plugins/kvtier/disk {"op":"read-threads","threads":6}` moves the count in place,
+in **both** directions, as often as you like, in one boot. It exists because the only
+lever was `VLLM_E2_TIER_DISK_READ_THREADS`, and every move of 8 -> 16 -> 6 cost an engine
+restart: a couple of minutes down, the previous arm's counters wiped, and every
+comparison left resting on a short window. `{"op":"read-threads"}` alone **reads** the
+posture (the house grammar of every mutating `/disk` op: a key present is an
+instruction, a key absent is a question), and a `threads` that is not an integer in
+`[1, 16]` is refused at the wire with a 400 and again by the verb, naming the range and
+changing nothing; asking for the count the pool already has is an idempotent success;
+only one resize may be in flight, and a second is refused rather than queued.
+
+A **raise** spawns the missing slots. A **shrink is cooperative and therefore
+asynchronous**: a surplus slot finishes the read it is holding, settles it, returns its
+buffer, and exits at its next loop top - nothing is cancelled, no job changes owner, and
+`resize.surplus_draining` says how many slots have not exited yet (`configured` 1 with
+`alive` 4 for one `reader_poll_seconds` is a shrink landing, not a shrink refused). The
+exit is a condition the slot reads about itself (`slot >= _reader_want`) and **cannot**
+be a `_STOP` sentinel, because a sentinel is unaddressed: a queue cannot hand an item to
+slot 7 specifically, so a sentinel posted for a surplus slot is one any reader may
+consume - including one nobody asked to stop. `_ensure_thread` re-reads the limit at
+every bind, so the override is applied inside `_resolve_limits` (the single place that
+read goes through), which is what makes the count survive a re-bind instead of reverting
+to the boot value on the next step - pinned by `test_the_runtime_count_survives_a_re_bind`.
+
+**Two boundaries, and the verb says both in its own answer.** PER BOOT: a restart
+restores the launcher's environment, `read_threads.env_requested` keeps what the boot
+was given, `read_threads.source` is `env` or `verb`, and the `DISK[read]` announce line
+stays the proof of what a boot was given - this verb does not replace the launcher, and
+neither does the relay. PER PROCESS, RELAYED: a reader pool is process state, and this
+door is answered by the process that holds the engine call - on a real boot the
+EngineCore, which **never reads a spill file**. A worker is reachable by no door (that is
+why `spill-one` writes a request file a worker polls), so 0.2.67 relays the ask the same
+way, over its own file, and the ranks that apply restores are the processes it matters to
+reach.
+
+Deep detail: see docs/disk-tier.md for the eligibility arithmetic, the bound tables, the
+journal's filesystem rules and the reader relay's internals; and DEVLOG.md for the dated
+entries this tier grew from - "What a failed load costs", "The ceiling walk, the sample,
+and the store that grew past its ceiling", "The claim must match the bytes", "The SSD
+tier serves the GDN groups", "The door that showed zeros", "The buried journal", "The
+eviction clock is a touch clock", "Four ranks, one ceiling", "An unattributable name
+never buys capacity" and "The restore race, measured, and the wait that stopped
+guessing".
+
