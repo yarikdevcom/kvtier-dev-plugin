@@ -88,6 +88,50 @@ fork_pin_head=9c27ca9a0657338852c7d3e59561d424fc036fde
 # The interpreter the engine itself runs on; every apply-time check uses it.
 engine_python=/home/user/vllm-38-next/venv/bin/python
 
+# ---- trees this manifest answers about ---------------------------------------
+# The flat keys above are the v2.2 tree's record (that is the tool's rule), so this
+# section adds the v2.5.1 experiment tree rather than changing any v2.2 value. The
+# five NEVER-INHERITED keys (target_abs, git_root, engine_python, file_sha_pre,
+# file_sha_post) are all spelled out below: an omitted one is not "assume the same",
+# it is UNKNOWN PROVENANCE, and the tool refuses instead of comparing this tree's
+# file against the other tree's fingerprint.
+#
+# WHY THE v2.5.1 HASHES HERE ARE THE SAME NUMBERS AS THE FLAT ONES, AND WHY THAT IS
+# NOT A COPY-PASTE BUG. `metadata.py` is the one file of this pair that BOTH trees
+# carry BYTE-IDENTICALLY. Measured on the box 2026-10-22 with the two paths hashed
+# side by side: v2.5.1's file is 6fd003219f3746e848bd8f93c5bb570c5d3b1564a5eb18c847c7c50bc1fb8bac,
+# which IS the v2.2 pre-image, and the tracked patch reproduces
+# 4b4b8dddede1df9feb46930463ec3880723a4c65d6723f604e5b226acc3759e6 from it, which IS the
+# v2.2 post-image. Neither tree carries a committed `store_keys` (grep -c = 0 in both),
+# so neither tree had anything to diverge FROM. The numbers are recorded per tree
+# anyway - the tool will not read a v2.5.1 answer out of the flat keys, and it should
+# not: what makes them equal here is a measurement, not an inheritance.
+trees="v2.2 v2.5.1"
+tree_default=v2.2
+
+# The v2.5.1 experiment tree: /home/user/vllm-38-next-v2.5/vllm-v2.5, which is the
+# PYTHONPATH of the engine process that ran when this was recorded (read out of
+# /proc/<engine pid>/environ, and corroborated by importlib.util.find_spec under the
+# v2.5 venv's interpreter, which resolved vllm.v1.simple_kv_offload.metadata to
+# exactly this path). NOT the production tree - production is the v2.2 record above.
+tree_v2_5_1_target_abs=/home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/simple_kv_offload/metadata.py
+tree_v2_5_1_git_root=/home/user/vllm-38-next-v2.5/vllm-v2.5
+tree_v2_5_1_engine_python=/home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+tree_v2_5_1_file_sha_pre=6fd003219f3746e848bd8f93c5bb570c5d3b1564a5eb18c847c7c50bc1fb8bac
+tree_v2_5_1_file_sha_post=4b4b8dddede1df9feb46930463ec3880723a4c65d6723f604e5b226acc3759e6
+# Read with `git -C <v2.5.1 root> rev-parse HEAD`, so the divergence is printed
+# against THIS checkout's real HEAD and not the v2.2 pin (an inheritable key, which
+# is exactly why a wrong-but-plausible value here would be printed as fact).
+tree_v2_5_1_fork_pin_head=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+# Measured, not assumed-equal: `stat -c %a` on the v2.5.1 file is 664, and the v2.5.1
+# tree's own vllm/_version.py reports 0.30.0. target_mode is spelled out anyway (it is
+# an inheritable key) because apply CHMODS with it - a mode inherited from the other
+# tree would be applied to this tree's file.
+tree_v2_5_1_target_mode=664
+# The canary method `aggregate` is byte-identical in both trees (hashed with the
+# tool's own VERIFY_PROG algorithm over both trees' files), so the flat method
+# fingerprints are correct for this tree too and stay inherited.
+
 # ---- the patch itself -------------------------------------------------------
 patch_file=metadata.py.patch
 patch_sha256=51b2643b63fef97887d45a1c60c65c9a0ae5782cf966d8a1901606c91ece07cc

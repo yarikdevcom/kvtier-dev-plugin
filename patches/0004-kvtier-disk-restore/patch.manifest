@@ -116,6 +116,66 @@ fork_pin_head=9c27ca9a0657338852c7d3e59561d424fc036fde
 # The interpreter the engine itself runs on; every apply-time check uses it.
 engine_python=/home/user/vllm-38-next/venv/bin/python
 
+# ---- trees this manifest answers about ---------------------------------------
+# The flat keys above are the v2.2 tree's record; this section adds the v2.5.1
+# experiment tree without touching any v2.2 value. All five NEVER-INHERITED keys are
+# spelled out: a v2.5.1 verdict must be computed from v2.5.1's own numbers, and the
+# two trees' manager.py are NOT the same file (v2.2's is 1393 lines, v2.5.1's 1368).
+trees="v2.2 v2.5.1"
+tree_default=v2.2
+
+# THE HONEST STATE OF THIS TREE: UNPATCHED, and un-patched-by-everything. v2.5.1
+# carries NEITHER 0001 (pr56810) NOR 0002 (cpu-release-order) NOR this patch, so its
+# pre-image here is the PRISTINE fork file - NOT 0002's post-image, which is what the
+# flat file_sha_pre above is. Two different chains, recorded separately; neither tree
+# borrows the other's numbers.
+tree_v2_5_1_target_abs=/home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/simple_kv_offload/manager.py
+tree_v2_5_1_git_root=/home/user/vllm-38-next-v2.5/vllm-v2.5
+tree_v2_5_1_engine_python=/home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+tree_v2_5_1_file_sha_pre=3cc841ff97e4ec237800d4f81dcb5dfb5191c639f275a32892915e8b1af43eb7
+tree_v2_5_1_file_sha_post=a639c9715a401afeccdcd3487edd618ab81137d6bbd4b104dacf06fddef411a8
+tree_v2_5_1_fork_pin_head=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+tree_v2_5_1_target_mode=664
+# v2.5.1's own numbers for the same quantities the flat block reports for v2.2
+# (pre 58865 B / 1368 lines, post 60887 B / 1400 lines - the patch is +32/-0 in both
+# trees because it is the SAME patch bytes, applied per tree).
+#
+# WHY THE SAME PATCH BYTES LAND ON A 25-LINE-SHORTER FILE, read this before calling
+# this port a guess. `git apply --check -p1` against the box's own v2.5.1 bytes reports
+# both hunks succeeding at a UNIFORM -6 line offset, i.e. every context line matched
+# byte-for-byte and only the file position moved. The offset is 6 because 0001/0002
+# are the only things that ever made the v2.2 file longer ABOVE build_connector_meta.
+# Stronger than a context match: the method-level fingerprint proves the method this
+# patch edits is the SAME METHOD in both trees. Hashed with the tool's own
+# VERIFY_PROG algorithm over both trees' files, `build_connector_meta` is
+# 7addf1e77638810c108669aaf26f91097736b399fc7c23955cc912ecc844292e pre and
+# c185ec7cc3bb21691d922f56fd445aa9db5b26d9e98301b91fec44632a014847 post on BOTH trees -
+# identical to the flat values, so the method hashes are inherited CORRECTLY and are
+# not overridden. The whole-file hash differs because of code OUTSIDE this method.
+#
+# NOT A RE-IMPLEMENTATION, AND NOT A RENAME: THERE WAS NOTHING TO PORT. The brief
+# asked whether `prefix_cacheable_groups` is a filter that decides which groups get a
+# key or merely an anchor in the surrounding code. Answer, from the patch bytes
+# themselves: `grep -c prefix_cacheable` is ZERO in manager.py.patch and ZERO in this
+# patch's whole diff. It is neither filter nor anchor HERE - the store loop keys every
+# store entry unconditionally off `self._gpu_block_pool.blocks[store_gpu[i]].block_hash`
+# and never consults a group set at all. `prefix_cacheable_groups` belongs to 0001.
+# And the concept is NOT missing from v2.5.1 either: `KVCacheConfig`
+# (vllm/v1/kv_cache_interface.py) defines BOTH `prefix_cacheable_group_ids` and
+# `prefix_cacheable_groups`, built from `kv_cache_spec.prefix_cacheable`, and
+# vllm/v1/core/kv_cache_coordinator.py, kv_cache_utils.py and kv_cache_manager.py all
+# consume them. It is only ABSENT FROM manager.py, because the patch that made
+# manager.py use it (0001) is not applied on this tree. So nothing here was derived:
+# no predicate was invented, no group set was reconstructed, and every line in the
+# diff is the tracked v2.2 hunk verbatim.
+#
+# WHAT THAT LEAVES UNPROVEN (say it plainly, do not let this read as "spill fixed"):
+# this patch makes store_keys EXIST and be POPULATED wherever a store entry's GPU
+# block already carries a hash. It cannot make the hash be set earlier than v2.5.1's
+# own scheduler sets it, and 0001/0002 are still absent from this tree. Whether the
+# per-rank `no_key_for_slot` refusals stop is a BOOT question, graded on
+# `ranks_reads_applied` and a greedy-output comparison, never on this diff.
+
 # ---- the patch itself -------------------------------------------------------
 patch_file=manager.py.patch
 patch_sha256=1c014dd9a998da92649f4ebedf399eea7875897d05ab9cb19d112e4c29ac92c5
