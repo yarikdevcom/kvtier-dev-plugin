@@ -41,7 +41,11 @@ from kvtier_dev_plugin import (  # noqa: E402
 )
 
 ENV_VARS = (config.ENV_ENABLE, config.ENV_TOKEN, config.ENV_TIMEOUT,
-            config.ENV_ALLOW, config.ENV_DIAG_DIR, config.ENV_DIAG_EPOCH,
+            # The RETIRED peer allowlist (0.2.72). Cleared like every other variable:
+            # it gates nothing, but it is REPORTED (`status`'s `allow_list_configured`
+            # and the boot warning), so a test must not inherit a value that changes
+            # what the report says.
+            config.ENV_ALLOW_RETIRED, config.ENV_DIAG_DIR, config.ENV_DIAG_EPOCH,
             config.ENV_DIAG_INTERVAL, config.ENV_DIAG_MIN_INTERVAL,
             config.ENV_DIAG_RANK, config.ENV_BOOT_INERT,
             config.ENV_MISS_LOG, config.ENV_DISK_ROOT, config.ENV_DISK_BYTES,

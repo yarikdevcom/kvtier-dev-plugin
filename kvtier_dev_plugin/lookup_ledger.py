@@ -83,7 +83,7 @@ import json
 import logging
 import time
 
-from . import config, snapshot
+from . import config, route_policy, snapshot
 
 # WARNING, for the reason every other module in this package gives: a plugin logger is
 # not one of the `vllm.*` loggers the engine configures, so an INFO line from here never
@@ -955,6 +955,12 @@ def lookups_for_engine(engine, args=None) -> dict:
     started = time.perf_counter()
     arguments = args if isinstance(args, dict) else {}
     from . import guard_mode  # noqa: PLC0415 - cycle: guard_mode records into us
+    # THE SAFE-METHOD BACKSTOP, engine-side: `GET /lookups?op=arm` is a 405 at the
+    # route because `arm` installs wrappers over the tier's entry points, and this is
+    # the refusal asked of the verb itself so the rule does not live in one layer.
+    refused = route_policy.safe_method_refusal(config.ROUTE_LOOKUPS, arguments)
+    if refused is not None:
+        return refused
     try:
         op = arguments.get("op", "read")
         op = op.strip().lower() if isinstance(op, str) else None
@@ -1003,7 +1009,8 @@ def lookups_for_engine(engine, args=None) -> dict:
 
         unknown = sorted(key for key in arguments
                          if key not in ("op", "cap", "limit", "verdict", "deep",
-                                        "sample_every"))
+                                        "sample_every")
+                         and key != route_policy.SAFE_METHOD_KEY)
         payload["version"] = PROTOCOL_VERSION
         payload["epoch"] = str(snapshot.epoch())
         payload["ts"] = round(time.time(), 6)

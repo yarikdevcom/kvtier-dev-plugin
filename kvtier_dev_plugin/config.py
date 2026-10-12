@@ -21,7 +21,8 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
                                WARNING and `status` publishes `token_gating: false`
                                with the same sentence - so unset it rather than
                                trusting it. What is left in front of this surface is
-                               VLLM_E2_TIER_DEV_ALLOW below, and nothing else.
+                               the single switch below and the safe-method rule in
+                               `route_policy.py`: there is no address filter either.
   VLLM_E2_TIER_DEV_TIMEOUT  -- seconds the HTTP layer waits for the engine
                                utility call before answering 504. Default 5.0,
                                clamped to [0.05, 60.0]; garbage falls back.
@@ -37,21 +38,31 @@ for `VLLM_E2_MEMSTATS`, `VLLM_E2_SCHED_LOG`, `VLLM_E2_GUARD_MODE`, ...):
                                {"op":"arm"}. It never ARMS anything by itself:
                                truthy = inert, falsy = auto. `status` and the
                                engine's BOOT log line both say which mode ran.
-  VLLM_E2_TIER_DEV_ALLOW    -- comma-separated list of IP addresses or CIDR
-                               networks allowed in ADDITION to loopback, e.g.
-                               `192.168.2.64,192.168.2.120` or `192.168.2.0/24`.
-                               UNSET OR EMPTY = LOOPBACK ONLY, which is the
-                               pre-allowlist behaviour and the safe default.
-                               A malformed entry is logged and skipped, never
-                               fatal and never an opening. SINCE 0.2.68 THIS IS THE
-                               ONLY GATE on /plugins/kvtier: there is no token in
-                               front of it any more, so an address admitted here can
-                               arm guard mode, arm the SSD spill tier, reload the
-                               policy and read parked KV bytes, unauthenticated.
-                               These routes are NOT covered by vLLM's --api-key
-                               (that covers /v1, /v2, /inference and /cohere only).
-                               Traffic is plaintext HTTP, so keep this list as narrow
-                               as the trust that actually exists.
+  VLLM_E2_TIER_DEV_ALLOW    -- RETIRED (0.2.72), and NOT a gate. It used to be the
+                               peer allowlist that stood in place of a token: a
+                               comma-separated list of addresses or CIDRs admitted in
+                               ADDITION to loopback. The whole peer-address check is
+                               gone, because an address is not a credential - a local
+                               proxy IS the loopback peer, so the check was defeated
+                               by the ordinary way this engine is fronted, and a
+                               control that always looks like it is working is worse
+                               than none. NOTHING in this package parses the variable
+                               any more (`allow_networks()` is deleted, not
+                               stubbed); the name survives here ONLY so the boot and
+                               `status` can say out loud that it is set and does
+                               nothing. If you still export it, unset it: the
+                               surface is reachable by every client that can reach
+                               the port, and the protection is now network-level and
+                               yours to own (bind the port, firewall it, or an
+                               authenticating reverse proxy in front of it).
+
+THE ONE GATE, stated where a reader of this file needs it: `VLLM_E2_TIER_DEV` is on
+or it is off, and ON MEANS OPEN. Enabling the dev surface publishes /plugins/kvtier/*
+to whoever can reach the engine's port - unauthenticated, and NOT covered by vLLM's
+--api-key (that covers /v1, /v2, /inference and /cohere only). What limits the damage
+is not secrecy: it is that the operator opted in explicitly, that no state-changing
+op runs from a safe method (`route_policy.py`), that the argument specs fix which
+engine method a route may call, and that each facility keeps its own arm.
 
 There is deliberately NO env var that selects the policy file. The reloadable
 policy is `kvtier_dev_plugin/policy.py` next to this file, and nothing else.
@@ -282,7 +293,6 @@ the file contract the proxy host's reader expects):
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -290,7 +300,15 @@ from pathlib import Path
 ENV_ENABLE = "VLLM_E2_TIER_DEV"
 ENV_TOKEN = "VLLM_E2_TIER_DEV_TOKEN"  # noqa: S105 - a variable NAME, not a secret
 ENV_TIMEOUT = "VLLM_E2_TIER_DEV_TIMEOUT"
-ENV_ALLOW = "VLLM_E2_TIER_DEV_ALLOW"  # empty/unset = loopback only
+# THE RETIRED PEER ALLOWLIST (0.2.72). The name of a variable NOTHING in this package
+# reads any more: the peer-address gate it fed is deleted, on the ground that an
+# address is not a credential - a local proxy is itself the loopback peer, so the
+# check fell to the ordinary way this engine is fronted. It is kept as a NAME for one
+# purpose: an operator who still exports it (the live unit does, and every README
+# before 0.2.72 told them to) must be told at the boot that ignores it rather than
+# left believing a door is shut. `endpoint` reports it; no parser, no cache, no
+# admission. Same doctrine as `ENV_TOKEN`, same reason: no silent dead config.
+ENV_ALLOW_RETIRED = "VLLM_E2_TIER_DEV_ALLOW"  # read ONLY to be reported as retired
 # THE BOOT OPT-OUT. Unset = the boot arms (guard + tier) once the install
 # verifies; truthy = the old inert boot. The name deliberately says what it
 # DISABLES rather than what it enables: no env var of this plugin ARMS guard mode,
@@ -859,8 +877,9 @@ METHODS = (METHOD_SNAPSHOT, METHOD_RELOAD_POLICY, METHOD_KVCONFIG, METHOD_INSPEC
 ROUTE_PREFIX = "/plugins/kvtier"
 
 # Route names, for status and the tests. The verbs that CAN change dev state
-# (`/guard`, `/trace`, `/tier`, `/lookups`) require the token in every shape,
-# loopback included.
+# (`/guard`, `/trace`, `/tier`, `/lookups`) are listed as such in `DEV_STATE_ROUTES`
+# and refuse a mutating `op` on a safe method (`route_policy.py`); since 0.2.68 no
+# route asks for a token and since 0.2.72 none filters the peer by address.
 ROUTE_STATUS = "/status"
 ROUTE_SNAPSHOT = "/snapshot"
 ROUTE_RELOAD = "/policy/reload"
@@ -878,8 +897,9 @@ ROUTE_BLOCKDUMP = "/blockdump"
 # The SSD spill tier's control verb. It can ARM a facility that writes real KV
 # bytes to disk, and `spill-one` makes a worker write one, so it is a dev-state
 # route on the same rule as `/blockdump`: a category, and since 0.2.68 not a gate.
-# What still gates the mutating half of it is POST-only (`MUTATING_DISK_OPS`) and
-# the engine's own arm - both deliberately untouched by the removal.
+# What gates the mutating half of it is POST-only - `route_policy.py` is the shared
+# rule, `disk_store.MUTATING_DISK_OPS` is this route's list of truth, and the verb's
+# own `safe_method` refusal is the backstop behind both.
 ROUTE_DISK = "/disk"
 
 # The same routes as one tuple, in the order a reader wants them, so `status`
@@ -893,8 +913,9 @@ ROUTES = (ROUTE_STATUS, ROUTE_SNAPSHOT, ROUTE_KVCONFIG, ROUTE_BLOCK, ROUTE_REQUE
 # `status`. UNTIL 0.2.68 THIS TUPLE WAS ALSO A GATE (`endpoint.require_dev_state_token`
 # demanded the token on every one of them, loopback included). The tuple stays - it is
 # an inventory of what can move engine state, and the tests that sweep the dev surface
-# read it from here - but it gates nothing. The only gate on the whole surface is
-# `endpoint.peer_denial()`.
+# read it from here - but it gates nothing. Since 0.2.72 the surface has NO address
+# gate either: `config.enabled()` is the only gate, and what stands in front of a
+# state change is `route_policy.py`'s safe-method rule.
 DEV_STATE_ROUTES = (ROUTE_TRACE, ROUTE_GUARD, ROUTE_TIER, ROUTE_LOOKUPS,
                     ROUTE_BLOCKDUMP, ROUTE_DISK)
 
@@ -917,11 +938,6 @@ MAX_DIAG_RANK_CHARS = 32
 
 _PKG_DIR = Path(__file__).resolve().parent
 _FALSY = frozenset({"", "0", "false", "off", "no"})
-
-# The single-slot allowlist cache. `_ALLOW_CACHE_RAW` starts as None, which no
-# env value can equal, so the first call always parses.
-_ALLOW_CACHE_RAW: str | None = None
-_ALLOW_CACHE_VALUE: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
 
 
 class PolicyPathError(ValueError):
@@ -1340,44 +1356,18 @@ def token_configured() -> bool:
     return bool(os.environ.get(ENV_TOKEN, "").strip())
 
 
-def allow_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
-    """Extra peer networks admitted by VLLM_E2_TIER_DEV_ALLOW.
+def allow_list_configured() -> bool:
+    """Is the RETIRED `VLLM_E2_TIER_DEV_ALLOW` set? REPORTED ONLY - it gates nothing.
 
-    An EMPTY tuple means "loopback only" - today's behaviour, and the default
-    when the variable is unset, empty, or entirely garbage. Nothing here ever
-    widens access on a parse failure: an entry that does not parse contributes
-    nothing to the result, so a typo in the env opens a door for nobody.
-
-    Both a bare address (`192.168.2.64`, stored as a /32) and a network
-    (`192.168.2.0/24`) are accepted, hence `strict=False`. Loopback is NOT
-    added here; the guard always accepts loopback and uses this only to widen.
-
-    Cost: this runs per request in the HTTP process, so the parse is memoised
-    in a single slot keyed on the raw env string - no lock (a torn read of two
-    module globals is impossible in CPython, and the assignment order below
-    means a reader that matches on the key always sees the matching value), and
-    an env change invalidates it by definition because the key IS the env.
+    Since 0.2.72 nothing parses this variable: the peer-address gate it used to widen
+    is deleted, so a value here admits no peer and refuses no peer. The function
+    survives for the same reason `token_configured()` does - the honest report needs
+    to be able to say "you have a knob set that is not a knob", and a variable that is
+    still exported but reported by nothing is how a dead control survives. It must stay
+    the ONLY reader of `ENV_ALLOW_RETIRED`, and `tests/test_guards.py` enumerates the
+    files that name it.
     """
-    global _ALLOW_CACHE_RAW, _ALLOW_CACHE_VALUE
-    raw = os.environ.get(ENV_ALLOW, "")
-    if raw == _ALLOW_CACHE_RAW:
-        return _ALLOW_CACHE_VALUE
-    parsed: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        try:
-            parsed.append(ipaddress.ip_network(entry, strict=False))
-        except ValueError as exc:
-            # Never fatal, never an opening: the entry is simply absent.
-            logger.warning("[KVTIER_DEV] ignoring malformed %s entry %r (%s)",
-                           ENV_ALLOW, entry, exc)
-    # Value before key: a concurrent reader can only ever pair a raw string
-    # with the value parsed from that same raw string.
-    _ALLOW_CACHE_VALUE = tuple(parsed)
-    _ALLOW_CACHE_RAW = raw
-    return _ALLOW_CACHE_VALUE
+    return bool(os.environ.get(ENV_ALLOW_RETIRED, "").strip())
 
 
 def timeout_seconds() -> float:

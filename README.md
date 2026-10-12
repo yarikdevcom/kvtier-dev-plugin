@@ -15,7 +15,7 @@ Out-of-tree. No file in the vLLM tree is edited, nothing is written to the GPU
 box, and the engine-side code path never imports `torch`.
 
 ```
-HTTP (loopback + allowlist)                 EngineCore loop thread (the one that runs step_fn)
+HTTP (any peer that can reach the port)      EngineCore loop thread (the one that runs step_fn)
 GET  /plugins/kvtier/status        local  -> no engine call, answers while the engine is wedged
 GET  /plugins/kvtier/snapshot  -- utility -> kvtier_dev_snapshot      (pure reads, contained)
 GET  /plugins/kvtier/kvconfig  -- utility -> kvtier_dev_kvconfig      (geometry + divisibility)
@@ -128,8 +128,8 @@ Nothing activates yet - see the switches below.
 |---------|---------|
 | `VLLM_PLUGINS` | vLLM's own allowlist. **Endpoint plugins never load unless named here.** One name (`kvtier_dev`) covers both halves. |
 | `VLLM_E2_TIER_DEV` | this plugin's switch. Unset/`0`/`false`/`off`/`no` = inert: no engine methods attached, HTTP answers 503. |
-| `VLLM_E2_TIER_DEV_TOKEN` | **NO LONGER A GATE (0.2.68).** It used to be required of the mutating verb, then of every read from a non-loopback peer, then of every shape of the six dev-state routes (`trace`, `guard`, `tier`, `lookups`, `blockdump`, `disk`) - loopback included, so even a plain `GET /trace` needed it. **The plugin no longer reads it for access control at all**, and a value set here is ignored. Setting it is not a risk and not a protection: the boot says so once at `WARNING` (`<VAR> is SET but is no longer read by this plugin`) and `/status` answers `token_gating: false` with `token_note` naming the release. Unset it, because a variable that reads like a control and is not one is how an operator ends up believing a door is shut. What gates this surface now is `VLLM_E2_TIER_DEV_ALLOW` below, and nothing else. |
-| `VLLM_E2_TIER_DEV_ALLOW` | extra peers beyond loopback: a comma-separated list of addresses or CIDRs. **Unset/empty = loopback only** (the pre-allowlist behaviour). A malformed entry is logged and skipped - never fatal, never an opening. See *Access model*. |
+| `VLLM_E2_TIER_DEV_TOKEN` | **NO LONGER A GATE (0.2.68).** It used to be required of the mutating verb, then of every read from a non-loopback peer, then of every shape of the six dev-state routes (`trace`, `guard`, `tier`, `lookups`, `blockdump`, `disk`) - loopback included, so even a plain `GET /trace` needed it. **The plugin no longer reads it for access control at all**, and a value set here is ignored. Setting it is not a risk and not a protection: the boot says so once at `WARNING` (`<VAR> is SET but is no longer read by this plugin`) and `/status` answers `token_gating: false` with `token_note` naming the release. Unset it, because a variable that reads like a control and is not one is how an operator ends up believing a door is shut. What gates this surface now is `VLLM_E2_TIER_DEV` alone - the allowlist below was retired in 0.2.72 and reads nothing either. |
+| `VLLM_E2_TIER_DEV_ALLOW` | **RETIRED (0.2.72) - reads nothing.** Used to be extra peers beyond loopback, a comma-separated list of addresses or CIDRs widening the peer-address gate. That gate is DELETED (an address is not a credential: a local proxy IS the loopback peer), so a value here admits nobody and refuses nobody, and nothing parses it - a malformed entry is not even logged any more. The boot logs one `WARNING` while it is set; **unset it**. See *Access model* for where the protection actually lives. |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | seconds the HTTP layer waits for the engine before answering 504. Default `5.0`, clamped to `[0.05, 60]`. |
 | `VLLM_E2_TIER_DIAG` | the worker diagnostics directory (capability 5). **Unset = the worker writer is completely inert: no directory created, no file written, nothing wrapped in the worker.** Set it to a path both the worker ranks and the proxy host's reader can see. |
 | `VLLM_E2_TIER_DISK_ROOT` | **the SSD tier's store root - one file per KV slot, and the tier's existence condition.** Unset = the tier cannot exist: no directory is created, no thread starts, no byte is written (`config.py`). A root on tmpfs is REFUSED, because a store that a reboot erases is not a store. It is not an arm: naming a root makes the tier possible, `POST /plugins/kvtier/disk {"op":"arm"}` makes it happen. Keep the root **per tree** (per geometry, per `--block-size`, per digest) - one root under one ceiling means one tree's capacity pass is free to evict another's data. |
@@ -223,7 +223,7 @@ Tier environment in force, against the default this table documents:
 |---|---|---|
 | `VLLM_E2_TIER_DEV` | `1` | on (unset = inert) |
 | `VLLM_E2_TIER_DEV_TIMEOUT` | `8.0` | default `5.0`, so this boot waits longer for the engine |
-| `VLLM_E2_TIER_DEV_ALLOW` | one address (the proxy host) | unset = loopback only; this is the ONLY gate (0.2.68) |
+| `VLLM_E2_TIER_DEV_ALLOW` | one address (the proxy host) | **RETIRED (0.2.72), reads nothing.** Nothing admits a peer by address, so this opens no door and closes none; unset it, and see *Access model* for where the protection actually lives |
 | `VLLM_E2_TIER_DIAG` | `/tmp/kv-tier-diagnostics` | as documented; without it no rank file is ever written |
 | `VLLM_E2_TIER_DISK_ROOT` | a per-tree root (`$HOME/kv-tier/disk-v25`) | the `-v25` suffix is the per-tree rule, not a version tag |
 | `VLLM_E2_TIER_DISK_JOURNAL_DIR` | a per-tree journal (`$HOME/kv-tier/journal-v25`) | as documented: persistent storage, survives reboot |
@@ -264,8 +264,12 @@ Environment=VLLM_E2_TIER_DEV_TIMEOUT=5
 # Worker diagnostics: leave this out and the worker writer never runs at all.
 Environment=VLLM_E2_TIER_DIAG=/tmp/kv-tier-diagnostics
 Environment=VLLM_E2_TIER_DIAG_INTERVAL=50
-# Only if you need to reach it from other machines (see *Access model*):
-Environment=VLLM_E2_TIER_DEV_ALLOW=192.168.2.64,192.168.2.120
+# RETIRED since 0.2.72 and read by nothing: it used to widen the peer-address gate,
+# and that gate is deleted. Leave it OUT of a new unit; unset it in an old one (the
+# boot logs a WARNING while it is set). Enabling VLLM_E2_TIER_DEV opens /plugins/kvtier/*
+# to every client that can reach the port - the protection is the port binding, a
+# firewall, or denying /plugins/kvtier/* at an authenticating proxy.
+# Environment=VLLM_E2_TIER_DEV_ALLOW=192.168.2.64,192.168.2.120   # no effect
 ```
 
 ```bash
@@ -438,12 +442,14 @@ make is one you will eventually skip, which is what 0.2.50 fixed.
 ## Operator runbook: the KV tier is misbehaving, right now
 
 Terse commands for standing at the box while something is wrong. Everything
-below runs **on the box** (`ssh llm ...`) because `/plugins/kvtier/*` is
-loopback-or-allowlist. Nothing needs a header: since 0.2.68 the dev-state routes
-(`/tier`, `/guard`, `/disk`, ...) answer a loopback peer exactly like the plain
-reads do, so `~/.local/share/kvtier-dev-token` is only a receipt of an older
-posture, not a credential. If a command below ever starts answering 403, the
-question is "which address did the engine see", not "which token did I send".
+below runs **on the box** (`ssh llm ...`) out of reflex, not necessity: since
+0.2.72 `/plugins/kvtier/*` answers any peer that can reach the port, and since
+0.2.68 it needs no header - the dev-state routes (`/tier`, `/guard`, `/disk`, ...)
+answer exactly like the plain reads do. `~/.local/share/kvtier-dev-token` is a
+receipt of an older posture, not a credential. That the box is the convenient place
+to stand is now a fact about latency and shells, not about access: if you can reach
+`:8000`, you can run every command below. If a command ever answers 403, this plugin
+is not the one answering - it has no 403 left to give.
 
 ### Every boot with the tier env set: the order traffic goes in
 
@@ -703,43 +709,81 @@ Read `docs/usage/security.md:349` first: `--api-key` only covers `/v1`, `/v2`,
 1. **Prefix.** Everything is under `/plugins/kvtier`. The prefix is baked into
    the `APIRouter`, not added at mount time, so it cannot be dropped, and no
    `/v1/*` path is touched.
-2. **Loopback, or an explicit allowlist - decided from the socket.** A peer is
-   served only if it is loopback **or** contained in `VLLM_E2_TIER_DEV_ALLOW`:
+2. **There is no address filter (0.2.72).** Until this release a peer was served only
+   if it was loopback **or** contained in `VLLM_E2_TIER_DEV_ALLOW`. That check is
+   **removed**, and it is worth knowing why, because the reason is the whole point of
+   this release:
 
-   ```python
-   not_loopback = loopback_denial(scope)          # scope['client'] only
-   if not_loopback is None: return None           # loopback: always allowed
-   address = _peer_address_unwrapped(scope)       # ::ffff:a.b.c.d -> a.b.c.d
-   for network in config.allow_networks():        # VLLM_E2_TIER_DEV_ALLOW
-       if address in network: return None
-   return f"{not_loopback}, and it is not in the {ENV_ALLOW} allowlist"
-   ```
+   *An address is not a credential.* The rule admitted the loopback peer, and a local
+   proxy **is** the loopback peer. Front this engine with anything on the same host -
+   `llama-swap`'s `/upstream/` path, an nginx on the box, a sidecar that forwards
+   `/plugins/*` to its own clients - and every one of their clients arrives from
+   `127.0.0.1`. The check could not fail for exactly the deployment that is exposed,
+   while reporting itself as a working control. A gate that cannot fail is worse than
+   no gate: it manufactures assurance, and the log line says "permitted".
 
-   The whole operator-facing line:
+   So the plugin no longer reads an address, a header or a scope at all. `guard_route`
+   asks `config.enabled()` and nothing else. This is asserted structurally
+   (`tests/test_guards.py::test_the_gate_reads_no_address_and_no_headers_source_level`
+   parses the module's AST) so a future edit cannot start reading `X-Forwarded-For`
+   again without a test failing.
 
-   ```
-   VLLM_E2_TIER_DEV_ALLOW=192.168.2.64,192.168.2.120
-   ```
+   `VLLM_E2_TIER_DEV_ALLOW` is retired, not repurposed. A value there admits nobody and
+   refuses nobody, the boot says so once at `WARNING` (`... is SET but is no longer
+   read by this plugin (since 0.2.72) ...`) and `/status` reports `allow_env` with
+   `allow_env_gates: false`. **Unset it in the unit file** - it is still exported there,
+   and leaving it set is a story an operator tells themselves about a door that is shut.
+   The two keys that could only describe the parser (`allow_networks`, `loopback_only`)
+   are gone from `/status` rather than answered falsely.
 
-   (the proxy that serves real traffic, and the development workstation).
-   `192.168.2.0/24` is accepted too - use a network only if you genuinely need
-   every address in it, because a CIDR is exactly as wide as it says.
+   What that leaves, stated plainly because it is the sentence this section exists to
+   make impossible to miss:
 
-   **Unset or empty means loopback only**, which is the fail-closed default and
-   the behaviour before the allowlist existed. Parsing is `ipaddress.ip_network
-   (entry, strict=False)`, so a bare address and a CIDR both work. A malformed
-   entry (`garbage`, `10.0.0.0/99`, a hostname) is logged as a warning and
-   skipped: it never raises into the request path, and it never admits anyone.
-   `localhost` is never resolved - name addresses.
+   > **`VLLM_E2_TIER_DEV` is the only gate on this surface, and `/plugins/*` is NOT
+   > covered by vLLM's `--api-key`** (that covers `/v1`, `/v2`, `/inference` and
+   > `/cohere` only). A key in front of `/v1` protects nothing here. **Enabling the
+   > plugin opens these routes to every client that can reach the engine's port**,
+   > unauthenticated: whoever can route to `:8000` can arm guard mode, arm the SSD
+   > spill tier, reload the policy and read parked KV bytes. The protection is
+   > network-level and it is the operator's job - bind the port to an interface, put a
+   > firewall in front of it, or deny `/plugins/kvtier/*` at an authenticating proxy.
+   > Do not enable this plugin on a port that is reachable by clients you have not
+   > accounted for.
 
-   `scope["client"]` is the peer of the TCP connection. Headers are never read
-   for this decision, so `X-Forwarded-For: 127.0.0.1` grants nothing. Verified
-   both with constructed scopes and against a **real uvicorn socket** driven
-   from a source-bound client socket (`tests/test_routes.py::
-test_real_socket_*`).
-   *Do not* put uvicorn's proxy-headers middleware in front of this: it rewrites
-   `scope["client"]` from `X-Forwarded-For` and would hand the forgeability back.
-3. **There is no third gate (0.2.68).** Until this release a bearer token stood
+   What stands between a caller and engine state is therefore not a secret and not an
+   address: the arm itself (a `POST {"op":"arm"}` per facility, expiring or latching per
+   verb, and there is no env var that arms guard mode, the byte dump or `spill-one`),
+   the `safe_method` wall (a mutating `op` on a `GET` is a 405 before the engine is
+   touched, on **every** state-changing route and not only `/disk`, with each verb
+   refusing again on `safe_method`), the argument specs (`ARG_SPECS`, validated before
+   the engine is reached, with the engine method a route may call fixed by the route and
+   never by the wire), and `policy.py`'s own path validation. Removing the peer check
+   made every one of these MORE important, not less.
+
+   **The transport is plaintext HTTP with no TLS**, as it always was. Nothing secret
+   crossed it before and nothing does now - but before, at least, the set of peers that
+   could read the tier's internals was written down somewhere. Now it is "the network".
+
+   Order on every route: prove the plugin is enabled -> refuse a state change carried by
+   a safe method -> run. An inert plugin answers 503 to every peer, and the refusal
+   doubles as the disclosure statement: it names `VLLM_E2_TIER_DEV`, says the routes
+   become open to every client that can reach the port, and says `--api-key` does not
+   cover them. An enabled plugin answers, to everyone.
+
+   **The dead variables do not go quietly.** A variable that reads like a control and
+   gates nothing is a story an operator tells themselves, so the plugin says so where an
+   operator looks. The boot logs ONE `WARNING` per dead variable naming it, the release
+   that stopped reading it and what is left instead (`... is SET but is no longer read by
+   this plugin ...`; their VALUE is never logged), and `/status` answers `token_gating:
+   false`, `token_header`, `allow_env_gates: false`, `peer_gate: {removed: true, ...}`,
+   `non_loopback_peers_require_token: false`, `vllm_api_key_covers_these_routes: false`
+   and a `token_note` carrying the same sentence. `token_configured` and `token_env` are
+   still published with their literal meaning ("is the variable set", "which variable"),
+   because a key vanishing from the payload is its own kind of silence. Setting either
+   variable moves its own `*_configured`/`*_list_configured` key and nothing else
+   anywhere on the surface - pinned by
+   `tests/test_routes.py::test_setting_the_token_env_changes_the_report_and_nothing_else`.
+3. **There is no third gate (0.2.68).** Until that release a bearer token stood
    behind the peer rule, in three shapes:
 
    * `POST /policy/reload` required `x-kvtier-dev-token` to equal
@@ -753,48 +797,13 @@ test_real_socket_*`).
 
    **All three are removed**, by the operator's decision: the token made the surface
    painful to drive from the proxy and from scripts, and the engine is to be
-   access-controlled later by other means. The consequence, stated plainly because it
-   is the sentence this section exists to make impossible to miss:
-
-   > **The peer allowlist is now the ONLY gate on this surface, and `/plugins/*` is
-   > NOT covered by vLLM's `--api-key`** (that covers `/v1`, `/v2`, `/inference` and
-   > `/cohere` only). A key in front of `/v1` protects nothing here. An address on
-   > `VLLM_E2_TIER_DEV_ALLOW` reaches this surface unauthenticated and can arm guard
-   > mode, arm the SSD spill tier, reload the policy and read parked KV bytes. Keep
-   > the list at individual `/32` addresses, never `0.0.0.0/0`, and remove entries
-   > when you are done - unset the variable and the surface is loopback-only again.
-
-   What stands between a caller and engine state is therefore not a secret: the arm
-   itself (a `POST {"op":"arm"}` per facility, expiring or latching per verb, and
-   there is no env var that arms guard mode, the byte dump or `spill-one`), the
-   `safe_method` wall (a mutating `/disk` `op` on a `GET` is a 405 before the engine
-   is touched), the argument specs (`ARG_SPECS`, validated before the engine is
-   reached, with the engine method a route may call fixed by the route and never by
-   the wire), and `policy.py`'s own path validation. Those got MORE important in
-   0.2.68, not less.
-
-   **The transport is plaintext HTTP with no TLS**, as it always was. Nothing secret
-   crosses it now - that is the one security gain in the removal.
-
-   Order on every route: prove the peer is allowed -> prove the plugin is enabled ->
-   run. A peer the guard rejects gets 403 and learns nothing about the plugin's
-   configuration (not even the contents of the allowlist, which are deliberately
-   absent from the refusal), and that 403 names the PEER rule and never a token,
-   because there is no token left to name.
-
-   **`VLLM_E2_TIER_DEV_TOKEN` does not go quietly.** A variable that reads like a
-   control and gates nothing is a story an operator tells themselves, so the plugin
-   says so where an operator looks. The boot logs ONE `WARNING` naming the variable,
-   the release that stopped reading it and the gate that replaced it (`... is SET but
-   is no longer read by this plugin (since 0.2.68) ...`; its VALUE is never logged),
-   and `/status` answers `token_gating: false`, `token_header`,
-   `non_loopback_peers_require_token: false`, `vllm_api_key_covers_these_routes:
-   false` and a `token_note` carrying the same sentence. `token_configured` and
-   `token_env` are still published with their literal meaning ("is the variable set",
-   "which variable"), because a key vanishing from the payload is its own kind of
-   silence. Setting the variable moves `token_configured` and nothing else anywhere on
-   the surface - pinned by
-   `tests/test_routes.py::test_setting_the_token_env_changes_the_report_and_nothing_else`.
+   access-controlled later by other means. Read the blockquote in item 2 above for what
+   is left standing, since 0.2.72 the answer is one opt-in switch and the network.
+   `VLLM_E2_TIER_DEV_TOKEN` is read only to be reported: it grants nothing, withholds
+   nothing, and the `x-kvtier-dev-token` header an operator's old script still sends is
+   ignored on every route - inert in both directions, so no script starts failing and
+   none starts working (`tests/test_routes.py::
+a_leftover_token_header_changes_no_answer_on_any_route`).
 4. **One mutating verb, one file.** The engine-side method takes **no
    arguments**, so nothing on the wire selects a module. The HTTP layer
    separately validates any `path` you send, and refuses anything that does not
@@ -827,9 +836,11 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
 ## Inert, contained, cheap
 
 * Inert: with `VLLM_E2_TIER_DEV` unset, `register()` returns before importing
-  anything and every route answers 503 (after the peer check, so a peer that is
-  not loopback and not allowlisted learns nothing). With `VLLM_E2_TIER_DIAG`
-  unset the worker writer never wraps, never creates a directory and never writes.
+  anything and every route answers 503 - to every peer, because there is no peer
+  check to run first. The 503 is where the exposure statement lives, so the refusal
+  an operator reads while the surface is off is the one that tells them what turning
+  it on costs. With `VLLM_E2_TIER_DIAG` unset the worker writer never wraps, never
+  creates a directory and never writes.
 * Contained: every engine-side body is wrapped in `try/except Exception` in this
   fork's idiom (`vllm/v1/core/sched/e2_alloc_log.py:143,151,201`, capped
   `_error()` at `:92`): failures are counted, the first 20 are logged, the log
@@ -868,9 +879,10 @@ Two deliberate strengthening steps over the plain-`reload` design, both tested:
 ```bash
 # 1. Stop exposing it: drop the two env vars (or set VLLM_E2_TIER_DEV=0) and
 #    restart the engine. Routes 503 immediately; with VLLM_PLUGINS dropped from
-#    the allowlist the endpoint plugin is not even loaded. To close only the
-#    LAN half, unset VLLM_E2_TIER_DEV_ALLOW - the surface goes back to
-#    loopback-only.
+#    the allowlist the endpoint plugin is not even loaded. There is NO narrower
+#    switch: since 0.2.72 nothing filters a peer, so "unset VLLM_E2_TIER_DEV_ALLOW"
+#    closes nothing (that variable reads nothing any more) and the only lever is the
+#    enable switch or the network the port sits on.
 sudo systemctl daemon-reload && sudo systemctl restart vllm.service
 
 # 2. Remove the package
@@ -910,7 +922,7 @@ Deep detail: see docs/testing.md - what each file in `tests/` guards.
   fault ring survives the boot, `boot.faults_at_boot`/`faults_now` compare across
   it, and the ring is named in the boot line itself. **Read
   `{"op":"captures"}` after every boot**: a tier that is armed, up, and doing no
-  work is a tier that is declining. Reachable from any allowlisted peer since 0.2.68
+  work is a tier that is declining. Reachable from any peer since 0.2.68
   (there is no token to have), it echoes
   `guard_mode: true` everywhere, is opt-out-able only as a whole
   (`VLLM_E2_TIER_DEV_BOOT_INERT`), and must be disarmed before a production boot.

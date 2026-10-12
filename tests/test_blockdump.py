@@ -1106,8 +1106,9 @@ def test_the_route_answers_a_loopback_peer_with_no_token_at_all(http, tmp_path,
                                                                 monkeypatch):
     """`/blockdump` can read parked KV bytes, so it used to be the sharpest case of
     "the door that can read bytes is not a read" - token required even to ask. Since
-    0.2.68 the peer rule is the whole gate: loopback reads it, and the arm-gating
-    that actually protects the bytes is untouched."""
+    0.2.68 no header is asked and since 0.2.72 no address is checked; the arm-gating
+    that actually protects the bytes is untouched, which is the whole argument for
+    removing the checks that were never protecting anything."""
     monkeypatch.setenv(config.ENV_DIAG_DIR, str(tmp_path / "diag"))
     client, engine, headers = http(result={"version": 2, "op": "status",
                                            "blockdump_armed": True})
@@ -1116,7 +1117,11 @@ def test_the_route_answers_a_loopback_peer_with_no_token_at_all(http, tmp_path,
     assert client.get(BLOCKDUMP).status_code == 200      # no header, from loopback
     assert client.post(BLOCKDUMP, json={"op": "arm"}).status_code == 200
     assert client.get(BLOCKDUMP, headers=headers).status_code == 200
-    assert engine.calls[-1] == (config.METHOD_BLOCKDUMP, ({"op": "status"},))
+    # The GET route stamps its method attestation on the forwarded arguments, so the
+    # verb behind it can refuse a mutation that arrives from a method a browser may
+    # issue without a preflight. `safe_method` describes the METHOD, not the op.
+    assert engine.calls[-1] == (config.METHOD_BLOCKDUMP,
+                                ({"op": "status", "safe_method": True},))
     client.post(BLOCKDUMP, headers=headers,
                 json={"op": "dump", "group": "0", "block_id": 170, "offset": 0,
                       "length": 4096})
@@ -1139,19 +1144,26 @@ def test_the_route_refuses_an_unknown_verb_and_an_unknown_key(http):
     assert engine.calls == []
 
 
-def test_the_route_is_refused_from_a_non_loopback_peer_with_or_without_a_token(http):
-    """The gate that remains: an address that is not loopback and not allowlisted.
-    The old token, sent or not, changes nothing about the answer or its reason."""
+def test_the_route_is_answered_to_a_non_loopback_peer_whoever_it_is(http):
+    """What replaced "the address that is not loopback and not allowlisted is 403".
+
+    The peer rule is gone, so the same address that used to be refused on peer grounds
+    is served - with the old token header or without it, which used to make no
+    difference either and still does not. What DOES stand between this caller and the
+    parked bytes is the arm: `/blockdump` answers a `status` read, and a `dump` with
+    no arm deployed returns the refusal, not a byte. That is the protection this route
+    has always really had, and it is why the removed checks can go without the door
+    getting weaker.
+    """
     from test_routes import BLOCKDUMP
 
-    client, _engine, headers = http(peer=("198.51.100.9", 51234))
+    client, engine, headers = http(peer=("198.51.100.9", 51234))
     for sent in ({}, headers):
         response = client.get(BLOCKDUMP, headers=sent)
-        assert response.status_code == 403
-        detail = response.json()["detail"]
-        assert "not loopback" in detail and config.ENV_ALLOW in detail
-        assert "198.51.100.9" in detail
-        assert "token" not in detail.lower()
+        assert response.status_code == 200, (sent, response.text)
+        assert "token" not in response.text.lower()
+    assert engine.calls, "the route ran, which is what changed"
+    assert all("198.51.100.9" not in call for call in engine.calls)
 
 
 def test_status_reports_the_capability_and_never_invents_an_arm(http, tmp_path,

@@ -150,13 +150,17 @@ A `length` is REQUIRED by the `dump` verb: the caller must ask for an explicit
 number of bytes. This module has no path that dumps "a whole arena", and no path
 that reads a block without being told how far to read.
 
-THE PEER ALLOWLIST IS THE GATE (0.2.68). This route is reached through the ONE
-gate this surface has - the ASGI peer address, loopback or
-`VLLM_E2_TIER_DEV_ALLOW` - and nothing else. The bearer token that used to be
-demanded of `/trace`, `/guard` and this route in every shape is GONE (`see
-endpoint.guard_route), which is exactly why the bounds above are the safety: an
-explicit `length`, one region, one slot, an arm that expires, a rate window. This
-module reads no secret and logs none - it never even sees one.
+THERE IS NO GATE HERE AND THAT IS THE DESIGN (0.2.72). This route is reached
+through the ONE gate the surface has - `VLLM_E2_TIER_DEV` being on - which means
+every client that can reach the engine's port reaches it. The bearer token that
+used to be demanded of `/trace`, `/guard` and this route in every shape is GONE
+(0.2.68), and so is the peer-address check that was described as the whole gate
+until 0.2.72: an address is not a credential, because a local proxy IS the
+loopback peer. What keeps this verb from reading the host dry is therefore not
+identity at all: an explicit `length`, one region, one slot, an arm that expires,
+a rate window, and the POST-only rule (`GET ?op=arm|disarm|dump` is a 405 here and
+refused again in the verb below), because a page load must not be able to ask for
+bytes. This module reads no secret and logs none - it never even sees one.
 NO USER CONTENT EVER LEAVES THROUGH HERE. These are KV bytes, not tokens: the
 plugin's rule is that the diagnostic plane carries no prompt or completion
 content, which is why a caller must name an explicit byte length and cannot ask
@@ -179,7 +183,7 @@ import os
 import sys
 import time
 
-from . import config, snapshot
+from . import config, route_policy, snapshot
 
 # The worker half lives on the fork's worker class, wrapped with the exact
 # owner-marker discipline `worker_diag` uses on the same class/method.
@@ -1096,6 +1100,14 @@ def blockdump_for_engine(engine, args=None) -> dict:
     snapshot._state["calls"] += 1
     started = time.perf_counter()
     arguments = args if isinstance(args, dict) else {}
+    # THE SAFE-METHOD BACKSTOP, engine-side. `arm` and `disarm` are obvious, and `dump`
+    # is here with them because it is not a read: it writes the pending request file
+    # every worker picks up, which makes four processes read parked KV bytes and write
+    # response files. `GET /blockdump?op=dump` is a 405 at the route; this is the same
+    # refusal asked of the verb.
+    refused = route_policy.safe_method_refusal(config.ROUTE_BLOCKDUMP, arguments)
+    if refused is not None:
+        return refused
     payload: dict = {"version": PROTOCOL_VERSION, "verb": "blockdump"}
     try:
         op = arguments.get("op", "status")
@@ -1158,7 +1170,8 @@ def blockdump_for_engine(engine, args=None) -> dict:
         unknown = sorted(key for key in arguments
                          if key not in ("op", "group", "block_id", "block_ids",
                                         "offset", "offset_bytes", "length",
-                                        "length_bytes", "seconds"))
+                                        "length_bytes", "seconds")
+                         and key != route_policy.SAFE_METHOD_KEY)
         payload["armed_state"] = arm_state()
         if unknown:
             payload["unknown_args"] = unknown

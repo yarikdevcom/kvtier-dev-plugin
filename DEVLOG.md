@@ -4326,3 +4326,67 @@ worker-report hook with ZERO steps must satisfy `disk_restore.worker_proof(force
 on the spot (the old code answers `no_worker_proof`); the primed file must carry a
 NONZERO arena and a `disk_restore` section; and a prime that raises must not reach worker
 startup while the loop's later beats still write.
+
+## The gate that could not fail: the peer-address check is removed, and the safe-method wall becomes a matrix (0.2.72)
+
+The peer rule read `scope["client"]` and admitted loopback. A local proxy **is** the
+loopback peer. So `llama-swap`'s `/upstream/` path, or nginx on the box, or any sidecar
+forwarding `/plugins/*`, republished the whole dev surface to its own clients while the
+check saw a permitted address and logged a pass. A control that cannot fail for exactly
+the deployment that is exposed is worse than no control: it manufactures assurance, and
+the operator's log says "permitted". The check is **deleted**, not widened, not made
+stricter, not defaulted off - `require_peer`, `peer_denial`, `loopback_denial`,
+`require_loopback`, `_peer_address_unwrapped` and the `GuardDenied` they raised are gone,
+`config.allow_networks()`/`ENV_ALLOW` with them, `ipaddress` gone from the import list.
+`config.enabled()` is the whole gate. Tests assert the deletion twice over: an AST pass
+that `endpoint.py` touches no `request.headers`, no `forwarded` attribute and never
+imports `ipaddress`, and a peer matrix (loopback, the production proxy, a TEST-NET-3
+address, `testclient`, `127.0.0.1:1234`) served identically on every route.
+
+Honesty replaced the protection, in three places that a reader actually reaches: the 503
+detail (the answer an operator reads while the surface is *off* is the right place to say
+what turning it on costs), the boot `WARNING` when the plugin is enabled, and
+`GET /status`, which now publishes `peer_gate.removed`, an `exposure` sentence naming
+"EVERY client that can reach this engine's port" and `--api-key`'s non-coverage, and
+`mutating_ops_refused_on_get` read live from the policy so it cannot drift.
+`allow_networks`/`loopback_only` are **deleted** from the payload rather than answered
+falsely: a truthful `[]`/`false` there would read as "an empty allowlist", which is a lie
+that looks like a fact. `allow_env` keeps its literal meaning ("which variable") and
+gains `allow_env_gates: false`, because the live unit file still exports the name and a
+set-but-dead knob must stay visible - that is how a dead control gets found instead of
+assumed.
+
+**The second finding was worse and is what made this a security fix rather than a
+documentation change.** With the peer check gone, the safe-method rule is load-bearing -
+and it existed on exactly one route. `/disk` had refused a mutating `op` on a `GET` with
+405 since the rule was introduced; `/trace`, `/guard`, `/tier`, `/lookups` and
+`/blockdump` had no answer to "does this op change state?" at all. Every one of them takes
+its `op` from a **query parameter**, so these URLs worked from a browser address bar and
+from an `<img src>` with no preflight and no custom header: `GET /guard?op=arm` armed
+guard mode (which masks real bugs), `GET /tier?op=arm` flipped the tier's kill switch,
+`GET /lookups?op=arm` installed wrappers on the live tier, `GET /trace?op=clear` emptied
+the ring, `GET /blockdump?op=arm` armed the facility that reads parked KV bytes, and
+`GET /guard?armed=true` armed it through the ergonomic spelling an op list cannot see.
+
+Fix: `kvtier_dev_plugin/route_policy.py` is the one list of truth (`MUTATING_OPS` per
+route, `MUTATING_ARGUMENTS` for `armed`, `/disk`'s list read from `disk_store` rather than
+copied - a copy is how two answers to one question start to differ). The HTTP half answers
+405 naming the op and the POST route before the engine is touched; the engine half refuses
+the same call on `safe_method` with both refusal vocabularies (`reason`, `error`) so no
+caller has to know which dialect a refusal is written in. `/disk`'s existing inline check
+now calls the shared function, so there is one implementation and not a sixth opinion.
+`dump` is classified as mutating on purpose: it writes the pending-request file that makes
+four processes read real KV bytes, and the rate window it charges is state.
+
+Wrong turn kept: the first draft of the engine-side matrix test asserted the refusal for
+every mutating op *without* the `safe_method` stamp, which would have made the backstop a
+gate - a POST carries no stamp, so refusing an unstamped mutation takes away the only
+route that exists to run it. The stamp describes the METHOD, never the op, and reads carry
+it too; three existing tests that asserted exact wire payloads for `GET /trace`,
+`GET /guard` and `GET /lookups` had to gain `"safe_method": true` for that reason.
+
+Tests: 5 files, 612 passed (baseline 417). New: the 405 matrix over 14 (route, op) pairs
+plus `/guard`'s `armed` spelling, the engine-side refusal for all five verbs asked
+directly, a test that the two layers read the same list (`/disk`'s included), the AST
+no-header test, the retired-allowlist-is-inert sweep over every route x four values x two
+peers, and the real-socket tests inverted to assert the LAN peer is **served**.

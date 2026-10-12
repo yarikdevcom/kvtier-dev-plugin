@@ -81,9 +81,11 @@ THE KILL SWITCH (two steps, no restart, no new endpoint):
            def decide_store(ctx):
                return "veto"
     2. `curl -X POST http://127.0.0.1:8000/plugins/kvtier/policy/reload`
-           (no header: since 0.2.68 the ONLY gate on this surface is the peer's
-           address - loopback, or `VLLM_E2_TIER_DEV_ALLOW`. There is no token to
-           pass, and vLLM's `--api-key` does not cover `/plugins/*`.)
+           (no header: since 0.2.68 there is no token on this surface, and since
+           0.2.72 no peer-address filter either - the ONLY gate is
+           `VLLM_E2_TIER_DEV` being on, which means anything that can reach the
+           port reaches these routes, and vLLM's `--api-key` does not cover
+           `/plugins/*`.)
 
 Then `GET /plugins/kvtier/snapshot` and read `store_hook.vetoes` (rising). New
 parking stops immediately; a copy already handed to the workers still completes

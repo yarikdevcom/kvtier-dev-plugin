@@ -41,12 +41,16 @@ bounded previews), `trace` (the ring's counters and the step observer's), and
 ## Using it
 
 The whole surface, all under `/plugins/kvtier`. **No route in this table requires a
-token any more** (0.2.68 removed it from every route, in every shape): the ONLY gate
-is the peer rule - loopback, or an address in `VLLM_E2_TIER_DEV_ALLOW`. And because
-`/plugins/*` is **not** covered by vLLM's `--api-key` (that covers `/v1`, `/v2`,
-`/inference` and `/cohere` only), the allowlist is not a second line of defence
-behind a key - it is the whole defence. The table used to carry a `Token` column
-with `off-box only` / `always` per row; it is gone because every answer is now
+token any more** (0.2.68 removed it from every route, in every shape) **and no route
+filters a peer any more** (0.2.72 removed the address rule, because an address is not
+a credential: a local proxy IS the loopback peer, so the ordinary way this engine is
+fronted walked through the check while it reported itself as working). The ONLY gate
+is `VLLM_E2_TIER_DEV`, and because `/plugins/*` is **not** covered by vLLM's
+`--api-key` (that covers `/v1`, `/v2`, `/inference` and `/cohere` only), enabling the
+plugin opens these routes to **every client that can reach this port** - there is no
+second line, and the protection is the port binding, a firewall, or denying
+`/plugins/kvtier/*` at an authenticating proxy. The table used to carry a `Token`
+column with `off-box only` / `always` per row; it is gone because every answer is now
 `none`, and a column of `none` is how a table starts lying.
 
 | Route | Methods | What it does |
@@ -80,30 +84,35 @@ curl -s -X POST -d '{"op":"arm","depth":256}' $B/trace
 curl -s "$B/trace?limit=40" | python3 -m json.tool
 curl -s -X POST -d '{"op":"disarm"}' $B/trace
 
-# the mutating verb: no header, no token, only the peer rule
+# the mutating verb: no header, no token, no address rule
 curl -s -X POST $B/policy/reload | python3 -m json.tool
 ```
 
-From an allowlisted machine the SAME calls work unchanged - since 0.2.68 there is
-nothing to add to them, off-box or on it:
+From another machine the SAME calls work unchanged - since 0.2.68 there is nothing to
+add to them, and since 0.2.72 nothing to ask permission from:
 
 ```bash
 # on the engine's own machine, nothing to configure:
 ssh llm curl -s http://127.0.0.1:8000/plugins/kvtier/snapshot | python3 -m json.tool
 
-# from 192.168.2.64 / 192.168.2.120, once VLLM_E2_TIER_DEV_ALLOW names you:
+# from anywhere that can route to the port. Say that to yourself once before you run
+# it against a host whose network you have not accounted for:
 B=http://192.168.2.42:8000/plugins/kvtier
 curl -s $B/status | python3 -m json.tool
 curl -s $B/snapshot | python3 -m json.tool
 ```
 
-`status` is the place to check what you actually opened: `allow_networks` is the
-parsed list (an entry that failed to parse is simply absent from it), and
-`loopback_only` answers "is this still closed to the LAN?". It also answers
-"is this engine in a development mode?": `guard_mode` and `trace_armed` at the top
-level, the same facts again in `dev_state` with their `source`, `epoch` and
-`age_seconds`, and `worker_diagnostics` with the directory the worker writer was
-told to use. Because `/status` never calls the engine, `guard_mode` is `null` until
+`status` is the place to check what you actually opened. `peer_gate.removed` and
+`peer_gate.peers_filtered_by_address: false` are the current posture; `exposure` (and
+the `guard` sentence beside it) state in words that enabling the plugin makes these
+routes reachable by any client on the network and that `--api-key` does not cover them.
+`allow_env` names the retired allowlist and `allow_env_gates: false` says it does
+nothing; `allow_list_configured: true` next to that means a knob is set that is not a
+knob, and the boot logs a `WARNING` about it. It also answers "is this engine in a
+development mode?": `guard_mode` and `trace_armed` at the top level, the same facts
+again in `dev_state` with their `source`, `epoch` and `age_seconds`, and
+`worker_diagnostics` with the directory the worker writer was told to use. Because
+`/status` never calls the engine, `guard_mode` is `null` until
 this API process has seen an engine answer that says otherwise - it is never a
 guessed `false`. It also answers "which code is THIS process running?" with
 `plugin_version` - the API server's own loaded version, not the engine's (see
@@ -286,7 +295,7 @@ request id - with a cause attached, plus a measured answer to "how many tokens c
 the RAM tier actually retain".
 
 ```bash
-# arm it: no token, since 0.2.68 (the peer address is the gate)
+# arm it: no token, since 0.2.68 (and no address rule since 0.2.72)
 ssh llm "curl -s -X POST http://127.0.0.1:8000/plugins/kvtier/lookups \
   -H 'content-type: application/json' -d '{\"op\":\"arm\",\"cap\":256}'"
 

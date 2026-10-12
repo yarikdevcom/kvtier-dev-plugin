@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import time
 
-from . import snapshot
+from . import config, route_policy, snapshot
 
 PROTOCOL_VERSION = 1
 
@@ -292,6 +292,12 @@ def trace_for_engine(engine, args=None) -> dict:
     started = time.perf_counter()
     arguments = args if isinstance(args, dict) else {}
     from . import guard_mode  # noqa: PLC0415 - cycle: guard_mode records into us
+    # THE SAFE-METHOD BACKSTOP, engine-side. `GET /trace?op=arm` is a 405 at the route;
+    # this is the same refusal asked of the verb, so a mutation cannot land because the
+    # HTTP half one day forgot to check. Mirrors `disk_store.disk_for_engine`.
+    refused = route_policy.safe_method_refusal(config.ROUTE_TRACE, arguments)
+    if refused is not None:
+        return refused
     try:
         op = arguments.get("op", "read")
         # A non-string `op` is None, which is not in TRACE_OPS: a wrong type is a
@@ -317,7 +323,8 @@ def trace_for_engine(engine, args=None) -> dict:
             payload = {"op": "read", **read(arguments.get("limit"),
                                             arguments.get("after_seq"))}
         unknown = sorted(key for key in arguments
-                        if key not in ("op", "depth", "limit", "after_seq"))
+                         if key not in ("op", "depth", "limit", "after_seq")
+                         and key != route_policy.SAFE_METHOD_KEY)
         payload["version"] = PROTOCOL_VERSION
         payload["epoch"] = str(snapshot.epoch())
         payload["ts"] = round(time.time(), 6)

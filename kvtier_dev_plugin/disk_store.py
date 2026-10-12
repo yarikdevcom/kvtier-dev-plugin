@@ -224,6 +224,7 @@ from . import (
     disk_shadow,
     disk_spill,
     mamba_anchor,
+    route_policy,
     snapshot,
 )
 
@@ -5985,10 +5986,13 @@ def disk_for_engine(engine=None, args: dict | None = None) -> dict:  # noqa: ARG
                 "reason": f"unknown op {op!r}; the ops are {', '.join(DISK_OPS)}",
                 "ops": list(DISK_OPS)}
     if op in MUTATING_DISK_OPS and body.get("safe_method"):
-        return {"ok": False,
-                "reason": f"op '{op}' mutates and will not run from a method a "
-                          f"browser may issue without a preflight; send it as POST",
-                "op": op}
+        # THE SAME REFUSAL AS EVERY OTHER ROUTE, from the one place that owns it.
+        # `MUTATING_DISK_OPS` stays this route's list of truth (the dispatcher and
+        # several tests are pinned against it) and `route_policy` reads it from here
+        # rather than copying it; what used to be this function's private wording is
+        # now shared with /trace, /guard, /tier, /lookups and /blockdump so a refusal
+        # cannot mean two things depending on which verb answered.
+        return route_policy.safe_method_refusal(config.ROUTE_DISK, body)
     try:
         response = _DISK_OPS[op](body)
     except Exception as exc:  # noqa: BLE001 - the verb is contained by contract

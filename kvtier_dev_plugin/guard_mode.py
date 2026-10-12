@@ -79,7 +79,7 @@ import sys
 import time
 import traceback
 
-from . import lookup_ledger, snapshot, trace_ring
+from . import config, lookup_ledger, route_policy, snapshot, trace_ring
 
 logger = None  # set by engine_side.attach_logger-style wiring; None stays quiet
 
@@ -971,14 +971,23 @@ def guard_for_engine(engine, args=None) -> dict:
     accepted as the ergonomic spelling of arm/disarm, because that is the state an
     operator is actually thinking in.
 
-    Both mutating ops are token-gated by the HTTP layer - loopback included - and
-    the resulting state is echoed in `status` and in every verb payload as
-    `guard_mode`, because the failure mode this plugin must never produce is a
-    guarded dev engine being mistaken for a production one.
+    Both mutating ops refuse a safe method - 405 at the route, refused again here on
+    the `safe_method` marker - and the resulting state is echoed in `status` and in
+    every verb payload as `guard_mode`, because the failure mode this plugin must
+    never produce is a guarded dev engine being mistaken for a production one. There
+    is no token on this route (gone in 0.2.68) and no peer filter (gone in 0.2.72):
+    what makes arming guard mode deliberate is the method it must arrive on and the
+    operator's own network posture, not who the caller claims to be.
     """
     snapshot._state["calls"] += 1
     started = time.perf_counter()
     arguments = args if isinstance(args, dict) else {}
+    # THE SAFE-METHOD BACKSTOP, engine-side: `GET /guard?op=arm` and `GET
+    # /guard?armed=true` are 405s at the route, and this is the same refusal asked of
+    # the verb so a future HTTP bug cannot flip guard mode from a safe method.
+    refused = route_policy.safe_method_refusal(config.ROUTE_GUARD, arguments)
+    if refused is not None:
+        return refused
     try:
         op = arguments.get("op")
         if isinstance(op, str):
@@ -1002,7 +1011,8 @@ def guard_for_engine(engine, args=None) -> dict:
         else:
             payload = {"op": "status", "guard": section()}
         unknown = sorted(key for key in arguments
-                         if key not in ("op", "armed", "limit", "traceback_chars"))
+                         if key not in ("op", "armed", "limit", "traceback_chars")
+                         and key != route_policy.SAFE_METHOD_KEY)
         payload["guard_mode"] = is_armed()
         payload["development_only"] = True
         payload["version"] = PROTOCOL_VERSION

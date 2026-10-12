@@ -1,18 +1,26 @@
 """Route level: the real FastAPI stack, a fake engine client, no vllm.
 
+THE REACH MODEL, SINCE 0.2.72: `VLLM_E2_TIER_DEV` is the only gate, and it is an
+opt-in rather than an access control. With it unset, every route answers 503 to
+every peer; with it set, no peer is filtered by address and no header grants
+anything. The peer-address check that used to be asserted here (loopback or
+`VLLM_E2_TIER_DEV_ALLOW`) is deleted, because a local proxy IS the loopback peer - so
+the check fell to the ordinary way this engine is fronted while reporting itself as
+working. The tests that used to prove "a stranger is refused" now prove the weaker,
+true statement: "the answer does not depend on who you are", driven over the same
+peer matrix so the property is measured across the range that used to matter.
+
 Two transports, deliberately.
 
 * TestClient's `client=` argument is what starlette puts into
   `scope["client"]` - the same field uvicorn fills from the accepted socket.
-  It is the only way to assert on a peer this host cannot source packets from
-  (the real proxy at `192.168.2.64`, the outside half of a CIDR, a spoofed
-  `X-Forwarded-For`), so the allowlist matrix is driven that way.
+  It is the only way to drive a peer this host cannot source packets from
+  (the real proxy at `192.168.2.64`, a TEST-NET address, a spoofed
+  `X-Forwarded-For`), so the no-peer-filtering matrix is driven that way.
 * The real-uvicorn tests at the bottom (`served_on_real_socket`) accept a real
-  TCP connection, which is the only way to prove that the peer uvicorn writes
-  into the scope is the peer of the socket - and to prove the operator's
-  token-free `ssh llm curl 127.0.0.1` read still works over a real socket.
-  A non-loopback peer is driven from a client socket bound to one of this
-  host's own LAN addresses; a CI box with no such address skips those.
+  TCP connection, which is the only way to prove that nothing about the peer
+  uvicorn writes into the scope changes an answer - on loopback AND from one of
+  this host's own LAN addresses. A CI box with no such address skips those.
 """
 
 from __future__ import annotations
@@ -137,22 +145,23 @@ def token_headers(token="tk"):
     return {"x-kvtier-dev-token": token}
 
 
-def assert_refused_on_peer_grounds(response, peer):
-    """THE one shape a refusal of this surface may have since 0.2.68.
-
-    403 whose detail names the PEER rule (loopback, or `VLLM_E2_TIER_DEV_ALLOW`),
-    names the peer's own address, does NOT leak the allowlist's contents, and
-    mentions no token: the peer gate is the only gate, so a refusal that read like
-    a token refusal would send an operator looking for a knob that no longer exists
-    (and used to make "is my peer wrong or is my token wrong" unanswerable).
-    """
-    assert response.status_code == 403, response.text
-    detail = response.json()["detail"]
-    assert "not loopback" in detail, detail
-    assert config.ENV_ALLOW in detail and "allowlist" in detail, detail
-    assert peer in detail, detail
-    assert "token" not in detail.lower(), detail
-    return detail
+# The peers the reach matrix is driven over: loopback in all its spellings, the two
+# addresses the production box actually names in its unit file, an address on another
+# network entirely, and the shapes the removed guard used to refuse as "unprovable".
+# Under the old gate these divided the surface into served and refused; the whole
+# point of the new contract is that they do not divide it at all.
+REACH_PEERS = [
+    ("127.0.0.1", 43210),
+    ("127.2.3.4", 1),
+    ("::1", 1),
+    ("::ffff:127.0.0.1", 1),
+    ("10.0.0.7", 1),
+    ("192.168.2.42", 8000),
+    ("203.0.113.9", 51234),
+    ("0.0.0.0", 1),
+    ("testclient", 50000),      # what a test harness reports: not an IP
+    ("127.0.0.1:1234", 1),      # not a parseable IP either
+]
 
 
 # --- real-socket machinery (see the module docstring) -----------------------
@@ -314,115 +323,167 @@ def test_the_guard_and_trace_verbs_advertise_themselves_as_development_facilitie
     assert "GUARD MODE IS A DEVELOPMENT FACILITY" in doc
 
 
-# --- loopback ---------------------------------------------------------------
+# --- the reach model: the switch answers for every peer ---------------------
+#
+# WHAT THIS SECTION REPLACED. Until 0.2.72 it asserted a split: loopback (or an
+# address in `VLLM_E2_TIER_DEV_ALLOW`) was served, everything else got 403 on peer
+# grounds. That gate is deleted, and the reason is in the module docstring: a local
+# proxy IS the loopback peer, so the check passed for exactly the deployment that is
+# exposed. What is asserted here instead is the true and weaker property - the answer
+# does not depend on the peer - over the SAME peer matrix, so the range that used to
+# matter is still exercised. The peer addresses below are TestClient-constructed on
+# purpose: `192.168.2.64` is the production proxy and no test box can legitimately
+# source packets from it. The real-socket section covers the peers we CAN source from.
 
-@pytest.mark.parametrize("peer", [
-    ("127.0.0.1", 43210),
-    ("127.2.3.4", 1),
-    ("::1", 1),
-    ("::ffff:127.0.0.1", 1),
-])
-def test_loopback_peers_may_read(enabled, peer):
+PROXY = ("192.168.2.64", 51000)
+WORKSTATION = ("192.168.2.120", 51001)
+
+
+@pytest.mark.parametrize("peer", REACH_PEERS)
+def test_every_peer_is_served_when_the_switch_is_on(enabled, peer):
+    """No address is admitted and no address is refused, over the whole matrix -
+    including the two shapes the removed guard refused as UNPROVABLE (`testclient`,
+    `127.0.0.1:1234`): with no peer question to fail, an unparsable address is just
+    another client.
+    """
     app = build_app(FakeAsyncLLM(FakeEngineCoreClient()))
     response = client_for(app, peer).get(STATUS)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 200, (peer, response.text)
 
 
-@pytest.mark.parametrize("peer", [
-    ("10.0.0.7", 1),
-    ("192.168.2.42", 8000),
-    ("0.0.0.0", 1),
-])
-def test_remote_peers_are_403_on_peer_grounds(enabled, peer):
-    """No token involved and none needed: the peer rule alone answers 403, and the
-    detail is the peer's own address against the allowlist."""
-    assert_refused_on_peer_grounds(
-        client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                   peer).get(STATUS), peer[0])
+@pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
+@pytest.mark.parametrize("peer", [("127.0.0.1", 1), PROXY, ("203.0.113.9", 1),
+                                  ("testclient", 50000)])
+def test_no_peer_is_filtered_on_any_route(enabled, method, path, peer):
+    """THE rule, over the whole surface: every route answers every peer.
 
-
-def test_a_peer_that_is_not_an_ip_is_refused_as_unprovable_not_as_unauthorized(
-        enabled):
-    """`testclient` is what a test harness reports: not a parseable address, so
-    loopback cannot be proved and the refusal says so - and still says nothing
-    about a token, which no route here asks for."""
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          ("testclient", 50000)).get(STATUS)
-    assert response.status_code == 403
-    assert "parseable" in response.json()["detail"]
-    assert "token" not in response.text.lower()
-
-
-def test_spoofed_forwarded_for_from_remote_peer_is_403(enabled):
-    """The attack the guard exists for: a LAN client claims to be loopback.
-
-    The last call still carries the (now inert) token header, so this doubles as
-    proof that a header cannot help a peer the allowlist refused.
+    This includes every member of `config.DEV_STATE_ROUTES` (trace, guard, tier,
+    lookups, blockdump, disk) - the routes that used to demand a token in every shape
+    and then a permitted address. They are still listed as dev-state routes (they can
+    move engine state); they simply gate on nothing but the switch, which is the
+    honest arrangement now that nothing pretends to identify the caller.
     """
-    engine = FakeEngineCoreClient()
+    engine = FakeEngineCoreClient(result={"version": 1})
+    response = client_for(build_app(FakeAsyncLLM(engine)), peer).request(method,
+                                                                        path)
+    assert response.status_code == 200, (peer, method, path, response.text)
+
+
+@pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
+def test_inert_is_503_for_every_peer_on_every_route(method, path, monkeypatch):
+    """The other half of one gate: with the switch off, an address buys nothing and
+    the dead knobs buy nothing, on every route, for every peer.
+
+    This is the test that used to be two - "an allowlisted peer still learns the
+    plugin is inert" and "a disallowed peer is 403 even when inert, so an inert
+    plugin is not a way to enumerate configuration". With one gate there is one
+    answer, and the 503 is the whole of it: the plugin publishes its own
+    configuration to anyone who can reach the port the moment it is enabled, and
+    nothing when it is not.
+    """
+    monkeypatch.delenv(config.ENV_ENABLE, raising=False)
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")          # the dead knob, set
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "0.0.0.0/0")   # the other one
+    for peer in (("127.0.0.1", 1), PROXY, ("10.9.8.7", 1)):
+        response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                              peer).request(method, path,
+                                            headers=token_headers("tk"))
+        assert response.status_code == 503, (peer, method, path, response.text)
+        assert config.ENV_ENABLE in response.json()["detail"]
+
+
+def test_the_inert_answer_tells_the_operator_what_enabling_opens(monkeypatch):
+    """The 503 is read at the moment the surface is OFF, which makes it the right
+    place to say what turning it on costs: open to every client that can reach the
+    port, not covered by vLLM's `--api-key`, and the protection is network-level and
+    the operator's job.
+    """
+    monkeypatch.delenv(config.ENV_ENABLE, raising=False)
+    detail = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))
+                        ).get(STATUS).json()["detail"]
+    assert config.ENV_ENABLE in detail and config.ROUTE_PREFIX in detail
+    assert "every client" in detail.lower()
+    assert "--api-key" in detail
+    assert "operator" in detail.lower()
+
+
+def test_a_remote_peer_gets_the_same_answer_as_loopback(enabled):
+    """The inversion of the old "no configuration leak to a stranger" test.
+
+    There is no stranger, so there is no redaction to assert: `/status` answers the
+    same payload - `policy_target`, `peer_gate`, `guard`, all of it - to the LAN
+    address it used to refuse. What this DOES pin is that the payload states the
+    exposure out loud, because that payload is now the only warning a reader gets
+    before they start using the surface.
+    """
+    loopback = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))
+                          ).get(STATUS)
+    remote = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                        ("10.1.2.3", 1)).get(STATUS)
+    assert loopback.status_code == remote.status_code == 200
+    body = remote.json()
+    assert body["peer_gate"]["peers_filtered_by_address"] is False
+    assert body["peer_gate"]["removed"] is True
+    assert body["vllm_api_key_covers_these_routes"] is False
+    assert body["policy_target"]["path"]
+
+
+def test_a_forged_forwarded_header_grants_nothing_and_refuses_nothing(enabled):
+    """The attack the old guard existed to stop, restated against the new gate.
+
+    `X-Forwarded-For: 127.0.0.1` from a remote peer used to be refused because the
+    guard read the socket and not the header. Now there is no peer decision to make,
+    so the interesting half is that the header still does NOTHING - it does not open
+    a route that would otherwise be closed, and it does not close one that is open.
+    Nothing on this surface reads a header: the structural half of that is pinned in
+    `tests/test_guards.py` by AST.
+    """
+    engine = FakeEngineCoreClient(result={"version": 1})
     client = client_for(build_app(FakeAsyncLLM(engine)), ("203.0.113.9", 51234))
-    for response in (
-        client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1"}),
-        client.get(SNAPSHOT, headers={"x-forwarded-for": "127.0.0.1, 127.0.0.1"}),
-        client.get(SNAPSHOT, headers={"x-real-ip": "127.0.0.1"}),
-        client.post(RELOAD, headers={**token_headers("tk"),
-                                     "x-forwarded-for": "127.0.0.1"}),
-    ):
-        assert_refused_on_peer_grounds(response, "203.0.113.9")
-    assert engine.calls == []          # the engine was never touched
+    for headers in ({}, {"x-forwarded-for": "127.0.0.1"},
+                    {"x-forwarded-for": "127.0.0.1, 127.0.0.1"},
+                    {"x-real-ip": "127.0.0.1"},
+                    {**token_headers("tk"), "x-forwarded-for": "127.0.0.1"}):
+        assert client.get(STATUS, headers=headers).status_code == 200, headers
+        assert client.get(SNAPSHOT, headers=headers).status_code == 200, headers
+        assert client.post(RELOAD, headers=headers).status_code == 200, headers
+    assert [name for name, _ in engine.calls] == [
+        config.METHOD_SNAPSHOT, config.METHOD_RELOAD_POLICY] * 5
 
 
-def test_a_loopback_peer_does_not_need_a_forged_header_to_pass(enabled):
+def test_the_operator_at_the_box_still_needs_no_header_and_no_address(enabled):
+    """The `ssh llm curl 127.0.0.1` reflex is unchanged, and a header naming some
+    OTHER address does not change it either - there is nothing for it to change."""
     engine = FakeEngineCoreClient()
     client = client_for(build_app(FakeAsyncLLM(engine)), ("127.0.0.1", 1))
     assert client.get(STATUS, headers={"x-forwarded-for": "203.0.113.9"}
                       ).status_code == 200
 
 
-def test_remote_peer_gets_no_configuration_leak(enabled):
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          ("10.1.2.3", 1)).get(STATUS)
-    assert "policy_target" not in response.text
-    assert "10.1.2.3" in response.json()["detail"]
-
-
-# --- the allowlist (VLLM_E2_TIER_DEV_ALLOW) ----------------------------------
-#
-# Peers here are TestClient-constructed on purpose: `192.168.2.64` is the
-# production proxy and no test box can legitimately source packets from it.
-# The real-socket section below covers the peers we CAN source from.
-
-PROXY = ("192.168.2.64", 51000)
-WORKSTATION = ("192.168.2.120", 51001)
-
-
-def test_an_allowlisted_peer_may_read_without_a_token(enabled, monkeypatch):
-    """The whole point of 0.2.68: an allowlisted peer reads the surface with the
-    headers a plain `curl` sends. No `x-kvtier-dev-token` exists any more."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
-    engine = FakeEngineCoreClient(result={"version": 1})
-    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
-    assert client.get(STATUS).status_code == 200
-    assert client.get(SNAPSHOT).status_code == 200
-    assert engine.calls == [(config.METHOD_SNAPSHOT, ())]
-
-
 @pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
-def test_an_allowlisted_peer_needs_no_token_on_every_route(enabled, monkeypatch,
-                                                           method, path):
-    """THE rule of 0.2.68, over the whole surface: peer, then enabled, then the
-    route runs - for every route, both methods, no header anywhere.
+def test_the_retired_allowlist_changes_no_answer_on_any_route(enabled, monkeypatch,
+                                                              method, path):
+    """The variable that used to decide this is now inert on every route.
 
-    This includes every member of `config.DEV_STATE_ROUTES` (trace, guard, tier,
-    lookups, blockdump, disk), which is the shape that used to refuse even a
-    LOOPBACK reader: those routes are still listed as dev-state routes, they just
-    no longer carry a second gate.
+    Four values of `VLLM_E2_TIER_DEV_ALLOW` - the production pair, `0.0.0.0/0`,
+    garbage, and unset - and the answer is the same request the peer would get with
+    the variable deleted from its environment. This is the retirement, asserted
+    where it would otherwise be assumed: the live unit file still exports the name,
+    and every README before 0.2.72 told operators to set it.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
-    engine = FakeEngineCoreClient(result={"version": 1})
-    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
-    response = client.request(method, path)
-    assert response.status_code == 200, (method, path, response.text)
+    for allow in ("192.168.2.64,192.168.2.120", "0.0.0.0/0", "garbage", None):
+        if allow is None:
+            monkeypatch.delenv(config.ENV_ALLOW_RETIRED, raising=False)
+        else:
+            monkeypatch.setenv(config.ENV_ALLOW_RETIRED, allow)
+        engine = FakeEngineCoreClient(result={"version": 1})
+        # A peer the old parser would have refused, and the proxy it would have
+        # admitted: both are served, and the engine hears the same one call.
+        for peer in (PROXY, ("10.9.8.7", 1)):
+            response = client_for(build_app(FakeAsyncLLM(engine)),
+                                  peer).request(method, path)
+            assert response.status_code == 200, (allow, peer, method, path,
+                                                 response.text)
 
 
 @pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
@@ -432,7 +493,6 @@ def test_a_leftover_token_header_changes_no_answer_on_any_route(enabled,
     """An operator's old script must not start failing, and must not start working
     either: the header is inert on every route, and an unset token env is inert the
     same way (both are tested by the same pair of requests)."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)   # nothing configured...
     client = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())), PROXY)
     plain = client.request(method, path)
@@ -449,113 +509,61 @@ def test_a_leftover_token_header_changes_no_answer_on_any_route(enabled,
 
 
 @pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
-def test_a_peer_off_the_allowlist_is_403_on_every_route_on_peer_grounds(
+def test_a_stranger_holding_the_dead_token_is_served_like_anyone_else(
         enabled, monkeypatch, method, path):
-    """The gate that REMAINS, asserted alone: a stranger holding the old token (env
-    set, header sent) is refused because of its ADDRESS, and the detail proves it.
+    """What the removal actually means, stated at the route that used to prove the
+    opposite: a caller on a network nobody trusts, holding the old token in its env
+    and its header, is served - because nothing identifies anybody any more.
 
-    Before 0.2.68 this test could not exist in this shape: the same 403 came back
-    from two different guards and only their wording told them apart. Now there is
-    one guard, so every refusal must read as the peer rule - a token-shaped refusal
-    here would mean a gate came back.
+    Until 0.2.72 this request got 403 with a detail naming the peer rule, and that
+    403 was the file's most-repeated assertion. It is gone, and the test that
+    replaces it must fail the day a peer check comes back: that is the only way this
+    contract stays true in the product rather than in the README.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")      # the dead knob, set on purpose
-    engine = FakeEngineCoreClient()
-    client = client_for(build_app(FakeAsyncLLM(engine)), ("10.9.8.7", 1))
-    response = client.request(method, path, headers=token_headers("tk"))
-    assert_refused_on_peer_grounds(response, "10.9.8.7")
-    assert engine.calls == []
+    monkeypatch.setenv(config.ENV_TOKEN, "tk")          # the dead knob, set
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.64/32")  # admits nobody
+    engine = FakeEngineCoreClient(result={"version": 1})
+    response = client_for(build_app(FakeAsyncLLM(engine)),
+                          ("10.9.8.7", 1)).request(method, path,
+                                                   headers=token_headers("tk"))
+    assert response.status_code == 200, (method, path, response.text)
+    # `/status` is answered from this process and makes NO engine call by design, so
+    # "did the route run?" is only observable on the routes that forward.
+    if path != STATUS:
+        assert engine.calls, (method, path, "the route answered without the engine")
 
 
-def test_a_stranger_holding_the_token_is_still_refused(enabled, monkeypatch):
-    """The allowlist is the outer gate and the token is not a gate at all: a peer
-    that is not on it is 403 on every route and the engine never hears about it."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
-    engine = FakeEngineCoreClient()
-    client = client_for(build_app(FakeAsyncLLM(engine)), ("10.9.8.7", 1))
-    for method, path in (("get", STATUS), ("get", SNAPSHOT), ("post", RELOAD)):
-        response = client.request(method, path, headers=token_headers("tk"))
-        assert_refused_on_peer_grounds(response, "10.9.8.7")
-    assert engine.calls == []
-
-
-@pytest.mark.parametrize("peer,expected", [
-    (("192.168.2.1", 1), 200),      # inside the CIDR
-    (("192.168.2.255", 1), 200),    # ... right up to the boundary
-    (("192.168.3.1", 1), 403),      # one octet out
-    (("192.168.1.255", 1), 403),
-])
-def test_cidr_entry_admits_inside_and_refuses_outside(enabled, monkeypatch,
-                                                      peer, expected):
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.0/24")
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          peer).get(STATUS)
-    assert response.status_code == expected
-    if expected == 403:
-        assert_refused_on_peer_grounds(response, peer[0])
-
-
-def test_unset_allow_refuses_an_allowlisted_looking_peer(enabled, monkeypatch):
-    """Fail-closed default, restated at the route level: without the env there
-    is no allowlist, so the production proxy is refused - with the dead token env
-    set and its header sent, which buys it nothing."""
-    monkeypatch.delenv(config.ENV_ALLOW, raising=False)
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
-    engine = FakeEngineCoreClient()
-    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
-    assert_refused_on_peer_grounds(client.get(STATUS, headers=token_headers("tk")),
-                                   "192.168.2.64")
-    assert_refused_on_peer_grounds(client.post(RELOAD, headers=token_headers("tk")),
-                                   "192.168.2.64")
-    assert engine.calls == []
-
-
-@pytest.mark.parametrize("env", [
-    "garbage", "", "   ", "10.0.0.0/99", "192.168.2.999", "localhost", "::x",
-])
-def test_malformed_allow_env_is_403_not_500(enabled, monkeypatch, env):
-    """Garbage in the env must not break the request path and must not open it.
-    `localhost` in particular is never resolved."""
-    monkeypatch.setenv(config.ENV_ALLOW, env)
-    engine = FakeEngineCoreClient()
-    client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
-    for method, path in (("get", STATUS), ("post", RELOAD)):
-        response = client.request(method, path)
-        assert response.status_code == 403, (env, method, response.text)
-        assert_refused_on_peer_grounds(response, "192.168.2.64")
-    assert engine.calls == []
-
-
-def test_a_good_entry_survives_a_bad_neighbour_on_the_route(
+def test_a_malformed_allow_env_is_not_an_error_because_nothing_parses_it(
         enabled, monkeypatch):
-    monkeypatch.setenv(config.ENV_ALLOW, "garbage,,192.168.2.64,10.0.0.0/99")
-    client = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())), PROXY)
-    assert client.get(STATUS).status_code == 200
-    assert_refused_on_peer_grounds(
-        client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                   WORKSTATION).get(STATUS), "192.168.2.120")
+    """Garbage in the retired variable used to be a careful non-event: parsed,
+    skipped, warned about, refused nobody. Now it is not even parsed, so the only
+    honest assertion is that it cannot be seen at all - no 500, no warning line, no
+    change in the answer.
 
-
-@pytest.mark.parametrize("peer", [("127.0.0.1", 1), ("127.2.3.4", 1),
-                                 ("::1", 1), ("::ffff:127.0.0.1", 1)])
-def test_loopback_reads_stay_token_free_when_an_allowlist_is_set(
-        enabled, monkeypatch, peer):
-    """The operator's `ssh llm curl 127.0.0.1` workflow, unchanged by the
-    allowlist - and an allowlist naming other hosts must not remove loopback."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.0/24")
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          peer).get(STATUS)
-    assert response.status_code == 200, response.text
+    This replaces `test_malformed_allow_env_is_403_not_500` and
+    `test_cidr_entry_admits_inside_and_refuses_outside` and
+    `test_unset_allow_refuses_an_allowlisted_looking_peer` and
+    `test_a_good_entry_survives_a_bad_neighbour_on_the_route`: four tests that
+    measured a parser, for a parser that no longer exists. Keeping any of them would
+    have meant keeping the parser.
+    """
+    for env in ("garbage", "", "   ", "10.0.0.0/99", "192.168.2.999", "localhost",
+                "::x", "0.0.0.0/0,192.168.2.64"):
+        monkeypatch.setenv(config.ENV_ALLOW_RETIRED, env)
+        engine = FakeEngineCoreClient(result={"version": 1})
+        client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
+        for method, path in (("get", STATUS), ("post", RELOAD)):
+            response = client.request(method, path)
+            assert response.status_code == 200, (env, method, response.text)
 
 
 @pytest.mark.parametrize("route", list(config.DEV_STATE_ROUTES))
-def test_the_dev_state_routes_answer_a_loopback_peer_with_no_token(
-        enabled, monkeypatch, route):
-    """THE rule this release exists for, on exactly the routes that made testing
-    painful: every member of DEV_STATE_ROUTES, GET and POST, answers a loopback
-    peer that sends nothing but the URL.
+@pytest.mark.parametrize("peer", [("127.0.0.1", 1), PROXY, ("203.0.113.9", 1)])
+def test_the_dev_state_routes_answer_every_peer_with_no_token(enabled, monkeypatch,
+                                                              route, peer):
+    """Every member of DEV_STATE_ROUTES, GET and POST, answers a peer that sends
+    nothing but the URL - and it does so from loopback AND from the far side of the
+    address space, which is the price of the same rule.
 
     Until 0.2.68 these six routes required the token in EVERY shape - loopback
     included, `GET /trace` and `POST /disk {"op":"status"}` alike - which is what
@@ -564,55 +572,42 @@ def test_the_dev_state_routes_answer_a_loopback_peer_with_no_token(
     """
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     engine = FakeEngineCoreClient(result={"version": 1})
-    client = client_for(build_app(FakeAsyncLLM(engine)), ("127.0.0.1", 1))
+    client = client_for(build_app(FakeAsyncLLM(engine)), peer)
     path = config.ROUTE_PREFIX + route
-    assert client.get(path).status_code == 200, (route, "GET")
-    assert client.post(path, json={}).status_code == 200, (route, "POST")
+    assert client.get(path).status_code == 200, (peer, route, "GET")
+    assert client.post(path, json={}).status_code == 200, (peer, route, "POST")
 
 
-def test_the_mutating_verb_needs_no_token_on_loopback(enabled, monkeypatch):
+def test_the_mutating_verb_needs_no_token_and_no_particular_peer(enabled,
+                                                                 monkeypatch):
     """`POST /policy/reload` used to be the ONE mutating verb and the ONE thing the
-    token was documented to gate. It now needs only the peer rule - and the engine
-    call it drives happens with no header in the request."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.0/24")
+    token was documented to gate. It needs neither a token nor an address - and what
+    keeps it safe is not identity: the engine-side method takes no argument, so the
+    wire never selects a file, and the path validation here accepts exactly one."""
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     engine = FakeEngineCoreClient(result={"ok": True})
-    client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.post(RELOAD).status_code == 200
-    assert engine.calls == [(config.METHOD_RELOAD_POLICY, ())]
+    for peer in (("127.0.0.1", 1), WORKSTATION, ("203.0.113.9", 1)):
+        assert client_for(build_app(FakeAsyncLLM(engine)), peer).post(
+            RELOAD).status_code == 200, peer
+    assert engine.calls == [(config.METHOD_RELOAD_POLICY, ())] * 3
 
 
-def test_a_wide_allowlist_reaches_the_surface_without_a_token(enabled, monkeypatch):
-    """`0.0.0.0/0` is now the whole gate, and it is the ONLY thing that opens: the
-    peer is admitted by its address alone. (Which is exactly why README says keep it
-    narrow: these routes are NOT covered by vLLM's `--api-key`.)"""
-    monkeypatch.setenv(config.ENV_ALLOW, "0.0.0.0/0")
-    monkeypatch.delenv(config.ENV_TOKEN, raising=False)
-    engine = FakeEngineCoreClient(result={"version": 1})
-    response = client_for(build_app(FakeAsyncLLM(engine)),
-                          WORKSTATION).get(STATUS)
-    assert response.status_code == 200
+def test_the_surface_is_reachable_from_another_network_and_says_so(enabled):
+    """THE consequence, asserted rather than implied: a peer on a network the box
+    does not trust reads the whole `/status` payload, and the payload names that as
+    the operator's exposure rather than claiming a gate it does not have.
 
-
-def test_spoofed_forwarded_for_from_a_peer_not_on_the_allowlist_is_403(
-        enabled, monkeypatch):
-    """Same attack, now against the widened surface, with the dead header in hand:
-    a forged header and an old token together still cannot reach one route."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
-    engine = FakeEngineCoreClient()
-    client = client_for(build_app(FakeAsyncLLM(engine)), ("203.0.113.9", 51234))
-    for response in (
-        client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1"}),
-        client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1",
-                                   **token_headers("tk")}),
-        client.get(SNAPSHOT, headers={"x-real-ip": "127.0.0.1",
-                                     **token_headers("tk")}),
-        client.post(RELOAD, headers={"x-forwarded-for": "192.168.2.64",
-                                    **token_headers("tk")}),
-    ):
-        assert_refused_on_peer_grounds(response, "203.0.113.9")
-    assert engine.calls == []
+    This is the test that used to be `test_a_wide_allowlist_reaches_the_surface…`,
+    where `0.0.0.0/0` in an env var was the thing that opened the surface. Nothing
+    opens it now except enabling it, so the reach is unconditional and the only
+    remaining honest artefact is the report.
+    """
+    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                      WORKSTATION).get(STATUS).json()
+    assert body["enabled"] is True
+    assert body["peer_gate"]["removed"] is True
+    assert "network" in body["peer_gate"]["operators_job"]
+    assert body["vllm_api_key_covers_these_routes"] is False
 
 
 # --- THE SSD TIER'S FILL BLOCK, read from off the box (0.2.30) ---------------
@@ -664,16 +659,13 @@ def fill_store(tmp_path, monkeypatch):
 
 def test_the_proxy_peer_reads_the_fill_block_with_no_token(enabled, monkeypatch,
                                                            fill_store):
-    """THE DEPLOYMENT CASE, with the live box's actual allowlist.
-
-    `192.168.2.64` is the proxy that will poll this; `192.168.2.120` is the workstation.
-    Both are on the list, NOTHING is configured in `VLLM_E2_TIER_DEV_TOKEN`, and the
-    answer must be the block - not a redacted status payload, and not an engine call:
-    `/status` makes none, and the fill comes from the rank files the workers write on
-    this host. This is the case that made the token worth removing: a poller that has
-    to carry a secret for a read it is allowlisted for is a poller that gets dropped.
+    """THE DEPLOYMENT CASE: the proxy on `192.168.2.64` polls `/status`, nothing is
+    configured in `VLLM_E2_TIER_DEV_TOKEN`, and the answer must be the block - not a
+    redacted status payload, and not an engine call: `/status` makes none, and the
+    fill comes from the rank files the workers write on this host. This is the case
+    that made the token worth removing: a poller that has to carry a secret for a
+    read it was let through for is a poller that gets dropped.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
     engine = FakeEngineCoreClient()
@@ -696,8 +688,8 @@ def test_the_proxy_peer_reads_the_fill_block_with_no_token(enabled, monkeypatch,
 
 
 def test_the_workstation_peer_reads_the_same_block(enabled, monkeypatch, fill_store):
-    """Both allowlisted peers, one dialect: the block is not peer-specific."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    """Two peers, one dialect: the block is not peer-specific - there is no peer
+    question left to make it specific."""
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
@@ -705,39 +697,35 @@ def test_the_workstation_peer_reads_the_same_block(enabled, monkeypatch, fill_st
     assert body["disk_fill"]["used_bytes"] == FILL_USED
 
 
-def test_the_fill_block_is_not_served_to_a_peer_off_the_allowlist(
-        enabled, monkeypatch, fill_store):
-    """The allowlist is necessary AND sufficient now: no allowlist means no fill,
-    and no token is left to make up the difference."""
-    monkeypatch.delenv(config.ENV_ALLOW, raising=False)
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
-    fill_rank_file(fill_store)
-    client = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())), PROXY)
-    for headers in ({}, token_headers("tk"), {"x-kvtier-dev-token": ""}):
-        response = client.get(STATUS, headers=headers)
-        assert_refused_on_peer_grounds(response, "192.168.2.64")
-        assert "disk_fill" not in response.text, response.text
-
-
-def test_a_peer_off_the_allowlist_does_not_get_the_fill_block(enabled,
-                                                             monkeypatch,
+def test_the_fill_block_is_served_to_every_peer_when_enabled(enabled, monkeypatch,
                                                              fill_store):
-    """The proxy's address is not on the list here, and its old token is spent: 403,
-    no fill, no leak, and the refusal is the peer's own."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.120")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    """The block that exists so an off-box poller can read it is served to every
+    peer - the proxy, the workstation, and an address nobody recognised.
+
+    This replaces two tests that asserted the opposite ("not served to a peer off the
+    allowlist", "a peer off the allowlist does not get the fill block"). Their real
+    point - that the answer is not tailored per peer - survives; only its direction
+    flipped, because the thing that used to tailor it is gone. What no peer gets is a
+    DIFFERENT payload: every caller reads the same body, which is the property worth
+    keeping now that "who" is not a question.
+    """
+    monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          ("10.9.8.7", 1)).get(STATUS, headers=token_headers("tk"))
-    assert_refused_on_peer_grounds(response, "10.9.8.7")
-    assert "disk_fill" not in response.text
+    answers = set()
+    for peer in (PROXY, WORKSTATION, ("10.9.8.7", 1)):
+        response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                              peer).get(STATUS, headers=token_headers("tk"))
+        assert response.status_code == 200, (peer, response.text)
+        assert response.json()["disk_fill"]["used_bytes"] == FILL_USED, peer
+        answers.add(response.text)
+    assert len(answers) == 1, "the payload must not vary by peer"
 
 
 def test_loopback_reads_the_fill_block_with_no_token_at_all(enabled, monkeypatch,
                                                             fill_store):
-    """The operator at the box: `/status` on loopback needs nothing even with an
-    allowlist set, which is what makes a plain curl a usable reflex."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
+    """The operator at the box: `/status` on loopback needs nothing, which is what
+    makes a plain curl a usable reflex. The same curl from another host gets the same
+    answer - that is the cost side of this test, kept here so the pair is readable."""
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))).get(
@@ -746,44 +734,46 @@ def test_loopback_reads_the_fill_block_with_no_token_at_all(enabled, monkeypatch
     assert body["disk_fill"]["ranks_reported"] == 1
 
 
-def test_a_spoofed_forwarded_for_does_not_unlock_the_fill_block(enabled, monkeypatch,
-                                                                fill_store):
-    """The same attack as the existing spoof test, aimed at the new block.
+def test_a_spoofed_forwarded_for_unlocks_the_fill_block_for_nobody(enabled,
+                                                                   monkeypatch,
+                                                                   fill_store):
+    """The same attack as the spoof test above, aimed at the new block.
 
-    `X-Forwarded-For: 127.0.0.1` from a host that is not allowlisted must not turn a 403
-    into a read of the tier's fill - and neither does the old token header, which is
-    what the second and third requests are for.
+    `X-Forwarded-For: 127.0.0.1` from a remote host used to be the interesting case
+    because a guard existed to defeat it. There is no guard to defeat, so what this
+    pins is that the header is not a substitute for one: it neither opens the block
+    (nothing needs opening) nor closes it, and the answer is byte-identical with and
+    without the forgery and with and without the dead token header.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
     engine = FakeEngineCoreClient()
     client = client_for(build_app(FakeAsyncLLM(engine)), ("203.0.113.9", 51234))
+    answers = set()
     for response in (
+        client.get(STATUS),
         client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1"}),
         client.get(STATUS, headers={"x-forwarded-for": "127.0.0.1",
                                    **token_headers("tk")}),
         client.get(STATUS, headers={"x-real-ip": "192.168.2.64",
                                    **token_headers("tk")}),
-        client.get(SNAPSHOT, headers={"x-forwarded-for": "192.168.2.64",
-                                     **token_headers("tk")}),
     ):
-        assert_refused_on_peer_grounds(response, "203.0.113.9")
-        assert "disk_fill" not in response.text, response.text
-    assert engine.calls == []
+        assert response.status_code == 200, response.text
+        assert response.json()["disk_fill"]["used_bytes"] == FILL_USED
+        answers.add(response.text)
+    assert len(answers) == 1, "the fill answer must not depend on any header"
 
 
-def test_the_snapshot_route_carries_the_fill_block_to_the_proxy_peer(enabled,
-                                                                    monkeypatch,
-                                                                    fill_store):
+def test_the_snapshot_route_carries_the_fill_block_to_an_off_box_peer(enabled,
+                                                                      monkeypatch,
+                                                                      fill_store):
     """The engine-side view reaches the proxy too.
 
     `/snapshot` is the ENGINE's payload (the utility call), and `dev_state_sections()` -
     where `disk_fill` is built - is embedded at its top level. The fake engine here
     returns what the real handler would embed, so this proves the ROUTE carries the
-    block to an authorised off-box peer; building it is `test_disk_fill_block.py`.
+    block to an off-box peer; building it is `test_disk_fill_block.py`.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     fill_rank_file(fill_store)
     engine = FakeEngineCoreClient(result={"version": 1,
@@ -806,7 +796,6 @@ def test_the_fill_block_is_bounded_over_the_wire(enabled, monkeypatch, fill_stor
     Twenty-four rank files, one capped entry list, and a response that stays well under
     the verb's own ceiling: rank entries only, never an inventory.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     for pp in range(6):
         for tp in range(4):
@@ -828,7 +817,6 @@ def test_no_rank_files_reports_a_null_fill_rather_than_an_empty_tier(enabled,
     moment the workers have not written a rank file yet - the most misleading possible
     reading of a cold boot.
     """
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,192.168.2.120")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
                       PROXY).get(STATUS).json()
@@ -841,26 +829,16 @@ def test_no_rank_files_reports_a_null_fill_rather_than_an_empty_tier(enabled,
 
 def test_an_inert_plugin_learns_the_fill_block_never_ran(enabled, monkeypatch,
                                                          fill_store):
-    """peer -> enabled: the 503 comes before any fill read."""
+    """enabled is the FIRST thing the route does, so an inert plugin reads no rank
+    files and publishes no block - for any peer, including the one that used to be
+    the only one allowed to ask."""
     monkeypatch.delenv(config.ENV_ENABLE, raising=False)
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
     fill_rank_file(fill_store)
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          PROXY).get(STATUS)
-    assert response.status_code == 503
-    assert "disk_fill" not in response.text
-
-
-def test_a_refused_peer_does_not_learn_the_allowlist_contents(enabled,
-                                                              monkeypatch):
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.0/24,10.7.7.0/24")
-    monkeypatch.setenv(config.ENV_TOKEN, "tk")     # the dead knob, set on purpose
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          ("10.1.2.3", 1)).get(STATUS, headers=token_headers("tk"))
-    assert response.status_code == 403
-    detail = response.json()["detail"]
-    assert "10.1.2.3" in detail and config.ENV_ALLOW in detail
-    assert "192.168.2.0" not in detail and "10.7.7.0" not in detail
+    for peer in (("127.0.0.1", 1), PROXY, ("10.9.8.7", 1)):
+        response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                              peer).get(STATUS)
+        assert response.status_code == 503, (peer, response.text)
+        assert "disk_fill" not in response.text
 
 
 # --- what status reports about the new state ----------------------------------
@@ -879,20 +857,36 @@ def test_status_keeps_every_existing_key(enabled):
     assert body["token_env"] == config.ENV_TOKEN
 
 
-def test_status_reports_loopback_only_when_nothing_is_allowlisted(enabled):
+def test_status_reports_the_retired_allowlist_as_a_dead_knob(enabled, monkeypatch):
+    """The three keys that answered "who can reach this?" cannot survive the gate
+    they described, and they are handled two different ways - which is the part this
+    test exists to pin.
+
+    `allow_env` keeps its LITERAL meaning ("which variable", now the retired name)
+    and gains a companion that says whether it does anything, because a variable the
+    live unit file still exports must stay reported - that is how a dead knob gets
+    found instead of assumed. `allow_networks` and `loopback_only` are GONE: they
+    could only ever describe a parser that no longer exists, and answering them
+    truthfully (`[]`, `False`) would read as "an empty allowlist" - a lie that looks
+    like a fact. The one clear statement lives in `peer_gate`.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.0/24")
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))).get(
         STATUS).json()
-    assert body["allow_networks"] == []
-    assert body["loopback_only"] is True
-    assert body["allow_env"] == config.ENV_ALLOW
-    # 0.2.68: the peer allowlist is the whole gate, so NO peer - loopback or not -
-    # is asked for a token. The key STAYS with its value flipped rather than being
-    # deleted: something reading it must find a truthful `false`, not a KeyError
-    # that looks like the payload changed shape.
+    assert "allow_networks" not in body
+    assert "loopback_only" not in body
+    assert body["allow_env"] == config.ENV_ALLOW_RETIRED
+    assert body["allow_env_gates"] is False
+    assert body["allow_list_configured"] is True      # set, and read for nothing
+    # 0.2.68 retired the token, 0.2.72 the address: NO peer - loopback or not - is
+    # asked for a token or filtered by where it came from. The keys STAYS with its
+    # value flipped rather than being deleted: something reading it must find a
+    # truthful `false`, not a KeyError that looks like the payload changed shape.
     assert body["non_loopback_peers_require_token"] is False
     assert body["token_gating"] is False
-    assert config.ENV_ALLOW in body["guard"]
-    assert "loopback" in body["guard"]
+    assert config.ROUTE_PREFIX in body["guard"]
+    assert "the ONLY gate" in body["guard"]
+    assert "every client" in body["guard"]
 
 
 def test_status_says_the_token_no_longer_means_what_it_used_to(enabled, monkeypatch):
@@ -902,8 +896,8 @@ def test_status_says_the_token_no_longer_means_what_it_used_to(enabled, monkeypa
     set", "which variable"), because a key vanishing from `/status` is a silent
     change for anything that reads it. Beside them: `token_gating` is `false`, the
     note names the release that stopped reading the variable, and the note and
-    `guard` both say the thing a future reader most needs - the peer allowlist is
-    the ONLY gate here, and vLLM's `--api-key` does not cover `/plugins/*`.
+    `guard` both say the thing a future reader most needs - there is no gate here but
+    the enable switch, and vLLM's `--api-key` does not cover `/plugins/*`.
     """
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))).get(
@@ -914,7 +908,7 @@ def test_status_says_the_token_no_longer_means_what_it_used_to(enabled, monkeypa
     note = body["token_note"]
     assert config.ENV_TOKEN in note and "no longer" in note
     assert "0.2.68" in note
-    assert config.ENV_ALLOW in note
+    assert "0.2.72" in note, "the note must not stop at the first retirement"
     assert "token" not in body["guard"].lower() or "no token" in body["guard"].lower()
     assert body["vllm_api_key_covers_these_routes"] is False
     assert "--api-key" in body["guard"]
@@ -943,36 +937,37 @@ def test_setting_the_token_env_changes_the_report_and_nothing_else(
     assert on["token_gating"] is False and off["token_gating"] is False
 
 
-def test_status_reports_the_parsed_allowlist_to_a_peer_it_admits(
-        enabled, monkeypatch):
-    """An operator must be able to see what is open, including which entries
-    the parser dropped."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64, 192.168.2.0/24, bogus")
+def test_status_reports_the_exposure_instead_of_the_parsed_allowlist(enabled,
+                                                                    monkeypatch):
+    """An operator must be able to see what is open. What changed in 0.2.72 is that
+    the answer stopped being a list: there is no parsed set of networks to show, so
+    `/status` says the rule instead - enabled means reachable by whoever can route to
+    the port - and reports the retired variable as the dead knob it is.
+
+    The two tests this replaces asserted `allow_networks == [...]` and that a
+    malformed entry was "absent". Both were statements about a parser; the parser is
+    gone, and a `[]` here would read as "nothing is allowlisted" rather than as
+    "nobody is filtered", which is the kind of false-comfort key this project names
+    incidents for. So the keys are deleted, and the test asserts their absence.
+    """
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.64, 192.168.2.0/24, bogus")
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
                       WORKSTATION).get(STATUS).json()
-    assert body["allow_networks"] == ["192.168.2.64/32", "192.168.2.0/24"]
-    assert body["loopback_only"] is False
+    assert "allow_networks" not in body and "loopback_only" not in body
+    assert body["allow_list_configured"] is True, "a set knob must still be visible"
+    assert body["allow_env_gates"] is False
+    assert body["peer_gate"]["peers_filtered_by_address"] is False
     assert body["non_loopback_peers_require_token"] is False
 
 
-def test_a_malformed_entry_shows_up_as_absent_to_a_loopback_reader(
-        enabled, monkeypatch):
-    """`status` is always a readable place to check whether the env parsed the way
-    you meant (nothing asks for a token to read it), and `bogus` is simply absent."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64,10.0.0.0/99,bogus")
-    body = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient()))).get(
-        STATUS).json()
-    assert body["allow_networks"] == ["192.168.2.64/32"]
-    assert body["loopback_only"] is False
+# --- the one gate runs first, and nothing runs before it ---------------------
 
-
-# --- guard order -------------------------------------------------------------
-
-def test_inert_still_answers_503_to_an_allowlisted_peer(monkeypatch):
-    """peer -> enabled: an admitted peer still learns the plugin is inert rather
-    than getting a 200, and the dead token variable changes nothing about that."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
+def test_inert_answers_503_to_the_peer_that_used_to_be_the_only_allowed_one(monkeypatch):
+    """enabled is the first thing a route does, and the only thing: the production
+    proxy - the peer the old guard existed to admit - learns the plugin is inert
+    rather than getting a 200, and the dead token variable changes nothing."""
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.64")
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
     response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
                           PROXY).get(STATUS)
@@ -981,28 +976,37 @@ def test_inert_still_answers_503_to_an_allowlisted_peer(monkeypatch):
 
 
 @pytest.mark.parametrize("path,method", PLUGIN_ROUTES)
-def test_a_disallowed_peer_learns_nothing_even_when_inert(
-        monkeypatch, method, path):
-    """The peer check runs BEFORE the 503, so an inert plugin is not a way to
-    enumerate configuration from an unauthorised host."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64")
+def test_an_inert_plugin_answers_the_same_503_to_every_peer(monkeypatch, method,
+                                                            path):
+    """The inversion of "a disallowed peer learns nothing even when inert".
+
+    That test existed because the peer check ran BEFORE the 503, so an inert plugin
+    was not a way to enumerate configuration from an unauthorised host. There is no
+    peer check to run first, so the same address that used to learn nothing now gets
+    the same 503 as loopback - and that IS the disclosure this release accepts:
+    `/status` on an ENABLED plugin publishes this plugin's own configuration to any
+    peer that can route here. What is still true, and what this asserts, is that
+    nothing leaks before the switch is thrown: while inert, every peer gets the
+    refusal and not the payload.
+    """
+    monkeypatch.delenv(config.ENV_ENABLE, raising=False)
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.64")
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
-    response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
-                          ("10.9.8.7", 1)).request(method, path,
-                                                   headers=token_headers("tk"))
-    assert_refused_on_peer_grounds(response, "10.9.8.7")
-    # The 503 "inert" answer (and everything the plugin knows about itself) is
-    # only ever handed to a peer the guard accepted. `inert:` is the 503's text;
-    # ENV_ENABLE alone is useless as a marker because ENV_ALLOW contains it.
-    assert "inert" not in response.text
-    assert "policy_target" not in response.text
+    for peer in (("127.0.0.1", 1), PROXY, ("10.9.8.7", 1)):
+        response = client_for(build_app(FakeAsyncLLM(FakeEngineCoreClient())),
+                              peer).request(method, path, headers=token_headers("tk"))
+        assert response.status_code == 503, (peer, method, path, response.text)
+        assert config.ENV_ENABLE in response.json()["detail"]
+        # The self-description (policy_target, the parsed allowlist that used to be
+        # here) is published only by an ENABLED surface, to every peer or to none.
+        assert "policy_target" not in response.text
 
 
 # --- real sockets: the peer uvicorn writes is the peer of the socket ---------
 
 def test_real_socket_loopback_read_needs_no_token(enabled):
-    """THE operator workflow, over a real accepted TCP connection: no allowlist,
-    no token, `curl 127.0.0.1:<port>/plugins/kvtier/status` -> 200."""
+    """THE operator workflow, over a real accepted TCP connection: no token, no
+    allowlist, `curl 127.0.0.1:<port>/plugins/kvtier/status` -> 200."""
     engine = FakeEngineCoreClient(result={"version": 1})
     with served_on_real_socket(build_app(FakeAsyncLLM(engine)),
                               "127.0.0.1") as base:
@@ -1013,31 +1017,27 @@ def test_real_socket_loopback_read_needs_no_token(enabled):
 
 
 @needs_lan
-def test_real_socket_non_loopback_peer_is_refused_then_served(enabled, monkeypatch):
-    """A genuine non-loopback peer on a genuine socket: refused while the allowlist
-    is unset - holding the old token changes nothing about that - and served the
-    moment its address is allowlisted, with no header of any kind.
+def test_real_socket_non_loopback_peer_is_served_because_nothing_filters_it(
+        enabled, monkeypatch):
+    """A genuine non-loopback peer on a genuine socket: served, with no header of any
+    kind, and with the dead token variable set in the engine's environment.
 
-    The refusal is asserted on PEER grounds by the peer's own address appearing in
-    the detail, which is the half only a real socket can prove: what uvicorn wrote
-    into `scope["client"]` is what the guard refused.
+    This is the test whose whole existence was the peer gate, and the reason it had to
+    be a real socket: what uvicorn writes into `scope["client"]` is the peer of the
+    socket, and that is the value the removed check read. Now the interesting half is
+    that a peer on the LAN is simply served - and that the payload it reads says so,
+    because the only remaining protection is the network the operator drew.
     """
     peer = LAN_PEER
     engine = FakeEngineCoreClient(result={"version": 1})
     monkeypatch.setenv(config.ENV_TOKEN, "tk")      # the dead knob, set on purpose
     with served_on_real_socket(build_app(FakeAsyncLLM(engine)), peer) as base:
         with real_client(base, source=peer) as client:
-            # Sanity: this really is a non-loopback peer as far as uvicorn sees.
+            # Sanity: this really is a non-loopback peer as far as uvicorn sees - the
+            # fact the old guard refused on, asserted here as a fact and not a verdict.
             assert not ipaddress.ip_address(peer).is_loopback
-            assert_refused_on_peer_grounds(client.get(STATUS), peer)
-            assert_refused_on_peer_grounds(
-                client.get(STATUS, headers=token_headers("tk")), peer)
-            assert engine.calls == []
-            monkeypatch.setenv(config.ENV_ALLOW, peer)
-            # Allowlisted: the address alone is the whole credential.
             body = client.get(STATUS).json()
-            assert body["loopback_only"] is False
-            assert body["allow_networks"] == [f"{peer}/32"]
+            assert body["peer_gate"]["peers_filtered_by_address"] is False
             assert body["token_gating"] is False
             # A stale header still changes nothing.
             assert client.get(STATUS, headers=token_headers("nope")).status_code == 200
@@ -1048,23 +1048,33 @@ def test_real_socket_non_loopback_peer_is_refused_then_served(enabled, monkeypat
 
 
 @needs_lan
-def test_real_socket_forwarded_for_does_not_help_a_real_remote_peer(
+def test_real_socket_forwarded_for_is_not_a_credential_and_not_a_refusal(
         enabled, monkeypatch):
-    """The forgeable-header attack against a real socket: a real LAN peer that
-    claims to be 127.0.0.1 is refused, with the dead header and without it."""
+    """The forgeable-header attack against a real socket, restated for a gate that
+    never looks at a header: a real LAN peer that claims to be 127.0.0.1 gets the
+    same answer as the same peer that claims nothing, because there is no identity in
+    the header for it to steal.
+
+    Before 0.2.72 every one of these was a 403 naming the peer's real address, and
+    that was the guard's whole purpose: read the socket, ignore the header. The
+    property that survives is the narrower one - the header has no effect at all -
+    and it is what a reviewer should re-check if a future change starts parsing one.
+    """
     peer = LAN_PEER
-    engine = FakeEngineCoreClient()
+    engine = FakeEngineCoreClient(result={"version": 1})
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
     with served_on_real_socket(build_app(FakeAsyncLLM(engine)), peer) as base:
         with real_client(base, source=peer) as client:
+            plain = client.get(STATUS)
+            assert plain.status_code == 200
             for headers in ({"x-forwarded-for": "127.0.0.1"},
                             {"x-forwarded-for": "127.0.0.1",
                              **token_headers("tk")},
                             {"x-real-ip": "127.0.0.1",
                              **token_headers("tk")}):
-                assert_refused_on_peer_grounds(client.get(STATUS, headers=headers),
-                                               peer)
-            assert engine.calls == []
+                forged = client.get(STATUS, headers=headers)
+                assert forged.status_code == 200, headers
+                assert forged.json()["peer_gate"] == plain.json()["peer_gate"], headers
 
 
 # --- inert by default -------------------------------------------------------
@@ -1271,7 +1281,12 @@ def test_a_boot_with_the_dead_token_var_set_warns_about_once(caplog, monkeypatch
     assert len(lines) == 1, lines
     line = lines[0]
     assert "no longer" in line.lower() and "0.2.68" in line
-    assert config.ENV_ALLOW in line, "must name the gate that replaced it"
+    # WHAT REPLACED THE TOKEN is no longer "the peer allowlist" - that gate is gone
+    # too, so the line must name the switch that IS the gate and the release that
+    # removed the other one, or an operator reads it as "set the allowlist instead".
+    assert config.ENV_ENABLE in line, "must name the gate that is left"
+    assert "0.2.72" in line, "must not claim the allowlist still stands"
+    assert config.ENV_ALLOW_RETIRED not in line, "each dead variable gets its own line"
     assert "s3cr3t-token" not in line       # the VALUE is never echoed, only the name
     assert "token_env" not in line
 

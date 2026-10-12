@@ -138,10 +138,18 @@ cannot reproduce.
 
 `/trace`, `/guard`, `/tier`, `/lookups`, `/blockdump` and `/disk` can change engine
 dev state, and until 0.2.68 they were token-gated as a whole (not per field) in every
-shape, loopback included. **That gate is removed.** What still separates an arm from a
-read is the engine-side arm itself (`POST {"op":"arm"}`, an arm that expires or latches
-per verb), the `safe_method` wall that refuses a mutating `op` on a `GET` with a 405,
-and the peer allowlist - see *Access model*.
+shape, loopback included. **That gate is removed**, and so is the peer-address rule that
+stood in front of it since 0.2.68 (**0.2.72**) - see *Access model* for why an address
+is not a credential. What still separates an arm from a read is the engine-side arm
+itself (`POST {"op":"arm"}`, an arm that expires or latches per verb), the `safe_method`
+wall that refuses a mutating `op` on a `GET` with a 405 on **every one of these six
+routes** (0.2.72: five of them had no such rule at all, so `GET /guard?op=arm` armed
+guard mode, `GET /tier?op=arm` flipped the kill switch, `GET /lookups?op=arm` installed
+wrappers on the live tier, `GET /trace?op=clear` emptied the ring and `GET
+/blockdump?op=arm` armed the byte dump), and each verb refusing the same call again
+engine-side on `safe_method` so the refusal does not depend on the HTTP layer staying
+correct. `/guard` has the extra rule that the `armed` key *is* the state change whatever
+`op` says. The one list of truth is `kvtier_dev_plugin/route_policy.py`.
 
 
 ## Dumping a few parked bytes to settle a byte-level question (`blockdump.py`)

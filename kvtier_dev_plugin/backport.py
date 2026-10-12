@@ -312,7 +312,7 @@ import logging
 import sys
 import textwrap
 
-from . import config, mamba_anchor, pr56810_sources, snapshot
+from . import config, mamba_anchor, pr56810_sources, route_policy, snapshot
 
 logger = logging.getLogger("kvtier_dev_plugin.backport")
 
@@ -3202,17 +3202,27 @@ def _next_step(refusal: dict | None) -> str:
 def tier_for_engine(engine, args=None) -> dict:
     """`{op: status|arm|disarm}` for `POST /plugins/kvtier/tier`. Never raises.
 
-    `arm`/`disarm` flip the kill switch; `status` only reads. An unknown or
-    missing `op` is a DECLINE with 400 semantics in the payload, never a flip:
-    a mistyped body must not silently turn the tier off (or on) on the way to
-    doing something else. The endpoint validates `op` against `TIER_OPS` first,
-    so this is the second line of defence for a direct engine call.
+    `arm`/`disarm` flip the kill switch; `status` only reads. A MISSING `op` is
+    `status` (the friendly read default this verb has always had, and what a bare
+    `GET /tier` sends); an `op` that IS named and is not one of `TIER_OPS` is a
+    DECLINE with 400 semantics in the payload, never a flip: a mistyped body must not
+    silently turn the tier off (or on) on the way to doing something else. The
+    endpoint validates `op` against `TIER_OPS` first, so this is the second line of
+    defence for a direct engine call.
+
+    A call marked `safe_method` (forwarded from a method a browser may issue without
+    a preflight) that asks to arm or disarm is refused outright, the way
+    `disk_store.disk_for_engine` refuses: the route answers 405 first, and this is
+    what makes that refusal not depend on the route staying correct.
 
     The switch is applied to THIS process's manager class (the caller is the
     EngineCore loop thread, which holds the live manager), so the verb is also
     what makes a freshly-adopted class switchable.
     """
     args = args if isinstance(args, dict) else {}
+    refused = route_policy.safe_method_refusal(config.ROUTE_TIER, args)
+    if refused is not None:
+        return refused
     op = str(args.get("op", "status") or "status")
     out: dict = {"op": op, "applied": False, "reason": None}
     try:

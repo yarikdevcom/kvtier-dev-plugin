@@ -6,8 +6,8 @@ rather than a convenience:
 
 * the METHOD is chosen by the route, never by the wire - otherwise whoever could
   reach the port would hold an arbitrary-method-call primitive on the EngineCore,
-  which since 0.2.68 is a bigger deal and not a smaller one: the peer allowlist is
-  the only thing between a LAN address and these routes;
+  which since 0.2.72 is a bigger deal and not a smaller one: nothing stands between
+  a LAN address and these routes but the enable switch;
 * the ARGUMENTS are a plain dict of JSON primitives within bounds, validated
   against `endpoint.ARG_SPECS` before the call, so no verb receives a shape its
   own module did not declare.
@@ -15,9 +15,10 @@ rather than a convenience:
 GET and POST are held to the SAME spec: a bound you can evade by switching methods
 is not a bound. Since 0.2.68 the token is gone from every shape of every route -
 including `/trace`, `/guard`, `/tier`, `/lookups`, `/blockdump` and `/disk`, which
-used to require it even from loopback. That is why the argument specs and the
-`safe_method` wall matter MORE now: besides the peer address, they are all the gate
-that is left.
+used to require it even from loopback - and since 0.2.72 the peer address is gone
+from them too. That is why the argument specs and the `safe_method` wall matter
+MORE now: they are the only gate left below the enable switch, and the one that is
+still enforced by the code rather than by the network.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ from test_routes import (
     TRACE,
     FakeAsyncLLM,
     FakeEngineCoreClient,
-    assert_refused_on_peer_grounds,
     build_app,
     client_for,
     token_headers,
@@ -212,7 +212,7 @@ def test_the_trace_route_answers_a_loopback_peer_with_no_token(engine, armed_tok
 
     `GET /trace` and `POST /trace {"op":"read"}` are answered from loopback with no
     header at all, even though the same door arms the recorder: the whole route is
-    gated on the PEER, not on a token, and the engine sees no difference.
+    gated on the switch and nothing else, and the engine sees no difference.
     """
     client = client_for(build_app(FakeAsyncLLM(engine)))
     assert client.get(TRACE).status_code == 200
@@ -225,9 +225,17 @@ def test_a_trace_read_defaults_to_the_read_op_without_inventing_one_elsewhere(
         engine, armed_token):
     client = client_for(build_app(FakeAsyncLLM(engine)))
     client.get(TRACE, headers=token_headers())
-    assert engine.calls == [(config.METHOD_TRACE, ({"op": "read"},))]
+    # `safe_method: True` is the route's ATTESTATION that a method a browser cannot
+    # issue cross-site without a preflight carried this call; the engine-side verb
+    # refuses a mutating op that arrives stamped. A read carries the stamp too - the
+    # stamp describes the METHOD, not the op, and an unstamped call is the one shape
+    # the verb cannot reason about.
+    assert engine.calls == [(config.METHOD_TRACE,
+                             ({"op": "read", "safe_method": True},))]
     client.get(TRACE, params={"limit": 5}, headers=token_headers())
-    assert engine.calls[-1] == (config.METHOD_TRACE, ({"op": "read", "limit": 5},))
+    assert engine.calls[-1] == (config.METHOD_TRACE,
+                                ({"op": "read", "limit": 5,
+                                  "safe_method": True},))
 
 
 def test_arming_the_recorder_over_http(engine, armed_token):
@@ -244,12 +252,13 @@ def test_the_guard_route_answers_without_a_token_and_carries_its_op(engine,
     assert client.post(GUARD, json={"armed": True}).status_code == 200
     assert engine.calls == [(config.METHOD_GUARD, ({"armed": True},))]
     client.get(GUARD, headers=token_headers())
-    assert engine.calls[-1] == (config.METHOD_GUARD, ({"op": "status"},))
+    assert engine.calls[-1] == (config.METHOD_GUARD,
+                                ({"op": "status", "safe_method": True},))
 
 
 def test_the_lookup_ledger_route_answers_like_the_trace_ring(engine, armed_token):
-    """No token in any shape, the arm included: what stands in front of this door
-    is the peer address, and nothing else."""
+    """No token in any shape, the arm included: what stands in front of this door is
+    the enable switch, and nothing else."""
     client = client_for(build_app(FakeAsyncLLM(engine)))
     assert client.get(LOOKUPS).status_code == 200
     assert client.post(LOOKUPS, json={"op": "arm"}).status_code == 200
@@ -260,11 +269,14 @@ def test_a_lookup_read_defaults_to_read_and_a_verdict_travels_as_an_op(engine,
                                                                        armed_token):
     client = client_for(build_app(FakeAsyncLLM(engine)))
     client.get(LOOKUPS, headers=token_headers())
-    assert engine.calls == [(config.METHOD_LOOKUPS, ({"op": "read"},))]
+    # The `safe_method` stamp, for the reason spelled out in the trace read test.
+    assert engine.calls == [(config.METHOD_LOOKUPS,
+                             ({"op": "read", "safe_method": True},))]
     client.get(LOOKUPS, params={"op": "verdict", "limit": 8},
                headers=token_headers())
     assert engine.calls[-1] == (config.METHOD_LOOKUPS,
-                                ({"op": "verdict", "limit": 8},))
+                                ({"op": "verdict", "limit": 8,
+                                  "safe_method": True},))
 
 
 def test_arming_the_ledger_over_http_reaches_the_ledger_verb_method(engine,
@@ -340,13 +352,11 @@ def test_a_guard_argument_outside_its_bounds_is_refused(engine, armed_token, bod
     assert fragment in response.json()["detail"]
 
 
-def test_an_allowlisted_peer_reaches_every_new_verb_with_no_token(engine,
-                                                                  monkeypatch):
-    """What 0.2.68 buys, on the peers the box actually has: the proxy's address, no
-    header anywhere, and the whole dev surface answering - the six dev-state verbs
-    (trace, guard here; the rest in test_routes.py) plus the read verbs added with
-    the allowlist."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
+def test_the_proxy_peer_reaches_every_new_verb_with_no_token(engine, monkeypatch):
+    """What 0.2.68 bought and 0.2.72 made unconditional, on the peer the box actually
+    has: the proxy's address, no header anywhere, and the whole dev surface answering
+    - the six dev-state verbs (trace, guard here; the rest in test_routes.py) plus the
+    read verbs added with the allowlist that is now gone."""
     monkeypatch.delenv(config.ENV_TOKEN, raising=False)
     client = client_for(build_app(FakeAsyncLLM(engine)), PROXY)
     for path, method in ((KVCONFIG, "get"), (BLOCK, "get"), (BLOCK, "post"),
@@ -355,19 +365,28 @@ def test_an_allowlisted_peer_reaches_every_new_verb_with_no_token(engine,
         assert response.status_code == 200, (method, path, response.text)
 
 
-def test_a_peer_off_the_allowlist_is_refused_for_every_new_verb(engine,
-                                                                monkeypatch):
-    """The gate that stays, on the same six verbs: an address that is not on the
-    list is refused while holding the dead token, on PEER grounds, and the engine is
-    never touched."""
-    monkeypatch.setenv(config.ENV_ALLOW, "192.168.2.64/32")
+def test_a_stranger_reaches_every_new_verb_because_nothing_filters_it(engine,
+                                                                     monkeypatch):
+    """The other side of the same six verbs, and the sentence that used to read the
+    opposite way: an address nobody recognised is SERVED while holding the dead
+    token, and the engine is touched, because there is no address check left to
+    refuse it.
+
+    This test is the removal made visible at the verbs that can move engine state -
+    `POST /guard {"armed":true}` and `POST /trace` are not reads. It exists so that
+    anyone reintroducing a peer check has to delete it first, and so that the reason
+    these verbs are still survivable is read rather than assumed: the arms are
+    per-boot, they refuse a method a browser may issue without a preflight, and the
+    engine refuses them again on `safe_method`.
+    """
     monkeypatch.setenv(config.ENV_TOKEN, "tk")
+    monkeypatch.setenv(config.ENV_ALLOW_RETIRED, "192.168.2.64/32")
     client = client_for(build_app(FakeAsyncLLM(engine)), ("198.51.100.9", 1))
     for path, method in ((KVCONFIG, "get"), (BLOCK, "get"), (BLOCK, "post"),
                          (REQUEST, "post"), (TRACE, "get"), (GUARD, "post")):
         response = client.request(method, path, headers=token_headers("tk"))
-        assert_refused_on_peer_grounds(response, "198.51.100.9")
-    assert engine.calls == []
+        assert response.status_code == 200, (method, path, response.text)
+    assert engine.calls, "nothing on this surface refuses a peer any more"
 
 
 # --- status: what this process has learned ----------------------------------
@@ -404,15 +423,15 @@ def test_a_verb_that_changes_state_updates_the_mirror_immediately(engine,
     """The operator who just armed guard mode must see it on the very next
     `/status`, without the status route having to ask the engine anything.
 
-    A REFUSED call must still teach it nothing, so the first half asks from a peer
-    the gate does keep out: an unallowlisted address, holding the dead token.
+    A call that never reached the engine must still teach it nothing, so the first
+    half asks for a REFUSED shape instead of a refused peer - a mutating op carried
+    by GET, which is the one thing this surface still refuses on the request itself.
     """
     engine.result = {"version": 1, "guard_mode": True, "epoch": "boot-1"}
     stranger = client_for(build_app(FakeAsyncLLM(engine)), ("198.51.100.9", 1))
-    assert_refused_on_peer_grounds(
-        stranger.post(GUARD, json={"armed": True}), "198.51.100.9")
+    assert stranger.get(GUARD, params={"armed": "true"}).status_code == 405
     client = client_for(build_app(FakeAsyncLLM(engine)))
-    assert client.get(STATUS).json()["guard_mode"] is None   # a 403 taught it nothing
+    assert client.get(STATUS).json()["guard_mode"] is None   # a 405 taught it nothing
     response = client.post(GUARD, json={"armed": True}, headers=token_headers())
     assert response.status_code == 200
     status = client.get(STATUS).json()

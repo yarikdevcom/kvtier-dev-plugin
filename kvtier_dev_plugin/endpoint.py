@@ -30,8 +30,9 @@ it):
 [dev-state] marks the members of `config.DEV_STATE_ROUTES`: they can change engine
 dev state, so `status` lists them as such and the engine-side verbs behind them are
 arm-gated. SINCE 0.2.68 THE MARK IS NOT A GATE: no route on this surface asks for a
-token in any shape, and the ONLY gate on every one of them is the peer rule in (b)
-of the security notes below.
+token in any shape, and since 0.2.72 none filters the peer by address either. What
+the mark means now is "there is a state change behind this door", which is why the
+safe-method rule in `route_policy.py` covers every one of them.
 
 GET takes its arguments from query parameters, POST from a JSON object body.
 Both are validated against the SAME per-route spec (`ARG_SPECS`) before anything
@@ -68,42 +69,51 @@ SURFACE IS NOT COVERED BY vLLM's `--api-key`: a request to /plugins/kvtier/* tha
 carries the engine's API key is no more trusted than one that carries nothing, and
 an operator who protects /v1 with a key has NOT protected this surface.
 
-Since 0.2.68 there is exactly ONE gate here, and it is the peer address:
+THERE IS ONE GATE, AND IT IS AN OPT-IN, NOT AN ACCESS CONTROL. `config.enabled()`
+(`VLLM_E2_TIER_DEV`) is the only thing `guard_route` asks. If it is off, every route
+answers 503 and the surface does not exist. If it is on, EVERY ROUTE HERE ANSWERS
+EVERY CLIENT THAT CAN REACH THE PORT - over the LAN, over whatever the port is
+routed to, authenticated by nothing.
 
-  (a) everything is under /plugins/kvtier, never /v1/*;
-  (b) EVERY request is refused unless the ASGI peer address is loopback OR is
-      contained in VLLM_E2_TIER_DEV_ALLOW (a comma-separated list of addresses
-      or CIDRs; UNSET/EMPTY = LOOPBACK ONLY, the fail-closed default). The
-      check reads `scope["client"]` and nothing else - never X-Forwarded-For,
-      never X-Real-IP. A forged header grants nothing (see
-      tests/test_routes.py::test_spoofed_forwarded_for_from_remote_peer_is_403).
-      Caveat for the operator: do not put uvicorn's proxy-headers middleware in
-      front of this, because that middleware REWRITES scope["client"] from
-      X-Forwarded-For and would hand the forgeability back.
-  (c) THERE IS NO SECOND GATE. Until 0.2.68 a bearer token (the environment
-      variable VLLM_E2_TIER_DEV_TOKEN, checked with a constant-time digest
-      comparison) was
-      required of every mutating verb, of every non-loopback read, and of every
-      shape of the six DEV_STATE_ROUTES - loopback included, so even a plain
-      `GET /trace` needed it. That requirement is removed by the operator's
-      decision: it made the surface painful to drive from the proxy and from
-      scripts, and the engine is to be access-controlled later by other means.
-      The variable is now READ FOR REPORTING ONLY (`status` publishes it and says
-      it gates nothing) and the boot WARNS once if it is set, so it cannot rot
-      into a knob that looks like a control while doing nothing. The peer
-      allowlist is therefore the WHOLE gate, and VLLM_E2_TIER_DEV_ALLOW must be
-      kept as narrow as the trust that actually exists: with the token gone, an
-      address on that list can arm guard mode, arm the spill tier, reload the
-      policy and read parked KV bytes. The transport is plaintext HTTP either way.
-  (d) the mutating verbs cannot name a file, a method or a module. The engine
-      reloads the single file this package owns, and the HTTP layer separately
-      validates any `path` the caller sends so it can only ever be that file.
-      Which engine method a route reaches is fixed per route and never comes from
-      the wire: `getattr(self, method_name)` on the EngineCore would otherwise be
-      an arbitrary-method-call primitive handed to whoever can reach the port -
-      which, since 0.2.68, is anyone on the allowlist. That is why the argument
-      specs (`ARG_SPECS`) and the `safe_method` wall are now the heaviest security
-      properties on this surface: besides the peer address, they are all of it.
+  (a) everything is under /plugins/kvtier, never /v1/*, so an operator who puts an
+      authenticating proxy in front of the engine can deny this prefix explicitly
+      and see that they did;
+  (b) THE PEER-ADDRESS CHECK IS GONE (0.2.72), and it is gone because it was not a
+      security control. It accepted a peer whose socket peer was loopback, or whose
+      address was on `VLLM_E2_TIER_DEV_ALLOW`. A local proxy IS the loopback peer: a
+      fronting proxy (llama-swap's `/upstream/` path, nginx on the same host, a
+      sidecar) republishes these routes to whoever it faces, and the check sees the
+      proxy and serves the client behind it. The variable is RETIRED and read by
+      nothing; it is named in `status` and in the boot log so an operator still
+      exporting it is told it opens no door. Headers are still consulted by nothing
+      here - not because a header check was replaced by a better one, but because
+      nothing here decides anything from who you claim to be.
+  (c) THERE WAS A SECOND GATE AND IT IS GONE TOO. Until 0.2.68 a bearer token (the
+      environment variable VLLM_E2_TIER_DEV_TOKEN, checked with a constant-time
+      digest comparison) was required of every mutating verb, of every non-loopback
+      read, and of every shape of the six DEV_STATE_ROUTES - loopback included, so
+      even a plain `GET /trace` needed it. Removed by the operator's decision: it
+      made the surface painful to drive from the proxy and from scripts. The variable
+      is READ FOR REPORTING ONLY (`status` publishes it and says it gates nothing)
+      and the boot WARNS once if it is set, so it cannot rot into a knob that looks
+      like a control while doing nothing. The same treatment now covers the retired
+      allowlist.
+  (d) WHAT ACTUALLY LIMITS THE DAMAGE, and none of it is secrecy: the operator
+      opted in by name, and network-level protection - binding the port, a firewall,
+      or an authenticating proxy that denies /plugins/* - is the operator's job and
+      is NOT provided here. Behind that: no state-changing op runs from a method a
+      browser may issue without a preflight (`route_policy.py`: the route answers 405
+      and the engine-side verb refuses again on `safe_method`), each facility keeps
+      its own arm (guard mode, the byte dump, the spill tier, the two disk switches),
+      the mutating verbs cannot name a file, a method or a module - the engine
+      reloads the single file this package owns and the HTTP layer validates any
+      `path` so it can only ever be that file - and which engine method a route
+      reaches is fixed per route and never comes from the wire
+      (`getattr(self, method_name)` on the EngineCore would otherwise be an
+      arbitrary-method-call primitive handed to whoever can reach the port). The
+      argument specs (`ARG_SPECS`) and the `safe_method` wall are therefore the
+      heaviest properties on this surface: besides the operator's own network
+      posture, they are all of it.
 
 GUARD MODE IS A DEVELOPMENT FACILITY. `POST /plugins/kvtier/guard {"armed":
 true}` makes the tier's entry points turn an exception into a record plus a safe
@@ -126,7 +136,6 @@ InvalidStateError (core_client.py:847-865).
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import time
@@ -134,142 +143,89 @@ import time
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import config, loaded_version
+from . import config, loaded_version, route_policy
 
 logger = logging.getLogger("kvtier_dev_plugin.endpoint")
 
 TOKEN_HEADER = "x-kvtier-dev-token"  # noqa: S105 - a header NAME, not a secret
 STATE_KEY = "kvtier_dev"
 
+# WHEN THE PEER GATE DIED, written once so the boot line, `/status` and the docs
+# cannot each invent their own date for it.
+PEER_GATE_REMOVED_IN = "0.2.72"
+
 router = APIRouter(prefix=config.ROUTE_PREFIX, tags=["kvtier-dev"])
 
-
-class GuardDenied(Exception):
-    """A guard refused the request. Carries the HTTP status to answer with."""
-
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
-
-
-# --- guards (framework-free: they take a scope / a header mapping) ---------
-
-def loopback_denial(scope) -> str | None:
-    """None if the peer is loopback, else the reason it is not.
-
-    Reads ONLY the ASGI scope's client address, which is the peer of the TCP
-    connection. Request headers are never consulted here: an attacker who can
-    set X-Forwarded-For can set it to 127.0.0.1.
-    """
-    client = scope.get("client") if isinstance(scope, dict) else None
-    if not isinstance(client, (tuple, list)) or not client or client[0] is None:
-        # No peer address (a unix socket, or a non-standard ASGI server): we
-        # cannot prove loopback, so we do not serve.
-        return "ASGI scope carries no client address, cannot prove loopback"
-    raw = str(client[0])
-    try:
-        address = ipaddress.ip_address(raw)
-    except ValueError:
-        return f"peer address {raw!r} is not a parseable IP address"
-    # A dual-stack listener reports an IPv4 peer as ::ffff:a.b.c.d. Unwrap it
-    # so 127.0.0.1 over IPv6 still counts as loopback, independent of the
-    # ipaddress version's treatment of mapped addresses.
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        address = mapped
-    if not address.is_loopback:
-        return f"peer {address} is not loopback"
-    return None
-
-
-def require_loopback(scope) -> None:
-    denial = loopback_denial(scope)
-    if denial is not None:
-        raise GuardDenied(403, denial)
-
-
-def _peer_address_unwrapped(scope):
-    """The peer's IP with the IPv4-mapped form unwrapped, or None if absent or
-    unparseable. Same unwrap rule as loopback_denial(), so the allowlist and
-    the loopback test can never disagree about who the peer is.
-    """
-    client = scope.get("client") if isinstance(scope, dict) else None
-    if not isinstance(client, (tuple, list)) or not client or client[0] is None:
-        return None
-    try:
-        address = ipaddress.ip_address(str(client[0]))
-    except ValueError:
-        return None
-    mapped = getattr(address, "ipv4_mapped", None)
-    return address if mapped is None else mapped
-
-
-def peer_denial(scope) -> str | None:
-    """None if this peer may reach these routes at all, else the why-not.
-
-    Loopback is accepted unconditionally (the pre-allowlist behaviour). Anyone
-    else is accepted only if contained in one of config.allow_networks(); an
-    empty allowlist therefore means loopback-only, and a malformed entry admits
-    nobody. Headers are never consulted here either: like loopback_denial(),
-    this reads the socket peer and nothing a client can type.
-    """
-    not_loopback = loopback_denial(scope)
-    if not_loopback is None:
-        return None
-    address = _peer_address_unwrapped(scope)
-    if address is not None:
-        # A v4 address is never `in` a v6 network and vice versa (ipaddress
-        # returns False rather than raising), so no version guard is needed.
-        for network in config.allow_networks():
-            if address in network:
-                return None
-    # Name the variable, never its contents: a refused peer learns nothing it
-    # did not already have (tests/test_routes.py::test_remote_peer_gets_no_*).
-    return (f"{not_loopback}, and it is not in the {config.ENV_ALLOW} "
-            "allowlist")
-
-
-def require_peer(scope) -> None:
-    denial = peer_denial(scope)
-    if denial is not None:
-        raise GuardDenied(403, denial)
+# WHAT THE 503 SAYS, and why it says it. A route that answers 503 is a surface that
+# is OFF, and the sentence an operator reads at that moment is the one place the
+# cost of turning it on can be stated before they turn it on. It is not a threat and
+# it is not prose padding: every clause is a fact about this deployment (the engine
+# binds 0.0.0.0, `--api-key` does not cover /plugins/*, there is no address filter
+# and no token), and the operator who reads it and decides they want it anyway should
+# be the one deciding, not an operator who discovered it from a request that worked.
+INERT_DETAIL = (
+    f"inert: {config.ENV_ENABLE} is not enabled. Turning it on opens "
+    f"{config.ROUTE_PREFIX}/* to EVERY client that can reach this engine's port: "
+    "there is no token, no peer-address filter and no allowlist on this surface, and "
+    "vLLM's --api-key does not cover /plugins/* (it covers /v1, /v2, /inference and "
+    "/cohere only). State-changing verbs refuse a method a browser may issue without "
+    "a preflight, and each facility keeps its own arm, but the exposure control here "
+    "is NETWORK-LEVEL AND IS THE OPERATOR'S JOB: bind the port, firewall it, or deny "
+    f"{config.ROUTE_PREFIX}/* at an authenticating proxy. Set {config.ENV_ENABLE} "
+    "only if that is what you mean.")
 
 
 def guard_route(request: Request) -> None:
-    """THE gate for the whole /plugins/kvtier surface: peer, then enabled.
+    """THE gate for the whole /plugins/kvtier surface: the operator's opt-in. One
+    question, one answer, and no pretence about what the answer means.
 
-    Since 0.2.68 there is nothing third. There used to be a bearer token
-    (`require_bearer`, and the three helpers built on it:
-    `require_mutating_token`, `require_dev_state_token`,
-    `require_token_for_remote_read`) and it was asked in three different shapes -
-    always of the mutating verb, always of the six dev-state routes, and of reads
-    from any non-loopback peer. All four are DELETED rather than left unreachable:
+    `config.enabled()` is the ONLY gate, and it is an opt-in rather than an access
+    control: off, this surface does not exist; on, it answers whoever can reach the
+    port. There is deliberately nothing else here to add back.
+
+    WHAT USED TO STAND HERE, and why it is deleted rather than left unreachable.
+    Until 0.2.68 a bearer token was asked in three shapes (`require_bearer` and the
+    three helpers built on it: `require_mutating_token`, `require_dev_state_token`,
+    `require_token_for_remote_read`); until 0.2.72 the peer address was checked
+    against loopback or `VLLM_E2_TIER_DEV_ALLOW` (`require_peer`, `peer_denial`,
+    `loopback_denial`, `require_loopback`, `_peer_address_unwrapped` and the
+    `GuardDenied` they raised). Both sets are gone from the product, not gated off:
     a helper nobody calls misdescribes this surface exactly as surely as a variable
-    nobody reads would (`tests/test_guards.py::test_the_token_guards_are_gone_*`
-    fails if one comes back). `VLLM_E2_TIER_DEV_TOKEN` is now read only to be
-    REPORTED - in `status_payload` and in the boot warning in
-    `KVTierDevEndpointPlugin.attach_router` - so it cannot rot into a knob that
-    looks like a control while doing nothing.
+    nobody reads would (`tests/test_guards.py` fails if either family comes back).
+    The peer check was not a control - a local proxy IS the loopback peer, so the
+    ordinary way this engine is fronted walked straight through it, which is worse
+    than having no check because it produced false assurance.
 
-    What has NOT moved is the peer gate: `peer_denial()` and
-    `config.allow_networks()` are untouched and stay fail-closed - loopback only
-    when `VLLM_E2_TIER_DEV_ALLOW` is unset, empty or garbage. The gate got thinner,
-    not absent, and the allowlist is now the whole of it: keeping that list narrow
-    is the operator's remaining job on this surface.
-
-    It raises `HTTPException` itself - converting the framework-free `GuardDenied`
-    at the one place the two shapes meet - so no route can forget the conversion and
-    answer 500 for a peer the guard refused.
+    Neither `request.headers` nor `scope["client"]` decides anything on this path.
+    `route_reload_policy` LOGS the scope's client address for audit; a log line is
+    not a gate, and the structural test that keeps headers out of the decision
+    (`test_the_gate_reads_no_address_and_no_headers_source_level`) is the guard
+    against someone re-deriving an identity from either.
     """
-    try:
-        require_peer(request.scope)
-    except GuardDenied as denied:
-        raise HTTPException(status_code=denied.status_code,
-                            detail=denied.detail) from None
     if not config.enabled():
-        raise HTTPException(status_code=503,
-                            detail=f"inert: {config.ENV_ENABLE} is not enabled")
+        raise HTTPException(status_code=503, detail=INERT_DETAIL)
+
+
+def refuse_mutating_get(route: str, args: dict) -> None:
+    """405 if these arguments ask a safe method to change state. Answers BEFORE the
+    engine is touched; every GET handler on a state-changing route calls it.
+
+    WHY THE ROUTE ANSWERS AT ALL, when the engine-side verb refuses too: the verb's
+    refusal arrives as a 200 with `ok: false` inside the payload (that is how the
+    utility channel works - a refusal is data, not an exception), so a page load that
+    armed nothing would still look like a call that went through. A 405 out here is
+    the shape an operator, a proxy log and a browser can all act on. The engine-side
+    `route_policy.safe_method_refusal` behind it is not redundant: it is what stops a
+    future HTTP bug from landing the mutation, and the pair is the reason neither
+    layer has to be correct on its own.
+
+    The check runs on the arguments as they arrived, so an `op` the route would have
+    defaulted (a bare GET, which is a read) is judged as the read it is.
+    """
+    label = route_policy.mutating_op(route, args)
+    if label is not None:
+        raise HTTPException(status_code=405,
+                            detail=route_policy.refusal_detail(route, label))
 
 
 # --- engine hop -------------------------------------------------------------
@@ -665,13 +621,14 @@ async def post_arguments(request: Request, route: str) -> dict:
         rule that silently picks a winner: silent precedence is a smaller version of
         the bug being fixed;
       * the SAFE-method route is untouched. A mutating `op` still cannot run from a
-        method a browser may issue without a preflight (`route_disk`'s 405 and the
-        engine-side `safe_method` refusal are the two guards), and the guard is
-        method-independent, so a query-string `op` is exactly as authorised as a
-        body `op`. Since 0.2.68 that word carries the whole weight: with the token
-        gone, "this peer is allowed" is the entire authentication on both methods -
-        which is exactly why the safe-method half stays POST-only discipline that
-        no token ever covered.
+        method a browser may issue without a preflight (`route_policy.refusal_detail`
+        at the route and the engine-side `safe_method` refusal behind it are the two
+        guards), and the guard is method-independent, so a query-string `op` is
+        exactly as authorised as a body `op`. That wall carries MORE weight than it
+        used to: with the token gone (0.2.68) and the peer check gone (0.2.72) there
+        is no identity behind either method to be trusted with, so "this arrived on a
+        method that required a preflight" is one of the few real signals left, and it
+        is the same on both methods by design.
     """
     body = await body_arguments(request, route)
     query = query_arguments(request, route)
@@ -829,7 +786,6 @@ def status_payload(dev_state: dict | None = None) -> dict:
         target = str(config.canonical_policy_path())
         loadable = False
         refusal = str(exc)
-    allowed = config.allow_networks()
     mirrored = dev_state if isinstance(dev_state, dict) else {
         "guard_mode": None, "trace_armed": None, "lookup_ledger_armed": None,
         "blockdump_armed": None, "note": DEV_STATE_UNKNOWN_NOTE}
@@ -862,27 +818,81 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # NOT get to keep is the implication: `token_gating` is false, `token_note`
         # says so and names the release, and both this note and `guard` say the thing
         # a reader most needs to know - these routes are not covered by vLLM's
-        # --api-key, so the allowlist is not a second line of defence, it is the only
-        # one. Nothing here is read for access control any more.
+        # --api-key, and since 0.2.72 there is no address filter either, so there is
+        # no second line and no first one. Nothing here is read for access control.
         "token_gating": False,
         "token_header": TOKEN_HEADER,
         "token_note": (f"{config.ENV_TOKEN} no longer gates anything, since 0.2.68. "
-                       "It is read only to be reported here. The peer allowlist "
-                       f"({config.ENV_ALLOW}, with loopback always admitted) is the "
-                       f"ONLY gate on {config.ROUTE_PREFIX}: a value set in "
-                       f"{config.ENV_TOKEN} is ignored, and so is any "
-                       f"{TOKEN_HEADER} header. These routes are NOT covered by "
-                       "vLLM's --api-key, which covers /v1, /v2, /inference and "
-                       "/cohere only. Unset the variable to stop the boot warning."),
+                       "It is read only to be reported here. There is no gate on "
+                       f"{config.ROUTE_PREFIX} but {config.ENV_ENABLE}: a value set "
+                       f"in {config.ENV_TOKEN} is ignored, and so is any "
+                       f"{TOKEN_HEADER} header. The peer allowlist that used to be "
+                       "named here as the whole gate is retired too (0.2.72) - see "
+                       "`exposure`. These routes are NOT covered by vLLM's "
+                       "--api-key, which covers /v1, /v2, /inference and /cohere "
+                       "only. Unset the variable to stop the boot warning."),
         "timeout_seconds": config.timeout_seconds(),
         "timeout_env": config.ENV_TIMEOUT,
         "policy_target": {"path": target, "loadable": loadable, "refusal": refusal},
-        # What an operator can actually reach from. `allow_networks` is the
-        # PARSED list (a dropped entry is absent, which is how a typo shows up
-        # here), and `loopback_only` is the whole answer to "is this open?".
-        "allow_env": config.ENV_ALLOW,
-        "allow_networks": [str(network) for network in allowed],
-        "loopback_only": not allowed,
+        # THE REAL POSTURE OF THIS SURFACE (0.2.72). `allow_env`, `allow_networks`
+        # and `loopback_only` used to answer "who can reach this?" and every one of
+        # them is now a lie by implication: the peer-address check they described is
+        # DELETED, because an address is not a credential - a local proxy is itself
+        # the loopback peer, so the ordinary way this engine is fronted walked through
+        # the check while it reported itself as working. Two keys keep the literal
+        # meaning of the old pair (`allow_env`: which variable; `allow_env_gates`
+        # whether it does anything) and the retired list is reported as the dead knob
+        # it is rather than deleted from the vocabulary. The two keys that could only
+        # ever describe the removed mechanism (`allow_networks`, `loopback_only`) are
+        # GONE rather than answered falsely: a truthful `false` is what a reader of
+        # `peers_filtered_by_address` gets now.
+        "allow_env": config.ENV_ALLOW_RETIRED,
+        "allow_env_gates": False,
+        "allow_list_configured": config.allow_list_configured(),
+        "peer_gate": {
+            "removed": True,
+            "since": PEER_GATE_REMOVED_IN,
+            "peers_filtered_by_address": False,
+            "headers_grant_access": False,
+            "replaced_by": (f"{config.ENV_ENABLE} is the only gate, and it is an "
+                            "opt-in rather than an access control: when it is on, "
+                            "every route here answers every client that can reach "
+                            "this engine's port"),
+            "still_enforced": ("no state-changing op runs from a method a browser may "
+                               "issue without a preflight (route_policy: 405 at the "
+                               "route, refused again engine-side); argument specs fix "
+                               "which engine method a route may call; each facility "
+                               "keeps its own arm"),
+            "operators_job": ("network-level protection. Bind the port, firewall it, "
+                              "or deny /plugins/* at an authenticating proxy. This "
+                              "plugin does not and cannot provide it, and vLLM's "
+                              "--api-key does not cover /plugins/*"),
+            "note": ("the peer check was removed because it was not a control: it "
+                     "accepted the loopback peer, and a local proxy IS the loopback "
+                     "peer, so a fronting proxy republished these routes to its own "
+                     "clients while the check saw a permitted address. A gate that "
+                     "cannot fail is worse than no gate: it produces assurance."),
+        },
+        # THE SENTENCE, AS ITS OWN KEY. `token_note` points here by name, so it must
+        # exist: a payload that cites a key it does not publish is the same class of
+        # lie as a boot line that names an environment variable nobody set. A reader
+        # asking "what am I open to?" should not have to assemble it from three
+        # booleans and someone else's note.
+        "exposure": (f"{config.ENV_ENABLE} is the only gate on {config.ROUTE_PREFIX}/*. "
+                     "Enabling it opens these routes to EVERY client that can reach "
+                     "this engine's port, unauthenticated: no token, no address "
+                     "filter, no header. vLLM's --api-key does NOT cover /plugins/*. "
+                     "Network-level protection - port binding, firewall, or denying "
+                     f"{config.ROUTE_PREFIX}/* at an authenticating proxy - is the "
+                     "operator's job and is not provided here."),
+        # THE SAFE-METHOD MATRIX: the state-changing ops that will NOT run from a GET
+        # on each route, read from `route_policy` so this cannot drift from the rule.
+        # Publishing it is the point of the block: an operator asking "what can a page
+        # load do to me?" should get the answer from the surface, not from source.
+        "mutating_ops_refused_on_get": {
+            route.lstrip("/"): list(route_policy.mutating_ops(route))
+            for route in config.ROUTES if route_policy.mutating_ops(route)
+        },
         # 0.2.68: this used to be `True`, and it was the whole shape of the old
         # second gate. The key STAYS with its value flipped rather than being deleted,
         # so a reader finds a truthful `false` instead of a missing key.
@@ -890,13 +900,19 @@ def status_payload(dev_state: dict | None = None) -> dict:
         # The sentence this payload exists to make impossible to miss: protecting
         # /v1 with vLLM's --api-key protects NOTHING on this surface.
         "vllm_api_key_covers_these_routes": False,
-        "guard": "ASGI scope['client'] must be a loopback IP or be contained "
-                 "in VLLM_E2_TIER_DEV_ALLOW; forwarded headers are ignored. This is "
-                 "the ONLY gate: since 0.2.68 there is no token on any route here, "
-                 "and vLLM's --api-key does NOT cover /plugins/* (it covers /v1, /v2, "
-                 "/inference and /cohere), so a peer on the allowlist reaches this "
-                 "surface unauthenticated - keep the list as narrow as the trust "
-                 "that actually exists.",
+        "guard": (f"{config.ENV_ENABLE} is the ONLY gate on this surface, and it is "
+                  "an opt-in, not an access control: when it is set, every route "
+                  "under " + config.ROUTE_PREFIX + " answers every client that can "
+                  "reach this port, unauthenticated. The peer-address check "
+                  f"(loopback or {config.ENV_ALLOW_RETIRED}) was removed in "
+                  f"{PEER_GATE_REMOVED_IN} because a local proxy IS the loopback "
+                  "peer, so it could not fail; no header grants anything and no "
+                  f"address is filtered. There is no token since 0.2.68, and vLLM's "
+                  "--api-key does NOT cover /plugins/* (it covers /v1, /v2, "
+                  "/inference and /cohere), so this surface is open to every peer the "
+                  "network reaches - network-level protection is the operator's job. "
+                  "What is enforced: state-changing ops refuse a method a browser may "
+                  "issue without a preflight, and the engine refuses them again."),
         # GUARD MODE, up top and impossible to miss, and the trace ring beside
         # it. `null` here means THIS API PROCESS HAS NEVER SEEN AN ENGINE ANSWER
         # - never "off": status makes no engine call, so it cannot know, and a
@@ -1188,15 +1204,19 @@ async def route_request_post(request: Request):
 
 @router.get(config.ROUTE_TRACE)
 async def route_trace(request: Request):
-    """The trace ring's newest events.
+    """The trace ring's newest events, and NOTHING that changes state.
 
-    Answered without a token since 0.2.68, the read included - the same door arms
-    the recorder, and what stands in front of that door is the peer address.
+    A mutating `op` here (`arm`, `disarm`, `clear`) is a 405 that names the POST
+    route: a browser issues a GET with no preflight and no custom header, and the
+    `op` is a query parameter, so without this rule the URL that installs observers
+    on a live scheduler would be a link a page could load. The engine-side verb
+    refuses the same request again on `safe_method`.
     """
     guard_route(request)
-    raw = query_arguments(request, config.ROUTE_TRACE)
-    args = dict(raw)
+    args = dict(query_arguments(request, config.ROUTE_TRACE))
+    refuse_mutating_get(config.ROUTE_TRACE, args)
     args.setdefault("op", "read")
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_TRACE, args,
                                      source="trace read"))
 
@@ -1217,10 +1237,18 @@ async def route_trace_post(request: Request):
 
 @router.get(config.ROUTE_GUARD)
 async def route_guard(request: Request):
-    """Guard-mode state and its error histogram. No token, as for /trace."""
+    """Guard-mode state and its error histogram.
+
+    `arm`/`disarm` - and the `armed` argument, which is guard mode's ergonomic
+    spelling of them - are refused here with a 405 naming the POST route. Guard mode
+    masks real bugs, so the fact that `GET /guard?armed=true` used to flip it on is
+    exactly the kind of thing a page load must never be able to do to a live engine.
+    """
     guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_GUARD))
+    refuse_mutating_get(config.ROUTE_GUARD, args)
     args.setdefault("op", "status")
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_GUARD, args,
                                      source="guard status"))
 
@@ -1246,14 +1274,19 @@ async def route_guard_post(request: Request):
 
 @router.get(config.ROUTE_TIER)
 async def route_tier(request: Request):
-    """KV-tier state: is the PR #56810 fix live, and is the tier armed? The same
-    door arms AND disarms the connector, and since 0.2.68 the peer rule is all that
-    gates it. With no `op`
-    this is `op=status`: it installs the fix against the live manager and reports
-    `armed: false` - arming is a separate, deliberate act (see the runbook)."""
+    """KV-tier state: is the PR #56810 fix live, and is the tier armed?
+
+    `op=arm` and `op=disarm` are refused here with a 405 naming the POST route - the
+    tier's kill switch is one query parameter wide, and a state change must not be
+    reachable on a method a browser issues without asking. With no `op` this is
+    `op=status`: it installs the fix against the live manager and reports
+    `armed: false` - arming is a separate, deliberate act, POST-only (see the
+    runbook)."""
     guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_TIER))
+    refuse_mutating_get(config.ROUTE_TIER, args)
     args.setdefault("op", "status")
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_TIER, args,
                                      source="tier status"))
 
@@ -1302,11 +1335,17 @@ async def route_tier_post(request: Request):
 
 @router.get(config.ROUTE_LOOKUPS)
 async def route_lookups(request: Request):
-    """The lookup/adopt ledger's newest records. No token even for this
-    read, as for `/trace`: the same door arms the recorder."""
+    """The lookup/adopt ledger's newest records.
+
+    `arm`, `disarm` and `clear` are refused here with a 405 naming the POST route:
+    `arm` installs wrappers over the tier's own entry points, which is not something a
+    request without a preflight should be able to do.
+    """
     guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_LOOKUPS))
+    refuse_mutating_get(config.ROUTE_LOOKUPS, args)
     args.setdefault("op", "read")
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_LOOKUPS, args,
                                      source="lookup ledger read"))
 
@@ -1340,11 +1379,19 @@ async def route_lookups_post(request: Request):
 
 @router.get(config.ROUTE_BLOCKDUMP)
 async def route_blockdump(request: Request):
-    """The raw-byte dump's capability state. Answered even for this read without
-    as for `/trace` and `/guard`: the same door ARMS the facility."""
+    """The raw-byte dump's capability state.
+
+    `arm`, `disarm` AND `dump` are refused here with a 405 naming the POST route.
+    `dump` is included with the arming verbs deliberately: it writes the pending
+    request file that every worker picks up, which makes four processes read parked KV
+    bytes and write response files. A read that writes files and charges a rate
+    window is not a read a page load should be able to ask for.
+    """
     guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_BLOCKDUMP))
+    refuse_mutating_get(config.ROUTE_BLOCKDUMP, args)
     args.setdefault("op", "status")
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_BLOCKDUMP, args,
                                      source="blockdump status"))
 
@@ -1359,9 +1406,9 @@ async def route_blockdump_post(request: Request):
     so the payload is bytes - which is exactly why this route is shaped the way it
     is:
 
-      * PEER-GATED like `/guard`, and since 0.2.68 NOTHING else: the peer address is
-        the whole gate, which is why the bounds below (not a token) are what keep
-        this verb from reading the host dry.
+      * OPEN LIKE EVERY OTHER ROUTE HERE (the only gate is `VLLM_E2_TIER_DEV`), which
+        is why the bounds below - not a token, not an address - are what keep this
+        verb from reading the host dry.
       * DISARMED at every boot, no env var that arms it, and an arm EXPIRES
         (`seconds`, default 1800, max 7200). `op: dump` on a disarmed engine is a
         refusal that names the arm verb, never a silent no-op.
@@ -1386,8 +1433,9 @@ async def route_blockdump_post(request: Request):
 @router.get(config.ROUTE_DISK)
 async def route_disk(request: Request):
     """The SSD spill tier's state. Answered without a token, as for `/blockdump`:
-    the same door ARMS a facility that writes real KV bytes, and what gates that
-    door since 0.2.68 is the peer address alone.
+    the same door ARMS a facility that writes real KV bytes, and what gates that door
+    is the operator's opt-in alone - there is no token and, since 0.2.72, no peer
+    filter either.
 
     READ-ONLY BY CONSTRUCTION. The `op` is a QUERY PARAMETER here, so the URL that
     arms the tier is as short as the URL that reads its status - and a browser
@@ -1400,24 +1448,20 @@ async def route_disk(request: Request):
     """
     guard_route(request)
     args = dict(query_arguments(request, config.ROUTE_DISK))
-    from . import disk_store  # noqa: PLC0415 - the op lists live with the verb, and
-    # this module otherwise knows only `config` (no engine-side module at import).
+    refuse_mutating_get(config.ROUTE_DISK, args)
     op = str(args.get("op") or "status").strip().lower()
-    if op in disk_store.MUTATING_DISK_OPS:
-        raise HTTPException(
-            status_code=405,
-            detail=f"op '{op}' changes state and will not run from GET; send it as "
-                   f"POST {config.ROUTE_PREFIX + config.ROUTE_DISK} "
-                   f"(this route's GET answers op=status only)")
     args.setdefault("op", "status")
     if op == "contains":
+        from . import disk_store  # noqa: PLC0415 - the key rule lives with the verb,
+        # and this module otherwise knows only `config` (no engine-side module at
+        # import).
         # The same rule as the POST: "you asked badly" is a 400 here too, never a
         # `present: false` - a GET is the form an operator reaches for when they are
         # already unsure, so it must not answer their malformed key with a "not there".
         problem = disk_store.contains_key_problem(args.get("key"))
         if problem is not None:
             raise HTTPException(status_code=400, detail=f"op=contains: {problem}")
-    args["safe_method"] = True
+    args[route_policy.SAFE_METHOD_KEY] = True
     return as_json(await engine_call(request, config.METHOD_DISK, args,
                                      source="disk spill status"))
 
@@ -1508,10 +1552,11 @@ async def route_disk_post(request: Request):
       refusal door. The fallback stays silent and cheap: the fork's own
       answer.
 
-      * PEER-GATED like `/guard` and `/blockdump`, and that is the whole gate since
-        0.2.68: this route can arm a facility that writes KV bytes to disk, so the
-        narrowness of VLLM_E2_TIER_DEV_ALLOW is what stands between a page load and
-        an armed spill tier - together with the POST-only rule below.
+      * OPEN LIKE EVERY OTHER ROUTE HERE (`VLLM_E2_TIER_DEV` is the only gate), and
+        this route can arm a facility that writes KV bytes to disk - so what stands
+        between a page load and an armed spill tier is the POST-only rule below, the
+        arm itself, and the operator's network posture. Nothing here is an
+        authenticator.
       * OFF TWICE OVER: `VLLM_E2_TIER_DISK_ROOT` must name a real filesystem (the
         tmpfs roots are refused by the layout layer), AND the tier must be ARMED.
         No env var arms it; `{"op":"arm"}` does, and since 0.2.35 an arm is a LATCH:
@@ -1595,11 +1640,12 @@ async def route_disk_post(request: Request):
 
 @router.post(config.ROUTE_RELOAD)
 async def route_reload_policy(request: Request):
-    # THE SAME ONE GATE as every other route, in the same order: prove the peer is
-    # allowed (loopback or allowlisted), then prove we are even on. Nothing is
-    # leaked to a peer that is not allowed. Until 0.2.68 a third step demanded the
-    # bearer token here - this was the ONE mutating verb the token was invented for,
-    # and the header is now inert on this route like every other.
+    # THE SAME ONE GATE as every other route: prove we are even on. There is nothing
+    # before it to check - the peer-address rule that used to run first is gone
+    # (0.2.72), as is the bearer token this route was the verb the token was invented
+    # for (0.2.68). WHAT MAKES THIS SAFE is not who is calling: the engine-side method
+    # takes no argument, so the wire never selects a file, and the path a caller
+    # sends is validated here against the one file this package owns.
     guard_route(request)
 
     body = await read_json_object(request)
@@ -1650,24 +1696,62 @@ class KVTierDevEndpointPlugin:
 
     def attach_router(self, app: FastAPI) -> None:
         app.include_router(router)
-        logger.info("kvtier-dev-plugin: routes attached under %s "
-                    "(inert until %s is set)", config.ROUTE_PREFIX,
-                    config.ENV_ENABLE)
-        # NO SILENT DEAD CONFIG (0.2.68). An operator who still exports the variable
-        # this plugin stopped reading believes they have a token in front of this
-        # surface. They do not, and silence would be the lie - so the boot that
-        # ignores it says so, once, at WARNING, naming the variable (NEVER its
-        # value), the release that stopped reading it, and the gate that replaced it.
-        # Unset means no line: the point is to be read, not to be noise.
+        # THE EXPOSURE LINE. One WARNING, at the boot that opens the surface, saying
+        # what is actually true of it: the opt-in switch is the whole gate, so every
+        # client that can reach this port can arm facilities and read parked KV bytes,
+        # and the protection that limits that is network-level and not provided here.
+        # It is a WARNING and not an INFO because a plugin logger's INFO lines never
+        # reach the log an operator greps on this box (see disk_store's logging note),
+        # and because the sentence is one an operator should read BEFORE the first
+        # request arrives rather than after. It is ONE line, not a lecture: the long
+        # form lives in `/status` (`peer_gate`) and in README's *Access model*.
+        if config.enabled():
+            logger.warning("kvtier-dev-plugin: %s is set, so %s/* is LIVE and answers "
+                           "EVERY client that can reach this engine's port - there is "
+                           "no token, no peer-address filter and no allowlist here, "
+                           "and vLLM's --api-key does not cover /plugins/* (only /v1, "
+                           "/v2, /inference, /cohere). State-changing verbs refuse a "
+                           "method a browser may issue without a preflight, and each "
+                           "facility keeps its own arm, but network-level protection "
+                           "is the OPERATOR'S JOB: bind the port, firewall it, or deny "
+                           "%s/* at an authenticating proxy. GET %s/status repeats "
+                           "this", config.ENV_ENABLE, config.ROUTE_PREFIX,
+                           config.ROUTE_PREFIX, config.ROUTE_PREFIX)
+        else:
+            logger.info("kvtier-dev-plugin: routes attached under %s "
+                        "(inert until %s is set)", config.ROUTE_PREFIX,
+                        config.ENV_ENABLE)
+        # NO SILENT DEAD CONFIG (0.2.68, extended to the allowlist in 0.2.72). An
+        # operator who still exports a variable this plugin stopped reading believes
+        # they have a control in front of this surface. They do not, and silence would
+        # be the lie - so the boot that ignores it says so, once, at WARNING, naming
+        # the variable (NEVER its value), the release that stopped reading it, and
+        # what replaced it. Unset means no line: the point is to be read, not to be
+        # noise.
         if config.token_configured():
             logger.warning("kvtier-dev-plugin: %s is SET but is no longer read by "
                            "this plugin (since 0.2.68): there is no token gate on %s "
-                           "any more, and the peer allowlist %s (loopback always "
-                           "admitted) is the ONLY gate - keep it narrow, because "
-                           "these routes are not covered by vLLM's --api-key. Unset "
-                           "%s to silence this line; GET %s/status repeats it",
-                           config.ENV_TOKEN, config.ROUTE_PREFIX, config.ENV_ALLOW,
-                           config.ENV_TOKEN, config.ROUTE_PREFIX)
+                           "any more, and since 0.2.72 no peer-address gate either - "
+                           "%s is the only gate, so anything that can reach the port "
+                           "reaches these routes, and vLLM's --api-key does not cover "
+                           "/plugins/*. Unset %s to silence this line; GET %s/status "
+                           "repeats it", config.ENV_TOKEN, config.ROUTE_PREFIX,
+                           config.ENV_ENABLE, config.ENV_TOKEN, config.ROUTE_PREFIX)
+        if config.allow_list_configured():
+            logger.warning("kvtier-dev-plugin: %s is SET but is no longer read by "
+                           "this plugin (since %s): the peer-address gate it widened "
+                           "is REMOVED, because an address is not a credential - a "
+                           "local proxy is itself the loopback peer, so the ordinary "
+                           "way this engine is fronted walked through the check while "
+                           "it reported itself as working. Nothing admits a peer by "
+                           "address any more, so this variable opens no door and "
+                           "closes none: unset it, and put the protection where it "
+                           "actually works (the port binding, a firewall, or an "
+                           "authenticating proxy that denies %s/*). Unset %s to "
+                           "silence this line; GET %s/status repeats it",
+                           config.ENV_ALLOW_RETIRED, PEER_GATE_REMOVED_IN,
+                           config.ROUTE_PREFIX, config.ENV_ALLOW_RETIRED,
+                           config.ROUTE_PREFIX)
 
     # `args` is part of the EndpointPlugin protocol; this plugin needs
     # nothing from it.

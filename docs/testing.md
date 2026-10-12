@@ -57,18 +57,27 @@ fair-share ceiling is in `tests/test_ceiling_fair_share_multi_rank.py`, the fill
 `tests/test_disk_fill_block.py` and its access rules in `tests/test_routes.py`; the 0.2.29
 touch-clock / peer-rank / deadline / evict-pool behaviour is in
 `tests/test_touch_promotion_and_peer_eviction.py`. They cover:
-loopback accept/reject (including a spoofed `X-Forwarded-For` from a real remote
-peer), the allowlist (bare address, CIDR, IPv6, the `::ffff:` unwrap, unset =
-loopback-only, malformed entries that neither raise nor admit, cache invalidation
-when the env shrinks), **that no route asks for a token in any shape** (the whole
-surface swept route-by-route from an allowlisted peer with no header, including the
-six dev-state routes from loopback, and every refusal asserted to name the PEER rule
-and never a token), that the dead `VLLM_E2_TIER_DEV_TOKEN` moves exactly one field of
-`status` (`token_configured`) and nothing else, that the boot warns once when it is
-set and says nothing when it is not, and that a mutating `/disk` `op` on a `GET` is
-still a 405, the guard order (peer -> enabled), the `status` payload's
-`allow_networks` / `loopback_only` / `non_loopback_peers_require_token` fields and
-its `guard_mode` /
+loopback and non-loopback peers get the SAME answer (the removal of the peer gate is
+asserted structurally - an AST test that `endpoint.py` touches no header, no
+`scope["client"]` and never imports `ipaddress` - and behaviourally, over a peer matrix
+that includes loopback, the production proxy, a TEST-NET address and two unparsable
+ones), that a spoofed `X-Forwarded-For: 127.0.0.1` neither opens nor closes anything
+(both over constructed scopes and against a **real uvicorn socket** driven from a
+source-bound client socket), that the retired `VLLM_E2_TIER_DEV_ALLOW` changes no answer
+on any route at any peer - set to the production pair, to `0.0.0.0/0`, to garbage, or
+unset - and is not even parsed any more, **that no route asks for a token in any shape**
+(the whole surface swept route-by-route with no header, including the six dev-state
+routes), that the dead `VLLM_E2_TIER_DEV_TOKEN` moves exactly one field of `status`
+(`token_configured`) and nothing else, that the boot warns once for each dead variable
+and says nothing when neither is set, that the `status` payload reports the peer gate as
+`removed` while the keys that could only describe it (`allow_networks`, `loopback_only`)
+are deleted rather than answered falsely, that every state-changing route refuses a
+mutating `op` on a `GET` with a 405 that arms nothing - the MATRIX (`/trace`, `/guard`,
+`/tier`, `/lookups`, `/blockdump`, `/disk`) and `/guard`'s `armed` spelling, with the
+engine-side `safe_method` backstop asked of each of the five verbs directly and one test
+asserting the two layers read the same list - the guard order (enabled first, and that
+is all), the `status` payload's `non_loopback_peers_require_token` fields and its
+`guard_mode` /
 `dev_state` / `worker_diagnostics` fields (including `guard_mode` being `null` -
 not `false` - until an engine has actually said something), path rejection for the
 reload verb, holder-based reload actually changing behaviour (same-size/same-mtime
@@ -80,7 +89,9 @@ answers under both dispatch shapes, and that the mount point is exactly the twel
 cannot go unlisted, with the openapi surface checked against it too). Three of them
 (`test_real_socket_*`) drive a real uvicorn listener over a real TCP connection -
 one from loopback, two from a source-bound non-loopback client socket
-on this host's own LAN address (skipped on a box with no such address).
+on this host's own LAN address (skipped on a box with no such address), where the
+assertion is that the LAN peer is SERVED: what uvicorn writes into `scope["client"]`
+is the peer of the socket, and that is the value nothing reads any more.
 
 The raw-byte dump (`tests/test_blockdump.py`) is the one that tests bytes rather
 than claims, because the question it serves is a byte-level one: a real `ctypes`

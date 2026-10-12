@@ -26,7 +26,10 @@ Coverage:
   3. an unknown query key on a POST is refused, not ignored (the same accepted-then-
      ignored shape, one level down);
   4. the safe-method wall is untouched: `GET ?op=arm` is still a 405 and still arms
-     nothing;
+     nothing - and since 0.2.72 it is the MATRIX, not one route: `/trace`, `/guard`,
+     `/tier`, `/lookups` and `/blockdump` all refused a state change on nothing at all
+     before this release, and all four answer 405 now, with the engine-side backstop
+     behind each of them;
   5. the fix is not `/disk`-only: `/blockdump?op=arm` honours it too, because leaving
      five routes with the same trap would be a half fix.
 """
@@ -41,6 +44,7 @@ from test_routes import (
     BLOCKDUMP,
     DISK,
     FakeAsyncLLM,
+    FakeEngineCoreClient,
     build_app,
     client_for,
     token_headers,
@@ -53,6 +57,7 @@ from kvtier_dev_plugin import (
     disk_restore,
     disk_spill,
     disk_store,
+    route_policy,
 )
 
 pytest.importorskip("fastapi")
@@ -379,3 +384,186 @@ def test_blockdump_arms_from_a_query_string_too(world):
     assert engine.calls == [(config.METHOD_BLOCKDUMP,
                              ({"op": "arm", "seconds": 600},))]
     assert blockdump_arm_state() == before
+
+
+# --- 6. the wall is a MATRIX now, not one route (0.2.72) --------------------
+#
+# `/disk` had this rule since the day the safe-method idea was introduced. The other
+# five state-changing routes had NOTHING: `GET /guard?op=arm` armed guard mode, `GET
+# /tier?op=arm` flipped the tier's kill switch, `GET /lookups?op=arm` installed
+# wrappers on the live tier, `GET /trace?op=clear` emptied the ring, `GET
+# /blockdump?op=arm` armed a facility that reads parked KV bytes out of a running
+# engine. Each route takes its `op` from a QUERY PARAMETER, so in every case the URL
+# that changes the engine is as short as the URL that reads its status - and a browser
+# fetches a URL with no preflight and no custom header. Removing the peer-address gate
+# made this the load-bearing wall, which is why it is asserted per route rather than
+# "once, in the helper": the one-route version is exactly how five routes ended up
+# without it.
+
+MATRIX_ROUTES = {
+    config.ROUTE_TRACE: ("arm", "disarm", "clear"),
+    config.ROUTE_GUARD: ("arm", "disarm"),
+    config.ROUTE_TIER: ("arm", "disarm"),
+    config.ROUTE_LOOKUPS: ("arm", "disarm", "clear"),
+    config.ROUTE_BLOCKDUMP: ("arm", "disarm", "dump"),
+}
+
+
+@pytest.mark.parametrize("route,op", sorted(
+    (route, op) for route, ops in MATRIX_ROUTES.items() for op in ops))
+def test_a_mutating_op_on_get_is_a_405_on_every_route_and_touches_no_engine(route,
+                                                                            op):
+    """The 405 half of the wall, over the whole matrix: refused, named, and the
+    engine never heard about it.
+
+    `engine.calls == []` is the assertion that matters. A 405 that armed something is
+    a worse answer than a 200 that did not, because the operator reads the status code
+    and the arm file keeps its secret. The detail must name the op it refused and the
+    POST route that runs it - a refusal an operator cannot act on is a bug report.
+    """
+    engine = FakeEngineCoreClient()
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    response = client.get(f"{config.ROUTE_PREFIX}{route}?op={op}",
+                          headers=token_headers())
+    assert response.status_code == 405, (route, op, response.text)
+    assert "will not run from GET" in response.json()["detail"]
+    assert f"POST {config.ROUTE_PREFIX}{route}" in response.json()["detail"]
+    assert op in response.json()["detail"]
+    assert engine.calls == [], (route, op, engine.calls)
+
+
+def test_the_guard_armed_spelling_is_refused_on_get_too():
+    """`/guard`'s ergonomic spelling is the case an op list cannot see.
+
+    `{"armed": true}` is arm/disarm in another word (see `guard_mode.guard_for_engine`),
+    so on this route the PRESENCE of the key is the state change whatever `op` says -
+    `GET /guard?armed=true` used to flip guard mode on, and guard mode masks real bugs.
+    The rule lives in `route_policy.MUTATING_ARGUMENTS`, shared by both layers, so
+    neither can be right about it while the other is wrong.
+    """
+    engine = FakeEngineCoreClient()
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    for spelling in ("armed=true", "armed=false", "armed=1", "armed=0"):
+        response = client.get(f"{config.ROUTE_PREFIX}{config.ROUTE_GUARD}?{spelling}",
+                              headers=token_headers())
+        assert response.status_code == 405, (spelling, response.text)
+        assert "'armed'" in response.json()["detail"], spelling
+        assert "will not run from GET" in response.json()["detail"]
+    assert engine.calls == []
+
+
+def test_a_read_on_get_is_still_a_read_on_every_route():
+    """The wall must not become a wall on reads: every route's default and every
+    declared read op still answers 200 from a GET.
+
+    A 405 that also blocks reads is a refusal that gets disabled within a day, and the
+    `status` op on `/tier` is the case the rule's author nearly got wrong: `status`
+    re-runs the install check, which is work, but it changes no posture, so it is a
+    read. If a future op is added to a route's mutating list and is really a read, this
+    is the test that says so.
+    """
+    engine = FakeEngineCoreClient(result={"version": 1})
+    client = client_for(build_app(FakeAsyncLLM(engine)))
+    reads = {
+        config.ROUTE_TRACE: (None, "read", "status"),
+        config.ROUTE_GUARD: (None, "status", "captures"),
+        config.ROUTE_TIER: (None, "status"),
+        config.ROUTE_LOOKUPS: (None, "read", "status", "verdict", "depth"),
+        config.ROUTE_BLOCKDUMP: (None, "status"),
+        config.ROUTE_DISK: (None, "status"),
+    }
+    for route, ops in reads.items():
+        for op in ops:
+            url = f"{config.ROUTE_PREFIX}{route}" + (f"?op={op}" if op else "")
+            response = client.get(url, headers=token_headers())
+            assert response.status_code == 200, (route, op, response.text)
+
+
+@pytest.mark.parametrize("route,op", sorted(
+    (route, op) for route, ops in MATRIX_ROUTES.items() for op in ops))
+def test_the_engine_side_verb_refuses_a_stamped_mutation_on_every_route(route, op):
+    """The backstop, asked of each verb directly - the four that had none until 0.2.72
+    included.
+
+    The utility channel answers a refusal as DATA (a payload with `ok: false`), not as
+    an exception, so a refusal that lives only in the HTTP layer means a future HTTP
+    bug lands the mutation. Each verb is called the way `engine_side` binds it, with
+    `safe_method` set, and must decline with both refusal vocabularies present: `reason`
+    (the `/disk` dialect) and `error` (the ring verbs'), so no caller has to know which
+    family a refusal was written in. The wording is pinned because operators grep for
+    it, and because "will not run from a method" is the phrase that tells a reader this
+    was a method refusal and not a failure.
+    """
+    from kvtier_dev_plugin import backport, guard_mode, lookup_ledger, trace_ring
+
+    handlers = {
+        config.ROUTE_TRACE: trace_ring.trace_for_engine,
+        config.ROUTE_GUARD: guard_mode.guard_for_engine,
+        config.ROUTE_TIER: backport.tier_for_engine,
+        config.ROUTE_LOOKUPS: lookup_ledger.lookups_for_engine,
+        config.ROUTE_BLOCKDUMP: blockdump.blockdump_for_engine,
+    }
+    answer = handlers[route](None, {"op": op, "safe_method": True})
+    assert answer["ok"] is False, (route, op, answer)
+    assert answer["mutating_op"] is True, (route, op, answer)
+    assert answer["status_code"] == 405, (route, op, answer)
+    assert "will not run from a method" in answer["reason"], (route, op, answer)
+    assert "will not run from a method" in answer["error"], (route, op, answer)
+    assert f"POST {config.ROUTE_PREFIX}{route}" in answer["reason"], (route, op, answer)
+
+
+def test_the_engine_side_refusal_asks_the_armed_key_too_and_nothing_else():
+    """Both halves of `/guard`'s rule, from the verb's own side: `{"armed": true}`
+    stamped is refused, and the same call WITHOUT the stamp is not refused by this
+    layer.
+
+    The second half is the one that keeps the backstop from becoming the gate: a POST
+    carries no `safe_method` stamp, and a verb that refused an unstamped mutation would
+    take away the route that exists to run it. Refusing on the stamp is what lets the
+    HTTP 405 and this payload be two answers to one question instead of two questions.
+    """
+    from kvtier_dev_plugin import guard_mode
+
+    refused = guard_mode.guard_for_engine(None, {"armed": True,
+                                                 "safe_method": True})
+    assert refused["ok"] is False and refused["mutating_op"] is True
+    assert "'armed'" in refused["reason"]
+    assert route_policy.safe_method_refusal(config.ROUTE_GUARD,
+                                           {"armed": True}) is None
+    assert route_policy.safe_method_refusal(config.ROUTE_GUARD,
+                                           {"op": "status"}) is None
+    assert route_policy.safe_method_refusal(config.ROUTE_GUARD,
+                                           {"op": "arm"}) is None
+
+
+def test_the_http_and_engine_halves_cannot_disagree_about_which_ops_mutate():
+    """One list, both layers, asserted as a property rather than a convention.
+
+    The failure this prevents is silent and specific: a new mutating `op` added to a
+    dispatch table but not to the route's policy answers 200 from a GET (the HTTP half
+    does not know it mutates) and then runs - the engine half checks the same list, so
+    it does not catch it either. Reading the ops from `route_policy` here, and
+    `/disk`'s from its own module, means the matrix above and the refusal below are
+    generated from the same source the product uses.
+    """
+    from kvtier_dev_plugin import disk_store
+
+    assert route_policy.mutating_ops(config.ROUTE_DISK) == tuple(
+        disk_store.MUTATING_DISK_OPS), "the route must not keep a copy of /disk's list"
+    for route, ops in MATRIX_ROUTES.items():
+        assert route_policy.mutating_ops(route) == ops, route
+        for op in ops:
+            label = route_policy.mutating_op(route, {"op": op})
+            assert label == f"op {op!r}", (route, op, label)
+            assert "will not run from GET" in route_policy.refusal_detail(route, label)
+            assert route_policy.safe_method_refusal(
+                route, {"op": op, "safe_method": True}) is not None, (route, op)
+    # A read, a missing op and an unknown op are NOT mutations, on every route.
+    for route in list(MATRIX_ROUTES) + [config.ROUTE_DISK]:
+        for args in ({}, {"op": route_policy.DEFAULT_OPS[route]}, {"op": "nonsense"},
+                     {"limit": 5}):
+            assert route_policy.mutating_op(route, args) is None, (route, args)
+    # `/disk`'s default and every route's default must be reads, or a bare GET mutates.
+    assert route_policy.mutating_op(config.ROUTE_DISK,
+                                    {"op": "status"}) is None
+    assert set(route_policy.DEFAULT_OPS) == set(MATRIX_ROUTES) | {config.ROUTE_DISK}
