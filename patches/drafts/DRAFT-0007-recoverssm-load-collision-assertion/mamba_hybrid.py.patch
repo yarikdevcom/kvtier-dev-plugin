@@ -1,0 +1,74 @@
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index b31a0ce..3913ce7 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -371,10 +371,50 @@ class MambaHybridModelState(DefaultModelState):
+             return
+         if self.recoverssm is None:
+             raise RuntimeError("deferred RecoverSSM state without RecoverSSM")
+         self.recoverssm.restore_step(state)
+ 
++    def _publish_state_blocks_for_guard(self, idx_mapping: torch.Tensor) -> None:
++        """Resolve `(row, state block id)` pairs for the guard in `RecoverSSMState`.
++
++        `_mamba_state_idx_gpu[r]` is a block-table COLUMN, not a block id: row r's
++        recurrent state lives at `block_tables[gid][r, column]`. The connector
++        publishes block IDS, so the intersection has to be taken on block ids and
++        the table has to be read - which is what `guard_armed()` at the call site
++        pays for.
++
++        UNPROVEN, STATED NOT HIDDEN: on a PP-deferred commit this names the column
++        the row points at NOW, two steps after the verify whose state is being
++        committed. That is still the right set to intersect with a load in flight
++        (it is the row's live state block), but whether the deferred commit can
++        reach a block OTHER than the one published here is the residual PP question
++        this guard exists to make loud, not to answer.
++        """
++        recoverssm = self.recoverssm
++        if recoverssm is None or not recoverssm.guard_armed():
++            return
++        if not self._align_mode or self._runner_block_tables is None:
++            # No align state to collide with: publish empty, so a stale set from an
++            # earlier step cannot fire the guard on a block this step cannot write.
++            recoverssm.publish_state_blocks(())
++            return
++        rows = idx_mapping[idx_mapping >= 0]
++        if rows.numel() == 0:
++            recoverssm.publish_state_blocks(())
++            return
++        row_ids = rows.tolist()
++        index = rows.long()
++        pairs: list[tuple[int, int]] = []
++        # Every mamba group owns a state block per row, so every group is published.
++        # `_mamba_group_ids` is empty until the first `_get_mamba_group_info`, and an
++        # empty publish means INERT for that step - never read as an all-clear.
++        for gid in self._mamba_group_ids:
++            table = self._runner_block_tables.block_tables[gid].gpu
++            columns = self._mamba_state_idx_gpu[index]
++            pairs.extend(zip(row_ids, table[index, columns].tolist()))
++        recoverssm.publish_state_blocks(pairs)
++
+     def postprocess_state(
+         self,
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor | int,
+         num_computed_tokens: torch.Tensor | None = None,
+@@ -398,10 +438,18 @@ class MambaHybridModelState(DefaultModelState):
+                     self.num_accepted_tokens_gpu,
+                     max(num_sampled, 1),
+                 )
+ 
+         if self.recoverssm is not None:
++            # Collision guard (DRAFT-0007): name the align-state block every
++            # committing row writes, so the commit has both sides to intersect.
++            # `guard_armed()` is the gate - a step with no connector load in flight
++            # resolves NOTHING, so the only step that pays for the device reads
++            # below is a step that also carries a load: the step the guard exists
++            # for. The check itself runs inside `commit_step`, ahead of the commit
++            # loop, so a collision stops the step before any state is written.
++            self._publish_state_blocks_for_guard(idx_mapping)
+             self.recoverssm.commit_step(
+                 num_sampled,
+                 idx_mapping,
+                 state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
+                 num_accepted_tokens=self.num_accepted_tokens_gpu,

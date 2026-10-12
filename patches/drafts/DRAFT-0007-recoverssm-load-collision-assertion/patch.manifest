@@ -1,0 +1,463 @@
+# DRAFT - **DO NOT APPLY** (it has never been applied or graded on a boot; that is
+# the remaining gate, not the wiring). STATUS 2026-10-22: the inertness this header
+# used to announce is CLOSED. `kv_connector.py.patch` and `model_runner.py.patch`
+# (this directory) call the publish at the connector's load submit, register the
+# guard's other half at the model runner's connector construction site, and un-publish
+# when the engine proves a transfer is over. The in-flight set is no longer empty by
+# construction, `guard_armed()` is reachable, and a collision would raise. What the
+# draft still is: UNGRADED. No boot has ever run all four hunks, no planted-word
+# request has ever been graded against a recomputed answer, and the witness the guard
+# writes has no reader inside the plugin yet. See "WHAT IS MISSING" and promotion
+# items 4 and 5.
+#
+# WHY IT LIVES HERE AND NOT IN `patches/0007-...`: `apply-kvtier-patches.sh` dies on any
+# `[0-9][0-9][0-9][0-9]-*/` directory the `series` file does not list ("an unlisted patch
+# is a patch nobody applies"), and `tests/test_patch_series.py` asserts `entries ==
+# on_disk`. A numbered draft directory would break both - a draft that is not ready would
+# disable the tool that keeps the engine honest. `drafts/` is invisible to both.
+#
+# WHAT MUST BE TRUE BEFORE PROMOTION, in the order they will be checked:
+#   1. THE LOAD-SIDE PUBLISH HUNK EXISTS. **SATISFIED 2026-10-22** by
+#      `kv_connector.py.patch` (+ the one-line registration in
+#      `model_runner.py.patch`). `publish_inflight_load_blocks` now has a caller on
+#      the submit path and a matching un-publish on the completion path; a load
+#      submit without a publish, or a publish without an un-publish, fails
+#      `tests/test_recoverssm_guard_wiring.py`. What that file CANNOT do is reach
+#      the three call sites behaviourally (they are one line each inside methods
+#      that need a connector, a forward context and a GPU), so those three are
+#      STRUCTURAL tests that parse the shipped hunk - weaker than a behavioural
+#      test, labelled as such where they are defined, and verified to fail when
+#      the publish line is deleted from the patch (checked by mutation: removing
+#      it fails exactly one test). Inert-by-accident is now a test failure instead
+#      of a manifest sentence.
+#   2. THE TOOL CAN EXPRESS IT. `patch.manifest` describes ONE target file and ONE
+#      `klass`; this entry is two files and wants to be three - and is now FOUR
+#      (`kv_connector.py.patch`, `model_runner.py.patch`). Either it splits into
+#      entries with a declared order, or `kvtier-patch.sh` grows multi-file support -
+#      which is a change to the tool and to its own test, not to this manifest. The
+#      order is not free: `model_runner.py.patch` and `kv_connector.py.patch` must
+#      land together (a connector with no registrant never arms, and a registrant
+#      calling a method the connector does not have is a boot-time AttributeError),
+#      and both must precede nothing - they are independent of the other two files.
+#      The four records below are therefore written as COMMENTED key blocks, not as
+#      live keys: the manifest is shell-sourced, and a second live
+#      `tree_v2_5_1_target_abs=` line would let the last assignment win and silently
+#      re-point the primary entry at the wrong file.
+#   3. THE RESIDUAL PP=2 QUESTION IS ANSWERED THE ONLY WAY IT CAN BE. This draft exists to
+#      convert that question from SILENT to LOUD; it does not answer it. See "THE
+#      RESIDUAL QUESTION". A guard that can fire is the precondition for the answer,
+#      because nothing else in the stack will ever notice the collision.
+#   4. THE ACCEPTANCE BOOT IS GRADED, NOT OBSERVED. Both flags on one boot
+#      (`--use-replayssm` + our connector), a `kvtier_disk_restore`-flagged request on a
+#      prompt with a planted code word, graded on greedy equality against the recomputed
+#      answer - never on `offers`/`adopted`/`reads_applied`. The guard must stay SILENT on
+#      it, and a synthetic collision injected into the same build must RAISE. Silence
+#      without the injected positive is an untested guard.
+#   5. `kvtier-patch.sh verify` re-reads every fingerprint below with the ENGINE
+#      interpreter against the real tree, and agrees.
+
+draft_id=recoverssm-load-collision-assertion
+title="v2.5.1: raise, do not guess, when a RecoverSSM state commit and a connector KV load claim the same block"
+upstream_issue="none (fork-local; the mechanisms are the fork's, patches 0071/0072/0085/0091)"
+upstream_pr="none (fork-local)"
+
+# ---- WHAT THIS IS, IN ONE PARAGRAPH ----------------------------------------
+# DRAFT-0006 asks the fork to LIFT a refusal (`validate_mamba_cached_kernel`'s last
+# clause, which vetoes `--use-replayssm` + any KV connector, and fires on us because
+# `serve-v2.2.sh` passes `kv_role: "kv_both"`). Lifting a refusal grants a PERMISSION.
+# This entry is the thing that has to exist beside the permission: an ASSERTION. The
+# research pass that read the clause's history found it is conservatism, not a
+# documented interaction - one commit owns the string (`ced6857`, a tree-wide import
+# squash with no attributable reason) and the ~40 fork commits on top never touch it or
+# name a connector. Conservatism is liftable. The failure mode underneath it is not, and
+# it is the reason a guard beats a permission: if the two mechanisms' step orderings ever
+# do collide, BOTH outcomes produce a fluent continuation and no exception anywhere - the
+# deferred RecoverSSM commit overwrites state a load just restored with one derived from a
+# checkpoint that predates the load, or the load overwrites a state the commit had already
+# advanced. This repo has live evidence of exactly that class (an unsound KV claim, a
+# fluent `Register Register Register...` loop at temperature=0 where the recomputed answer
+# was correct, 2026-10-06). OUTPUT CANNOT BE THE WITNESS. So the witness is an exception
+# with the row and the block id in its message.
+
+# ---- THE SITES, AS THEY ACTUALLY ARE (three corrections to the brief) -----
+# COMMIT SITE. The brief said "`commit_recoverssm_state` in the model-state path under
+# `v1/worker/gpu/`". There is no such method under `v1/worker/gpu/`. `grep -rn "def
+# commit_recoverssm_state"` in the v2.5.1 tree finds FOUR, all on ATTENTION METADATA
+# classes: `v1/attention/backends/recoverssm_metadata.py`, `.../gdn_recoverssm.py`,
+# `.../ple_recoverssm.py`, `models/kimi_k3/nvidia/kda_metadata.py`. The thing under
+# `v1/worker/gpu/` that COMMITS the step - the only caller of all four - is
+# `RecoverSSMState.commit_step` in `vllm/v1/worker/gpu/model_states/recoverssm.py`,
+# reached from `MambaHybridModelState.postprocess_state` in the sibling `mamba_hybrid.py`.
+# So: the CHECK goes in `commit_step` (ahead of its commit loop, so a collision stops the
+# step BEFORE any state is written), and the row -> block RESOLUTION goes in
+# `postprocess_state`, which is where the block tables live.
+#
+# LOAD-SUBMIT SITE. `post_forward` is the CONNECTOR's method, called by the runner at
+# `v1/worker/gpu/model_runner.py` (three call sites); the worker-side submit it drives is
+# `SimpleCPUOffloadWorker.start_load_kv` in `v1/simple_kv_offload/worker.py`, whose own
+# comment says "Invoked after the forward launch on steps without sync loads
+# (SchedulerOutput.has_sync_kv_loads)" - the deferred async load, exactly as described.
+# The ids to intersect there are `SimpleCPUOffloadMetadata.load_gpu_blocks`.
+#
+# RE-READ ON THE BOX 2026-10-22, because the brief's two site paths were both wrong
+# once already and this one was imprecise too. The runner never calls `start_load_kv`
+# itself (it has no such call). The funnel is `ActiveKVConnector` in
+# `v1/worker/gpu/kv_connector.py`: `pre_forward` binds the metadata and launches
+# immediately when `scheduler_output.has_sync_kv_loads`, otherwise it defers to
+# `post_forward`, and BOTH branches run through the one private method
+# `ActiveKVConnector._start_load_kv`, which calls
+# `SimpleCPUOffloadConnector.start_load_kv` -> `SimpleCPUOffloadWorker.start_load_kv`,
+# where `backend.launch_copy(metadata.load_cpu_blocks, metadata.load_gpu_blocks,
+# is_store=False, ...)` is the copy. So the publish sits in `_start_load_kv` (one
+# site, both load paths, and the `no_forward` path, which reaches the launch through
+# `pre_forward`), and the ids are captured in `pre_forward` where the metadata object
+# is in hand. `get_kv_connector(...)` is called from exactly one place
+# (`GPUModelRunner.initialize_kv_cache`, which the worker reaches after `load_model`,
+# so `self.model_state` exists there) - which is why the sink registration is one
+# line in `model_runner.py.patch` and why no other caller needed touching.
+# There is NO `_handle_failed_recving` on the worker side: that method is
+# `v1/core/sched/scheduler.py`'s, a different process. What reaches this process is
+# `transfer_results.finished_recving` / `.failed_recving`.
+#
+# `TransferMeta.gpu_block_ids` IS the right thing, but it is the SCHEDULER-side name:
+# `v1/simple_kv_offload/manager.py` does `load_gpu.extend(load_state.transfer_meta
+# .gpu_block_ids)`, and that list becomes `load_gpu_blocks` on the worker. Intersecting
+# the scheduler's field from the worker would be reading the wrong process.
+#
+# `_mamba_state_idx_gpu` IS per-row and reachable, but it is a block-table COLUMN, not a
+# block id - the align kernel stores
+# `min(max(num_computed + num_sampled - 1, 0) // MAMBA_BLOCK_SIZE, width - 1)`. Comparing
+# it to a connector block id would compare two different namespaces and produce false
+# positives AND false negatives at once. The real block id is
+# `block_tables[gid][row, state_idx[row]]`, and the hunk in `mamba_hybrid.py` resolves
+# exactly that, for every mamba group.
+
+# ---- WHAT THE ASSERTION INTERSECTS, AND ITS COST ---------------------------
+# Two HOST-SIDE id collections: the `(row, state block id)` pairs published by
+# `publish_state_blocks` (resolved from the persistent per-req-slot tables the align
+# post-process already uses), and the frozenset of the connector's in-flight destination
+# block ids published by `publish_inflight_load_blocks`. The predicate is
+# `find_load_collision`; the raising wrapper is `assert_no_load_collision`; both live in
+# `RecoverSSMState`, so `kvtier-patch.sh`'s AST fingerprinter can hash them (they are
+# METHOD bodies, not module-level functions - see the fingerprint section).
+# MEASURED (this host, python 3.14.7, 200k calls; the predicate re-extracted from the
+# shipped bytes and executed, which is what tests/
+# test_recoverssm_load_collision_guard.py does, so the numbers price the code that ships):
+#     guard not armed (no load in flight)      0.050 us/call   <- the per-step cost
+#     64 rows committed,   320 ids in flight   2.221 us/call
+#     512 rows committed,  320 ids in flight  10.647 us/call
+#     512 rows committed, 4096 ids in flight  13.880 us/call
+#     tracemalloc peak over 20,000 no-collision calls: 112 bytes (no per-step set)
+# A set intersection was rejected on purpose: `set(committed.values()) & inflight`
+# allocates on every call and loses the row the message has to name, so the shipped loop
+# does one O(1) membership test per committed row and returns the first hit.
+# The armed path ALSO pays the resolution: one masked select, one gather, and TWO
+# `.tolist()` transfers in `mamba_hybrid.py`. That is reasoned, not measured - it needs
+# tensors and a real block-table set, which nothing here can boot. Its exposure is
+# bounded by design: `guard_armed()` is False on a step with no connector load, so the
+# only steps that pay it are steps that also carry a load, which are the steps the guard
+# exists for and a small minority of them. The plugin's dev-door lesson (a handler that
+# slept 3 s on the EngineCore loop stalled serving 3.01 s per call) is the reason the
+# unarmed step costs one attribute read and nothing else.
+
+# ---- THE RESIDUAL QUESTION THIS CONVERTS FROM SILENT TO LOUD ---------------
+# `--pipeline-parallel-size 2` is how this box boots (`serve-v2.2.sh`: TP=2, PP=2).
+# `_preempt_request` took a `drop_stale_output` argument explicitly for "connectors with a
+# pending KV hand-off, which the preemption's block free would leave without valid KV" -
+# so the author DID consider preemption-plus-connector, and did not consider RecoverSSM
+# rows. `RecoverSSMState.detach_step` / `restore_step` hold a commit for pp_size steps and
+# defend it with ROW MASKING ("masks freed rows", and the deferred branch zeroes
+# `num_sampled` where `idx_mapping < 0`). If a freed row index is reused by a LOADED
+# request inside that window, masking is the only defence, and it could not be proven
+# safe from source.
+# What this draft makes provable at runtime: a collision between a committing row's state
+# block and a load in flight. What it does NOT make provable: whether a PP-deferred commit
+# writes the block published for it two steps earlier. The wiring names the row's CURRENT
+# state block, which is the right thing to intersect with a live load but is not a proof
+# about the deferred write. That gap is stated in the wiring hunk's own docstring so it
+# cannot be read as coverage later.
+
+# ---- WHAT IS MISSING, AND WHAT NOW EXISTS ----------------------------------
+# CLOSED (2026-10-22): the publish, and the un-publish. `kv_connector.py.patch`
+# captures `load_gpu_blocks` in `pre_forward`, publishes the union in
+# `_start_load_kv` BEFORE the copy is launched, and retires it in `post_forward`
+# from the same `transfer_results` the output is built from.
+#
+# IS THERE A RELIABLE UN-PUBLISH POINT? YES, and it is the engine's own verdict,
+# not a guess. This connector has no per-transfer callback: `get_finished` polls the
+# copy stream's events and resolves the completed event index through
+# `SimpleCPUOffloadMetadata.load_event_to_reqs`, which is exactly why the capture
+# keeps the requests an event carries alongside its ids. An event retires when
+# EVERY request it names has been reported finished - and a FAILED load is
+# reported finished too (the base class's own contract; the bad blocks are named
+# separately by `get_block_ids_with_load_errors`), with `failed_recving` honoured
+# the same way. So "in flight" means "not yet proven to have stopped writing",
+# which is what the guard needs; clearing per step would NOT be, because the async
+# path launches after this step's commit and the collision lands a later step.
+# The one gap: an event whose request set came back EMPTY has no proof available
+# by construction (the scheduler only allocates an event when it has requests, so
+# this should be unreachable), so it is bounded at
+# `KVTIER_LOAD_INFLIGHT_MAX_SUBMITS` (32 submits) and counted as
+# `expired_unproven`. Expiry is an UNDER-report - the dangerous direction - which
+# is why it is a counter and not a comment.
+#
+# STILL MISSING, in order:
+#   a. NO READER INSIDE THE PLUGIN. The counters and the verdict go to a witness
+#      file (`recoverssm-guard-<rank>.json` under `VLLM_E2_TIER_DIAG`, `/tmp` when
+#      unset) and to one WARNING line at first arming, which the proxy already
+#      ingests into `logs.db`. Wiring it through `/plugins/kvtier/*` is a plugin
+#      change, not an engine one, and is deliberately NOT done here: the dev-door
+#      handler runs on the EngineCore loop, so a new verb is its own review. Until
+#      it exists, an operator proves the guard live from the file/log, and the
+#      three states stay distinguishable because the file carries `verdict`:
+#      absent = no load submit has ever run in this process (NOT "clean boot"),
+#      `guard_not_armed_no_recover_ssm_sink` = loads ran with no RecoverSSM to
+#      arm, `armed_no_load_submit_yet` = armed and idle, `armed_loads_observed`
+#      = the guard has had something to check.
+#   b. THE COMMIT-SIDE PREDICATE'S OWN INVOCATION COUNT is not observable from
+#      here - it runs inside `commit_step`, which this hunk does not touch. The
+#      witness counts the LOAD side (`checks_at_submit`: submits that could reach
+#      the predicate because the commit side had published) and the armings, and
+#      says nothing it cannot see. Naming it beats a number that looks total.
+#   c. THE TOOL CANNOT CARRY FOUR FILES (promotion item 2), and the ACCEPTANCE
+#      BOOT HAS NEVER BEEN GRADED (item 4). Neither is closed by this hunk.
+
+# ---- WHAT THIS DELIBERATELY DOES NOT DO ------------------------------------
+# It does not lift the validator clause (DRAFT-0006 owns that, and its own blocker is the
+# call-site enumeration). It does not make the pair SAFE; it makes one failure mode LOUD.
+# It is behaviour-neutral for unflagged traffic on its own: no new work runs on a step
+# unless the guard is armed. That sentence is now TRUE IN FACT RATHER THAN VACUOUSLY -
+# the guard arms when a load is in flight, so the neutrality has to be argued, and it is
+# argued by the measured cost below plus the fact that the sink push only ever hands
+# over host-side ints.
+
+# ---- which tree this entry describes ----------------------------------------
+# v2.5.1 ONLY. RecoverSSM, `--use-replayssm` and the align-state machinery are v2.5
+# concepts (fork 0071/0072/0085/0091); `model_states/recoverssm.py` does not exist in the
+# v2.2 tree, so there is no v2.2 record to write and inventing one would be a fabricated
+# reference - the exact thing `verify` exists to refuse.
+trees="v2.5.1"
+tree_default=v2.5.1
+
+# ---- what is patched, and where (PRIMARY file) ------------------------------
+# The five verdict-bearing values (target_abs, git_root, engine_python, file_sha_pre,
+# file_sha_post) are NEVER inherited from the flat keys, so all five are explicit below.
+module=vllm.v1.worker.gpu.model_states.recoverssm
+klass=RecoverSSMState
+git_rel=vllm/v1/worker/gpu/model_states/recoverssm.py
+target_mode=UNKNOWN
+tree_v2_5_1_target_abs=/home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/worker/gpu/model_states/recoverssm.py
+tree_v2_5_1_git_root=/home/user/vllm-38-next-v2.5/vllm-v2.5
+tree_v2_5_1_engine_python=/home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+# Read read-only on the box 2026-10-22: `sha256sum` of the installed file, AND the same
+# digest returned by the engine interpreter when it read the file itself, AND the digest
+# of the copy scp'd into the local scratch tree - three reads, one value. NOT the
+# production tree: the engine SERVING is /home/user/vllm-38-next/vllm-workspace, which
+# this entry never reads, scans or touches.
+tree_v2_5_1_file_sha_pre=06f9e733f583a35a9b1c1977baedaf4a5af0fccf5235901d812935788f7dd954
+# NOT A GUESS, and the build path is the tool's own: `git apply --check -p1` clean at zero
+# offset on a freshly scp'd pristine pre-image, then `git apply -p1`, then the resulting
+# image compiled by the ENGINE interpreter (base64 in argv, stdin-piped program, nothing
+# written to the box - the interpreter itself re-reported this digest before printing
+# `COMPILE ok`). The box's tree was NOT modified; the apply happened in a local scratch
+# copy under /home/user/.tmp-kvtier.
+tree_v2_5_1_file_sha_post=ed8e8c97488872a4f1682de0e2955dbec18d51f775eec980b1bea121cfa101c2
+# LOWERCASE IS LOAD-BEARING, not style: `TREE_FIELDS` (kvtier-patch.sh:328) spells every
+# field lowercase and `tree_field()` (:354) builds `local v="tree_$1_$2"` from it, so an
+# upper-cased field suffix is a key the tool never reads and the tree answers "UNKNOWN
+# PROVENANCE - no recorded reference". Worked example: 0003/.../patch.manifest:117-130.
+tree_v2_5_1_target_mode=UNKNOWN
+# `git -C /home/user/vllm-38-next-v2.5/vllm-v2.5 rev-parse HEAD`, read 2026-10-22; agrees
+# with the pin DRAFT-0005/DRAFT-0006 carry, and `git status --porcelain` on both target
+# files was EMPTY, so the pre-image below is HEAD's copy and not a hand-edit.
+fork_pin_head=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+fork_version=UNKNOWN
+
+# ---- the patch bytes (built, applied-clean, compile-checked) ----------------
+patch_file=recoverssm.py.patch
+patch_sha256=907cb9060926ebda8d79a648a92b33e29b9708d462fbf0d3ff3ee141e59640a0
+patch_hunks=3
+patch_added=150
+patch_removed=0
+
+file_bytes_pre=6656
+file_bytes_post=14073
+file_lines_pre=176
+file_lines_post=326
+
+# ---- per-method fingerprints (PRIMARY file) ---------------------------------
+# All three are methods that ALREADY EXIST and are MODIFIED, so a pre-image hash exists
+# for each; the NEW members (`find_load_collision`, `assert_no_load_collision`,
+# `guard_armed`, `publish_state_blocks`, `publish_inflight_load_blocks`) have no pre-image
+# by definition and are carried by the whole-file hashes instead.
+# PRE values: computed by the tool's own AST algorithm (klass walk, body from
+# decorator-or-def through `end_lineno`) run by the ENGINE interpreter against the box's
+# real file. POST values: the identical algorithm against the locally-applied image whose
+# digest the engine interpreter confirmed before compiling it. Local python was 3.14.7 for
+# the POST run, so a promotion must let the tool re-read them with 3.13.5 - cross-checked
+# here by running the same program on the PRE image under BOTH interpreters and getting
+# the same three digests, which is what makes the POST digests trustworthy.
+methods="commit_step __init__ reset"
+methods_pre_sha256="da8b5404e37e167a6bf6430698c5760d628a4ed95970486732df66217814001d bc685873624d0e182ace306c004293da8befff9b73ea8b1990e8f7d1deafba94 117d6ce24975098c5efc57ac47927aae96531343ea214f1d1423188e18b1d82d"
+methods_post_sha256="03e879fc160d9c49fb1fb0214495e2dbeb8c595594ff53a4b67003607f9b2d54 b4aa09156c2d56d6f60267aeb102a0e799490e73465cf00669bc5804c2296d37 99803546a280488246ed6a732ef2d3b3e5ab33ecdc70d7dbb39eafedc010faa2"
+
+# ---- THE SECOND FILE, WHICH THIS SCHEMA CANNOT HOLD -------------------------
+# `mamba_hybrid.py.patch` sits beside the primary patch. It resolves `(row, state block
+# id)` pairs in `MambaHybridModelState.postprocess_state` and publishes them. Its own
+# record, for the day the tool can carry it (NOT a substitute for the keys above):
+#   file             vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+#   klass            MambaHybridModelState
+#   patch            mamba_hybrid.py.patch
+#   patch_sha256     e8fdecefc46768d646617b4d3ea6f5f4279e84f46ac3c4cc399ec369222f304b
+#   hunks/added/removed  2 / 48 / 0
+#   file_sha_pre     18de468ede879cbf447cf9779648d95625bc4cbc6436ec1be6e65e68feda7a21
+#   file_sha_post    b916da33c121cac3f8a80fd58a8548c13f4783d73a5aa61208e94b1cb799c2da
+#                    (same build path as above, same engine-interpreter compile check)
+#   bytes / lines    19907 -> 22725  /  455 -> 503
+#   methods          postprocess_state
+#   methods_pre      3e87c91273108f8a449bea872650a22770f3ef1c37d1b665041715ae9b134b02
+#                    (engine interpreter, box file)
+#   methods_post     e10e5db083628fe7ba27c94be55e5e68228c714bd287fe5795b1c602c2f441bf
+#   new member       _publish_state_blocks_for_guard
+#                    997730a14c0df5d35ce4766343c69b4ac6f086eb830a4b3f1c53a619291edaa4
+# Verified together with the primary hunk: both `git apply --check -p1` clean, zero offset,
+# on the same freshly-scp'd pre-image pair; both applied; both compiled by the engine
+# interpreter.
+#
+# ---- THE THIRD FILE: the load side, which is what makes the other two live ----------
+# Written as a COMMENTED block with lowercase key names, for the day the tool can carry
+# it. They are comments on purpose: this file is shell-sourced, and a second live
+# `tree_v2_5_1_target_abs=` would win over the primary entry's and silently re-point a
+# verdict at the wrong file. The names are lowercase because `TREE_FIELDS`
+# (kvtier-patch.sh:328) and `tree_field()` (:354) only ever read lowercase suffixes.
+#   module                  vllm.v1.worker.gpu.kv_connector
+#   klass                   ActiveKVConnector
+#   git_rel                 vllm/v1/worker/gpu/kv_connector.py
+#   target_mode             UNKNOWN
+#   tree_v2_5_1_target_abs  /home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/worker/gpu/kv_connector.py
+#   tree_v2_5_1_git_root    /home/user/vllm-38-next-v2.5/vllm-v2.5
+#   tree_v2_5_1_engine_python /home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+#   tree_v2_5_1_file_sha_pre  b89a4333f1e552d86e1815674b59e9f1335f0f49c0a7b46082439076f62c6a81
+#   tree_v2_5_1_file_sha_post dbac473e408c4022831669340c608b9cfb8a537839241e5d6cfc3f2e834af212
+#   patch                   kv_connector.py.patch
+#   patch_sha256            34180795a058a087c057dddf171652c5697350a753a0a1af11c2bb548205c718
+#   hunks/added/removed     9 / 359 / 0
+#   bytes / lines           5393 -> 23874  /  151 -> 510
+#   methods                 __init__ pre_forward _start_load_kv post_forward
+#   methods_pre_sha256 / methods_post_sha256: the PRE values are read from the box's
+#                           real file by the engine interpreter (3.13) and the POST
+#                           values by the identical AST program run by the SAME
+#                           interpreter against the applied image piped in as base64 -
+#                           so no cross-version drift is being assumed. Both runs
+#                           printed `COMPILE ok` and the file digest above, so the
+#                           post-image is the one the engine would import and not a
+#                           local reconstruction. The build path is the tool's own:
+#                           `git apply --check -p1` clean at zero offset on a freshly
+#                           scp'd pre-image, then `git apply -p1`, then the result
+#                           compared byte-for-byte with the locally built image.
+#   methods_pre_sha256      "97e1699f0f70fcda0b8877b283f289b9027a2eb8ea2e2852cc267465766e59da c3c8f1f3dda46488c360a06f12b45df28c5af4920a1bba65ac5679cc99551a0b 6eefbbef6bc4849b071a3d7c6ade76ac82591605605122c9713f2cb28ab973c9 890072097bd4bf6811d30a231a2a9168add3ced60b8b86e39616bcf425feebdd"
+#   methods_post_sha256     "a953dc2593831a6e8040b817864bdbcbdf9dab51e2682b03ce65a455ba0cd824 c5d43d2a71c437a4aecce923e02aa1939e62bb5bae08b78d2679628aac8bf8f6 8025b22d91d82181415606e806113f6c263286f17bf191737433385570f00044 6d4a03ccf12620243ca43b7bbea445a56dbdb0339ecac315152bd49f88f5d156"
+#   new members (no pre-image by definition, carried by the whole-file hashes):
+#                           set_load_collision_sink (on BOTH classes: the interface stub
+#                           so the runner may register unconditionally, and the real one),
+#                           _kvtier_capture_load_submit, _kvtier_publish_inflight_loads,
+#                           _kvtier_retire_completed, _kvtier_push_guard,
+#                           _kvtier_guard_witness_path, _kvtier_write_guard_witness,
+#                           plus the module-level `logger` and the two KVTIER_ constants.
+#                           FINGERPRINTING IS NOT A BLOCKER HERE, unlike DRAFT-0005: every
+#                           function this hunk adds is a METHOD of a declared klass, and
+#                           the four methods it MODIFIES all already exist, so the
+#                           fingerprinter has a pre-image for each. The module-level names
+#                           it adds carry no fingerprint and are covered by the whole-file
+#                           hashes alone - said rather than glossed, since the tool has no
+#                           way to say it.
+#
+# ---- THE FOURTH FILE: one line, because the runner is the only join ----------
+#   module                  vllm.v1.worker.gpu.model_runner
+#   klass                   GPUModelRunner
+#   git_rel                 vllm/v1/worker/gpu/model_runner.py
+#   target_mode             UNKNOWN
+#   tree_v2_5_1_target_abs  /home/user/vllm-38-next-v2.5/vllm-v2.5/vllm/v1/worker/gpu/model_runner.py
+#   tree_v2_5_1_git_root    /home/user/vllm-38-next-v2.5/vllm-v2.5
+#   tree_v2_5_1_engine_python /home/user/vllm-38-next-v2.5/venv-v2.5/bin/python
+#   tree_v2_5_1_file_sha_pre  ac31600f478559a98d8179411037873d42632da00dec27c4cae49b69e4000efa
+#   tree_v2_5_1_file_sha_post c4b0a60eed46696f1eb2a567e30c635e85cb7273ce6b70d58701a43bcd75a0f1
+#   patch                   model_runner.py.patch
+#   patch_sha256            562e4116d349fb851bdedf5722ef691beeb090844aee2f2575d493022ad80e13
+#   hunks/added/removed     1 / 9 / 0
+#   bytes / lines           118566 -> 119233  /  2659 -> 2668
+#   methods                 initialize_kv_cache
+#   methods_pre_sha256      "36c313eec8f2007bcc6ab43fb292e49dc62515d7b2a745db86f51538ae2894db"
+#   methods_post_sha256     "305625149b53a6f38dda253f9f24344c518ac6716877f395ae2d8f02d127f41a"
+# Why a setter and not a constructor argument: `get_kv_connector` has exactly one
+# caller, but the NO_OP connector is a module-level singleton built at import, so the
+# call has to be answered by the interface either way. Registering unconditionally
+# (outside the `is_profiling` branch) is the point - a skipped registration would be
+# indistinguishable from an un-armed guard, and the interface stub makes the call
+# legal on every connector the runner can hold.
+#
+# ---- THE LOAD SIDE'S COST, MEASURED (same host, engine venv python 3.13) ------
+# The only UNCONDITIONAL new per-step work is two host-side calls on a step that has a
+# connector and no load (the plugin's dev-door lesson is that work on the step loop
+# stalls serving, so these are priced against a bare Python call measured alongside):
+#     bare Python call, same loop                    0.016 us
+#     capture on a step with no load  (per step)     0.072 us
+#     publish with nothing pending/outstanding       0.049 us   (called at the submit)
+#     publish, one event and 320 ids outstanding     0.051 us
+#     retire of a proven event                       0.079 us
+# Steps that ACTUALLY load pay once each, for turning ids into a frozenset: capture
+# with 320 destination ids 2.659 us, the full submit cycle 7.300 us. A load step is
+# already a step the tier chose to slow down, and the guard's whole purpose is that
+# step; the settle allowance this box grants a restore is 5,000 ms.
+#
+# ---- OBSERVABILITY: "armed" must be provable from outside the process --------
+# Every publish, un-publish, expiry and check is counted on the connector, and the
+# counters are published twice: once as a WARNING line at the first arming (which the
+# proxy already ingests from `/tmp/vllm-serve.log` into `logs.db`, so the dashboard
+# shows it with no plugin change), and once as a JSON witness at
+# `$VLLM_E2_TIER_DIAG/recoverssm-guard-<PPn_TPk>.json` (`/tmp` when unset - so a
+# missing diagnostics directory never makes "no file" mean "no loads"). The file is
+# SAMPLED, not an event log: a rewrite happens when the outstanding count moves or
+# after `KVTIER_GUARD_WITNESS_EVERY` (64) accumulated changes, because this code runs
+# on the step loop. Its `verdict` key is the answer to "do not let a zero look like a
+# pass": the four states in "WHAT IS MISSING" differ in nothing else, and the file
+# carries its own reading rule in a `meaning` key so an operator does not need this
+# manifest to interpret it. The name never begins with `rank-`, so the reader that
+# walks that directory for rank documents cannot mistake it for one (a test pins it).
+# Writes are wrapped in `except (OSError, TypeError, ValueError)`, counted as
+# `witness_write_failures`, and the log call inside that handler passes no `exc_info`
+# - a diagnostic path that can raise is how a witness silently becomes an assumption.
+
+# ---- what these hunks are NOT tested by ------------------------------------
+# `tests/test_recoverssm_load_collision_guard.py` (18 tests) exercises the COLLISION
+# PREDICATE in-process, without an engine, by extracting the guard's bytes out of the
+# patch file and executing them - so the tests run the shipped code and cannot drift from
+# it. It proves: the raise, the message naming row + block + which side was second, that
+# it is a real exception type with no statement-level `assert` in the added lines, both
+# directions of "seen second", the inert-until-published contract, the guard's position
+# ahead of the commit loop, and the fast-path/zero-allocation claims. A mutation that
+# swaps the raise for `ValueError` fails 4 of the 18.
+# What it CANNOT test: `mamba_hybrid.py`'s resolution hunk. It needs tensors and a real
+# `BlockTables`, so it is compile-verified only. The manifest says so rather than letting
+# the file count as coverage.
+#
+# `tests/test_recoverssm_guard_wiring.py` (25 tests) covers the LOAD SIDE the same way:
+# the shipped `+` lines of `kv_connector.py.patch` are carved out and exec'd, and the
+# sink they publish into is the REAL `RecoverSSMState` the sibling suite extracts, so a
+# publish travels through both hunks into the shipped exception in one process. It pins:
+# the publish/un-publish round trip (armed, then disarmed, and the commit-side gate
+# closing); that an un-retired event arms a LATER step's commit (the async case that a
+# per-step clear would have hidden); a load shared by two requests retiring only when
+# both are reported; a failed load retiring like a success; a bound that never submitted
+# never being published; a stale bind note not leaking into the next submit; the
+# expiry-when-unprovable counter; that the collision exception is never swallowed by the
+# counter or witness path; that an unwritable witness still serves AND says so; the
+# three-way verdict distinction; the witness being sampled rather than per-step; and the
+# unarmed path priced against a bare call measured in the same loop. Three of its tests
+# are STRUCTURAL (they parse the patch for the publish at the submit site, the capture
+# after the bind, the retire against `transfer_results`, and the runner's registration),
+# because those four lines sit inside methods no in-process test can call; deleting the
+# publish line from the hunk was checked to fail one of them.
+
+state_dir=UNKNOWN
+backup_dir=UNKNOWN

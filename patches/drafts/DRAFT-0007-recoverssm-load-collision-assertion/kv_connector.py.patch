@@ -1,0 +1,425 @@
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from typing import TYPE_CHECKING, Any
+ 
++import json
++import os
++
+ import torch
+ 
+ from vllm.config import VllmConfig
+@@ -16,6 +19,7 @@
+     is_forward_context_available,
+     set_forward_context,
+ )
++from vllm.logger import init_logger
+ from vllm.v1.outputs import (
+     EMPTY_MODEL_RUNNER_OUTPUT,
+     KVConnectorOutput,
+@@ -25,6 +29,21 @@
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import SchedulerOutput
+ 
++logger = init_logger(__name__)
++
++# How many load submits an outstanding destination set may survive without its
++# completion being PROVEN before it is dropped. By construction a load event
++# always names the requests it carries, so completion is provable for every
++# event this file publishes and this bound should never fire; it exists because
++# an unbounded set is a guard that fires later for a reason nobody can trace.
++# Dropping one is an UNDER-report, the dangerous direction, so it is counted
++# (`expired_unproven`) rather than absorbed.
++KVTIER_LOAD_INFLIGHT_MAX_SUBMITS = 32
++
++# Re-write the counter file at most this often per change burst, so a boot that
++# loads every step cannot turn a diagnostic into per-step file I/O.
++KVTIER_GUARD_WITNESS_EVERY = 64
++
+ 
+ class KVConnector:
+     """KVConnector interface used by GPUModelRunner."""
+@@ -49,6 +68,17 @@
+     def reset_capture_state(self) -> None:
+         pass
+ 
++    def set_load_collision_sink(self, model_state: Any) -> None:
++        """Offer the model state whose RecoverSSM commit this connector's loads
++        must never collide with (DRAFT-0007).
++
++        The interface answers nothing; `ActiveKVConnector` overrides this. The
++        method exists on the interface so the model runner can register
++        UNCONDITIONALLY - a `hasattr` at the call site would skip the arm
++        silently on any connector refactor, and a silently un-armed guard is the
++        failure this draft exists to prevent.
++        """
++
+ 
+ class ActiveKVConnector(KVConnector):
+     def __init__(
+@@ -62,6 +92,39 @@
+ 
+         self._pending_load_kwargs: dict[str, Any] | None = None
+         self._disabled = False
++        # ---- RecoverSSM / KV-connector collision guard, LOAD SIDE (DRAFT-0007).
++        # The other side is `RecoverSSMState` in
++        # vllm/v1/worker/gpu/model_states/recoverssm.py: it publishes the
++        # align-state block each committing row writes and intersects the two.
++        # Neither can see the other, so the runner hands this connector the
++        # model state once (`set_load_collision_sink`) and this class pushes its
++        # own destination ids at every change. Host-side bookkeeping only: no
++        # device read, no synchronisation, no lock, nothing on the unarmed path.
++        self._kvtier_guard_sink: Any = None
++        # One entry per outstanding load event: its destination block ids, the
++        # request ids the scheduler said that event carries (the ONLY proof of
++        # completion available in this process), and how many submits have gone
++        # by since it was added.
++        self._kvtier_inflight_loads: dict[int, tuple[frozenset, set, int]] = {}
++        # Where the load this step's metadata describes will land, noted at
++        # bind time and made IN FLIGHT by the submit that launches it.
++        self._kvtier_pending_load: tuple[int, frozenset, set] | None = None
++        self._kvtier_guard_counters: dict[str, int] = {
++            "publishes": 0,
++            "unpublishes": 0,
++            "expired_unproven": 0,
++            "pending_replaced": 0,
++            "unprovable_events": 0,
++            "pushes_to_guard": 0,
++            "checks_at_submit": 0,
++            "state_side_unknown": 0,
++            "witness_writes": 0,
++            "witness_write_failures": 0,
++        }
++        self._kvtier_guard_rank_tag: str | None = None
++        self._kvtier_guard_armed_logged = False
++        self._kvtier_witness_events: int | None = None
++        self._kvtier_witness_changes = 0
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput", **kwargs: Any) -> None:
+         if self._disabled:
+@@ -72,6 +135,12 @@
+         self.kv_connector.handle_preemptions(kv_connector_metadata)
+         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+         self._pending_load_kwargs = kwargs
++        # DRAFT-0007: note where this step's load will land, while the metadata
++        # object that the copy is launched from is in hand. Noting it here (and
++        # not at the launch) is what covers BOTH the sync submit below and the
++        # async one deferred to `post_forward`, plus the `no_forward` path,
++        # which reaches the launch through this method.
++        self._kvtier_capture_load_submit(kv_connector_metadata)
+ 
+         if scheduler_output.has_sync_kv_loads:
+             # Sync loads need to run before this step's forward.
+@@ -83,6 +152,11 @@
+         load_kwargs = self._pending_load_kwargs
+         assert load_kwargs is not None
+         self._pending_load_kwargs = None
++        # DRAFT-0007: from this line the destination blocks are in flight, so
++        # the guard gets the new union BEFORE the copy is launched. A collision
++        # raised here stops the step before a byte moves, and it is deliberately
++        # not caught: the connector's own submit failing is the loud outcome.
++        self._kvtier_publish_inflight_loads()
+         # TODO: sort out KV Connectors' use of forward_context
+         if is_forward_context_available():
+             self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
+@@ -113,6 +187,13 @@
+         output.finished_sending = transfer_results.finished_sending or None
+         output.finished_recving = transfer_results.finished_recving or None
+         output.failed_recving = transfer_results.failed_recving
++        # DRAFT-0007: retire the events the engine has just PROVEN finished -
++        # loaded or failed, both mean the copy is over. See
++        # `_kvtier_retire_completed` for why this is the only completion signal
++        # that reaches this process.
++        self._kvtier_retire_completed(
++            transfer_results.finished_recving, transfer_results.failed_recving
++        )
+         output.invalid_block_ids = self.kv_connector.get_block_ids_with_load_errors()
+         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
+         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
+@@ -137,6 +218,284 @@
+         kv_transfer_state._KV_CONNECTOR_AGENT = None if disabled else self.kv_connector
+         self._disabled = disabled
+ 
++    # ---- RecoverSSM / KV-connector collision guard: the LOAD side -------------
++    # (DRAFT-0007.) The predicate and the raise live in `RecoverSSMState`; this
++    # half only publishes where the connector's loads are going. Everything here
++    # is host-side: the ids arrive as ints on a metadata object the connector
++    # already holds, and the union is a set union of small int sets.
++
++    def set_load_collision_sink(self, model_state: Any) -> None:
++        """Register the guard's other half; called once, by the model runner.
++
++        The guard lives on the model state's `recoverssm` member, which is None
++        unless `--use-replayssm` is on. A model with no RecoverSSM registers
++        nothing and this connector keeps counting without ever pushing - and
++        says so in the witness, because a counter that reads zero must never be
++        readable as "the guard ran and found nothing".
++        """
++        sink = getattr(model_state, "recoverssm", None)
++        if not hasattr(sink, "publish_inflight_load_blocks"):
++            sink = None
++        self._kvtier_guard_sink = sink
++        logger.info(
++            "RECOVERSSM-GUARD load side registered: sink=%s; the guard is armed "
++            "from the first load submit, not from this line",
++            type(sink).__name__ if sink is not None else "none",
++        )
++        self._kvtier_write_guard_witness(force=True)
++
++    def _kvtier_capture_load_submit(self, metadata: Any) -> None:
++        """Remember where this step's load lands, before anything is launched.
++
++        The ids are read off the SAME object the copy is launched from:
++        `load_gpu_blocks` is the worker-side landing spot of the scheduler's
++        `TransferMeta.gpu_block_ids` (the manager does
++        `load_gpu.extend(load_state.transfer_meta.gpu_block_ids)`), so this is
++        the destination set as the submit itself sees it, not a re-derivation of
++        it. `load_event_to_reqs` is kept alongside because completion arrives as
++        REQUEST ids - the worker polls the copy stream's events and resolves
++        them through that same map, and nothing else in this process can tie a
++        finished request back to a load event.
++        """
++        ids = getattr(metadata, "load_gpu_blocks", None)
++        event = getattr(metadata, "load_event", -1)
++        if not ids or event is None or event < 0:
++            # Nothing to load this step. A previous step's note must not
++            # survive: the next submit would publish it as if it were that
++            # submit's own destination, which is a false alarm waiting for a
++            # colliding commit.
++            if self._kvtier_pending_load is not None:
++                self._kvtier_guard_counters["pending_replaced"] += 1
++            self._kvtier_pending_load = None
++            return
++        by_event = getattr(metadata, "load_event_to_reqs", None) or {}
++        # A MUTABLE set on purpose: `_kvtier_retire_completed` shrinks it as the
++        # requests it names are reported finished, and the event retires when it
++        # runs empty.
++        self._kvtier_pending_load = (int(event), frozenset(ids), set(by_event.get(event, ())))
++
++    def _kvtier_publish_inflight_loads(self) -> None:
++        """At the submit: the pending note becomes in-flight, and the guard gets
++        the new union.
++
++        A load's ids must stay published until its completion is PROVEN, not
++        merely until the next step: the async path launches after this step's
++        RecoverSSM commit, so the collision this guard exists to catch is one
++        this step cannot see. Clearing per step would therefore be the silent
++        direction of wrong.
++        """
++        outstanding = self._kvtier_inflight_loads
++        if outstanding:
++            aged = {}
++            for event, (ids, reqs, seen) in outstanding.items():
++                if seen + 1 >= KVTIER_LOAD_INFLIGHT_MAX_SUBMITS:
++                    # No completion proof ever arrived for it. Dropping is an
++                    # under-report and is counted, never absorbed.
++                    self._kvtier_guard_counters["expired_unproven"] += 1
++                    continue
++                aged[event] = (ids, reqs, seen + 1)
++            self._kvtier_inflight_loads = outstanding = aged
++        pending = self._kvtier_pending_load
++        self._kvtier_pending_load = None
++        if pending is not None:
++            event, ids, reqs = pending
++            outstanding[event] = (ids, reqs, 0)
++            self._kvtier_guard_counters["publishes"] += 1
++            self._kvtier_witness_changes += 1
++            if not reqs:
++                # The scheduler only allocates a load event when it has requests
++                # to load, so an event naming none has no completion proof
++                # available and can only expire. Counted, so a future change
++                # that makes it common is visible instead of quietly expiring.
++                self._kvtier_guard_counters["unprovable_events"] += 1
++            self._kvtier_push_guard()
++
++    def _kvtier_retire_completed(
++        self, finished_recving: Any, failed_recving: Any
++    ) -> None:
++        """Un-publish the events whose copies are over - loaded or failed.
++
++        The only per-transfer completion signal that reaches this process is
++        `get_transfer_results()`'s finished/failed recving, which names
++        REQUESTS: `get_finished()` polls the copy stream's events and resolves
++        them through `load_event_to_reqs`. A failed load is reported as finished
++        recving as well (the base class's own contract, and
++        `get_block_ids_with_load_errors()` is how the bad blocks are named),
++        while `failed_recving` is what the scheduler feeds
++        `Scheduler._handle_failed_recving`. Honouring both is the honest
++        definition of "this copy will write nothing more", which is all the
++        guard needs. There is no per-transfer callback in this connector, and
++        this is the closest thing to one that exists.
++
++        An event is retired only once EVERY request it carries has been seen
++        finished. The engine reports an event's requests together (it resolves
++        the completed event index through `load_event_to_reqs`), but the
++        remaining set is kept per event so a report that arrives split across
++        steps still retires, instead of leaving a live transfer armed until it
++        expires.
++        """
++        outstanding = self._kvtier_inflight_loads
++        if not outstanding:
++            return
++        done = set(finished_recving or ()) | set(failed_recving or ())
++        if not done:
++            return
++        retired = []
++        for event, (_ids, remaining, _seen) in outstanding.items():
++            if not remaining:
++                continue
++            remaining -= done
++            if not remaining:
++                retired.append(event)
++        for event in retired:
++            del outstanding[event]
++        if retired:
++            self._kvtier_guard_counters["unpublishes"] += len(retired)
++            self._kvtier_witness_changes += 1
++            self._kvtier_push_guard()
++
++    def _kvtier_push_guard(self) -> None:
++        """Hand the sink the union of everything still in flight.
++
++        The call is the disarm path too: an empty union is what turns
++        `guard_armed()` off again, so a step with no load resolves nothing on
++        the model-state side.
++        """
++        union: frozenset = frozenset()
++        for ids, _reqs, _seen in self._kvtier_inflight_loads.values():
++            union = union | ids
++        sink = self._kvtier_guard_sink
++        if sink is not None:
++            self._kvtier_guard_counters["pushes_to_guard"] += 1
++            # The predicate runs inside the sink when BOTH sides are non-empty,
++            # and the other side is the sink's own state, so counting it needs
++            # this read. It is the attribute the DRAFT-0007 hunk declares; if it
++            # is ever renamed the counter degrades to `state_side_unknown`
++            # instead of reporting a suspicious zero.
++            if union and hasattr(sink, "_state_blocks"):
++                if sink._state_blocks:
++                    self._kvtier_guard_counters["checks_at_submit"] += 1
++            else:
++                self._kvtier_guard_counters["state_side_unknown"] += 1
++            if union and not self._kvtier_guard_armed_logged:
++                self._kvtier_guard_armed_logged = True
++                logger.warning(
++                    "RECOVERSSM-GUARD ARMED: %d destination blocks in flight; the "
++                    "commit-side intersection now runs on every RecoverSSM commit "
++                    "(witness: %s)",
++                    len(union),
++                    self._kvtier_guard_witness_path(),
++                )
++            # NOT inside try/except, deliberately: a collision is the one
++            # exception this path must let through, and it must reach the step
++            # loop as itself rather than as a swallowed log line.
++            sink.publish_inflight_load_blocks(union, side="load_submit")
++        self._kvtier_write_guard_witness()
++
++    def _kvtier_guard_witness_path(self) -> str:
++        """Where this process publishes its guard counters.
++
++        `VLLM_E2_TIER_DIAG` is the directory the operator already reads for
++        tier diagnostics; with it unset the witness falls back to `/tmp` rather
++        than vanishing, since "no file" is supposed to mean "no load submit has
++        ever run here", not "the diagnostics directory was not configured".
++        The name never starts with `rank-`, so it cannot be mistaken for a rank
++        document by the reader that walks that directory.
++        """
++        if self._kvtier_guard_rank_tag is None:
++            try:
++                from vllm.distributed.parallel_state import (
++                    get_pp_group,
++                    get_tp_group,
++                )
++
++                tag = (
++                    f"PP{get_pp_group().rank_in_group}"
++                    f"_TP{get_tp_group().rank_in_group}"
++                )
++            except Exception:  # pragma: no cover - only before distributed init
++                tag = f"pid{os.getpid()}"
++            self._kvtier_guard_rank_tag = tag
++        directory = (os.environ.get("VLLM_E2_TIER_DIAG") or "/tmp").strip() or "/tmp"
++        return os.path.join(
++            directory, f"recoverssm-guard-{self._kvtier_guard_rank_tag}.json"
++        )
++
++    def _kvtier_write_guard_witness(self, force: bool = False) -> None:
++        """Publish the guard's counters outside the process.
++
++        A diagnostic must never break serving, so every failure here is caught -
++        and counted, because a witness that silently stopped being written is
++        how "armed, no collisions" turns into an assumption. It is SAMPLED (a
++        rewrite at most every `KVTIER_GUARD_WITNESS_EVERY` changes, or whenever
++        the outstanding-event count moves), so it is a live view of the
++        counters, not an event log.
++
++        `verdict` is written down because the three states a reader must tell
++        apart do not differ in any number: a file that is absent means no load
++        submit has ever run in this process; `sink: null` means loads ran with
++        no RecoverSSM guard to arm; `publishes: 0` with a sink means armed and
++        never yet given anything to check.
++        """
++        outstanding = len(self._kvtier_inflight_loads)
++        due = (
++            force
++            or outstanding != self._kvtier_witness_events
++            or self._kvtier_witness_changes >= KVTIER_GUARD_WITNESS_EVERY
++        )
++        if not due:
++            return
++        self._kvtier_witness_events = outstanding
++        self._kvtier_witness_changes = 0
++        counters = self._kvtier_guard_counters
++        sink = self._kvtier_guard_sink
++        if sink is None:
++            verdict = "guard_not_armed_no_recover_ssm_sink"
++        elif not counters["publishes"]:
++            verdict = "armed_no_load_submit_yet"
++        else:
++            verdict = "armed_loads_observed"
++        payload = {
++            "kind": "kvtier-recoverssm-guard",
++            "verdict": verdict,
++            "sink": type(sink).__name__ if sink is not None else None,
++            "pid": os.getpid(),
++            "in_flight_events": outstanding,
++            "in_flight_blocks": sum(
++                len(ids) for ids, _reqs, _seen in self._kvtier_inflight_loads.values()
++            ),
++            "counters": dict(counters),
++            "max_submits_before_expiry": KVTIER_LOAD_INFLIGHT_MAX_SUBMITS,
++            "meaning": (
++                "publishes counts load submits that added destination blocks; "
++                "unpublishes counts events whose completion was proven; "
++                "expired_unproven counts sets dropped with no proof, which is an "
++                "UNDER-report and must stay 0; checks_at_submit counts submits "
++                "that could reach the predicate because the commit side had "
++                "published. Absent file = no load submit ever ran in this "
++                "process, which is NOT the same claim as a collision-free boot."
++            ),
++        }
++        path = self._kvtier_guard_witness_path()
++        tmp = f"{path}.{os.getpid()}.tmp"
++        try:
++            with open(tmp, "w", encoding="utf-8") as handle:
++                json.dump(payload, handle, sort_keys=True)
++                handle.flush()
++            os.replace(tmp, path)
++            counters["witness_writes"] += 1
++        except (OSError, TypeError, ValueError):
++            # A diagnostic never outranks serving. Counted, and said once.
++            counters["witness_write_failures"] += 1
++            if counters["witness_write_failures"] == 1:
++                # No `exc_info`: this block must not be able to raise, and a
++                # logging call that formats an traceback is one way it could.
++                # The failure is a counter, and the path it failed on.
++                logger.warning(
++                    "RECOVERSSM-GUARD witness could not be written to %s; the "
++                    "counters below are still correct in memory", path,
++                )
++
+ 
+ NO_OP_KV_CONNECTOR = KVConnector()
+ 

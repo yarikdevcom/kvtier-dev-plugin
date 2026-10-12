@@ -1,0 +1,193 @@
+diff --git a/vllm/v1/worker/gpu/model_states/recoverssm.py b/vllm/v1/worker/gpu/model_states/recoverssm.py
+index 2aafa25..85d3663 100644
+--- a/vllm/v1/worker/gpu/model_states/recoverssm.py
++++ b/vllm/v1/worker/gpu/model_states/recoverssm.py
+@@ -12,10 +12,29 @@ from vllm.v1.attention.backends.recoverssm_metadata import RecoverSSMMetadata
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ logger = init_logger(__name__)
+ 
+ 
++class RecoverSSMLoadCollisionError(RuntimeError):
++    """A RecoverSSM state commit and a connector KV load claim one block.
++
++    The message always opens with the constant phrase below so an operator
++    reading a crash can tell this collision from every other assertion in this
++    file (and from a torch/Triton index error, which is what a raw `assert`
++    would have produced - and a raw `assert` also vanishes under `python -O`,
++    which is why this is a real exception type).
++
++    Both orders of this collision answer the prompt and neither raises
++    anywhere else in the engine: the deferred commit overwrites state a load
++    just restored with one derived from a checkpoint that predates the load,
++    or the load overwrites a state the commit had already advanced. A fluent
++    continuation is the failure, so the engine must stop here instead.
++    """
++
++    MARKER = "RECOVERSSM/KV-CONNECTOR STATE COLLISION"
++
++
+ @dataclass(frozen=True)
+ class DeferredRecoverSSMStep:
+     """One verify step's RecoverSSM commits, detached on a non-last PP rank.
+ 
+     The rank verified the window at step T but receives the accepted counts
+@@ -35,16 +54,136 @@ class RecoverSSMState:
+         self._step: tuple[RecoverSSMMetadata, ...] | None = None
+         # True while `_step` is a restored PP-deferred step: its commit must
+         # skip rows whose request was freed since the verify (their state
+         # blocks may already belong to another request).
+         self._step_is_deferred = False
++        # Host-side id sets the collision guard intersects. Both are published
++        # by their owners (see `publish_*` below) because neither side can see
++        # the other from here: the align-state block ids are resolved from the
++        # runner's block tables and the connector's destinations from its own
++        # worker metadata. Empty means "not published", which cannot collide.
++        self._state_blocks: Any = None
++        self._inflight_load_blocks: Any = None
+ 
+     def reset(self) -> None:
+         """Drop the recorded step. Its metadata holds the commit contexts, which
+         reference the KV cache tensors they were built for."""
+         self._step = None
+         self._step_is_deferred = False
++        # A guard reading ids from a previous step over-reports (a false alarm),
++        # never under-reports, which is the only direction worth paying for.
++        self._state_blocks = None
++        self._inflight_load_blocks = None
++
++    @staticmethod
++    def find_load_collision(
++        committed_rows: Any,
++        in_flight_blocks: Any,
++    ) -> tuple[int, int] | None:
++        """First `(row, block)` claimed by BOTH sides, else None.
++
++        Host-side arithmetic only, and deliberately NOT a set intersection:
++        `set(committed.values()) & in_flight` allocates a set per step on the
++        step loop, which runs thousands of times a minute on the thread that
++        steps the engine, and a comprehension also loses the row the caller has
++        to name in the message. Here the whole cost is one `in` test per
++        committed row (O(1), so `in_flight_blocks` MUST be a set/frozenset) and
++        the common answer - no collision - costs nothing but that loop.
++        `committed_rows` is a row -> block mapping or an iterable of pairs.
++        """
++        items = (
++            committed_rows.items()
++            if hasattr(committed_rows, "items")
++            else committed_rows
++        )
++        for row, block in items:
++            if block in in_flight_blocks:
++                return row, block
++        return None
++
++    @classmethod
++    def assert_no_load_collision(
++        cls,
++        committed_rows: Any,
++        in_flight_blocks: Any,
++        *,
++        side: str,
++    ) -> None:
++        """Raise `RecoverSSMLoadCollisionError` if the two id sets intersect.
++
++        `side` names who is checking, i.e. which side saw the collision SECOND:
++        "commit" for the RecoverSSM commit (the load published first) and
++        "load_submit" for the connector's submit hook (the commit published
++        first). Both directions are needed because the winner depends on the
++        step order, and a guard on one side only is silent on the other.
++        """
++        hit = cls.find_load_collision(committed_rows, in_flight_blocks)
++        if hit is None:
++            return
++        row, block = hit
++        second = (
++            "the RecoverSSM commit is the SECOND side to see it (the connector "
++            "published its in-flight load blocks first)"
++            if side == "commit"
++            else "the KV connector's load submit is the SECOND side to see it "
++            "(RecoverSSM published its committed state blocks first)"
++        )
++        raise RecoverSSMLoadCollisionError(
++            f"{RecoverSSMLoadCollisionError.MARKER}: request state row {row} "
++            f"owns align-state block {block} and the KV connector has that same "
++            f"block in flight for a load; {second}. Both orders corrupt in "
++            "silence - the deferred commit overwrites state the load just "
++            "restored, or the load overwrites state the commit had advanced - "
++            "so serving stops here rather than answering from state neither "
++            "side can vouch for. This is not a transient: restarting the same "
++            "configuration re-runs into it."
++        )
++
++    def guard_armed(self) -> bool:
++        """True when a connector load is in flight, i.e. when resolving the ids
++        the guard intersects is worth its cost.
++
++        Only the in-flight side is consulted, deliberately: the caller of this is
++        the owner of the OTHER side, so asking it whether state blocks are already
++        published would deadlock the pairing (nothing is published until the first
++        armed step resolves it). The owner of the row -> block resolution asks this
++        BEFORE it pays for a device read, so an ordinary step - no load in flight -
++        never resolves anything. That single attribute read is the whole hot-path
++        argument.
++        """
++        return bool(self._inflight_load_blocks)
++
++    def publish_state_blocks(self, row_to_block: Any) -> None:
++        """Report the align-state block each committing row writes (row -> id).
++
++        Stored BY REFERENCE, never copied: the owner may reuse one dict per step
++        (clear and refill) because the guard reads it inside the same step. The
++        caller resolves row -> block id from the block tables; on a PP-deferred
++        commit the host mirror can already have moved, which is the residual
++        question this guard exists to make loud.
++        """
++        self._state_blocks = row_to_block
++
++    def publish_inflight_load_blocks(
++        self, gpu_block_ids: Any, *, side: str = "load_submit"
++    ) -> None:
++        """Report the GPU blocks the connector's loads target, and check them.
++
++        The connector's submit hook hands a list, so it is coerced to a
++        frozenset exactly once per submit - that is where the only allocation on
++        this path happens, and it is what makes the per-row test O(1). Passing
++        an empty sequence when nothing is loading is the owner's job; leaving a
++        previous step's ids published keeps the guard armed and over-reports.
++        """
++        blocks = (
++            gpu_block_ids
++            if isinstance(gpu_block_ids, (frozenset, set))
++            else frozenset(gpu_block_ids)
++        )
++        self._inflight_load_blocks = blocks
++        if blocks and self._state_blocks:
++            self.assert_no_load_collision(self._state_blocks, blocks, side=side)
+ 
+     def detach_step(self) -> DeferredRecoverSSMStep | None:
+         """Take this step's commits for a deferred (non-last PP rank) commit.
+ 
+         Returns None when the step has nothing to commit (no spec rows)."""
+@@ -119,10 +258,21 @@ class RecoverSSMState:
+             # request no longer owns.
+             num_sampled = torch.where(
+                 idx_mapping >= 0, num_sampled, torch.zeros_like(num_sampled)
+             )
+ 
++        # Collision guard, BEFORE any state is written: this commit is about to
++        # write the recurrent state of every row in `_state_blocks`, so if the
++        # connector has any of those same blocks in flight for a load, the two
++        # writes race for the row and the loser's data becomes the answer. An
++        # in-flight id set that was never published (None) or is empty costs one
++        # truthiness test, which is the whole per-step price when armed.
++        if self._inflight_load_blocks and self._state_blocks:
++            self.assert_no_load_collision(
++                self._state_blocks, self._inflight_load_blocks, side="commit"
++            )
++
+         for metadata in step:
+             postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
+             if postprocess_meta is None:
+                 continue
+             assert state_indices is not None
