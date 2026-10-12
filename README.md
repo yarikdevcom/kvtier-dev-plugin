@@ -232,6 +232,21 @@ Engine: `vllm serve <model-dir>` on v2.5.1, the tier mounted, with
 the tier and that flag are refused together, that is a statement about the engine's
 validator, not about this boot: this boot already runs without the flag.
 
+> **Since 0.2.72 the plugin refuses that combination itself, in `ssm_guard.py`.** If an SSM-recovery flag
+> is set and this boot installs OUR connector, the boot raises `ValueError` naming the flag, before the tier
+> installs or arms anything. The reason is not tidiness: nothing orders a Mamba boundary-state store after
+> the RecoverSSM commit, so a spilled boundary block may not be the committed state — and a wrong KV claim
+> comes back as plausible output rather than an error, which is the one outcome worse than not running. The
+> engine's `validate_mamba_cached_kernel` normally refuses this first, so **seeing the plugin's message means
+> that validator was relaxed** (that is precisely what the DO-NOT-APPLY `DRAFT-0006` would do). Three things
+> an operator must not misread: the flag is checked under all three names this ecosystem uses
+> (`use_replayssm`, `use_recoverssm`, `use_kda_recoverssm`); a fork where the attribute does **not exist** is
+> not SSM and boots normally, so an old engine is never bricked by this; and a flag that cannot be READ
+> warns, loudly, and installs — the plugin is not the primary defence here, and refusing to boot because its
+> own probe was confused would be a new failure mode. There is no env opt-out; the remedy is to drop the
+> flag. A `VLLM_E2_TIER_DEV_BOOT_INERT` boot warns instead of refusing, because an install-only boot arms
+> nothing and therefore spills nothing.
+
 Tier environment in force, against the default this table documents:
 
 | Variable | Live value | Against the documented default |

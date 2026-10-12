@@ -4438,3 +4438,51 @@ it destroys scratch belonging to concurrent sessions — it was disclosed, steer
 recorded here because the temptation is structural: a suite that demands a nearly-full tmpfs will keep
 producing this mistake. Green gate for the change: 224 targeted tests, then **3397 passed** full-suite
 with ≥2.7 GB of tmpfs free. Commits `732d65b` (the access-model change) and `53670e0` (this one).
+
+## The guard that had to be placed, not written: SSM recovery refuses at boot (`ssm_guard.py`) - 0.2.72
+
+**The reviewer's finding:** *"nothing orders Mamba boundary stores after the RecoverSSM commit, so lifting the
+replayssm refusal would persist the wrong state."* The first design mapped a runtime guard — a named refusal in
+`disk_store.REFUSAL_REASONS` enforced in the `on_store_completed` pair loop *and* in `disk_spill.request_spill`, plus
+a new contract kind in `_group_serviceability` so `_eligible_groups` names it in `OFFER_REFUSALS`. That is the correct
+design if we ever need to *run* under SSM recovery. We do not: the operator's decision was to refuse the boot, which
+costs ~110 logic lines instead of a change through three files that hold the correctness of every claim the tier makes.
+
+**Placement was the entire task; the check itself is trivia.** Three candidate homes would have produced a gate that
+cannot fail, and two of them are in this plugin on purpose: `_after_connector_created` runs inside its own
+`try/except Exception` ("nothing here may raise into `create_connector`"), and `engine_side.register()` is wholly
+wrapped *and* is not even passed a `vllm_config`, so it cannot answer the question there. The guard is therefore called
+from the hook *wrapper* in `backport._make_create_connector_hook.create_connector`, after the fork builds the connector
+and **before** `_after_connector_created` installs or arms anything — the moment the tier exists at all. From there the
+`ValueError` crosses `Scheduler.__init__` (no `try` around the `create_connector` call) and `EngineCore.__init__`, and
+the background `run_engine_core`'s `except Exception` logs `EngineCore failed to start.` and **re-raises**. Proven by a
+test with a real fitted hook (raises, and `hook_errors == 0`, `hook_installs == 0`, `not is_armed()`), and pinned
+structurally by an AST test so that moving the call back inside the contained region fails there rather than on a GPU
+box. This is the same class of defect the access-model change removed: a control that reads as protection and cannot
+fail.
+
+**The load-bearing branch is the one that does not refuse.** An engine where the attribute does not *exist* is a fork
+without the feature, and must boot — otherwise this guard bricks every older engine to protect one configuration nobody
+runs. `_read_flag` distinguishes that from a flag legitimately set to `None` with a `_MISSING` **sentinel**, because
+`None` is a value and absence is not, and collapsing the two is exactly how a probe becomes a liar. Five verdicts
+(`clear`, `refused`, `refused-inert`, `indeterminate`, `no-config`); truthy outranks an unreadable sibling; the flag is
+checked under all three names this ecosystem uses (`use_replayssm`, `use_recoverssm`, `use_kda_recoverssm`) even though
+`use_recoverssm` turns up in **neither** fork on this disk — checked defensively rather than by guessing which fork
+serves next. Two deliberate non-refusals, both tested: a **foreign** connector is not refused, because the tier never
+arms behind one (`_is_tier_connector` → `hook_other_connector`) so it spills nothing and there is no wrong claim to
+prevent — refusing somebody else's boot would be this plugin reaching past its own tier; and a
+`VLLM_E2_TIER_DEV_BOOT_INERT` boot warns instead of refusing, since an install-only boot arms nothing. The
+**fail-open** on an unreadable flag or a missing `cache_config` is deliberate and logged as loudly as a refusal
+(`SSM BOOT GUARD: NOT ESTABLISHED`), because the engine's own `validate_mamba_cached_kernel` is the primary defence and
+a plugin that dies because its own probe was confused is a new failure mode nobody needed. There is no env opt-out
+— a test sweeps the source for one — and the message says so: the remedy is to drop the flag.
+
+**What this still cannot prove.** No boot with `--use-replayssm` and this tier has ever run, so we have never
+*witnessed* the wrong state being spilled; the guard closes a configuration, it does not measure the ordering gap, and
+nobody should describe it as proven-correct on a live SSM engine. Two existing DRAFT-0007 suites guard the load/commit
+collision engine-side and were left untouched — they are complementary, not redundant. Numbers: 27 new tests, and the
+suite total moved 3397 → **3426**, which is 27 + 2 and those 2 are the package sweeps (`test_disk_authority_switch.py`,
+`test_guards.py` iterate every `*.py` in the package) enrolling the new module automatically — a count that does not
+add up is worth chasing to an explanation rather than accepting. Full suite green with ≥2.7 GB of tmpfs free; an
+intermediate run showed 39 failures at 1.6 GB free, all `no_free_space`, correctly reported as environment and not
+worked around. Commit `75983f1`.
