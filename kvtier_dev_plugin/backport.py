@@ -2864,6 +2864,27 @@ def _make_create_connector_hook(original):
         config_arg = kwargs.get("config")
         if config_arg is None and args:
             config_arg = args[0]
+        # THE SSM BOOT GUARD: the ONE place this plugin raises into the engine on
+        # purpose, and deliberately HERE rather than inside `_after_connector_created`.
+        # That hook runs inside its own `try/except Exception` ("nothing here may raise
+        # into `create_connector`"), so a refusal raised in there is swallowed and the
+        # guard would be theatre - a gate that cannot fail. Out here the ValueError
+        # reaches the operator: `Scheduler.__init__` and `EngineCore.__init__` have no
+        # try around this call, and the background EngineCore's `run_engine_core`
+        # `except Exception` logs `EngineCore failed to start.` and RE-RAISES. Read
+        # `ssm_guard.py` for the semantics (truthy = refuse, ABSENT = not SSM, an
+        # unreadable flag = warn only) and for why this boot must die instead of
+        # degrading: a spilled Mamba boundary state that predates the RecoverSSM commit
+        # would be served back as a correct restore, and a wrong KV claim returns
+        # plausible output rather than an error.
+        #
+        # THE PREDICATE IS OUR OWN CONNECTOR, not every connector: with a foreign one
+        # the tier never arms (`_is_tier_connector` -> `hook_other_connector`), so it
+        # spills nothing and there is no wrong claim to prevent - refusing somebody
+        # else's boot would be this plugin over-reaching past its own tier.
+        if _is_tier_connector(connector):
+            from . import ssm_guard  # noqa: PLC0415 - lazy by idiom
+            ssm_guard.boot_check(config_arg)
         _after_connector_created(connector, config_arg)
         return connector
 
@@ -2875,7 +2896,9 @@ def _make_create_connector_hook(original):
         "kvtier-dev-plugin: the fork's own create_connector, unchanged, then the "
         "PR #56810 install against the manager class the connector just imported "
         "- the first moment that class exists. Contained: a hook failure cannot "
-        "stop the connector being built.")
+        "stop the connector being built. The ONE exception is `ssm_guard` above, "
+        "which refuses an SSM-recovery boot by raising on purpose, outside the "
+        "contained region - see its module docstring.")
     return create_connector
 
 

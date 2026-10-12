@@ -607,7 +607,9 @@ def register() -> None:
         # EVERY process like the capacity wrappers: in a worker the hook fires and
         # finds no `scheduler_manager`, which is the normal `no_manager` answer,
         # not an error, and a failure inside the hook can never stop a connector
-        # being built. Contained by its own try/except; never raises.
+        # being built. Contained by its own try/except; never raises - with ONE
+        # deliberate exception, the SSM boot guard, which runs OUTSIDE that contained
+        # region so a refused boot really dies (see `ssm_guard.py`).
         connector_hook = backport.install_connector_hook()
         cls = _engine_core_class()
         if cls is None:
