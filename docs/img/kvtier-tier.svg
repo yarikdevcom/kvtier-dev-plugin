@@ -111,6 +111,6 @@
     <text x="32" y="534" fill="#0f172a">g4    never spilled, excluded from every predicate</text>
     <text x="536" y="502" fill="#334155">restore reads the CONTIGUOUS prefix:</text>
     <text x="536" y="518" fill="#334155">g5 g5 g5 HOLE g5 g5  gives 3 spans</text>
-    <text x="536" y="534" fill="#334155">and recomputes all 31,845 behind it</text>
+    <text x="536" y="534" fill="#334155">and recomputes all 31,845 tokens behind it</text>
   </g>
 </svg>
